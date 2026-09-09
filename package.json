@@ -1,6 +1,6 @@
 {
   "name": "@leviyuan/lodestar",
-  "version": "0.16.5",
+  "version": "0.16.6",
   "publishConfig": {
     "access": "public"
   },
@@ -89,7 +89,7 @@
     "@hono/node-server": "1.19.15",
     "@xmldom/xmldom": "0.9.12",
     "fast-uri": "3.1.6",
-    "hono": "4.13.3",
+    "hono": "4.13.5",
     "ip-address": "10.5.0",
     "protobufjs": "7.6.5",
     "qs": "6.16.0",

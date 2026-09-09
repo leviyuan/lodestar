@@ -8,6 +8,19 @@ export function isStaleAtReceipt(
   return createTime > 0 && receivedAt - createTime > thresholdMs
 }
 
+/** One incoming text is consumed by exactly one pending interaction. Lower
+ * priority Agent routing runs only when this returns false. */
+export async function consumePendingTextInput(handlers: {
+  reply(): Promise<boolean>
+  hasQuestion(): boolean
+  answerQuestion(): Promise<void>
+}): Promise<boolean> {
+  if (await handlers.reply()) return true
+  if (!handlers.hasQuestion()) return false
+  await handlers.answerQuestion()
+  return true
+}
+
 export interface InboundMessageResource {
   key: string
   type: 'image' | 'file'

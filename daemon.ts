@@ -39,6 +39,7 @@ import {
 import { buildNotifyCardFromReg } from './src/notify'
 import { startNotifyServer } from './src/notify'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
+import { createNotifyReplyRuntime } from './src/notify-replies'
 import { AgentService } from './src/agent-service'
 import { handleAgentRequest } from './src/agent-api'
 import { ensureLodestarAgentSkill } from './src/agent-skill'
@@ -49,6 +50,7 @@ import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
 import { checkPidGuard, writePidFile } from './src/pid-guard'
 import {
   inboundMessageResource,
+  consumePendingTextInput,
   inboundResourceDownloadFailureText,
   isStaleAtReceipt,
 } from './src/inbound-message'
@@ -391,6 +393,14 @@ function extractPostMarkdown(
 // ── Inbound message handler ─────────────────────────────────────────────
 const STALE_THRESHOLD_MS = 30_000
 const seenMessageIds = new Set<string>()
+const notifyReplies = createNotifyReplyRuntime({
+  sendCard: feishu.sendCard,
+  updateCard: feishu.updateCard,
+  sendText: feishu.sendText,
+  dispatch: dispatchCallback,
+  onWaitingChanged: chatId => sessions.get(chatId)?.refreshPendingAsks(),
+  log,
+})
 
 async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> {
   const message = data?.message
@@ -472,6 +482,7 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   try { contentObj = JSON.parse(message.content ?? '{}') } catch {}
   const msgType = message.message_type as string
   let text = ''
+  let postHasAttachments = false
   const filePaths: string[] = []
   if (msgType === 'text') {
     text = (contentObj.text ?? '').trim()
@@ -480,6 +491,7 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
     // markdown 给 Codex,内嵌图片/文件 key 走跟原生 image/file 一样的
     // downloadAttachment 路径。
     const post = extractPostMarkdown(contentObj)
+    postHasAttachments = post.imageKeys.length > 0 || post.fileKeys.length > 0
     text = post.markdown.trim()
     for (const key of post.imageKeys) {
       const p = await feishu.downloadAttachment(message.message_id, key, 'image')
@@ -500,23 +512,21 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
     if (await session.runCommand(text, userOpenId)) return
   }
 
+  // Pending text is consumed once: notification reply → Agent question.
+  // Only then can it reach model-entry or ordinary Agent input below.
+  if ((msgType === 'text' || msgType === 'post') && text && !postHasAttachments
+    && await consumePendingTextInput({
+      reply: () => notifyReplies.consume({
+        chatId, openId: userOpenId, messageId: msgId ?? '', text, createTime,
+        parentId: message.parent_id,
+      }),
+      hasQuestion: () => session.hasPendingAsk(),
+      answerQuestion: () => session.onAskMessageAnswer(text, userOpenId, msgId ?? ''),
+    })) return
+
   // 补录应答态:点「➕ 补录模型」后的下一条文本作为模型名消费(裸词命令
   // 已在上面优先分流)。同 AskUserQuestion 的消息应答语义。
   if (msgType === 'text' && text && await session.consumeModelCustomMessage(text, userOpenId)) {
-    return
-  }
-
-  // Pending AskUserQuestion: route the message as a custom answer
-  // instead of opening a new turn. This is how custom-text answers
-  // work in this version — Feishu schema 2.0 doesn't support form/
-  // input elements, so the chat box itself is the input. Only applies
-  // to text-only messages (post / 图片 / 文件 / 视频附件都按一次新轮处理)。
-  if (msgType === 'text' && text && session.hasPendingAsk()) {
-    // ✅ 不在这里抢打 —— 只有 onAskMessageAnswer 真把这条文本记成 ask
-    // 答案时才回 ✅。撞上僵尸 ask(can_use_tool 没来)时这条消息会被当
-    // 普通新轮重处理,不该留"答案已收到"标记。msgId 透传下去:成功消费
-    // 时用来打 ✅,兜底重处理时让消息走完整的普通 reaction 生命周期。
-    await session.onAskMessageAnswer(text, userOpenId, msgId ?? '')
     return
   }
 
@@ -560,7 +570,7 @@ function cardActionLabel(kind: string): string {
     tasklist_enable: '启用任务清单', tasklist_delete_prompt: '删除任务清单',
     tasklist_delete_confirm: '确认删除任务清单', token_source_enable: '启用账号',
     agent_identity_page: 'Agent 身份翻页',
-    notify_callback: '通知反馈',
+    notify_callback: '通知反馈', notify_reply: '通知回复', notify_reply_cancel: '取消通知回复',
   }
   return labels[kind] ?? kind
 }
@@ -608,6 +618,7 @@ async function sendActionReceipt(chatId: string, text: string): Promise<void> {
 }
 
 async function publishCardActionResult(data: any, result: any): Promise<void> {
+  if (result?.__cardActionPresented) return
   const kind = String(data?.action?.value?.kind ?? 'unknown')
   const label = cardActionLabel(kind)
   const chatId = String(
@@ -674,6 +685,10 @@ const cardActionAdmission = createCardActionAdmission<any, object>({
   scope: data => {
     const kind = String(data?.action?.value?.kind ?? '')
     if (kind.startsWith('agent_identity_')) return '__agent_identities_global__'
+    if (kind === 'notify_callback' || kind === 'notify_reply' || kind === 'notify_reply_cancel') {
+      const reg = getNotifyCallback(String(data?.action?.value?.notify_id ?? ''))
+      if (reg) return reg.chatId
+    }
     return String(data?.context?.open_chat_id ?? '') || '__notify_global__'
   },
   execute: handleCardAction,
@@ -739,8 +754,19 @@ async function handleCardAction(data: any): Promise<any> {
   // this chat — a notify push doesn't start a session, and the click's
   // job is to ping the local caller, not drive a turn. Short-circuit
   // before the session guard below.
-  if (value.kind === 'notify_callback') {
-    return await handleNotifyCallback(value, chatId, userId)
+  if (value.kind === 'notify_callback' || value.kind === 'notify_reply' || value.kind === 'notify_reply_cancel') {
+    const notifyId = String(value.notify_id ?? '')
+    const reg = getNotifyCallback(notifyId)
+    if (reg) data.__cardActionChatId = reg.chatId
+    if (value.kind === 'notify_callback') return await handleNotifyCallback(value, chatId, userId)
+    const result = value.kind === 'notify_reply'
+      ? await notifyReplies.open(notifyId, chatId, userId)
+      : await notifyReplies.cancel(notifyId, String(value.reply_id ?? ''), chatId, userId)
+    const response = withBusinessOutcome({
+      toast: { type: result.ok ? 'success' : 'error', content: result.message },
+      __cardActionPresented: result.presented === true,
+    }, result.ok)
+    return reg ? withNotifyContext(reg, response) : response
   }
 
   const session = sessions.get(chatId)
@@ -821,6 +847,8 @@ async function handleCardAction(data: any): Promise<any> {
       return modelActionResponse(result)
     }
     case 'ask': {
+      const blocked = session.askBlockReason(String(value.tool_use_id ?? ''))
+      if (blocked) return withBusinessOutcome({ toast: { type: 'error', content: blocked } }, false)
       // Custom-text branch: form submit packages the input under
       // `form_value`. Try a couple of plausible keys since the exact
       // shape can drift between Feishu schema versions; fall back to
@@ -946,6 +974,11 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
   }
   if (isDispatching(notifyId)) {
     return withNotifyContext(reg, { toast: { type: 'info', content: '处理中…' } })
+  }
+  if (reg.replyState?.status === 'waiting' || reg.replyState?.status === 'sending') {
+    return withNotifyContext(reg, withBusinessOutcome({
+      toast: { type: 'error', content: '正在等待文字回复，请先发送或取消回复，再选择按钮' },
+    }, false))
   }
   const button = reg.buttons.find((b) => b.id === buttonId)
   if (!button) {
@@ -1435,7 +1468,12 @@ async function boot(): Promise<void> {
   // Reload persisted /notify button→callback registrations before the
   // notify server starts serving, so a card tapped right after a daemon
   // restart still routes to its caller. Prunes entries older than 7 days.
-  loadCallbacks()
+  for (const reg of loadCallbacks()) {
+    // Restore visible UNKNOWN receipts for interrupted text deliveries. Use
+    // the same actor and shutdown tracking as live notification actions.
+    void trackCardActionWork(chatActor.enqueue(reg.chatId, () => notifyReplies.recover(reg)))
+      .catch(error => log(`notify-reply recovery failed: ${error instanceof Error ? error.message : error}`))
+  }
   startNotifyServer({
     bind: config.notify.bind,
     port: config.notify.port,

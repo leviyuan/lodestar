@@ -358,6 +358,9 @@ export class Session {
      * —— 这时若 requestId 已就位则 finalize；否则等 renderPermission
      * 一来立即 finalize。 */
     currentIdx?: number
+    /** Send a phone notification only when this ask becomes answerable. */
+    announced?: boolean
+    announcementVersion?: number
   }>()
   /** Thread-scoped goal reported by Codex app-server. Pure progress
    * accounting updates refresh this snapshot without adding card elements;
@@ -2858,6 +2861,14 @@ export class Session {
 
   hasPendingAsk(): boolean {
     return sessionAsk.hasPendingAsk(this)
+  }
+
+  refreshPendingAsks(): void {
+    sessionAsk.refreshPendingAsks(this)
+  }
+
+  askBlockReason(toolUseId: string): string | null {
+    return sessionAsk.askBlockReason(this, toolUseId)
   }
 
   /** 多条消息缓冲入口(`>>>` 开始 / `<<<` 收尾 / 中段普通消息)。返回 true

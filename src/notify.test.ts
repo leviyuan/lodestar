@@ -80,6 +80,27 @@ describe('buildNotifyCard', () => {
     expect(cs.columns[0].elements).toHaveLength(8)
   })
 
+  test('text-reply cards have only a fixed reply control below the footer, removed on completion', () => {
+    const opts = {
+      title: 'ops', text: 'type your reply', level: 'info' as const, notifyId: 'nf_reply', allowReply: true,
+    }
+    const card: any = buildNotifyCard(opts)
+    expect(findButtonValues(card).map(button => button.text.content)).toEqual(['回复'])
+    expect(cardBody(card).at(-1).columns[0].elements[0].behaviors[0].value.kind).toBe('notify_reply')
+    const done = buildNotifyCard({ ...opts, resolution: {
+      status: 'delivered', kind: 'text', text: '晚点', operatorOpenId: 'ou_owner',
+    } })
+    expect(findButtonValues(done)).toHaveLength(0)
+    expect(JSON.stringify(done)).toContain('已回复')
+  })
+
+  test('renderer rejects mixed selection and text-reply cards', () => {
+    expect(() => buildNotifyCard({
+      title: 'ops', text: 'invalid', level: 'info', notifyId: 'nf_mixed', allowReply: true,
+      buttons: [{ id: 'yes', text: '可以', type: 'default' }],
+    })).toThrow('mutually exclusive')
+  })
+
   test('buttons without notifyId are silently dropped (no dead value)', () => {
     const card: any = buildNotifyCard({
       title: 'ops', text: 'x', level: 'info',

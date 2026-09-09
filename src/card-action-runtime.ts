@@ -10,7 +10,7 @@ export const SUPPORTED_CARD_ACTION_KINDS = new Set([
   'model_panel_cancel', 'model_effort_select', 'ask', 'worktree_disband',
   'temp_fork_select', 'temp_back_select', 'temp_resume_select', 'tasklist_enable',
   'tasklist_delete_prompt', 'tasklist_delete_confirm', 'token_source_enable',
-  'agent_identity_page', 'notify_callback',
+  'agent_identity_page', 'notify_callback', 'notify_reply', 'notify_reply_cancel',
 ])
 
 /** Admission validation runs synchronously before actor/dedupe reservation;
@@ -20,10 +20,11 @@ export function validateCardActionAdmission(data: any): string | null {
   const kind = String(value.kind ?? '')
   if (!kind) return '无效操作'
   if (!SUPPORTED_CARD_ACTION_KINDS.has(kind)) return `不支持的操作: ${kind}`
-  if (kind !== 'notify_callback' && !String(data?.context?.open_chat_id ?? '')) {
+  const notification = kind === 'notify_callback' || kind === 'notify_reply' || kind === 'notify_reply_cancel'
+  if (!notification && !String(data?.context?.open_chat_id ?? '')) {
     return '回调缺少 chat_id，操作未执行'
   }
-  if (kind !== 'notify_callback' && !String(data?.context?.open_message_id ?? '')) {
+  if (!notification && !String(data?.context?.open_message_id ?? '')) {
     return '回调缺少原卡 message_id，操作未执行'
   }
   if (kind === 'permission' && !['allow', 'allow_always', 'deny'].includes(String(value.decision ?? ''))) {
@@ -196,6 +197,8 @@ function cardActionSemanticKey(data: any): string {
     case 'token_source_enable': resource = { source_id: value.source_id }; break
     case 'agent_identity_page': resource = { panel_id: value.panel_id, page: value.page }; break
     case 'notify_callback': resource = { notify_id: value.notify_id }; break
+    case 'notify_reply': resource = { notify_id: value.notify_id }; break
+    case 'notify_reply_cancel': resource = { notify_id: value.notify_id, reply_id: value.reply_id }; break
     case 'provider_select':
     case 'model_select':
     case 'model_custom_prompt':
@@ -222,7 +225,7 @@ export function cardActionDedupeIdentity(data: any): CardActionDedupeIdentity {
   return {
     ...(eventId ? { deliveryKey: `event\u0000${eventId}` } : {}),
     businessKey: `semantic\u0000${cardActionSemanticKey(data)}`,
-    ...(data?.action?.value?.kind === 'agent_identity_page' ? { repeatable: true } : {}),
+    ...(['agent_identity_page', 'notify_reply'].includes(data?.action?.value?.kind) ? { repeatable: true } : {}),
   }
 }
 

@@ -11,13 +11,78 @@ import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
+import { findPendingReply } from './notify-callbacks'
+
+function currentAsk(s: Session) {
+  return [...s.pendingAsks.entries()].find(([, pending]) => pending.currentIdx !== undefined)
+}
+
+export function askBlockReason(s: Session, toolUseId: string): string | null {
+  const pending = s.pendingAsks.get(toolUseId)
+  if (!pending || pending.currentIdx === undefined) return null
+  if (findPendingReply(s.chatId)) return '请先完成或取消通知回复，再回答 Agent 的提问'
+  if (currentAsk(s)?.[0] !== toolUseId) return '请先回答当前问题，再回答排队中的提问'
+  return null
+}
+
+export function askRenderState(s: Session, toolUseId: string): cards.AskState {
+  const pending = s.pendingAsks.get(toolUseId)
+  if (!pending) throw new Error(`missing pending ask: ${toolUseId}`)
+  const waitingFor = pending.currentIdx === undefined ? undefined
+    : findPendingReply(s.chatId) ? 'notification' as const
+    : currentAsk(s)?.[0] !== toolUseId ? 'question' as const : undefined
+  return { currentIdx: pending.currentIdx, answered: pending.answered, waitingFor }
+}
+
+/** Alert only for the single question currently eligible for an answer. */
+export function announceAsk(s: Session, toolUseId: string): void {
+  const pending = s.pendingAsks.get(toolUseId)
+  const turn = s.currentTurn
+  if (!pending || pending.currentIdx === undefined || pending.announced || askBlockReason(s, toolUseId)
+    || !turn?.userOpenId || !turn.messageId) return
+  pending.announced = true
+  const announcementVersion = (pending.announcementVersion ?? 0) + 1
+  pending.announcementVersion = announcementVersion
+  const question = pending.questions[pending.currentIdx]?.question.trim() ?? ''
+  const preview = question.length > 40 ? question.slice(0, 40) + '…' : question
+  const summary = pending.questions.length > 1
+    ? `❓ 待回答 ${pending.questions.length} 题${preview ? `: ${preview}` : ''}`
+    : preview ? `❓ ${preview}` : '❓ 等你回答问题'
+  void (async () => {
+    cardkit.cancelSummary(turn.cardId)
+    await cardkit.patchSettings(turn.cardId, { config: { summary: { content: summary } } })
+    if (s.currentTurn !== turn || s.pendingAsks.get(toolUseId) !== pending
+      || pending.announcementVersion !== announcementVersion || pending.currentIdx === undefined
+      || askBlockReason(s, toolUseId)) return
+    await feishu.urgentApp(turn.messageId, [turn.userOpenId])
+  })().catch(error => log(`session "${s.sessionName}": question notification failed: ${error}`))
+}
+
+/** Repaint after a reply opens/closes or the current question completes.
+ * Pending tool calls remain parked for their original backend handshake. */
+export function refreshPendingAsks(s: Session): void {
+  const turn = s.currentTurn
+  if (!turn) return
+  for (const [toolUseId, pending] of s.pendingAsks) {
+    const meta = turn.toolByUseId.get(toolUseId)
+    if (!meta || pending.currentIdx === undefined) continue
+    const state = askRenderState(s, toolUseId)
+    if (state.waitingFor) {
+      pending.announced = false
+      pending.announcementVersion = (pending.announcementVersion ?? 0) + 1
+    }
+    void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i),
+      cards.askUserQuestionElement(meta.i, toolUseId, pending.questions, '🤔', state))
+    announceAsk(s, toolUseId)
+  }
+}
 
 /** True iff there's at least one open AskUserQuestion awaiting an
  * answer in this session. `daemon.handleMessage` uses this to
  * decide whether an inbound chat message should be a custom answer
  * (routed to onAskMessageAnswer) instead of opening a new turn. */
 export function hasPendingAsk(s: Session): boolean {
-  return s.pendingAsks.size > 0
+  return currentAsk(s) !== undefined
 }
 
 /** Funnel an arbitrary chat message into the *current* question
@@ -26,40 +91,20 @@ export function hasPendingAsk(s: Session): boolean {
  * input always answers whatever question is on screen right now
  * (`pending.currentIdx`), and a new question slides in after. */
 export async function onAskMessageAnswer(s: Session, text: string, user: string, msgId: string): Promise<void> {
-  const firstEntry = s.pendingAsks.entries().next()
-  if (firstEntry.done) {
-    log(`session "${s.sessionName}": onAskMessageAnswer with no pending — falling back to onUserMessage`)
+  const active = currentAsk(s)
+  if (!active) {
+    log(`session "${s.sessionName}": no unanswered question; routing text to Agent`)
     await s.onUserMessage(text, [], user, msgId)
     return
   }
-  const [toolUseId, pending] = firstEntry.value
-  if (pending.currentIdx === undefined) {
-    // currentIdx undefined = 所有问题已答完。正常路径下 can_use_tool 一到,
-    // finalizeAsk 立刻把这条 ask 从 pendingAsks 删掉;还能在这里读到它只有
-    // 两种可能:
-    //   1. requestId 已 park,正等 finalize 落地(亚秒级窗口)—— 真·瞬态,
-    //      照旧忽略,别和 fast-clicker race 抢答。
-    //   2. requestId 始终没来 —— can_use_tool 永不会到(SDK 在 ask 握手中途
-    //      静默挂死,turn 既无 result 也不 exit)。这条 ask 是僵尸,会把整个
-    //      session 焊死:hasPendingAsk() 恒 true,后续每条消息都被吞,连
-    //      onUserMessage 都到不了,子进程也没机会重启。识破即逃生 —— 丢弃
-    //      僵尸,把这条消息当普通 user message 重新处理(interrupt + 开新
-    //      turn / 重启子进程),用户随手发一条就能自愈,不必去 stop+重启 daemon。
-    if (pending.requestId) {
-      log(`session "${s.sessionName}": pending ask ${toolUseId} awaiting finalize — ignoring message`)
-      return
-    }
-    log(`session "${s.sessionName}": pending ask ${toolUseId} orphaned (no can_use_tool) — dropping zombie, reprocessing as user message`)
-    s.pendingAsks.delete(toolUseId)
-    await s.onUserMessage(text, [], user, msgId)
+  const [toolUseId, pending] = active
+  const blocked = askBlockReason(s, toolUseId)
+  if (blocked) {
+    const notice = `${blocked}。这条文字未提交，请稍后重新发送。`
+    if (!await feishu.sendText(s.chatId, notice)) throw new Error(`提问等待提示发送失败: ${notice}`)
     return
   }
-  // 这条文本确实落在一个 live 问题上 —— 当 ask 答案消费。只有真记账成功
-  // (非空、非 stale)才回 ✅;否则这条消息没被收下,不该留"答案已收到"
-  // 标记。✅ 原先在 daemon 路由层 hasPendingAsk() 为真就无条件抢打,僵尸
-  // 自愈 / 兜底分支会残留一个语义错误的 ✅(消息其实被当普通新轮处理)——
-  // 下沉到这里按真实消费结果打。
-  const consumed = await onAskCustomAnswer(s, toolUseId, pending.currentIdx, text, user)
+  const consumed = await onAskCustomAnswer(s, toolUseId, pending.currentIdx!, text, user)
   if (consumed && msgId) void feishu.addReaction(msgId, 'CheckMark')
 }
 
@@ -120,6 +165,8 @@ export function advanceAsk(
 ): boolean {
   const pending = s.pendingAsks.get(toolUseId)
   if (!pending || pending.currentIdx === undefined) return false
+  const blocked = askBlockReason(s, toolUseId)
+  if (blocked) { log(`session "${s.sessionName}": ask ${toolUseId} waiting: ${blocked}`); return false }
   const cur = pending.currentIdx
   const q = pending.questions[cur]
   if (!q) { log(`session "${s.sessionName}": advanceAsk currentIdx=${cur} out of range`); return false }
@@ -166,7 +213,10 @@ export function advanceAsk(
     // All done. Finalize iff we have the permission request id;
     // otherwise renderPermission will pick it up when it arrives.
     if (pending.requestId) finalizeAsk(s, toolUseId)
-    else log(`session "${s.sessionName}": ask ${toolUseId} all answered, waiting for can_use_tool`)
+    else {
+      log(`session "${s.sessionName}": ask ${toolUseId} all answered, waiting for can_use_tool`)
+      refreshPendingAsks(s)
+    }
   }
   return true
 }
@@ -189,6 +239,7 @@ export function finalizeAsk(s: Session, toolUseId: string): void {
     meta.isError = false
   }
   s.pendingAsks.delete(toolUseId)
+  refreshPendingAsks(s)
   if (s.pendingPermissions.size === 0 && s.status === 'awaiting_permission') {
     s.status = 'working'
   }

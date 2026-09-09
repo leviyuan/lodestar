@@ -39,6 +39,24 @@ export interface NotifyButton {
   type: 'default' | 'primary' | 'danger'
 }
 
+export interface NotifyTextResponse {
+  text: string
+  /** User's message, distinct from the original notification message_id. */
+  message_id: string
+  prompt_message_id: string
+}
+
+export interface NotifyReplyState {
+  id: string
+  openId: string
+  promptMessageId: string
+  openedAt: number
+  status: 'waiting' | 'sending' | 'failed' | 'cancelled'
+  cancelReason?: 'switched'
+  response?: NotifyTextResponse
+  error?: string
+}
+
 /** A registered interactive `/notify` card. Persisted wholesale so the
  * resolved-card rebuild after a click can re-render the original
  * images/text/header without re-uploading. */
@@ -59,6 +77,10 @@ export interface NotifyRegistration {
    * failure rendered inline in red. */
   imageKeys: Array<{ key: string; src: string }>
   buttons: NotifyButton[]
+  allowReply?: boolean
+  replyState?: NotifyReplyState
+  /** Keep dedupe across explicit failed-attempt retries and different owners. */
+  replyMessageIds?: string[]
   /** Unix-ms epoch. Used by {@link prune} (7-day TTL) and never
    * mutated after creation. */
   createdAt: number
@@ -67,12 +89,12 @@ export interface NotifyRegistration {
    * re-dispatch — prevents a double-fire when two members tap the
    * same card near-simultaneously. */
   resolvedAt?: number
-  resolvedBy?: { buttonId: string; openId: string }
+  resolvedBy?: { buttonId?: string; openId: string }
   /** External callback succeeded, but the durable resolved tombstone could
    * not be confirmed. Never retry this state automatically: the external
    * side effect may already have happened. */
   unknownAt?: number
-  unknownBy?: { buttonId: string; openId: string }
+  unknownBy?: { buttonId?: string; openId: string }
   unknownReason?: string
 }
 
@@ -122,28 +144,41 @@ function saveCallbacks(): void {
 /** Load + prune on daemon boot. Stale entries (older than 7 days) and
  * any shape-mismatched record are dropped so a corrupted/partial file
  * never wedges the store. */
-export function loadCallbacks(): void {
+export function loadCallbacks(): NotifyRegistration[] {
+  const interruptedReplies: NotifyRegistration[] = []
   let raw: string
   try {
     raw = readFileSync(storeFile, 'utf8')
   } catch {
-    return  // first boot — file doesn't exist yet
+    return []  // first boot — file doesn't exist yet
   }
   try {
     const obj = JSON.parse(raw) as Record<string, any>
     const cutoff = Date.now() - MAX_AGE_MS
     let dropped = 0
+    let interrupted = 0
     for (const rec of Object.values(obj)) {
       if (!rec || typeof rec !== 'object') continue
       if (typeof rec.notifyId !== 'string' || typeof rec.callbackUrl !== 'string') continue
       if (typeof rec.createdAt !== 'number' || rec.createdAt < cutoff) { dropped++; continue }
+      // A durable sending marker precedes the external POST. After a crash
+      // its outcome is uncertain; never replay a potentially delivered reply.
+      if (rec.replyState?.status === 'sending' && !rec.resolvedAt && !rec.unknownAt) {
+        rec.unknownAt = Date.now()
+        rec.unknownBy = { openId: rec.replyState.openId }
+        rec.unknownReason = '服务在文字回复回传期间中断，无法确认是否送达，禁止自动重试'
+        interrupted++
+      }
       map.set(rec.notifyId, rec as NotifyRegistration)
+      if (rec.replyState?.status === 'sending' && rec.unknownAt) interruptedReplies.push(rec)
     }
     log(`notify-callbacks: loaded ${map.size} registration(s)${dropped ? `, dropped ${dropped} stale` : ''}`)
-    if (dropped > 0) saveCallbacks()  // persist the prune
+    if (interrupted) log(`notify-callbacks: ${interrupted} interrupted text reply(s) marked UNKNOWN`)
+    if (dropped > 0 || interrupted > 0) saveCallbacks()
   } catch (e) {
     log(`notify-callbacks: load failed (${storeFile}): ${e}`)
   }
+  return interruptedReplies
 }
 
 export function register(reg: NotifyRegistration): void {
@@ -162,7 +197,43 @@ export function get(notifyId: string): NotifyRegistration | undefined {
   return map.get(notifyId)
 }
 
-export function markResolved(notifyId: string, buttonId: string, openId: string): void {
+export function pendingRepliesForChat(chatId: string): NotifyRegistration[] {
+  return [...map.values()].filter(rec => rec.chatId === chatId && !rec.resolvedAt && !rec.unknownAt
+    && (rec.replyState?.status === 'waiting' || rec.replyState?.status === 'sending'))
+}
+
+export function findPendingReply(chatId: string, openId?: string): NotifyRegistration | undefined {
+  if (!chatId) return undefined
+  return pendingRepliesForChat(chatId).find(rec => openId === undefined || rec.replyState?.openId === openId)
+}
+
+export function hasReplyMessage(chatId: string, messageId: string): boolean {
+  return !!messageId && [...map.values()].some(rec => rec.chatId === chatId
+    && (rec.replyMessageIds?.includes(messageId) || rec.replyState?.response?.message_id === messageId))
+}
+
+/** Mutate only after the state has been durably written; a failed write must
+ * not leave an invisible input reservation or authorize an external POST. */
+export function setReplyState(notifyId: string, state: NotifyReplyState): void {
+  const rec = map.get(notifyId)
+  if (!rec) throw new Error(`notify registration not found: ${notifyId}`)
+  const previous = rec.replyState
+  const previousIds = rec.replyMessageIds
+  rec.replyState = state
+  if (state.response && !rec.replyMessageIds?.includes(state.response.message_id)) {
+    rec.replyMessageIds = [...(rec.replyMessageIds ?? []), state.response.message_id]
+  }
+  try { saveCallbacks() }
+  catch (error) {
+    if (previous) rec.replyState = previous
+    else delete rec.replyState
+    if (previousIds) rec.replyMessageIds = previousIds
+    else delete rec.replyMessageIds
+    throw error
+  }
+}
+
+export function markResolved(notifyId: string, buttonId: string | undefined, openId: string): void {
   const rec = map.get(notifyId)
   if (!rec) throw new Error(`notify registration not found: ${notifyId}`)
   const previous = {
@@ -173,7 +244,7 @@ export function markResolved(notifyId: string, buttonId: string, openId: string)
     unknownReason: rec.unknownReason,
   }
   rec.resolvedAt = Date.now()
-  rec.resolvedBy = { buttonId, openId }
+  rec.resolvedBy = { ...(buttonId !== undefined ? { buttonId } : {}), openId }
   delete rec.unknownAt
   delete rec.unknownBy
   delete rec.unknownReason
@@ -196,7 +267,7 @@ export function markResolved(notifyId: string, buttonId: string, openId: string)
 
 export function markUnknown(
   notifyId: string,
-  buttonId: string,
+  buttonId: string | undefined,
   openId: string,
   reason: string,
 ): void {
@@ -205,7 +276,7 @@ export function markUnknown(
   delete rec.resolvedAt
   delete rec.resolvedBy
   rec.unknownAt = Date.now()
-  rec.unknownBy = { buttonId, openId }
+  rec.unknownBy = { ...(buttonId !== undefined ? { buttonId } : {}), openId }
   rec.unknownReason = reason
   // Keep the in-memory unknown guard even if this write throws. The caller
   // will also freeze the visible card so an ambiguous external success is not
@@ -221,7 +292,7 @@ export type NotifyCallbackSuccessRecord =
  * local persistence failure into a retryable outcome. */
 export function recordCallbackSuccess(
   notifyId: string,
-  buttonId: string,
+  buttonId: string | undefined,
   openId: string,
 ): NotifyCallbackSuccessRecord {
   try {
@@ -288,7 +359,7 @@ export interface DispatchResult {
  * host-local, owner-equivalent channel, not a public webhook. */
 export async function dispatchCallback(
   reg: NotifyRegistration,
-  button: NotifyButton,
+  answer: NotifyButton | NotifyTextResponse,
   operatorOpenId: string,
 ): Promise<DispatchResult> {
   const payload = {
@@ -296,7 +367,9 @@ export async function dispatchCallback(
     message_id: reg.messageId,
     chat_id: reg.chatId,
     project: reg.project,
-    button: { id: button.id, text: button.text, type: button.type },
+    ...('id' in answer
+      ? { button: { id: answer.id, text: answer.text, type: answer.type } }
+      : { response: { type: 'text', ...answer } }),
     operator: { open_id: operatorOpenId },
     timestamp: Math.floor(Date.now() / 1000),
   }
@@ -369,26 +442,36 @@ export function buildNotifyResult(reg: NotifyRegistration): object {
   const unknown = !!reg.unknownAt
   const buttonId = reg.resolvedBy?.buttonId ?? reg.unknownBy?.buttonId
   const button = buttonId ? reg.buttons.find((b) => b.id === buttonId) : undefined
+  const response = reg.replyState?.response
+  const verdict = buttonId !== undefined
+    ? { button: button ? { id: button.id, text: button.text, type: button.type } : { id: buttonId } }
+    : response ? { response: { type: 'text', ...response } } : {}
   return {
     notify_id: reg.notifyId,
     project: reg.project,
     message_id: reg.messageId,
     resolved,
     unknown,
+    ...(reg.replyState ? {
+      reply: {
+        status: resolved && buttonId === undefined ? 'resolved'
+          : unknown && buttonId === undefined ? 'unknown' : reg.replyState.status,
+        prompt_message_id: reg.replyState.promptMessageId,
+        operator: { open_id: reg.replyState.openId },
+        ...(reg.replyState.cancelReason ? { cancel_reason: reg.replyState.cancelReason } : {}),
+        ...(reg.replyState.error ? { error: reg.replyState.error } : {}),
+      },
+    } : {}),
     ...(resolved
       ? {
-          button: button
-            ? { id: button.id, text: button.text, type: button.type }
-            : { id: buttonId },
+          ...verdict,
           resolved_at: reg.resolvedAt,
           resolved_by: reg.resolvedBy?.openId ?? null,
         }
       : {}),
     ...(unknown
       ? {
-          button: button
-            ? { id: button.id, text: button.text, type: button.type }
-            : { id: buttonId },
+          ...verdict,
           unknown_at: reg.unknownAt,
           unknown_by: reg.unknownBy?.openId ?? null,
           unknown_reason: reg.unknownReason,

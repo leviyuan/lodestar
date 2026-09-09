@@ -239,6 +239,21 @@ describe('dispatchCallback', () => {
     expect(typeof captured.timestamp).toBe('number')
   })
 
+  test('text reply payload preserves user text and both message references without inventing a button', async () => {
+    let captured: any
+    globalThis.fetch = (async (_input: any, init?: RequestInit) => {
+      captured = JSON.parse(String(init?.body))
+      return new Response('{"text":"收到回复"}', { status: 200 })
+    }) as unknown as typeof fetch
+    const response = { text: '明天十点\n**保留原文**', message_id: 'om_user', prompt_message_id: 'om_waiting' }
+    const result = await dispatchCallback(sampleReg(), response, 'ou_author')
+    expect(captured.response).toEqual({ type: 'text', ...response })
+    expect(captured.message_id).toBe('om_msg')
+    expect(captured.operator).toEqual({ open_id: 'ou_author' })
+    expect(captured.button).toBeUndefined()
+    expect(result.reply).toBe('收到回复')
+  })
+
   test('reply capture: JSON {text} / {reply} / plain text / empty', async () => {
     // JSON {text}
     globalThis.fetch = (async () => new Response(JSON.stringify({ text: '已发布 v1.2.3' }), { status: 200 })) as unknown as typeof fetch

@@ -490,6 +490,22 @@ describe('CardActionAdmission integration', () => {
     expect(executeCalls).toBe(2)
   })
 
+  test('notification reply prompts can reopen immediately while replayed deliveries remain deduplicated', async () => {
+    let count = 0
+    const h = admissionHarness({ execute: async () => { count++; return { __businessOk: true } } })
+    const value = { kind: 'notify_reply', notify_id: 'nf_reply' }
+    const first = actionEvent('reply-event-1', '', value)
+    expect(validateCardActionAdmission(first)).toBeNull()
+    expect(h.admission.accept(first)).toEqual({ state: 'accepted' })
+    await h.drain()
+    expect(h.admission.accept(first)).toEqual({ state: 'completed' })
+    expect(h.admission.accept(actionEvent('reply-event-2', '', value))).toEqual({ state: 'accepted' })
+    await h.drain()
+    expect(count).toBe(2)
+    expect(cardActionDedupeKey(actionEvent('cancel-1', '', { kind: 'notify_reply_cancel', notify_id: 'nf_reply', reply_id: 'one' })))
+      .not.toBe(cardActionDedupeKey(actionEvent('cancel-2', '', { kind: 'notify_reply_cancel', notify_id: 'nf_reply', reply_id: 'two' })))
+  })
+
   test('close rejects new work while accepted tails remain drainable', async () => {
     const h = admissionHarness()
     const oldGate = deferred<void>()

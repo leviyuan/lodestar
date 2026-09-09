@@ -18,6 +18,7 @@ export const sentCards: object[] = []
 export const sentTexts: string[] = []
 export const sentRawTexts: string[] = []
 export const updatedCards: Array<[string, object]> = []
+export const addedReactions: Array<[string, string]> = []
 export const deletedReactions: Array<[string, string]> = []
 export const boundResumes: Array<[string, string, string | undefined]> = []
 export const clearedResumes: Array<[string, string | undefined]> = []
@@ -48,7 +49,7 @@ export const projectProfiles = new Map<string, { cwd?: string }>()
 
 export function resetFeishuMock(): void {
   for (const arr of [
-    sentCards, sentTexts, sentRawTexts, updatedCards, deletedReactions, boundResumes, clearedResumes, urgentPushes,
+    sentCards, sentTexts, sentRawTexts, updatedCards, addedReactions, deletedReactions, boundResumes, clearedResumes, urgentPushes,
     clearedTurnAnchorSessions, seededTurnAnchors,
   ]) {
     arr.length = 0
@@ -89,6 +90,10 @@ mock.module('./feishu', () => ({
   updateCard: async (messageId: string, card: object) => {
     updatedCards.push([messageId, card])
     if (updateCardHandler) await updateCardHandler(messageId, card)
+  },
+  addReaction: async (messageId: string, emojiType: string) => {
+    addedReactions.push([messageId, emojiType])
+    return `reaction_${addedReactions.length}`
   },
   deleteReaction: async (messageId: string, reactionId: string) => {
     deletedReactions.push([messageId, reactionId])
