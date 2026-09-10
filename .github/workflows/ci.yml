@@ -21,6 +21,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+      - name: Set up Node.js for DeepSeek Harness tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.2
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -53,6 +57,7 @@ jobs:
           node --check dist/lodestar-update.js
           node --check dist/lodestar-version.js
           node --check dist/lodestar-agent.js
+          node --check dist/dsh-bridge.js
           node -e "Promise.all([import('@anthropic-ai/claude-agent-sdk'), import('@larksuiteoapi/node-sdk'), import('cross-spawn')])"
 
   dependency-audit:

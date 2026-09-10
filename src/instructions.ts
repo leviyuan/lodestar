@@ -21,3 +21,9 @@ export const CLAUDE_CHANNEL_INSTRUCTIONS = [
     "- 当你有问题需要澄清时，使用 Claude Code 自带的 AskUserQuestion 工具向用户提问。",
     ...COMMON_TAIL_INSTRUCTIONS,
 ].join("\n");
+
+export const DSH_CHANNEL_INSTRUCTIONS = [
+    ...COMMON_CHANNEL_INSTRUCTIONS,
+    "- 当你有问题需要澄清时，使用 ask_user_question 工具向用户提问；不要把多选题写成文本。",
+    ...COMMON_TAIL_INSTRUCTIONS,
+].join("\n");

@@ -39,7 +39,7 @@ export interface TempSelectionResult {
 
 export interface ResumeSelectionPresentation {
   projectName: string
-  provider: 'claude' | 'codex'
+  provider: 'claude' | 'codex' | 'dsh'
   selectedPreview: string
   selectedTs: number
   sourceSessionId: string
@@ -73,7 +73,7 @@ interface TempPanelState {
   id: string
   mode: PanelMode
   requesterOpenId: string
-  provider: 'claude' | 'codex'
+  provider: 'claude' | 'codex' | 'dsh'
   sourceSessionId: string | null
   workDir: string
   baseName: string
@@ -344,7 +344,7 @@ export async function showResumeList(s: Session, userOpenId: string): Promise<vo
   try {
     history = s.selectedProvider === 'codex'
       ? await s.listCodexConversations()
-      : listClaudeSessions(s.workDir)
+      : s.selectedProvider === 'dsh' ? await s.listDshConversations() : listClaudeSessions(s.workDir)
   } catch (error) {
     await feishu.sendTextRaw(s.chatId, `❌ 历史会话读取失败: ${error instanceof Error ? error.message : error}`)
     return

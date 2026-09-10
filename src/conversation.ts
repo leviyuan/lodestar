@@ -18,6 +18,12 @@ export interface ConversationRef {
  */
 export type ConversationCheckpoint =
   | {
+      provider: 'dsh'
+      kind: 'event'
+      id: string
+      source: ConversationRef & { provider: 'dsh' }
+    }
+  | {
       provider: 'claude'
       kind: 'assistant-message'
       id: string
@@ -112,4 +118,7 @@ export function validateConversationLaunch(
     throw new Error('conversation checkpoint cwd does not match fork source')
   }
   if (!launch.through.id.trim()) throw new Error('conversation checkpoint id is empty')
+  if (provider === 'dsh' && (!/^\d+$/.test(launch.through.id) || !Number.isSafeInteger(Number(launch.through.id)))) {
+    throw new Error('DSH checkpoint must be a non-negative event sequence')
+  }
 }

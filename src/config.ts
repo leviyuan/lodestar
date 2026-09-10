@@ -70,10 +70,10 @@ export interface ClaudeModelConfig {
 }
 
 /** Token source 配置(一个账号)。parseToml 只支持标量,故 models/slots 用复合字符串。
- *  agent       — 'codex' | 'claude'(协议强制)
+ *  agent       — 'codex' | 'claude' | 'dsh'(协议强制)
  *  auth        — 'chatgpt-login'(codex 订阅)
  *  base_url + auth_token / api_key — claude 第三方(GLM/DeepSeek/中转)
- *  bin         — claude 包装器(reclaude)
+ *  bin         — Claude 包装器，或 DeepSeek Harness 使用的 Node 可执行文件
  *  model       — 默认模型 slug(codex 下发 gpt-5.6-sol;claude 真实模型走 slots)
  *  effort      — 默认 effort
  *  models      — 可选模型列表(逗号分隔,如 'gpt-5.6-sol,gpt-5.5,gpt-5.4')

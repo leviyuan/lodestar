@@ -1,3 +1,4 @@
+import { agentProviderLabel } from '../agent-process'
 /**
  * Console / menu / settings cards — every non-turn-card Feishu surface
  * the daemon paints. Companion file to turn.ts; both re-exported from
@@ -430,6 +431,8 @@ export function consoleUnifiedUsageContent(snap: UsageSnapshotUnified | undefine
 export function consoleUsageElement(opts: ConsoleOpts): object {
   const content = opts.unifiedUsage !== undefined
     ? consoleUnifiedUsageContent(opts.unifiedUsage)
+    : opts.provider === 'dsh'
+      ? '**📊 余额**　_加载中…_'
     : opts.provider === 'claude'
       ? consoleGlmUsageContent(opts.glmUsage)
       : consoleUsageContent(opts.usage)
@@ -788,6 +791,7 @@ function modelChoiceElements(models: ModelChoice[], panelId: string): object[] {
   const groups = [
     { title: 'Codex', models: models.filter(m => (m.provider ?? 'codex') === 'codex') },
     { title: 'Claude Code 后端', models: models.filter(m => m.provider === 'claude') },
+    { title: 'DeepSeek Harness', models: models.filter(m => m.provider === 'dsh') },
   ].filter(group => group.models.length > 0)
   const flat = (ms: ModelChoice[]) => ms.flatMap(model => modelChoiceElement(model, panelId))
   if (groups.length <= 1) return flat(models)
@@ -881,7 +885,7 @@ function settingsText(model?: string | null, effort?: string | null, provider?: 
 }
 
 function providerLabel(provider?: AgentProvider): string {
-  return provider === 'claude' ? 'Claude' : 'Codex'
+  return agentProviderLabel(provider ?? 'codex')
 }
 
 function truncate(s: string, max: number): string {

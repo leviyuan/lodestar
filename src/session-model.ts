@@ -1,3 +1,4 @@
+import { isAgentProvider, isDshReasoningEffort } from './agent-process'
 import { randomUUID } from 'node:crypto'
 
 import type { Session } from './session'
@@ -297,7 +298,7 @@ export async function onModelPanelCancel(
 
 /** 取消按钮(旧副本删除:见上方带补录态清理的版本)。 */
 function actionProvider(model: string, raw: any): AgentProvider {
-  return raw?.provider === 'claude' || raw?.provider === 'codex'
+  return isAgentProvider(raw?.provider)
     ? raw.provider
     : providerFromModel(model)
 }
@@ -362,10 +363,12 @@ export async function onModelEffortSelect(
   if (!model) return { ok: false, message: '模型为空' }
   const panelId = panelIdRaw.trim()
   const panel = s.modelPanels.get(panelId)
-  const provider: AgentProvider = providerRaw === 'claude' || providerRaw === 'codex'
+  const provider: AgentProvider = isAgentProvider(providerRaw)
     ? providerRaw
     : panel?.models.find(m => m.model === model)?.provider ?? providerFromModel(model)
-  if (provider === 'claude') {
+  if (provider === 'dsh') {
+    if (!isDshReasoningEffort(effortValue)) return { ok: false, message: 'DSH reasoning effort 无效' }
+  } else if (provider === 'claude') {
     if (!isClaudeReasoningEffort(effortValue)) return { ok: false, message: 'Claude reasoning effort 无效' }
   } else if (!isCodexReasoningEffort(effortValue)) {
     return { ok: false, message: 'Codex reasoning effort 无效' }

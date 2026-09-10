@@ -66,6 +66,41 @@ function extract(result: FreshResult): any {
 }
 
 describe('session turn checkpoint persistence', () => {
+  test('preserves DSH resume, off effort and native event checkpoints across reload', () => {
+    const result = runFreshState(`
+      loadSessionResumeMap()
+      loadSessionModelMap()
+      bindSessionResumeChecked('project', { provider: 'dsh', sessionId: 'dsh-second', cwd: '/tmp/project' })
+      appendTurnAnchorChecked('project', {
+        checkpoint: { provider: 'dsh', kind: 'event', id: '42', source: { provider: 'dsh', sessionId: 'dsh-second', cwd: '/tmp/project' } },
+        preview: 'native input', ts: 100, writes: [],
+      })
+      loadSessionResumeMap()
+      loadSessionTurnsMap()
+      __out({ resume: getSessionResumeRef('project', 'dsh'), claude: getSessionResumeRef('project', 'claude'),
+        model: getSessionModelSelection('project'), anchors: getTurnAnchors('project'), saved: __read('session-resume-map.json') })
+    `, {
+      'session-resume-map.json': { project: {
+        dsh: { provider: 'dsh', sessionId: 'dsh-first', cwd: '/tmp/project' },
+        claude: { provider: 'claude', sessionId: 'claude-original', cwd: '/tmp/project' },
+      } },
+      'session-model-map.json': { project: { provider: 'dsh', model: 'deepseek-v4-flash', effort: 'off', tokenSourceId: 'deepseek-harness' } },
+    })
+    expect(result.exitCode, result.stderr).toBe(0)
+    const data = extract(result)
+    expect(data.resume.sessionId).toBe('dsh-second')
+    expect(data.claude.sessionId).toBe('claude-original')
+    expect(data.model).toMatchObject({ provider: 'dsh', effort: 'off', tokenSourceId: 'deepseek-harness' })
+    expect(data.anchors[0].checkpoint).toMatchObject({ provider: 'dsh', kind: 'event', id: '42' })
+    expect(data.saved.project.dsh.sessionId).toBe('dsh-second')
+  })
+
+  test('rejects invalid DSH fork anchors before touching a backend', () => {
+    const source = { provider: 'dsh' as const, sessionId: 'native', cwd: '/tmp/project' }
+    expect(() => validateConversationLaunch({ kind: 'fork', source,
+      through: { provider: 'dsh', kind: 'event', id: '-1', source } }, 'dsh', '/tmp/project')).toThrow('non-negative')
+  })
+
   test('loads V2 checkpoints with an unknown base and null legacy cwd', () => {
     const result = runFreshState(`
       loadSessionTurnsMap()

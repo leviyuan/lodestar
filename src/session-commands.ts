@@ -64,10 +64,10 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
   }
   // <source>-setup <args> —— 启用某 token source(generic:路由到 source factory 的 setup.parseArgs,
   // 加新 source 不改本文件 —— 在 token-source-<name>.ts 声明 setup 字段即自动接入)。
-  const tsSetup = raw.trim().match(/^(\w+)-setup\s+([\s\S]+)$/i)
+  const tsSetup = raw.trim().match(/^([\w-]+)-setup(?:\s+([\s\S]+))?$/i)
   if (tsSetup) {
     const { runTokenSourceSetup } = await import('./token-source-setup')
-    await runTokenSourceSetup(s, tsSetup[1].trim(), tsSetup[2].trim())
+    await runTokenSourceSetup(s, tsSetup[1].trim().toLowerCase(), (tsSetup[2] ?? '').trim())
     return true
   }
   const command = CONTROL_COMMAND_ALIASES.get(raw.trim().toLowerCase())

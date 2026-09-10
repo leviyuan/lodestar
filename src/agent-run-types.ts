@@ -50,7 +50,7 @@ export interface AgentWorkerResult {
   identityId: string
   identityName: string
   tokenSourceId: string
-  provider: 'codex' | 'claude'
+  provider: 'codex' | 'claude' | 'dsh'
   model: string
   effort: string
   status: AgentWorkerStatus

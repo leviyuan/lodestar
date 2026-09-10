@@ -270,6 +270,22 @@ describe('applyBgToolUse / applyBgToolResult — 双池 steps 累积', () => {
     expect(s.active[0].steps[0].brief).toContain('tests failed')
   })
 
+  test('DSH 结构化工具结果可在后台和观察池中显示，保留错误信息', () => {
+    for (const pool of ['active', 'pending'] as const) {
+      let s: BgStore = { active: [], pending: [] }
+      s[pool] = [mk({ id: 'dsh-child', toolUseId: 'parent', status: 'running' })]
+      s = applyBgToolUse(s, 'parent', 'bash', 'Bash', { command: 'echo child' })
+      s = applyBgToolResult(s, 'parent', 'bash', [
+        { type: 'text', text: 'started background job bash-1' },
+        { type: 'text', text: 'second line' },
+      ], false)
+      expect(s[pool][0].steps[0].brief).toContain('started background job bash-1 second line')
+      s = applyBgToolUse(s, 'parent', 'failed', 'Bash', { command: 'false' })
+      s = applyBgToolResult(s, 'parent', 'failed', [{ type: 'text', text: 'command failed' }], true)
+      expect(s[pool][0].steps[1].brief).toContain('❌ command failed')
+    }
+  })
+
   test('trim:steps 累积超 ~1000 字只留最新', () => {
     let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
     for (let i = 0; i < 50; i++) {

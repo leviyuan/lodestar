@@ -10,13 +10,15 @@ AI 不是帮手,是倍率。它放大的不是体力,是你 —— 你的直觉�
 
 ---
 
-在飞书群里使用 Codex 和 Claude Code。每个群对应一个项目目录和会话，回复、工具调用、提问和后台任务通过飞书卡片展示。
+在飞书群里使用 Codex、Claude Code 和 DeepSeek Harness。每个群对应一个项目目录和会话，回复、工具调用、提问和后台任务通过飞书卡片展示。
 
-支持 Codex、GLM Coding Plan、DeepSeek 和 Claude native。账号、模型与 effort 可在群里切换，选择按群保存。
+支持 Codex、GLM Coding Plan、DeepSeek、Claude native 和 DeepSeek Harness 原生后端。账号、模型与 effort 可在群里切换，选择按群保存。
 
 ## 安装
 
 支持 Windows、macOS 和 Linux，需要 Node.js ≥ 18.15。Bun 用于源码开发和构建。
+
+DeepSeek Harness 子进程另需 Node 22.19+（22.x）或 Node 24+；可通过其账号配置的 `bin` 指定 Node 可执行文件。
 
 ```bash
 npm i -g @leviyuan/lodestar
@@ -88,7 +90,7 @@ GLM 的套餐与用量显示在 `hi` 控制台，回复底部也会显示当前�
 
 主 Agent 可以通过 `lodestar-agent` 查询实时身份，再把任务交给一个或多个模型。同一个任务选择多个身份时并发执行；后续追问可继续使用各模型的原生会话。
 
-被调用的 Agent 可以编辑文件、执行命令、使用 MCP 和 Skill，也可以继续委派。它们与主 Agent 共享工作区，修改会立即可见。运行状态和结果通过卡片展示；需要用户输入时暂停，由主 Agent 回填答案后继续。委派产生的会话不会混入主群的 `rs` 历史列表。
+被调用的 Agent 可以编辑文件、执行命令、使用 MCP 和 Skill；委派只允许一层，被调用的 Agent 不能继续派工。它们与主 Agent 共享工作区，修改会立即可见。运行状态和结果通过卡片展示；需要用户输入时暂停，由主 Agent 回填答案后继续。委派产生的会话不会混入主群的 `rs` 历史列表。
 
 `lodestar-agent` 只能在 Lodestar 管理的 Agent 进程里调用。命令用法见 [Agent Skill](src/agent-skill.ts)。
 
@@ -130,7 +132,18 @@ bin = "/abs/path/to/claude-wrapper"  # 可选的 Claude 可执行文件
 
 账号配置使用 `[token_source.glm]`、`[token_source.deepseek]` 等节。GLM 和 DeepSeek 也可以从本机 Claude settings 中识别；识别后由对应 Token Source 注入凭据，避免不同账号的环境变量串用。项目的工具限制只作用于主会话，委派 Agent 使用完整工具集。
 
-手动修改配置后需重启 daemon；群内账号启用和模型补录会自行重载相关配置。模型路由、配置优先级和双后端差异见 [后端说明](docs/claude-agent-backend.md)。
+DeepSeek Harness 使用独立的 `[token_source.deepseek-harness]` 账号与原生会话。在群内发送 `deepseek-harness-setup <api_key>`，再通过 `model` 面板选择该来源即可启用。自建端点用 `deepseek-harness-setup <base_url> <api_key>`；这里使用原生 API 根地址，不带 `/anthropic`。
+
+```toml
+[token_source.deepseek-harness]
+agent = "dsh"
+api_key = "填写自己的 API key"
+# bin = "/abs/path/to/node"  # 可选：运行 DSH 的 Node 可执行文件
+# model = "deepseek-v4-pro" # 可选：必须存在于 DSH 返回的模型目录
+# effort = "high"          # 可选：必须是该模型支持的推理强度
+```
+
+手动修改配置后需重启 daemon；群内账号启用和模型补录会自行重载相关配置。模型路由、配置优先级和后端差异见 [后端说明](docs/claude-agent-backend.md)。
 
 ## 开发
 

@@ -110,7 +110,7 @@ class FakeAgentProc extends EventEmitter {
   materializationBarrier: Promise<void> | null = null
 
   constructor(
-    readonly provider: 'codex' | 'claude',
+    readonly provider: 'codex' | 'claude' | 'dsh',
     public sessionId: string | null = null,
     readonly tokenSourceId: string | null = null,
   ) {
@@ -1440,6 +1440,59 @@ describe('Session provider switching', () => {
 
     expect(footer).toContain('Claude · GLM-5.2/max')  // [1m] 记账后缀不外露
     expect(footer).not.toContain('gpt-5.6-sol')
+  })
+
+  test('consumes hyphenated DSH setup commands before they can reach the model', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    expect(await session.runCommand('deepseek-harness-setup')).toBe(true)
+    expect(await session.runCommand('DEEPSEEK-HARNESS-SETUP one two three')).toBe(true)
+    expect(sentTexts.filter(text => text.includes('deepseek-harness-setup')).length).toBe(2)
+  })
+
+  test('DSH model panel accepts off effort and updates the same native process', async () => {
+    const previous = listTokenSources()
+    registerTokenSource({ id: 'deepseek-harness', kind: 'deepseek-harness', agent: 'dsh', display: 'DeepSeek Harness', enabled: true,
+      models: [{ model: 'deepseek-v4-flash', display: 'Flash', efforts: ['off', 'high'], defaultEffort: 'high' }],
+      defaultModel: 'deepseek-v4-flash', modelCatalogState: { status: 'ready', updatedAt: Date.now() },
+      refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    })
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      const proc = new FakeAgentProc('dsh', 'dsh-session', 'deepseek-harness')
+      session.proc = proc
+      session.selectedProvider = 'dsh'
+      session.selectedTokenSourceId = 'deepseek-harness'
+      session.selectedModel = 'deepseek-v4-flash'
+      session.selectedEffort = 'high'
+      session.modelPanels.set('panel-dsh', { models: [{ provider: 'dsh', sourceId: 'deepseek-harness', model: 'deepseek-v4-flash',
+        displayName: 'Flash', efforts: [{ effort: 'off', isDefault: false }, { effort: 'high', isDefault: true }] }] })
+      const result = await session.onModelEffortSelect('deepseek-v4-flash', 'off', 'panel-dsh', 'ou_user', 'dsh')
+      expect(result.ok).toBe(true)
+      expect(proc.setModelSettingsCalls).toEqual([['deepseek-v4-flash', 'off']])
+      expect(proc.killCalls).toBe(0)
+      expect(session.selectedProvider).toBe('dsh')
+      expect(session.selectedEffort).toBe('off')
+      expect(JSON.stringify(result.card)).toContain('DeepSeek Harness')
+    } finally {
+      resetTokenSourceRegistry()
+      for (const source of previous) registerTokenSource(source)
+    }
+  })
+
+  test('DSH cannot replace a busy Claude process', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session', 'glm')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'glm'
+    session.currentTurn = { ...turnState(), provider: 'claude' }
+    session.modelPanels.set('panel-dsh', { models: [{ provider: 'dsh', sourceId: 'deepseek-harness', model: 'deepseek-v4-flash',
+      displayName: 'Flash', efforts: [{ effort: 'off', isDefault: true }] }] })
+    const result = await session.onModelEffortSelect('deepseek-v4-flash', 'off', 'panel-dsh', 'ou_user', 'dsh')
+    expect(result.ok).toBe(false)
+    expect(proc.killCalls).toBe(0)
+    expect(session.selectedProvider).toBe('claude')
   })
 
   test('rejects cross-provider model switch while a turn is active', async () => {
@@ -3170,6 +3223,28 @@ describe('Session claude subagent tool calls stay off the main card', () => {
     } finally {
       session.stopFooterStatus(session.currentTurn)
       await cardkit.dispose('card_subagent_iso')
+    }
+  })
+
+  test('DSH 子工具返回内容块时不抛异常，也不写入主对话卡', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('dsh', 'dsh-session')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_dsh_child_blocks')
+    cardkit.recordCardCreated('card_dsh_child_blocks', 1)
+    try {
+      proc.emit('bg_task_started', { task_id: 'child', tool_use_id: 'child', description: 'DSH child', task_type: 'agent' })
+      proc.emit('tool_use', { id: 'child-bash', name: 'Bash', input: { command: 'echo child' }, parentToolUseId: 'child' })
+      expect(() => proc.emit('tool_result', { tool_use_id: 'child-bash', content: [{ type: 'text', text: 'started background job bash-1' }],
+        is_error: false, parentToolUseId: 'child' })).not.toThrow()
+      const child = [...session.backgroundTasks, ...session.pendingBgTasks].find((entry: any) => entry.id === 'child')
+      expect(child.steps[0].brief).toContain('started background job bash-1')
+      expect(session.currentTurn.toolByUseId.has('child-bash')).toBe(false)
+      expect(proc.isAlive()).toBe(true)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose('card_dsh_child_blocks')
     }
   })
 

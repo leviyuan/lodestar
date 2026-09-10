@@ -66,7 +66,7 @@ export interface SelectionResultCardOpts {
 
 export interface ResumeSelectionResultCardOpts {
   projectName: string
-  provider: 'claude' | 'codex'
+  provider: 'claude' | 'codex' | 'dsh'
   selectedPreview: string
   selectedTs: number
   sourceSessionId: string

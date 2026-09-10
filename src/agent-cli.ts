@@ -198,6 +198,13 @@ async function waitAndPrintRun(context: CliContext, runId: string): Promise<void
 }
 
 function cliContext(): CliContext {
+  if (process.env.DSH_LODESTAR_AGENT_CONTEXT !== undefined) {
+    const context = JSON.parse(process.env.DSH_LODESTAR_AGENT_CONTEXT)
+    if (typeof context.baseUrl !== 'string' || !context.baseUrl || typeof context.capability !== 'string' || !context.capability) {
+      throw new Error('invalid DSH Lodestar delegation context')
+    }
+    return { baseUrl: context.baseUrl.replace(/\/+$/, ''), capability: context.capability }
+  }
   const baseUrl = String(process.env.LODESTAR_AGENT_URL ?? '').replace(/\/+$/, '')
   const capability = String(process.env.LODESTAR_AGENT_CAPABILITY ?? '')
   if (!baseUrl || !capability) {

@@ -15,6 +15,7 @@ import './token-source-codex'
 import './token-source-glm'
 import './token-source-native'
 import './token-source-deepseek'
+import './token-source-dsh'
 
 /** 遍历已登记 factory 构建 source 实例,注册到 instance registry。
  *  daemon 启动调;飞书改 token source 配置后也可重调(热更新)。 */

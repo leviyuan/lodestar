@@ -89,7 +89,7 @@ const BALANCE_TIMEOUT_MS = 10_000
 /** GET {host}/user/balance(OpenAI 根路径,Bearer 认证)→ 剩余余额标量。
  *  DeepSeek 是充值余额模型(无配额百分比),故 planLabel 装余额、windows 空;
  *  失败如实 MISS(no_fallbacks),绝不假数据。 */
-async function fetchDeepseekBalance(baseUrl: string, apiKey: string): Promise<UsageSnapshotUnified> {
+export async function fetchDeepseekBalance(baseUrl: string, apiKey: string): Promise<UsageSnapshotUnified> {
   let origin: string
   try {
     origin = new URL(baseUrl).origin

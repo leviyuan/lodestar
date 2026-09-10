@@ -1,3 +1,4 @@
+import { AGENT_PROVIDERS, isAgentProvider, isDshReasoningEffort } from './agent-process'
 /**
  * Feishu (Lark) primitives: Lark client, tenant token cache, chat
  * directory, sendText/sendCard, reactions, attachment download, project
@@ -219,7 +220,7 @@ function setSessionResumeInMemory(sessionName: string, ref: ConversationRef): vo
 function parsePersistedResumeRef(value: unknown, expectedProvider?: AgentProvider): ConversationRef | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const record = value as Record<string, unknown>
-  const provider = record.provider === 'claude' || record.provider === 'codex'
+  const provider = isAgentProvider(record.provider)
     ? record.provider
     : expectedProvider ?? null
   if (!provider || (expectedProvider && provider !== expectedProvider)) return null
@@ -240,7 +241,7 @@ function parsePersistedResumeRef(value: unknown, expectedProvider?: AgentProvide
 function validateSessionResumeWrite(ref: ConversationRef): ConversationRef {
   const sessionId = ref.sessionId.trim()
   if (!sessionId) throw new Error('cannot bind an empty conversation session id')
-  if (ref.provider !== 'codex' && ref.provider !== 'claude') {
+  if (!isAgentProvider(ref.provider)) {
     throw new Error(`cannot bind an unknown conversation provider: ${String(ref.provider)}`)
   }
   if (typeof ref.cwd !== 'string' || !isAbsolute(ref.cwd)) {
@@ -278,7 +279,7 @@ export function loadSessionResumeMap(): void {
         setSessionResumeInMemory(name, singleRef)
         continue
       }
-      for (const p of ['codex', 'claude'] as const) {
+      for (const p of AGENT_PROVIDERS) {
         const persisted = record[p]
         if (typeof persisted === 'string' && persisted.trim()) {
           setSessionResumeInMemory(name, { provider: p, sessionId: persisted.trim(), cwd: null })
@@ -300,6 +301,7 @@ function saveSessionResumeMapChecked(): void {
     const persisted: Partial<Record<AgentProvider, ConversationRef>> = {}
     if (refs.codex) persisted.codex = { ...refs.codex }
     if (refs.claude) persisted.claude = { ...refs.claude }
+    if (refs.dsh) persisted.dsh = { ...refs.dsh }
     obj[sessionName] = persisted
   }
   writeJsonStateAtomic(SESSION_RESUME_MAP_FILE, obj)
@@ -392,7 +394,7 @@ const TURN_ANCHOR_MAX = 200
 function parseConversationRef(value: unknown): ConversationRef | null {
   if (!value || typeof value !== 'object') return null
   const ref = value as Record<string, unknown>
-  if (ref.provider !== 'claude' && ref.provider !== 'codex') return null
+  if (!isAgentProvider(ref.provider)) return null
   const sessionId = typeof ref.sessionId === 'string' ? ref.sessionId.trim() : ''
   if (!sessionId) return null
   let cwd: string | null
@@ -411,6 +413,10 @@ function parseCheckpoint(value: unknown): ConversationCheckpoint | null {
   const id = typeof checkpoint.id === 'string' ? checkpoint.id.trim() : ''
   if (!id || !parsedSource) return null
 
+  if (checkpoint.provider === 'dsh' && checkpoint.kind === 'event' && parsedSource.provider === 'dsh'
+    && /^\d+$/.test(id) && Number.isSafeInteger(Number(id))) {
+    return { provider: 'dsh', kind: 'event', id, source: { ...parsedSource, provider: 'dsh' } }
+  }
   if (
     checkpoint.provider === 'claude'
     && checkpoint.kind === 'assistant-message'
@@ -786,7 +792,7 @@ export function loadSessionModelMap(): void {
       if (!selection || typeof selection !== 'object') continue
       const model = (selection as { model?: unknown }).model
       const providerRaw = (selection as { provider?: unknown }).provider
-      const provider: AgentProvider = providerRaw === 'claude' || providerRaw === 'codex'
+      const provider: AgentProvider = isAgentProvider(providerRaw)
         ? providerRaw
         : (typeof model === 'string' && model.trim() ? providerFromModel(model) : 'claude')
       const modelStr = typeof model === 'string' && model.trim() ? model : null
@@ -797,7 +803,9 @@ export function loadSessionModelMap(): void {
       const tokenSourceId = typeof tokenSourceIdRaw === 'string' && tokenSourceIdRaw.trim()
         ? tokenSourceIdRaw.trim()
         : null
-      const normalizedEffort = provider === 'claude'
+      const normalizedEffort = provider === 'dsh'
+        ? isDshReasoningEffort(effort) ? effort : null
+        : provider === 'claude'
         ? isClaudeReasoningEffort(effort) ? effort : null
         : isCodexReasoningEffort(effort) ? effort : null
       selectedModelByName.set(name, {

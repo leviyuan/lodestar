@@ -38,12 +38,12 @@ export function setUpdateCardHandler(handler: ((messageId: string, card: object)
   updateCardHandler = handler
 }
 export const modelSelections = new Map<string, {
-  provider: 'codex' | 'claude'
+  provider: 'codex' | 'claude' | 'dsh'
   model: string | null
   effort: string | null
   tokenSourceId?: string | null
 }>()
-export const resumeRefs = new Map<string, { provider: 'codex' | 'claude'; sessionId: string; cwd: string | null }>()
+export const resumeRefs = new Map<string, { provider: 'codex' | 'claude' | 'dsh'; sessionId: string; cwd: string | null }>()
 /** [projects.<name>] 项目 profile 替身,测试往里 set 后 Session 构造时可查到。 */
 export const projectProfiles = new Map<string, { cwd?: string }>()
 

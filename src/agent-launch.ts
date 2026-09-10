@@ -4,7 +4,8 @@ import type {
   AgentProvider,
   AgentReasoningEffort,
 } from './agent-process'
-import { isClaudeReasoningEffort } from './agent-process'
+import { isClaudeReasoningEffort, isDshReasoningEffort } from './agent-process'
+import { DshProcess } from './dsh-process'
 import { ClaudeAgentProcess, assertClaudeCodeAvailable } from './claude-agent-process'
 import { CodexProcess, isCodexReasoningEffort } from './codex-process'
 import type { ConversationLaunch } from './conversation'
@@ -56,6 +57,12 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
     : requestedModel
   if (requestedModel && !model) throw new Error(`model did not resolve: ${opts.tokenSourceId ?? 'default'}/${requestedModel}`)
   const transformEnv = source ? (base: Record<string, string | undefined>) => source.spawnEnv(base) : undefined
+
+  if (opts.provider === 'dsh') {
+    if (!source || !model || !isDshReasoningEffort(opts.effort)) throw new Error('DSH requires a configured source, model and valid effort')
+    return { process: new DshProcess({ ...opts, model, effort: opts.effort,
+      tokenSourceId: source.id, transformEnv }), sourceRevision: source.spawnRevision ?? null }
+  }
 
   if (opts.provider === 'claude') {
     assertClaudeCodeAvailable()

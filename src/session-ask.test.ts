@@ -36,7 +36,7 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-function harness(provider: 'codex' | 'claude') {
+function harness(provider: 'codex' | 'claude' | 'dsh') {
   const answers: Array<{ requestId: string; decision: string; options: any }> = []
   const s = {
     chatId: 'oc_ask', sessionName: 'ask-priority', status: 'working',
@@ -75,7 +75,7 @@ function endReply() {
 const flushAnnouncements = () => new Promise<void>(resolve => setImmediate(resolve))
 
 describe('question presentation and backend handshakes', () => {
-  for (const provider of ['codex', 'claude'] as const) {
+  for (const provider of ['codex', 'claude', 'dsh'] as const) {
     test(`${provider}: notification input defers question controls and alerts; completion activates one question at a time`, async () => {
       const h = harness(provider)
       startReply()

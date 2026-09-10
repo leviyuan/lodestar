@@ -46,6 +46,10 @@ export async function runTokenSourceSetup(s: Session, sourceId: string, args: st
   try {
     await addTokenSource(def.configSectionId, parsed.config)
     const ts = getTokenSource(def.configSectionId)
+    if (ts?.modelCatalogState?.status === 'failed') {
+      await feishu.sendText(s.chatId, `❌ ${ts.display} 配置已保存，但模型目录未就绪：${ts.modelCatalogState.error ?? 'MISS'}`)
+      return
+    }
     await feishu.sendText(s.chatId, `✅ ${ts?.display ?? sourceId} 已启用。发 \`model\` 重新选择。`)
   } catch (e: any) {
     await feishu.sendText(s.chatId, `❌ 启用失败: ${e?.message ?? e}`)

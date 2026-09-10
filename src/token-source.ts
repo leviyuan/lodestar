@@ -3,11 +3,11 @@
  * 每个 token-source-*.ts 模块注册 factory，由 token-source-builtins.ts 构建实例。
  */
 
-import type { AgentReasoningEffort } from './agent-process'
+import type { AgentProvider, AgentReasoningEffort } from './agent-process'
 import type { TokenSourceConfig } from './config'
 import { log } from './log'
 
-export type TokenSourceAgent = 'claude' | 'codex'
+export type TokenSourceAgent = AgentProvider
 
 /** 账号模型目录中的一个可选模型。 */
 export interface TokenSourceModel {

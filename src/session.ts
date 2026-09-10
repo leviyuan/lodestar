@@ -1,3 +1,6 @@
+import { isAgentSession } from './agent-session-registry'
+import { queryDshRuntime } from './dsh-runtime'
+import { isDshReasoningEffort } from './agent-process'
 /**
  * Session — 1 Feishu chat ↔ 1 Codex app-server process ↔ 1 streaming card.
  *
@@ -594,7 +597,7 @@ export class Session {
     const provider: AgentProvider = (selection?.provider as AgentProvider) ?? this.selectedProvider
     // 只认 enabled source:disabled 的不参与 spawn,避免未配置凭据注入子进程把 claude 搞挂。
     // claude 侧 native 与 GLM 严格互斥,恒有一个 enabled;codex 侧 codex-sub 未登录时为空(走 ~/.codex)。
-    const list = listEnabledTokenSourcesByAgent(provider === 'codex' ? 'codex' : 'claude')
+    const list = listEnabledTokenSourcesByAgent(provider)
     // provider 侧无 enabled source → 返回 null(走旧路径:claude 透传 / codex 走 ~/.codex),
     // 不跨界 fallback 到别的 provider 的 default —— 否则 codex-sub 未登录会把 provider 误切成 claude。
     return list[0]?.id ?? null
@@ -644,6 +647,23 @@ export class Session {
     )
   }
 
+  dshEffortForSpawn() {
+    if (isDshReasoningEffort(this.selectedEffort)) return this.selectedEffort
+    const source = this.currentTokenSource()
+    const entry = source?.models.find(model => model.model === (this.selectedModel ?? source.defaultModel))
+    if (!entry || !isDshReasoningEffort(entry.defaultEffort)) throw new Error('DSH model reasoning effort is unavailable')
+    return entry.defaultEffort
+  }
+
+  async listDshConversations(): Promise<ConversationSummary[]> {
+    if (this.selectedProvider !== 'dsh') throw new Error('DSH history requested under a different provider')
+    const source = this.currentTokenSource()
+    if (!source?.enabled || source.agent !== 'dsh') throw new Error('DSH token source is unavailable')
+    const rows: ConversationSummary[] = await queryDshRuntime({ cwd: this.workDir,
+      env: source.spawnEnv(process.env), profile: { loadProjectMcp: false } }, 'session/list', { cwd: this.workDir })
+    return rows.filter(row => !isAgentSession('dsh', row.sessionId))
+  }
+
   /** Query Codex history without attaching the catalog process to this Session. */
   async listCodexConversations(): Promise<ConversationSummary[]> {
     if (this.selectedProvider !== 'codex') throw new Error('Codex history requested for a non-Codex session')
@@ -686,7 +706,9 @@ export class Session {
       throw new Error(`legacy resume provider mismatch: ${ref.provider} != ${this.selectedProvider}`)
     }
     let resolved: ConversationRef
-    if (ref.provider === 'claude') {
+    if (ref.provider === 'dsh') {
+      throw new Error('DSH resume reference requires its original cwd')
+    } else if (ref.provider === 'claude') {
       const transcript = claudeTranscriptPath(this.workDir, ref.sessionId)
       if (!existsSync(transcript)) {
         throw new Error(`旧 Claude 会话不属于当前 cwd，或 transcript 不存在: ${diagnosticIdLabel(ref.sessionId)}`)
@@ -765,6 +787,7 @@ export class Session {
 
   currentEffortLabel(): AgentReasoningEffort {
     return this.selectedEffort
+      ?? (this.selectedProvider === 'dsh' ? this.dshEffortForSpawn() : undefined)
       ?? this.proc?.lastEffort
       ?? (this.selectedProvider === 'claude' ? CLAUDE_EFFORT : CODEX_EFFORT)
   }
@@ -899,7 +922,9 @@ export class Session {
       workDir: this.workDir,
       tokenSourceId: ts?.id ?? null,
       model: ts ? (this.selectedModel ?? ts.defaultModel) : this.modelForSpawn(),
-      effort: this.selectedProvider === 'claude' ? this.claudeEffortForSpawn() : this.effortForSpawn(),
+      effort: this.selectedProvider === 'dsh'
+        ? this.dshEffortForSpawn()
+        : this.selectedProvider === 'claude' ? this.claudeEffortForSpawn() : this.effortForSpawn(),
       launch,
       developerInstructions: this.spawnDeveloperInstructions(),
       profile: feishu.projectProfile(this.worktreeProjectName()),
@@ -1442,7 +1467,7 @@ export class Session {
     let initializeThrown: unknown = null
     try {
       proc.sendInitialize()
-      if (this.selectedProvider === 'codex') initialization = proc.initializationPromise?.()
+      initialization = proc.initializationPromise?.()
     } catch (error) {
       initialization = undefined
       initializeThrown = error
@@ -1955,7 +1980,7 @@ export class Session {
       let initializeThrown: unknown = null
       try {
         proc.sendInitialize()
-        if (this.selectedProvider === 'codex') initialization = proc.initializationPromise?.()
+        initialization = proc.initializationPromise?.()
       } catch (error) {
         initialization = undefined
         initializeThrown = error
@@ -3619,7 +3644,7 @@ export class Session {
       })
     })
     on('scheduled_turn_input', ({ text, promptId }) => {
-      if (p.provider !== 'claude') return
+      if (p.provider !== 'claude' && p.provider !== 'dsh') return
       this.startScheduledTurnCard(p, epoch, text, promptId)
     })
     on('conversation_materialized', ({ session_id: sessionId, source }) => {
@@ -3996,7 +4021,7 @@ export class Session {
    * 的输入侧占用(proc.lastContextTokens = input+cache_read+cache_creation,
    * 不含 output);Codex 路径继续用 lastUsage.total_tokens。 */
   private currentContextTokens(proc: AgentProcess | null = this.proc): number | null {
-    if (proc?.provider === 'claude') {
+    if (proc?.provider === 'claude' || proc?.provider === 'dsh') {
       return proc.lastContextTokens ?? null
     }
     const u = proc?.lastUsage as CodexUsage | null | undefined
@@ -5468,7 +5493,7 @@ export class Session {
     cachedCodexUsage: UsageSnapshot | null,
   ): Promise<string> {
     if (selectedTokenSourceId && (!ts || !ts.enabled || ts.agent !== provider)) return ''
-    if (ts?.agent === provider && ts.enabled && provider === 'claude') {
+    if (ts?.agent === provider && ts.enabled && (provider === 'claude' || provider === 'dsh')) {
       const snap = await ts.readUsage()
       const fiveHour = snap.windows.find(w => w.kind === 'fiveHour')
       const weekly = snap.windows.find(w => w.kind === 'weekly')
@@ -5485,6 +5510,7 @@ export class Session {
       const u = fresh ?? cachedCodexUsage
       return u?.state === 'ok' ? this.fmtDualWindowSuffix(u.fiveHour ?? null, u.weekly ?? null) : ''
     }
+    if (provider === 'dsh') return '  |  额度 MISS'
     // claude 无匹配 token source(理论不发生,token source 总有)→ 回退 readGlmUsage 兼容
     const g = await readGlmUsage()
     return g.state === 'ok' ? this.fmtDualWindowSuffix(g.fiveHour ?? null, g.weekly ?? null) : ''

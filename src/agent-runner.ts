@@ -310,7 +310,7 @@ function normalizeQuestion(raw: unknown, index: number): AgentInputQuestion {
 
 function checkpointIdFrom(checkpoint: any, proc: AgentProcess): string | undefined {
   if (typeof checkpoint?.id === 'string' && checkpoint.id) return checkpoint.id
-  if (proc.provider === 'codex' && typeof proc.lastCompletedTurnId === 'string' && proc.lastCompletedTurnId) return proc.lastCompletedTurnId
+  if ((proc.provider === 'codex' || proc.provider === 'dsh') && typeof proc.lastCompletedTurnId === 'string' && proc.lastCompletedTurnId) return proc.lastCompletedTurnId
   if (proc.provider === 'claude' && proc.lastAssistantUuid) return proc.lastAssistantUuid
   return undefined
 }

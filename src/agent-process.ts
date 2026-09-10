@@ -21,9 +21,17 @@ import type {
   BgTaskSettledEvent,
 } from './claude-agent-process'
 
-export type AgentProvider = 'codex' | 'claude'
+export const AGENT_PROVIDERS = ['codex', 'claude', 'dsh'] as const
+export type AgentProvider = typeof AGENT_PROVIDERS[number]
+export function isAgentProvider(value: unknown): value is AgentProvider {
+  return typeof value === 'string' && (AGENT_PROVIDERS as readonly string[]).includes(value)
+}
+export type DshReasoningEffort = 'off' | 'low' | 'high' | 'max'
+export function isDshReasoningEffort(value: unknown): value is DshReasoningEffort {
+  return value === 'off' || value === 'low' || value === 'high' || value === 'max'
+}
 export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
-export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort
+export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort | DshReasoningEffort
 
 /** A Codex capacity failure keeps the logical task open while retrying. */
 export interface AgentTurnRetry {
@@ -41,11 +49,12 @@ export function isClaudeReasoningEffort(value: unknown): value is ClaudeReasonin
 }
 
 export function providerFromModel(model: string | null | undefined): AgentProvider {
+  if (model?.startsWith('dsh:')) return 'dsh'
   return model?.startsWith('claude:') ? 'claude' : 'codex'
 }
 
 export function agentProviderLabel(provider: AgentProvider): string {
-  return provider === 'claude' ? 'Claude' : 'Codex'
+  return { claude: 'Claude', codex: 'Codex', dsh: 'DeepSeek Harness' }[provider]
 }
 
 /** 主动 compact 时上下文不足、后端未触发压缩。这不是错误 —— 是"无需压缩"的正常
@@ -107,12 +116,17 @@ export interface AgentProcess extends EventEmitter {
    *  TERM/KILL (Codex) or SDK close/abort (Claude) cannot confirm exit. */
   kill(timeoutMs?: number): Promise<void>
 
-  listModels(): Promise<CodexModel[]>
+  listModels(): Promise<AgentModel[]>
   setModelSettings(model: string, effort: AgentReasoningEffort): Promise<void>
   compactThread(): Promise<void>
   /** codex:在现有 app-server 连接上读账号额度(read 端点,权威多桶);
    *  claude:无此通道,返回 null(session 的额度走 token source)。 */
   readRateLimits?(): Promise<any>
+}
+
+export interface AgentModel extends Omit<CodexModel, 'supportedReasoningEfforts' | 'defaultReasoningEffort'> {
+  supportedReasoningEfforts: Array<{ reasoningEffort: AgentReasoningEffort; description: string }>
+  defaultReasoningEffort: AgentReasoningEffort | null
 }
 
 export type AgentProcessEventMap = {
@@ -136,7 +150,7 @@ export type AgentProcessEventMap = {
   rate_limits_updated: any
   thread_goal_updated: ThreadGoal
   thread_goal_cleared: any
-  /** Claude SDK Cron dequeued an autonomous prompt. Unlike a daemon user
+  /** A backend dequeued autonomous work (Claude Cron or a DSH continuation). Unlike a daemon user
    * write, this has no pending input claim, so Session must open its own card. */
   scheduled_turn_input: { text: string; promptId: string | null }
   /** parentToolUseId 非空 = 子 agent 的正文块。它必须与子 agent 工具事件

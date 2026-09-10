@@ -1,6 +1,6 @@
 # Lodestar 项目指引
 
-Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个群对应一个 `Session`，通过 Codex app-server 或 Claude Agent SDK 执行任务，以 Feishu Card Kit schema 2.0 展示结果。
+Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个群对应一个 `Session`，通过 Codex app-server、Claude Agent SDK 或 DeepSeek Harness 执行任务，以 Feishu Card Kit schema 2.0 展示结果。
 
 维护说明以 `AGENTS.md` 为入口。Codex、Claude、GLM、DeepSeek 和 Claude native 都是受支持能力；文档清理、缺少本机凭据或维护工具选择不构成删除后端的理由。
 
@@ -27,7 +27,8 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 
 ## 模块边界
 
-- 一个群只有一个 Session 和一个当前主进程。Codex 使用 app-server JSON-RPC，Claude/GLM/DeepSeek/native 使用 Agent SDK streaming input；不引入 tmux、JSONL 队列或旁路进程控制。
+- 一个群只有一个 Session 和一个当前主进程。Codex 使用 app-server JSON-RPC，Claude/GLM/DeepSeek/native 使用 Agent SDK streaming input，DSH 使用独立 Node 子进程和 Cordis stdio 桥接；不引入 tmux、JSONL 队列或旁路进程控制。
+- DSH 的 `deepseek-harness` 来源独立于 Claude 兼容的 `deepseek`。运行时锁定版本，子进程需要 Node 22.19+（22.x）或 24+；`src/dsh-bridge.ts` 仅在该子进程加载。
 - Token Source 统一管理账号、凭据、模型目录、启动环境和额度。模型与 Agent 身份动态读取该目录，沿用目录声明的 effort；来源禁用或刷新失败显示 `MISS`。新增来源通过 factory 注册。
 - `AgentService` 的委派进程与主会话共用启动入口。委派仅一层：主 Agent 可并行派工、续跑与输入回填；被委派的 Agent 不得通过 Lodestar 或原生 Agent 工具继续委派。具体生命周期约束见 `src/AGENTS.md`。
 - `managed-skills.ts` 同源生成 Codex/Claude standalone Skill 和 Claude 本地插件。GLM/DeepSeek 通过插件加载 Skill，不为此重新引入 user settings 和凭据。
