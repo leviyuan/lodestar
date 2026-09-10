@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -13,26 +13,80 @@ afterEach(() => {
 })
 
 function tempRoot(): string {
-  const root = mkdtempSync(join(tmpdir(), 'lodestar-command-'))
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'lodestar command-')))
   roots.push(root)
   return root
 }
 
 describe('managed lodestar-agent command', () => {
   test('resolves Bun source and Node release layouts without substituting a missing entry', () => {
+    const root = tempRoot()
+    const daemonEntry = join(root, 'daemon.ts')
+    const source = join(root, 'src', 'agent-cli.ts')
+    const bundle = join(root, 'dist', 'lodestar-agent.js')
+    mkdirSync(join(root, 'src'))
+    mkdirSync(join(root, 'dist'))
+    writeFileSync(daemonEntry, '')
+    writeFileSync(source, '')
+    writeFileSync(join(root, 'dist', 'lodestar.js'), '')
+    writeFileSync(bundle, '')
     expect(resolveAgentCliLaunch({
-      daemonEntry: '/repo/daemon.ts',
+      daemonEntry,
       runtime: '/opt/bun/bin/bun',
-      exists: (path: string) => path === '/repo/src/agent-cli.ts',
-    })).toEqual({ runtime: '/opt/bun/bin/bun', entry: '/repo/src/agent-cli.ts' })
+    })).toEqual({ runtime: '/opt/bun/bin/bun', entry: source })
     expect(resolveAgentCliLaunch({
-      daemonEntry: '/pkg/dist/lodestar.js',
+      daemonEntry: join(root, 'dist', 'lodestar.js'),
       runtime: '/usr/bin/node',
-      exists: (path: string) => path === '/pkg/dist/lodestar-agent.js',
-    })).toEqual({ runtime: '/usr/bin/node', entry: '/pkg/dist/lodestar-agent.js' })
+    })).toEqual({ runtime: '/usr/bin/node', entry: bundle })
     expect(() => resolveAgentCliLaunch({
-      daemonEntry: '/missing/daemon.ts', runtime: '/opt/bun/bin/bun', exists: () => false,
+      daemonEntry, runtime: '/opt/bun/bin/bun', exists: () => false,
     })).toThrow('entry not found')
+  })
+
+  test('resolves the installed package through a Node command symlink', async () => {
+    const root = tempRoot()
+    const dist = join(root, 'lib', 'node_modules', '@leviyuan', 'lodestar', 'dist')
+    const bin = join(root, 'bin')
+    mkdirSync(dist, { recursive: true })
+    mkdirSync(bin)
+    writeFileSync(join(root, 'package.json'), '{"type":"module"}')
+    const probe = join(root, 'probe.ts')
+    writeFileSync(probe, [
+      `import { resolveAgentCliLaunch } from ${JSON.stringify(join(import.meta.dir, 'managed-commands.ts'))}`,
+      'process.stdout.write(JSON.stringify(resolveAgentCliLaunch()))',
+    ].join('\n'))
+    const build = await Bun.build({
+      entrypoints: [probe], target: 'node', minify: true,
+      outdir: dist, naming: 'lodestar.js',
+    })
+    expect(build.success, build.logs.join('\n')).toBe(true)
+    const entry = join(dist, 'lodestar-agent.js')
+    writeFileSync(entry, '')
+    symlinkSync('../lib/node_modules/@leviyuan/lodestar/dist/lodestar.js', join(bin, 'daemon-link'))
+    const command = join(bin, 'lodestar-daemon')
+    symlinkSync('daemon-link', command)
+    const proc = Bun.spawnSync(['node', command], { cwd: root })
+    expect(proc.exitCode, proc.stderr.toString()).toBe(0)
+    expect(JSON.parse(proc.stdout.toString()).entry).toBe(entry)
+
+    // A similarly named file beside the command must never override the package.
+    writeFileSync(join(bin, 'lodestar-agent.js'), '')
+    const withDecoy = Bun.spawnSync(['node', command], { cwd: root })
+    expect(withDecoy.exitCode, withDecoy.stderr.toString()).toBe(0)
+    expect(JSON.parse(withDecoy.stdout.toString()).entry).toBe(entry)
+
+    rmSync(entry)
+    const missing = Bun.spawnSync(['node', command], { cwd: root })
+    expect(missing.exitCode).not.toBe(0)
+    expect(missing.stderr.toString()).toContain(`entry not found beside daemon: ${entry}`)
+  })
+
+  test('surfaces a broken daemon symlink instead of selecting another command', () => {
+    const root = tempRoot()
+    const daemonEntry = join(root, 'lodestar-daemon')
+    symlinkSync('missing-daemon.js', daemonEntry)
+    writeFileSync(join(root, 'lodestar-agent.js'), '')
+    expect(() => resolveAgentCliLaunch({ daemonEntry, runtime: '/usr/bin/node' })).toThrow('ENOENT')
   })
 
   test('atomically installs an executable wrapper and prepends its directory to PATH', () => {

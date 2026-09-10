@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, readFileSync, unlinkSync } from 'node:fs'
+import { chmodSync, existsSync, readFileSync, realpathSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { log } from './log'
@@ -19,7 +19,9 @@ interface ResolveLaunchOptions {
  * Node. A missing command is a boot error: the Skill must never be installed
  * with a command that can only fail later. */
 export function resolveAgentCliLaunch(opts: ResolveLaunchOptions = {}): AgentCliLaunch {
-  const daemonEntry = resolve(opts.daemonEntry ?? process.argv[1] ?? '')
+  // npm bin commands are symlinks. argv[1] retains the bin path, so locate
+  // bundled companions beside the actual entry, not beside the command link.
+  const daemonEntry = realpathSync(resolve(opts.daemonEntry ?? process.argv[1] ?? ''))
   const runtime = opts.runtime ?? process.execPath
   const exists = opts.exists ?? existsSync
   const root = dirname(daemonEntry)

@@ -1,4 +1,4 @@
-import { resolve } from 'node:path'
+import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 interface CliContext {
@@ -303,7 +303,8 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// npm preserves the command symlink in argv[1]; compare the actual files.
+if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
   main().catch(error => {
     process.stderr.write(`lodestar-agent: ${messageOf(error)}\n`)
     process.exitCode = 1
