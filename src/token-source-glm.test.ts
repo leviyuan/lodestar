@@ -112,6 +112,12 @@ describe('anthropic-compatible source env isolation', () => {
     ANTHROPIC_AUTH_TOKEN: 'old-auth-token',
     ANTHROPIC_BASE_URL: 'https://old.invalid',
     ANTHROPIC_DEFAULT_OPUS_MODEL: 'old-opus',
+    ANTHROPIC_MODEL: 'openrouter/old-model',
+    ANTHROPIC_DEFAULT_FABLE_MODEL: 'openrouter/old-fable',
+    ANTHROPIC_SMALL_FAST_MODEL: 'openrouter/old-small',
+    CLAUDE_CODE_SUBAGENT_MODEL: 'openrouter/old-subagent',
+    CLAUDE_CODE_OAUTH_TOKEN: 'old-oauth',
+    CLAUDE_CODE_USE_BEDROCK: '1',
   }
 
   test('GLM keeps only its own auth and routing fields', () => {
@@ -121,6 +127,12 @@ describe('anthropic-compatible source env isolation', () => {
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('test-token')
     expect(env.ANTHROPIC_API_KEY).toBeUndefined()
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBeUndefined()
+    expect(env.ANTHROPIC_MODEL).toBeUndefined()
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBeUndefined()
+    expect(env.ANTHROPIC_SMALL_FAST_MODEL).toBeUndefined()
+    expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBeUndefined()
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined()
+    expect(env.CLAUDE_CODE_USE_BEDROCK).toBeUndefined()
   })
 
   test('DeepSeek keeps only its own API key and routing fields', () => {

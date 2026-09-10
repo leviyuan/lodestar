@@ -26,11 +26,12 @@ export type AgentProvider = typeof AGENT_PROVIDERS[number]
 export function isAgentProvider(value: unknown): value is AgentProvider {
   return typeof value === 'string' && (AGENT_PROVIDERS as readonly string[]).includes(value)
 }
-export type DshReasoningEffort = 'off' | 'low' | 'high' | 'max'
+export type DshReasoningEffort = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export function isDshReasoningEffort(value: unknown): value is DshReasoningEffort {
-  return value === 'off' || value === 'low' || value === 'high' || value === 'max'
+  return typeof value === 'string' && ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(value)
 }
-export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+/** default 表示模型没有 effort 选择器，SDK 不发送 effort 参数。 */
+export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'default'
 export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort | DshReasoningEffort
 
 /** A Codex capacity failure keeps the logical task open while retrying. */
@@ -41,7 +42,7 @@ export interface AgentTurnRetry {
   message: string
 }
 
-export const CLAUDE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export const CLAUDE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'default'] as const
 export const CLAUDE_EFFORT: ClaudeReasoningEffort = 'max'
 
 export function isClaudeReasoningEffort(value: unknown): value is ClaudeReasoningEffort {
@@ -81,6 +82,8 @@ export interface AgentProcess extends EventEmitter {
   lastCompletedTurnId?: string | null
   lastModel: string | null
   lastEffort: AgentReasoningEffort | null
+  /** 当前思考块的实时估计，不能用于计费或累计 token。 */
+  lastThinkingTokens?: number | null
   lastUsage: CodexUsage | null
   lastTotalUsage: CodexUsage | null
   lastResult: CodexResultMeta

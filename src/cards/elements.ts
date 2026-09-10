@@ -53,6 +53,7 @@ export const ELEMENTS = {
   /** Model command card — one replaceable panel for model → effort
    * multi-step selection inside a single card. */
   modelPanel: 'model_panel',
+  modelAgentGroup: (agent: string) => `model_agent_${agent}`,
   /** Basic project tasklist binding panel. */
   tasklistPanel: 'tasklist_panel',
   /** Global delegated-agent identity catalog and run status. */

@@ -8,7 +8,7 @@ import { agentProviderLabel } from '../agent-process'
 import { SERVICE_LABEL, type SysInfo } from '../sysinfo'
 import type { UsageSnapshot } from '../usage'
 import type { GlmUsageSnapshot } from '../glm-usage'
-import type { UsageSnapshotUnified } from '../token-source'
+import type { UsageSnapshotUnified, TokenSourceModelCatalogState } from '../token-source'
 import type { AgentProvider } from '../agent-process'
 import { ELEMENTS } from './elements'
 
@@ -61,6 +61,8 @@ export interface ModelChoice {
   selected?: boolean
   /** 该 source 是否已配置凭据;false = 灰显 +「启用」按钮(未配置 source 的占位项) */
   enabled?: boolean
+  unavailableReason?: string
+  origin?: 'upstream' | 'custom'
   efforts: ModelEffortChoice[]
 }
 
@@ -77,6 +79,11 @@ interface ModelSelectionCardOpts {
   currentModel?: string | null
   currentEffort?: string | null
   models: ModelChoice[]
+  pagination?: { sourceId: string; page: number; totalPages: number }
+  sourceId?: string
+  editable?: boolean
+  allowCustom?: boolean
+  mode?: 'select' | 'add'
 }
 
 interface ModelEffortSelectionCardOpts {
@@ -406,36 +413,34 @@ export function consoleHostElement(sysinfo?: SysInfo, elementId = ELEMENTS.conso
 /** 统一额度渲染:从 tokenSource.readUsage() 的 UsageSnapshotUnified 渲染。
  * 取代 consoleUsageContent/consoleGlmUsageContent 二元 —— 加新 token source 的额度
  * 自动支持(只要它的 readUsage 返回 unified)。失败态按 no_fallbacks 显式 MISS。 */
+export function unifiedUsageSummary(snap: UsageSnapshotUnified | undefined): string {
+  const label = snap?.kind === 'balance' ? '余额' : '额度'
+  if (!snap) return `${label} 加载中…`
+  if (snap.state === 'not_applicable') return `${label} —`
+  if (snap.state !== 'ok') return `${label} MISS`
+  const money = (amount: number, currency: string) => `${currency === 'USD' ? '$' : currency === 'CNY' ? '¥' : `${currency} `}${amount.toFixed(2)}`
+  if (snap.kind === 'balance') return snap.balance
+    ? `余额 ${money(snap.balance.remaining, snap.balance.currency)}` : '余额 MISS'
+  if (snap.quota) return snap.quota.limit === null ? '额度 未设上限'
+    : snap.quota.remaining === null ? '额度 MISS'
+    : `额度 ${money(snap.quota.remaining, snap.quota.currency)} / ${money(snap.quota.limit, snap.quota.currency)}`
+  if (!snap.windows.length) return '额度 MISS'
+  return `额度 ${snap.windows.map(w => {
+    const value = typeof w.used === 'number' && typeof w.total === 'number' ? `${w.used}/${w.total}`
+      : w.percent === null ? 'MISS' : `${Math.round(w.percent)}%`
+    return `${w.label} 已用 ${value}`
+  }).join(' · ')}`
+}
+
 export function consoleUnifiedUsageContent(snap: UsageSnapshotUnified | undefined): string {
-  if (snap === undefined) return '**📊 额度**　_加载中…_'
-  switch (snap.state) {
-    case 'no_credentials': return '**📊 额度**　未配置凭据 — 检查 config.toml [token_source.*]'
-    case 'not_applicable': return '**📊 额度**　—(该来源无额度查询)'
-    case 'rate_limited': return '**📊 额度**　API 限流,稍后重试'
-    case 'network': return `**📊 额度**　拉取失败${snap.reason ? ' — `' + snap.reason + '`' : ''}`
-  }
-  const head = snap.planLabel ? `**📊 额度** · ${snap.planLabel}` : '**📊 额度**'
-  const lines: string[] = [head]
-  for (const w of snap.windows) {
-    const parts = [fmtUsagePercent(w.percent)]
-    if (typeof w.used === 'number' && typeof w.total === 'number') parts.push(`${w.used}/${w.total}`)
-    if (w.resetsAt) parts.push(`重置 ${fmtResetIn(w.resetsAt)}`)
-    lines.push(`　· ${w.label}　${parts.join(' · ')}`)
-  }
-  // planLabel-only(标量余额 source 如 DeepSeek,无滚动窗口)不算「无数据」。
-  return lines.length === 1 && !snap.planLabel ? '**📊 额度**　_无数据_' : lines.join('\n')
+  const summary = unifiedUsageSummary(snap)
+  return summary.replace(/^(额度|余额)/, '**📊 $1**')
 }
 
 /** 订阅额度行:有 unifiedUsage(tokenSource.readUsage)优先统一渲染;
  * 否则按 provider 二元回退 Codex/GLM(兼容未配 token source 的旧路径)。 */
 export function consoleUsageElement(opts: ConsoleOpts): object {
-  const content = opts.unifiedUsage !== undefined
-    ? consoleUnifiedUsageContent(opts.unifiedUsage)
-    : opts.provider === 'dsh'
-      ? '**📊 余额**　_加载中…_'
-    : opts.provider === 'claude'
-      ? consoleGlmUsageContent(opts.glmUsage)
-      : consoleUsageContent(opts.usage)
+  const content = consoleUnifiedUsageContent(opts.unifiedUsage)
   return {
     tag: 'markdown',
     element_id: ELEMENTS.consoleUsage,
@@ -476,6 +481,8 @@ export interface ProviderChoice {
   display: string
   enabled: boolean
   modelCount: number
+  catalogStatus?: TokenSourceModelCatalogState['status']
+  catalogError?: string
   selected?: boolean
 }
 
@@ -498,7 +505,22 @@ export function providerSelectionCard(opts: ProviderSelectionCardOpts): object {
         tag: 'markdown',
         content: `当前: ${inlineCode(opts.currentDisplay ?? '未选择')}\n选账号进入模型选择。`,
       },
-      ...opts.providers.map(p => providerChoiceElement(p, opts.panelId)),
+      ...(['claude', 'codex', 'dsh'] as const).flatMap(agent => {
+        const providers = opts.providers.filter(p => (p.provider ?? 'codex') === agent)
+        return providers.length ? [{
+          tag: 'collapsible_panel',
+          element_id: ELEMENTS.modelAgentGroup(agent),
+          expanded: true,
+          header: {
+            title: { tag: 'markdown', content: `**Agent · ${agent}**` },
+            background_color: 'blue-50',
+          },
+          border: { color: 'blue-100', corner_radius: '8px' },
+          padding: '8px',
+          margin: '8px 0px 0px 0px',
+          elements: providers.map(p => providerChoiceElement(p, opts.panelId)),
+        }] : []
+      }),
     ],
   })
 }
@@ -524,7 +546,10 @@ function providerChoiceElement(p: ProviderChoice, panelId: string): object {
       ],
     }
   }
-  const flags = [p.selected ? '当前账号' : '', `${p.modelCount} 个模型`].filter(Boolean).join(' · ')
+  const catalog = p.catalogStatus === 'failed' ? `模型目录 MISS${p.catalogError ? `：${p.catalogError}` : ''}`
+    : p.catalogStatus === 'loading' || p.catalogStatus === 'idle' ? '模型目录加载中'
+    : `${p.modelCount} 个模型`
+  const flags = [p.selected ? '当前账号' : '', catalog].filter(Boolean).join(' · ')
   return {
     tag: 'column_set',
     columns: [
@@ -578,42 +603,64 @@ function modelCard(sessionName: string, element: object, template = 'turquoise')
 }
 
 export function modelSelectionPanelElement(opts: ModelSelectionCardOpts): object {
-  const modelElements = modelChoiceElements(opts.models, opts.panelId)
+  const modelElements = modelChoiceElements(opts.models, opts.panelId, opts.mode, opts.editable)
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.modelPanel,
-    header: { title: { tag: 'plain_text', content: '选择模型' } },
+    header: { title: { tag: 'plain_text', content: opts.mode === 'add' ? '显示模型' : '选择模型' } },
     expanded: true,
     elements: [
       {
         tag: 'markdown',
         content: [
           `当前: ${settingsLine(opts.currentModel, opts.currentEffort)}`,
-          '选模型进入 effort 选择。',
+          opts.mode === 'add' ? '显示账号接口中的模型。' : '接口模型可隐藏，补录模型可删除。选模型进入 effort 选择。',
         ].join('\n'),
       },
       ...(opts.models.length
         ? modelElements
-        : [{ tag: 'markdown', content: '_未返回可用模型列表_' }]),
+        : [{ tag: 'markdown', content: opts.editable ? (opts.mode === 'add' ? '_没有待显示的接口模型_' : '_列表为空，可显示接口模型或补录_') : '_未返回可用模型列表_' }]),
+      ...(opts.pagination ? modelPaginationElements(opts.panelId, opts.pagination) : []),
+      ...(opts.editable && opts.allowCustom ? [{
+        tag: 'button', text: { tag: 'plain_text', content: '补录模型' }, type: 'default',
+        behaviors: [{ type: 'callback', value: { kind: 'model_custom_prompt', panel_id: opts.panelId, source_id: opts.sourceId } }],
+      }] : []),
       // 列表外模型补录:上游列表滞后(新模型已可用但未列出)时用。点击进入
       // 「群里直接回复模型名」应答态(同 AskUserQuestion 的消息应答语义),
       // 回复后端点校验,存在才补进列表。
       {
         tag: 'button',
-        text: { tag: 'plain_text', content: '➕ 补录模型' },
+        text: { tag: 'plain_text', content: opts.editable ? (opts.mode === 'add' ? '返回模型列表' : '显示模型') : '补录模型' },
         type: 'default',
         width: 'default',
         behaviors: [{
           type: 'callback',
           value: {
-            kind: 'model_custom_prompt',
+            kind: opts.editable ? 'model_list_open' : 'model_custom_prompt',
             panel_id: opts.panelId,
-            ...(opts.models[0]?.sourceId ? { source_id: opts.models[0].sourceId } : {}),
+            ...(opts.sourceId || opts.models[0]?.sourceId ? { source_id: opts.sourceId ?? opts.models[0]?.sourceId } : {}),
+            ...(opts.editable ? { mode: opts.mode === 'add' ? 'select' : 'add' } : {}),
           },
         }],
       },
     ],
   }
+}
+
+function modelPaginationElements(panelId: string, pagination: NonNullable<ModelSelectionCardOpts['pagination']>): object[] {
+  const { sourceId, page, totalPages } = pagination
+  const button = (text: string, target: number): object => ({
+    tag: 'column', width: 'weighted', weight: 1,
+    elements: [{ tag: 'button', text: { tag: 'plain_text', content: text }, type: 'default',
+      behaviors: [{ type: 'callback', value: { kind: 'model_page', panel_id: panelId, source_id: sourceId, page: target } }] }],
+  })
+  return [
+    { tag: 'markdown', content: `第 ${page + 1} / ${totalPages} 页` },
+    { tag: 'column_set', columns: [
+      ...(page > 0 ? [button('上一页', page - 1)] : []),
+      ...(page + 1 < totalPages ? [button('下一页', page + 1)] : []),
+    ] },
+  ]
 }
 
 /** 补录等待态取消后的收尾卡:一行静态文本,无可交互元素。 */
@@ -645,7 +692,8 @@ export function modelCustomPromptCard(sessionName: string, sourceDisplay: string
       {
         tag: 'markdown',
         content: [
-          `**直接回复模型名补录到 ${sourceDisplay}**(列表外的模型,端点会先校验真伪)`,
+          `**直接回复模型名补录到 ${sourceDisplay}**`,
+          '仅补录接口列表外的模型。后端未确认的模型或 effort 会标为 MISS，记录可删除。',
           '_裸词命令(hi/stop/model 等)不受影响_',
         ].join('\n'),
       },
@@ -674,7 +722,7 @@ export function modelCustomResultPanelElement(
     elements: [{
       tag: 'markdown',
       content: ok
-        ? `✅ \`${model}\` 已加入列表`
+        ? `✅ \`${model}\` 已加入列表${reason ? `\n${reason}` : ''}`
         : `❌ \`${model}\` 未加入 — ${reason}`,
     }],
   }
@@ -724,7 +772,7 @@ export function modelResultPanelElement(opts: ModelResultPanelOpts): object {
   }
 }
 
-function modelChoiceElement(model: ModelChoice, panelId: string): object[] {
+function modelChoiceElement(model: ModelChoice, panelId: string, mode?: 'select' | 'add', editable = false): object[] {
   // 未配置 source 的占位项:灰显 + 「启用」按钮
   if (model.enabled === false) {
     return [{
@@ -759,6 +807,10 @@ function modelChoiceElement(model: ModelChoice, panelId: string): object[] {
   const desc = model.description
     ? '\n' + escapeMarkdown(truncate(model.description, 110))
     : ''
+  const listAction = (kind: 'model_add' | 'model_remove' | 'model_custom_remove', text: string): object => ({
+    tag: 'button', text: { tag: 'plain_text', content: text }, type: 'default',
+    behaviors: [{ type: 'callback', value: { kind, panel_id: panelId, source_id: model.sourceId, model: model.model } }],
+  })
   const row = {
     tag: 'column_set',
     columns: [
@@ -775,25 +827,30 @@ function modelChoiceElement(model: ModelChoice, panelId: string): object[] {
       },
       {
         tag: 'column', width: 'weighted', weight: 1,
-        elements: [{
+        elements: [
+          ...(mode === 'add' ? [listAction('model_add', '显示')]
+            : model.unavailableReason ? [{ tag: 'markdown', content: '**MISS**' }] : [{
           tag: 'button',
           text: { tag: 'plain_text', content: '选' },
           type: model.selected ? 'primary' : 'default',
           behaviors: [{ type: 'callback', value: modelSelectActionValue(model, panelId) }],
-        }],
+          }]),
+          ...(editable && mode !== 'add' ? [model.origin === 'custom'
+            ? listAction('model_custom_remove', '删除') : listAction('model_remove', '隐藏')] : []),
+        ],
       },
     ],
   }
   return [row]
 }
 
-function modelChoiceElements(models: ModelChoice[], panelId: string): object[] {
+function modelChoiceElements(models: ModelChoice[], panelId: string, mode?: 'select' | 'add', editable = false): object[] {
   const groups = [
     { title: 'Codex', models: models.filter(m => (m.provider ?? 'codex') === 'codex') },
     { title: 'Claude Code 后端', models: models.filter(m => m.provider === 'claude') },
     { title: 'DeepSeek Harness', models: models.filter(m => m.provider === 'dsh') },
   ].filter(group => group.models.length > 0)
-  const flat = (ms: ModelChoice[]) => ms.flatMap(model => modelChoiceElement(model, panelId))
+  const flat = (ms: ModelChoice[]) => ms.flatMap(model => modelChoiceElement(model, panelId, mode, editable))
   if (groups.length <= 1) return flat(models)
   const elements: object[] = []
   for (const group of groups) {
@@ -820,7 +877,7 @@ function effortChoiceElement(
         elements: [{
           tag: 'markdown',
           content: [
-            `**${escapeMarkdown(effort.effort)}**`,
+            `**${effort.effort === 'default' ? '模型默认' : escapeMarkdown(effort.effort)}**`,
             flags,
             effort.description ? escapeMarkdown(effort.description) : '',
           ].filter(Boolean).join('\n'),

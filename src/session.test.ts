@@ -14,7 +14,7 @@ const cardkit = await import('./cardkit')
 const feishu = await import('./feishu')
 const mathRender = await import('./math-render')
 const { config } = await import('./config')
-const { getTokenSource, listTokenSources, registerTokenSource, refreshAllTokenSourceModels, resetTokenSourceRegistry } = await import('./token-source')
+const { getTokenSource, listTokenSources, registerTokenSource, refreshAllTokenSourceModels, resetTokenSourceRegistry, tokenSourceProcessRevision } = await import('./token-source')
 const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
 const { peekUsage, refreshUsageFromConnection } = await import('./usage')
 
@@ -1205,7 +1205,20 @@ describe('Session automatic context compaction events', () => {
 })
 
 describe('Session provider switching', () => {
-  beforeAll(() => buildTokenSourcesFromConfig())
+  beforeAll(() => {
+    buildTokenSourcesFromConfig()
+    // 切换用例从目录刷新成功后开始；只准备测试数据，不访问真实账号。
+    const glm = getTokenSource('glm')!
+    glm.enabled = true
+    glm.models = [{ model: 'GLM-5.2', display: 'GLM-5.2', efforts: ['max'], defaultEffort: 'max' }]
+    glm.defaultModel = 'GLM-5.2'
+    glm.modelCatalogState = { status: 'ready', updatedAt: 1 }
+    const deepseek = getTokenSource('deepseek')!
+    deepseek.enabled = true
+    deepseek.models = [{ model: 'deepseek-v4-pro', display: 'DeepSeek V4 Pro', efforts: ['high'], defaultEffort: 'high' }]
+    deepseek.defaultModel = 'deepseek-v4-pro'
+    deepseek.modelCatalogState = { status: 'ready', updatedAt: 1 }
+  })
   afterAll(() => resetTokenSourceRegistry())
 
   test('uses provider-specific ask instructions', () => {
@@ -1420,7 +1433,7 @@ describe('Session provider switching', () => {
 
     const footer = session.withModel('Thinking(1s)')
 
-    expect(footer).toContain('Claude · GLM-5.2/max')  // [1m] 记账后缀不外露
+    expect(footer).toContain('claude · GLM-5.2/max')
     expect(footer).not.toContain('gpt-5.6-sol')
   })
 
@@ -1438,7 +1451,7 @@ describe('Session provider switching', () => {
 
     const footer = session.withModel('Writing(2s)')
 
-    expect(footer).toContain('Claude · GLM-5.2/max')  // [1m] 记账后缀不外露
+    expect(footer).toContain('claude · GLM-5.2/max')
     expect(footer).not.toContain('gpt-5.6-sol')
   })
 
@@ -1447,6 +1460,150 @@ describe('Session provider switching', () => {
     expect(await session.runCommand('deepseek-harness-setup')).toBe(true)
     expect(await session.runCommand('DEEPSEEK-HARNESS-SETUP one two three')).toBe(true)
     expect(sentTexts.filter(text => text.includes('deepseek-harness-setup')).length).toBe(2)
+  })
+
+  test('OpenRouter setup is routed to the registered source without sending credentials to an Agent', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    expect(await session.runCommand('openrouter-setup')).toBe(true)
+    expect(sentTexts.some(text => text.includes('openrouter-setup <api_key>'))).toBe(true)
+    expect(session.isRunning()).toBe(false)
+  })
+
+  test('MD waits for the source refresh instead of sending a zero-model snapshot', async () => {
+    const previous = listTokenSources()
+    resetTokenSourceRegistry()
+    let release!: () => void
+    const pending = new Promise<void>(resolve => { release = resolve })
+    const models = Array.from({ length: 9 }, (_, i) => ({ model: `vendor/model-${i}`, display: `Model ${i}`, efforts: ['high' as const], defaultEffort: 'high' as const }))
+    const source = { id: 'md-refresh', kind: 'test', agent: 'claude' as const, display: 'OpenRouter', enabled: true,
+      models, defaultModel: models[0].model,
+      modelCatalogState: { status: 'ready' as 'ready' | 'loading' | 'failed', updatedAt: 1, error: undefined as string | undefined },
+      async refreshModels() { source.models = []; source.modelCatalogState.status = 'loading'; await pending; source.models = models; source.modelCatalogState.status = 'ready' },
+      spawnEnv: (env: Record<string, string | undefined>) => env, resolveSpawnModel: (model: string) => model,
+      readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
+    }
+    registerTokenSource(source)
+    const session = new Session('md-refresh-test', 'chat_id')
+    try {
+      const opening = session.showModelPanel()
+      await Promise.resolve()
+      expect(sentCards).toHaveLength(0)
+      release()
+      await opening
+      expect(JSON.stringify(sentCards[0])).toContain('9 个模型')
+      expect(JSON.stringify(sentCards[0])).not.toContain('0 个模型')
+      const panelId = [...session.modelPanels.keys()][0]
+      expect(session.modelPanels.get(panelId)?.messageId).toBe('om_status_1')
+      await session.onProviderSelect(source.id, panelId)
+      expect(session.modelPanels.get(panelId)?.messageId).toBe('om_status_1')
+      source.refreshModels = async () => { source.models = []; source.modelCatalogState.status = 'failed'; source.modelCatalogState.error = 'HTTP 503' }
+      await session.showModelPanel()
+      expect(JSON.stringify(sentCards.at(-1))).toContain('模型目录 MISS')
+      expect(JSON.stringify(sentCards.at(-1))).toContain('HTTP 503')
+      expect(JSON.stringify(sentCards.at(-1))).not.toContain('0 个模型')
+    } finally {
+      release(); session.dispose(); resetTokenSourceRegistry()
+      for (const entry of previous) registerTokenSource(entry)
+    }
+  })
+
+  test('large model catalogs page through a snapshot and reject stale or cross-page choices', async () => {
+    const previous = listTokenSources()
+    const source = {
+      id: 'openrouter', kind: 'openrouter', agent: 'claude' as const, display: 'OpenRouter', enabled: true,
+      models: Array.from({ length: 45 }, (_, i) => ({ model: `vendor/model-${i}`, display: `Model ${i}`,
+        efforts: ['high' as const], defaultEffort: 'high' as const })),
+      defaultModel: '', modelCatalogState: { status: 'ready' as const, updatedAt: Date.now() },
+      refreshModels: async () => {}, spawnEnv: (env: Record<string, string | undefined>) => env,
+      resolveSpawnModel: (model: string) => model,
+      readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
+    }
+    registerTokenSource(source)
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      session.modelPanels.set('openrouter-page', { models: [] })
+      const first = await session.onProviderSelect('openrouter', 'openrouter-page')
+      expect(first.ok).toBe(true)
+      expect(session.modelPanels.get('openrouter-page').models).toHaveLength(20)
+      expect(JSON.stringify(first.card)).toContain('第 1 / 3 页')
+      expect(JSON.stringify(first.card)).not.toContain('vendor/model-20')
+      // 刷新后仍按本面板快照翻页，避免数组下标指到另一模型。
+      source.models = []
+      const last = await session.onModelPage('openrouter-page', 'openrouter', 2)
+      expect(last.ok).toBe(true)
+      expect(session.modelPanels.get('openrouter-page').models).toHaveLength(5)
+      expect(JSON.stringify(last.card)).toContain('vendor/model-44')
+      expect(JSON.stringify(last.card)).not.toContain('vendor/model-0')
+      expect((await session.onModelSelect('vendor/model-0', 'openrouter-page', '', { provider: 'claude' })).ok).toBe(false)
+      expect((await session.onModelSelect('vendor/model-44', 'openrouter-page', '', { provider: 'claude' })).ok).toBe(true)
+      expect((await session.onModelEffortSelect('vendor/model-44', 'high', 'openrouter-page', '', 'claude')).ok).toBe(false)
+      for (const page of [-1, 3, 0.5, NaN]) expect((await session.onModelPage('openrouter-page', 'openrouter', page)).ok).toBe(false)
+      expect((await session.onModelPage('openrouter-page', 'glm', 0)).ok).toBe(false)
+      expect((await session.onModelPage('stale', 'openrouter', 0)).ok).toBe(false)
+      expect((await session.onProviderSelect('openrouter', 'stale')).ok).toBe(false)
+    } finally {
+      resetTokenSourceRegistry()
+      for (const item of previous) registerTokenSource(item)
+    }
+  })
+
+  test('Claude source default efforts are authoritative and missing defaults are not replaced by max', () => {
+    const previous = listTokenSources()
+    registerTokenSource({ id: 'openrouter', kind: 'openrouter', agent: 'claude', display: 'OpenRouter', enabled: true,
+      models: [{ model: 'vendor/known', display: 'Known', efforts: ['medium'], defaultEffort: 'medium' },
+        { model: 'vendor/missing', display: 'Missing', efforts: ['high'], defaultEffort: null }],
+      defaultModel: 'vendor/known', refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    })
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      session.selectedProvider = 'claude'
+      session.selectedTokenSourceId = 'openrouter'
+      session.selectedModel = 'vendor/known'
+      session.selectedEffort = null
+      expect(session.claudeEffortForSpawn()).toBe('medium')
+      expect(session.currentEffortLabel()).toBe('medium')
+      session.selectedModel = 'vendor/missing'
+      expect(session.currentEffortLabel()).toBeNull()
+      expect(session.withModel('ready')).toContain('claude · vendor/missing/MISS')
+      expect(() => session.claudeEffortForSpawn()).toThrow('MISS')
+    } finally {
+      resetTokenSourceRegistry()
+      for (const item of previous) registerTokenSource(item)
+    }
+  })
+
+  test('switching between explicit and native-default effort replaces only the idle process and preserves its resume id', async () => {
+    const previous = listTokenSources()
+    const source = { id: 'openrouter-env', kind: 'openrouter', agent: 'claude' as const, display: 'OpenRouter', enabled: true,
+      spawnRevision: 'account', modelEnvironmentRevision: (model: string) => model === 'vendor/default' ? 'unset' : 'level',
+      models: [{ model: 'vendor/level', display: 'Level', efforts: ['high' as const], defaultEffort: 'high' as const },
+        { model: 'vendor/default', display: 'Default', efforts: ['default' as const], defaultEffort: 'default' as const }],
+      defaultModel: '', modelCatalogState: { status: 'ready' as const, updatedAt: 1 },
+      refreshModels: async () => {}, spawnEnv: (env: Record<string, string | undefined>) => env,
+      resolveSpawnModel: (model: string) => model, readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
+    }
+    registerTokenSource(source)
+    const session = new Session('openrouter-env-switch', 'chat_id') as any
+    try {
+      const proc = new FakeAgentProc('claude', 'preserved-session', source.id)
+      session.proc = proc
+      session.procSourceRevisions.set(proc, tokenSourceProcessRevision(source, 'vendor/level'))
+      session.selectedProvider = 'claude'; session.selectedTokenSourceId = source.id
+      session.selectedModel = 'vendor/level'; session.selectedEffort = 'high'
+      session.modelPanels.set('mode-panel', { models: [{ provider: 'claude', sourceId: source.id, model: 'vendor/default',
+        displayName: 'Default', efforts: [{ effort: 'default' }] }] })
+      const result = await session.onModelEffortSelect('vendor/default', 'default', 'mode-panel', '', 'claude')
+      expect(result.ok).toBe(true)
+      expect(proc.setModelSettingsCalls).toEqual([])
+      expect(proc.killCalls).toBe(1)
+      expect(session.selectedEffort).toBe('default')
+      expect(boundResumes).toContainEqual([session.sessionName, 'preserved-session', 'claude'])
+    } finally {
+      session.dispose()
+      resetTokenSourceRegistry()
+      for (const entry of previous) registerTokenSource(entry)
+    }
   })
 
   test('DSH model panel accepts off effort and updates the same native process', async () => {
@@ -3345,22 +3502,18 @@ describe('Session usage cache cross-backend isolation', () => {
     expect(snap?.fiveHour?.percent).not.toBe(7)
   })
 
-  test('双窗口额度后缀(codex/GLM 共用):5h 倒计时·% + 方括号周窗口;缺周数据退回纯 5h 段', () => {
+  test('额度后缀保留原紧凑倒计时与百分比格式，缺失值显示 MISS', () => {
     const session = new Session('probe', 'chat_id') as any
     const h = (ms: number) => new Date(Date.now() + ms)
     // 4.1h 后重置 5h 额度、已用 7%;6.9d 后重置周额度、已用 17%。
     const fiveHour = { percent: 7, resetsAt: h(4.1 * 3600_000) }
     const weekly = { percent: 17, resetsAt: h(6.9 * 24 * 3600_000) }
     expect(session.fmtDualWindowSuffix(fiveHour, weekly)).toBe('  |  4.1h·7%·[6.9d·17%]')
-    // 周窗口缺 → 只剩 5h 段(倒计时仍在)。
     expect(session.fmtDualWindowSuffix(fiveHour, null)).toBe('  |  4.1h·7%')
-    // 5h percent 缺但周窗口在(Prolite 形态)→ 裸周窗口段。
-    expect(session.fmtDualWindowSuffix({ percent: null, resetsAt: h(3600_000) }, weekly)).toBe('  |  [6.9d·17%]')
+    expect(session.fmtDualWindowSuffix({ percent: null, resetsAt: h(3600_000) }, weekly)).toBe('  |  MISS·[6.9d·17%]')
     expect(session.fmtDualWindowSuffix(null, weekly)).toBe('  |  [6.9d·17%]')
-    // resetsAt 已过期 → 该窗口只剩百分比。
     expect(session.fmtDualWindowSuffix({ percent: 7, resetsAt: new Date(Date.now() - 1000) }, weekly)).toBe('  |  7%·[6.9d·17%]')
-    // 两窗口都缺 → 空串(不假数据)。
-    expect(session.fmtDualWindowSuffix(null, null)).toBe('')
+    expect(session.fmtDualWindowSuffix(null, null)).toBe('  |  额度 MISS')
   })
 })
 

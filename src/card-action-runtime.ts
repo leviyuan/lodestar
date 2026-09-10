@@ -10,7 +10,8 @@ export const SUPPORTED_CARD_ACTION_KINDS = new Set([
   'model_panel_cancel', 'model_effort_select', 'ask', 'worktree_disband',
   'temp_fork_select', 'temp_back_select', 'temp_resume_select', 'tasklist_enable',
   'tasklist_delete_prompt', 'tasklist_delete_confirm', 'token_source_enable',
-  'agent_identity_page', 'notify_callback', 'notify_reply', 'notify_reply_cancel',
+  'agent_identity_page', 'model_page', 'notify_callback', 'notify_reply', 'notify_reply_cancel',
+  'model_list_open', 'model_add', 'model_remove', 'model_custom_remove',
 ])
 
 /** Admission validation runs synchronously before actor/dedupe reservation;
@@ -196,6 +197,11 @@ function cardActionSemanticKey(data: any): string {
     case 'tasklist_enable': resource = { guid: value.guid, project: value.project, panel_id: value.panel_id }; break
     case 'token_source_enable': resource = { source_id: value.source_id }; break
     case 'agent_identity_page': resource = { panel_id: value.panel_id, page: value.page }; break
+    case 'model_page': resource = { panel_id: value.panel_id, source_id: value.source_id, page: value.page }; break
+    case 'model_list_open': resource = { panel_id: value.panel_id, source_id: value.source_id, mode: value.mode }; break
+    case 'model_add':
+    case 'model_remove':
+    case 'model_custom_remove': resource = { panel_id: value.panel_id, source_id: value.source_id, model: value.model }; break
     case 'notify_callback': resource = { notify_id: value.notify_id }; break
     case 'notify_reply': resource = { notify_id: value.notify_id }; break
     case 'notify_reply_cancel': resource = { notify_id: value.notify_id, reply_id: value.reply_id }; break
@@ -225,7 +231,7 @@ export function cardActionDedupeIdentity(data: any): CardActionDedupeIdentity {
   return {
     ...(eventId ? { deliveryKey: `event\u0000${eventId}` } : {}),
     businessKey: `semantic\u0000${cardActionSemanticKey(data)}`,
-    ...(['agent_identity_page', 'notify_reply'].includes(data?.action?.value?.kind) ? { repeatable: true } : {}),
+    ...(['agent_identity_page', 'model_page', 'model_list_open', 'model_add', 'model_remove', 'model_custom_remove', 'notify_reply'].includes(data?.action?.value?.kind) ? { repeatable: true } : {}),
   }
 }
 

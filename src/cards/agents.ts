@@ -158,7 +158,7 @@ function identityRow(identity: AgentIdentity): object {
     tag: 'markdown',
     content: [
       `**${escapeMarkdown(identity.displayName)}** ${identity.sourceDefault ? '· 默认' : ''}`,
-      `${inlineCode(identity.id)}\n${inlineCode(identity.model)} · 默认 ${inlineCode(identity.defaultEffort)} · ${escapeMarkdown(detail)}`,
+      `${inlineCode(identity.id)}\n${inlineCode(identity.model)} · 默认 ${inlineCode(identity.defaultEffort ?? 'MISS')} · ${escapeMarkdown(detail)}`,
     ].join('\n'),
   }
 }

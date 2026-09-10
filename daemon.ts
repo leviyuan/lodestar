@@ -24,6 +24,7 @@ import { Session } from './src/session'
 import * as feishu from './src/feishu'
 import * as cards from './src/cards'
 import { actionCardResponse } from './src/card-action'
+import { debugModelActionEvent, debugModelState } from './src/debug-model'
 import {
   get as getNotifyCallback,
   markResolved as markNotifyCallbackResolved,
@@ -562,7 +563,8 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
 // ── Card action handler ────────────────────────────────────────────────
 function cardActionLabel(kind: string): string {
   const labels: Record<string, string> = {
-    permission: '权限决定', menu: '菜单选择', provider_select: '账号选择',
+    permission: '权限决定', menu: '菜单选择', provider_select: '账号选择', model_page: '模型翻页',
+    model_list_open: '模型列表', model_add: '显示模型', model_remove: '隐藏模型', model_custom_remove: '删除补录模型',
     model_select: '模型选择', model_custom_prompt: '模型补录',
     model_panel_cancel: '取消模型补录', model_effort_select: '模型 effort 选择',
     ask: '问题回答', worktree_disband: 'worktree 解散', temp_fork_select: '会话分叉',
@@ -818,6 +820,23 @@ async function handleCardAction(data: any): Promise<any> {
     case 'provider_select': {
       const result = await session.onProviderSelect(String(value.source_id ?? ''), String(value.panel_id ?? ''))
       return modelActionResponse(result)
+    }
+    case 'model_page': {
+      const result = await session.onModelPage(String(value.panel_id ?? ''), String(value.source_id ?? ''), Number(value.page))
+      return modelActionResponse(result)
+    }
+    case 'model_list_open': {
+      const panel = String(value.panel_id ?? '')
+      const source = String(value.source_id ?? '')
+      if (value.mode !== 'add' && value.mode !== 'select') throw new Error('模型管理模式无效')
+      return modelActionResponse(await (value.mode === 'add'
+        ? session.onModelAddOpen(panel, source) : session.onProviderSelect(source, panel)))
+    }
+    case 'model_add':
+    case 'model_remove':
+    case 'model_custom_remove': {
+      return modelActionResponse(await session.onModelListEdit(String(value.panel_id ?? ''), String(value.source_id ?? ''),
+        String(value.model ?? ''), value.kind === 'model_add' ? 'add' : value.kind === 'model_remove' ? 'remove' : 'delete'))
     }
     case 'model_select': {
       const result = await session.onModelSelect(String(value.model ?? ''), String(value.panel_id ?? ''), userId, value)
@@ -1140,10 +1159,14 @@ function startDebugSocket(): void {
     Bun.serve({
       unix: DEBUG_SOCK_FILE,
       fetch: async (req: Request) => {
-        if (req.method !== 'POST') return new Response('use POST', { status: 405 })
+        const url = new URL(req.url)
+        const readModelState = req.method === 'GET' && url.pathname === '/model-state'
+        if (req.method !== 'POST' && !readModelState) return new Response('unsupported debug method', { status: 405 })
         if (shutdownRequested) return new Response('daemon shutdown in progress', { status: 503 })
         let body: any = {}
-        try { body = await req.json() } catch { return new Response('bad json', { status: 400 }) }
+        if (req.method === 'POST') {
+          try { body = await req.json() } catch { return new Response('bad json', { status: 400 }) }
+        }
         if (!existsSync(DEBUG_CTX_FILE)) {
           return new Response('no debug context yet — send `[DEBUG]hi` from Feishu first', { status: 412 })
         }
@@ -1151,6 +1174,35 @@ function startDebugSocket(): void {
         try { ctx = JSON.parse(readFileSync(DEBUG_CTX_FILE, 'utf8')) } catch (e) {
           return new Response(`ctx read failed: ${e}`, { status: 500 })
         }
+        const target = readModelState ? url.searchParams.get('chat_id') : body.chat_id
+        if ((target !== undefined && target !== ctx.chat_id) || (url.pathname !== '/' && !target)) {
+          return new Response('explicit debug chat_id must match the seeded context', { status: 409 })
+        }
+        if (readModelState) {
+          const session = sessions.get(ctx.chat_id)
+          return session ? Response.json(debugModelState(session)) : new Response('send md to open a model panel first', { status: 404 })
+        }
+        if (url.pathname === '/model-action') {
+          const session = sessions.get(ctx.chat_id)
+          if (!session) return new Response('debug session not found', { status: 404 })
+          try {
+            if (typeof body.message_id !== 'string' || !body.message_id.startsWith('om_')) throw new Error('message_id required')
+            const panelId = typeof body.value?.panel_id === 'string' ? body.value.panel_id.trim() : ''
+            const panel = session.modelPanels.get(panelId)
+            if (!panel?.messageId || panel.messageId !== body.message_id) throw new Error('stale or mismatched model panel')
+            const response = await feishu.client.im.v1.message.get({ path: { message_id: body.message_id } })
+            if (response.code !== 0) throw new Error(`message.get failed: ${response.code} ${response.msg}`)
+            const event = debugModelActionEvent(body, ctx, response.data?.items?.[0], config.feishu.app_id, panel.messageId)
+            log(`debug: model action ${body.value.kind} chat=${ctx.chat_id.slice(0, 8)}…`)
+            const admission = acceptCardAction(event)
+            // 排到相同群的 actor 尾部，等待正常业务处理与卡片呈现完成。
+            await chatActor.enqueue(ctx.chat_id, async () => {})
+            return Response.json({ admission, state: debugModelState(session) })
+          } catch (error) {
+            return new Response(error instanceof Error ? error.message : String(error), { status: 400 })
+          }
+        }
+        if (url.pathname !== '/') return new Response('unknown debug endpoint', { status: 404 })
         const text: string = String(body.text ?? '')
         if (!text) return new Response('text required', { status: 400 })
         // 把 inject 内容**真发到目标群**,带"【自动化测试】"前缀让群成员
@@ -1183,6 +1235,7 @@ function startDebugSocket(): void {
         if (!enqueueMessage(payload, 'debug')) {
           return new Response('daemon shutdown in progress', { status: 503 })
         }
+        if (body.wait_for_handling === true) await chatActor.enqueue(ctx.chat_id, async () => {})
         return new Response(JSON.stringify({ ok: true, msg_id: realMsgId }), {
           headers: { 'content-type': 'application/json' },
         })

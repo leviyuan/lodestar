@@ -2,9 +2,10 @@ import { request } from 'node:http'
 import { DEBUG_SOCK_FILE } from '../src/paths'
 
 /** 向 debug context 指定的真实群发送消息，再由 daemon 处理。 */
-export function injectDebugMessage(text: string): Promise<string> {
+export function injectDebugMessage(text: string, expectedChatId?: string, waitForHandling = false): Promise<string> {
   return new Promise((resolve, reject) => {
-    const payload = JSON.stringify({ text })
+    const payload = JSON.stringify({ text, ...(expectedChatId ? { chat_id: expectedChatId } : {}),
+      ...(waitForHandling ? { wait_for_handling: true } : {}) })
     const req = request({
       socketPath: DEBUG_SOCK_FILE,
       method: 'POST',

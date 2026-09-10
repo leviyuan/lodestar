@@ -402,6 +402,30 @@ describe('CardActionAdmission integration', () => {
     expect(h.executeCalls()).toBe(4)
   })
 
+  test('model pagination can revisit pages without replaying a duplicate delivery', async () => {
+    const h = admissionHarness()
+    for (const [index, page] of [1, 0, 1].entries()) {
+      const event = actionEvent(`model-page-${index}`, 'chat-a', {
+        kind: 'model_page', source_id: 'openrouter', panel_id: 'panel-1', page,
+      })
+      expect(h.admission.accept(event)).toEqual({ state: 'accepted' })
+      await h.drain()
+      expect(h.admission.accept(event)).toEqual({ state: 'completed' })
+    }
+    expect(h.executeCalls()).toBe(3)
+  })
+
+  test('model list edits can repeat after a reverse edit while duplicate events stay suppressed', async () => {
+    const h = admissionHarness()
+    for (const [index, kind] of ['model_add', 'model_remove', 'model_add'].entries()) {
+      const event = actionEvent('edit-' + index, 'chat-a', { kind, panel_id: 'p', source_id: 'openrouter', model: 'qwen/test' })
+      expect(h.admission.accept(event)).toEqual({ state: 'accepted' })
+      await h.drain()
+      expect(h.admission.accept(event)).toEqual({ state: 'completed' })
+    }
+    expect(h.executeCalls()).toBe(3)
+  })
+
   test('presentation rejection cannot rerun successful business work', async () => {
     let executeCalls = 0
     let failureReceipts = 0

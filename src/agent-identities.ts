@@ -7,6 +7,7 @@ export type AgentIdentityStatus =
   | 'source_disabled'
   | 'catalog_loading'
   | 'catalog_failed'
+  | 'model_unavailable'
 
 export interface AgentIdentity {
   id: string
@@ -16,7 +17,7 @@ export interface AgentIdentity {
   provider: AgentProvider
   model: string
   modelDisplay: string
-  defaultEffort: AgentReasoningEffort
+  defaultEffort: AgentReasoningEffort | null
   supportedEfforts: AgentReasoningEffort[]
   sourceDefault: boolean
   status: AgentIdentityStatus
@@ -95,6 +96,9 @@ function materializeIdentity(source: TokenSource, model: TokenSourceModel, catal
   } else if (catalogState === 'failed') {
     status = 'catalog_failed'
     reason = source.modelCatalogState?.error ?? '模型目录刷新失败'
+  } else if (model.unavailableReason || !model.efforts.length) {
+    status = 'model_unavailable'
+    reason = model.unavailableReason ?? 'effort MISS：上游未声明该后端支持的推理档位'
   }
   return {
     id: agentIdentityId(source.id, model.model),

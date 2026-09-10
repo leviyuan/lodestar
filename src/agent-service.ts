@@ -782,11 +782,12 @@ function workerSnapshot(
 }
 
 function resolveEffort(identity: AgentIdentity, raw: string | undefined): AgentReasoningEffort {
-  const effort = (raw ?? identity.defaultEffort) as AgentReasoningEffort
-  if (!identity.supportedEfforts.includes(effort)) {
+  const effort = raw ?? identity.defaultEffort
+  if (!effort) throw new Error(`${identity.displayName} default effort MISS; specify effort explicitly`)
+  if (!identity.supportedEfforts.includes(effort as AgentReasoningEffort)) {
     throw new Error(`${identity.displayName} does not support effort ${effort}`)
   }
-  return effort
+  return effort as AgentReasoningEffort
 }
 
 function selectWorker(snapshot: AgentRunSnapshot, identityId?: string): AgentWorkerResult {

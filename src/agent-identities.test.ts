@@ -33,4 +33,13 @@ describe('Agent identity catalog', () => {
     expect(catalog.identities.every(identity => identity.status === 'source_disabled')).toBe(true)
     expect(catalog.sourceFailures[0].status).toBe('disabled')
   })
+
+  test('keeps missing effort visible and uncallable without a fabricated default', () => {
+    const catalog = buildAgentIdentityCatalog([source({
+      models: [{ model: 'missing-effort', display: 'Missing effort', efforts: [], defaultEffort: null }],
+    })])
+    expect(catalog.identities[0]).toMatchObject({
+      status: 'model_unavailable', defaultEffort: null, supportedEfforts: [], reason: expect.stringContaining('MISS'),
+    })
+  })
 })

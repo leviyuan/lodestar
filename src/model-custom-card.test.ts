@@ -55,7 +55,10 @@ auth_token = "test-token"
       return [{ model: 'GLM-5.2', display: 'GLM-5.2', efforts: ['max'], defaultEffort: 'max' }]
     },
     fetchCodexModels: async () => [],
+    fetchNativeClaudeModels: async () => [],
   }))
+  // 本文件只验证 Claude 补录卡，不启动其他来源的原生目录进程。
+  mock.module('./token-source-dsh-glm', () => ({}))
 
   const elementPatches: any[] = []
   const rawFallbacks: string[] = []

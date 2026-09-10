@@ -14,9 +14,13 @@ export interface TokenSourceModel {
   model: string
   display: string
   efforts: AgentReasoningEffort[]
-  defaultEffort: AgentReasoningEffort
+  /** null 表示上游未声明后端可用的默认档位，不能替换成猜测值。 */
+  defaultEffort: AgentReasoningEffort | null
   /** 真实 turn 已观测到 1M 上下文；undefined 表示未确认，仅供面板展示。 */
   context1m?: boolean
+  /** 显式选入但未获上游目录确认的模型，仅作为 MISS 项展示，不能启动。 */
+  unavailableReason?: string
+  origin?: 'upstream' | 'custom'
 }
 
 export interface TokenSourceModelCatalogState {
@@ -45,6 +49,9 @@ export type UsageStateUnified =
 
 export interface UsageSnapshotUnified {
   state: UsageStateUnified
+  kind?: 'quota' | 'balance'
+  balance?: { remaining: number; currency: string }
+  quota?: { remaining: number | null; limit: number | null; currency: string }
   planLabel?: string
   windows: UsageWindowUnified[]
   reason?: string
@@ -57,11 +64,23 @@ type Env = Record<string, string | undefined>
 const ANTHROPIC_ENV_KEYS = [
   'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL', 'ANTHROPIC_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL',
+  'CLAUDE_CODE_SUBAGENT_MODEL', 'ANTHROPIC_CUSTOM_HEADERS', 'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_EFFORT_LEVEL',
 ]
 
 export function scrubAnthropicEnv(base: Env): Env {
   const out: Env = { ...base }
   for (const k of ANTHROPIC_ENV_KEYS) delete out[k]
+  return out
+}
+
+export function scrubDshEnv(base: Env): Env {
+  const out = scrubAnthropicEnv(base)
+  for (const key of Object.keys(out)) {
+    if (/^(DSH_|DEEPSEEK_|LODESTAR_DSH_|ZAI_|ZHIPU_)/.test(key)) delete out[key]
+  }
   return out
 }
 
@@ -73,6 +92,8 @@ export interface TokenSource {
    * Registry rebuilds with the same effective config keep the same value;
    * credential/base-url/slot changes force an idle process replacement. */
   spawnRevision?: string
+  /** 模型能力需要不同的进程环境时参与启动身份，例如无 effort 参数的网关模型。 */
+  modelEnvironmentRevision?(model: string): string
   /** 固定种类(声明式:string —— 加 source 不扩枚举) */
   kind: string
   /** 绑定哪个 agent 进程(协议强制:claude 走 Anthropic,codex 走 OpenAI/app-server) */
@@ -82,6 +103,8 @@ export interface TokenSource {
    *  codex 看 ~/.codex 登录态;glm 看 config 有没有 token。精确有效性在 spawn/查额度时暴露。 */
   enabled: boolean
   models: TokenSourceModel[]
+  /** availableModels 包含接口目录及补录记录，origin 区分隐藏/显示和补录/删除。 */
+  modelSelection?: { mode?: 'allowlist' | 'catalog'; modelIds: string[]; availableModels: TokenSourceModel[] }
   /** Last authoritative model-catalog refresh result. Real built-in sources
    * populate this; test/custom sources may omit it and are reported as idle. */
   modelCatalogState?: TokenSourceModelCatalogState
@@ -89,15 +112,33 @@ export interface TokenSource {
   /** 启动/刷新时拉模型填 models。失败如实留空(MISS),绝不假数据。 */
   refreshModels(): Promise<void>
   /** 面板手动补录模型名时的存在性校验(端点 200/1214 判别)。
-   *  未声明 = 无从校验(补录入口对该 source 拒绝,不猜)。 */
+   *  未声明时允许登记补录记录，但能力未知的模型保持 MISS。 */
   verifyModel?(model: string): Promise<'exists' | 'not_found' | 'no_verdict'>
-  spawnEnv(base: Env): Env
+  validateCustomModelId?(model: string): void
+  spawnEnv(base: Env, model?: string): Env
   resolveSpawnModel(model: string): string | undefined
   /** 该 source spawn 的 claude 子进程 settingSources(覆盖 DEFAULT_SETTING_SOURCES)。
    *  注入 env 的 source(glm/deepseek)不设 → DEFAULT(['project','local'],spawnEnv 权威);
    *  透传型 source(native)设 ['user','project','local'] → 读本机 Claude Code 配置。 */
   settingSources?: readonly string[]
   readUsage(): Promise<UsageSnapshotUnified>
+}
+
+/** 隐藏只影响选择面板，已配置的模型仍按上游能力启动。 */
+export function tokenSourceRuntimeModels(source: TokenSource): TokenSourceModel[] {
+  return source.modelSelection ? [...source.models, ...source.modelSelection.availableModels.filter(
+    model => !source.models.some(selected => selected.model === model.model))] : source.models
+}
+
+export function tokenSourceRuntimeModel(source: TokenSource, model: string | undefined | null): TokenSourceModel | undefined {
+  const key = (id: string | undefined | null) => source.agent === 'claude' ? id?.replace(/\[1m\]$/, '') : id
+  return tokenSourceRuntimeModels(source).find(entry => key(entry.model) === key(model))
+}
+
+export function tokenSourceProcessRevision(source: TokenSource | undefined, model?: string | null): string | null {
+  const revision = source?.spawnRevision ?? null
+  const modelRevision = source?.modelEnvironmentRevision?.(model ?? source.defaultModel)
+  return modelRevision === undefined ? revision : JSON.stringify([revision, modelRevision])
 }
 
 // ── provider factory registry(声明式:每 source 模块加载时登记) ──────────

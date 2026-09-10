@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import { consoleUnifiedUsageContent } from './console'
+import { consoleUnifiedUsageContent, unifiedUsageSummary } from './console'
 
 describe('consoleUnifiedUsageContent(额度渲染)', () => {
-  test('ok 态:套餐头 + 两窗口(label 不为 undefined)+ 余额 used/total', () => {
+  test('只展示额度窗口和数值，不附加套餐说明', () => {
     const out = consoleUnifiedUsageContent({
       state: 'ok',
       planLabel: 'max 套餐',
@@ -12,7 +12,7 @@ describe('consoleUnifiedUsageContent(额度渲染)', () => {
       ],
       fetchedAt: Date.now(),
     })
-    expect(out).toContain('max 套餐')
+    expect(out).not.toContain('max 套餐')
     expect(out).toContain('5h 窗口')
     expect(out).toContain('月度工具')
     expect(out).toContain('290/4000')
@@ -53,14 +53,20 @@ describe('consoleUnifiedUsageContent(额度渲染)', () => {
     }
   })
 
-  test('planLabel-only(标量余额)不显示无数据', () => {
+  test('余额使用单一标签，不混入额度或附加说明', () => {
     const out = consoleUnifiedUsageContent({
       state: 'ok',
-      planLabel: '剩余 ¥12.34',
+      kind: 'balance', balance: { remaining: 12.34, currency: 'CNY' },
       windows: [],
       fetchedAt: Date.now(),
     })
-    expect(out).toContain('剩余 ¥12.34')
-    expect(out).not.toContain('无数据')
+    expect(out).toBe('**📊 余额** ¥12.34')
+  })
+
+  test('限额和余额保持语义，缺失数据明确 MISS', () => {
+    expect(unifiedUsageSummary({ state: 'ok', kind: 'quota', quota: { remaining: 3, limit: 10, currency: 'USD' }, windows: [] })).toBe('额度 $3.00 / $10.00')
+    expect(unifiedUsageSummary({ state: 'ok', kind: 'quota', quota: { remaining: null, limit: null, currency: 'USD' }, windows: [] })).toBe('额度 未设上限')
+    expect(unifiedUsageSummary({ state: 'network', kind: 'balance', windows: [], reason: 'HTTP 503' })).toBe('余额 MISS')
+    expect(unifiedUsageSummary({ state: 'ok', windows: [], planLabel: '不能作为余额' })).toBe('额度 MISS')
   })
 })

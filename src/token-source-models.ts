@@ -9,6 +9,8 @@
 import { AppServerOnce } from './usage'
 import type { TokenSourceModel } from './token-source'
 import type { AgentReasoningEffort } from './agent-process'
+import { homedir } from 'node:os'
+import { log } from './log'
 
 const TIMEOUT_MS = 10_000
 
@@ -28,6 +30,21 @@ function codexEffort(e: unknown): AgentReasoningEffort | null {
 
 export const CLAUDE_EFFORTS: AgentReasoningEffort[] = ['max', 'xhigh', 'high', 'medium', 'low']
 
+/** SDK 控制接口不发送用户输入；目录读取后关闭这个独立查询进程。 */
+export async function fetchNativeClaudeModels(): Promise<TokenSourceModel[]> {
+  const { ClaudeAgentProcess } = await import('./claude-agent-process')
+  const proc = new ClaudeAgentProcess({ workDir: homedir(), effort: 'high',
+    settingSources: ['user'], allowDelegation: false, profile: { loadProjectMcp: false } })
+  proc.on('error', error => log(`Claude model catalog MISS: ${error.message}`))
+  try {
+    const catalog = await withTimeout(proc.listModels())
+    if (!catalog.length) throw new Error('Claude SDK model catalog is empty')
+    return catalog.map(model => ({ model: model.model.replace(/^claude:/, ''), display: model.displayName,
+      efforts: model.supportedReasoningEfforts.map(item => item.reasoningEffort as AgentReasoningEffort),
+      defaultEffort: model.defaultReasoningEffort as AgentReasoningEffort }))
+  } finally { await proc.kill() }
+}
+
 /** codex 订阅可用模型(app-server model/list),过滤 hidden,effort 用 per-model。 */
 export async function fetchCodexModels(): Promise<TokenSourceModel[]> {
   const app = new AppServerOnce()
@@ -37,7 +54,8 @@ export async function fetchCodexModels(): Promise<TokenSourceModel[]> {
       capabilities: { experimentalApi: true, requestAttestation: false },
     }))
     const res = await withTimeout(app.request('model/list', {}))
-    const data: any[] = Array.isArray(res?.data) ? res.data : []
+    if (!Array.isArray(res?.data)) throw new Error('Codex model/list 缺少 data 数组')
+    const data: any[] = res.data
     const out: TokenSourceModel[] = []
     for (const m of data) {
       if (!m || m.hidden || !m.id) continue
@@ -70,7 +88,8 @@ export async function fetchGlmModels(baseUrl: string, token: string): Promise<To
   })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
   const json = await res.json()
-  const data: any[] = Array.isArray(json?.data) ? json.data : []
+  if (!Array.isArray(json?.data)) throw new Error('GLM models 缺少 data 数组')
+  const data: any[] = json.data
   return data
     .filter(m => m && (m.display_name || m.id))
     .map(m => {

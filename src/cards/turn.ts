@@ -11,6 +11,11 @@ import type { AgentProvider } from '../agent-process'
 import { contextPercentSummary, contextTokenRatioLabel } from '../context-window'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
 
+export function footerModelLabel(provider: AgentProvider, model?: string | null, effort?: string | null): string {
+  const label = model?.replace(/^claude:/i, '').replace(/\[1m\]$/i, '')
+  return `${provider} · ${label || 'MISS'}/${effort || 'MISS'}`
+}
+
 export interface TurnPlanStep {
   step: string
   status: 'pending' | 'inProgress' | 'completed' | string

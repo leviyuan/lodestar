@@ -66,7 +66,7 @@ function parseSlots(raw: string | undefined): Partial<Record<'opus' | 'sonnet' |
   return out
 }
 
-function glmUsageToUnified(s: GlmUsageSnapshot): UsageSnapshotUnified {
+export function glmUsageToUnified(s: GlmUsageSnapshot): UsageSnapshotUnified {
   if (s.state !== 'ok') {
     return {
       state: s.state === 'no_credentials' ? 'no_credentials'
@@ -121,11 +121,11 @@ registerTokenSourceFactory({
           const fetched = await fetchGlmModels(baseUrl, token)
           // config models 键补充:上游 /v1/models 列表滞后(新模型已可用但未列出)时手动补登。
           // 按 model 去重合并 —— 上游哪天补列出同名模型后自动收敛为 no-op。
-          const extra = parseModelList(cfg.models).filter(
+          const extra = [...new Set([...parseModelList(cfg.models), ...parseModelList(cfg.custom_models)])].filter(
             m => !fetched.some(f => f.model.toLowerCase() === m.toLowerCase()),
           )
           const extras: TokenSourceModel[] = extra.map(m => ({
-            model: m, display: m, efforts: CLAUDE_EFFORTS, defaultEffort: 'max',
+            model: m, display: m, efforts: CLAUDE_EFFORTS, defaultEffort: 'max', origin: 'custom',
           }))
           ts.models = [...fetched, ...extras]
           // 默认模型:config model 键优先;未配 → 版本号最新的(端点列表顺序是旧→新,

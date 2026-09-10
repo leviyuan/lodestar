@@ -4,7 +4,9 @@
 
 - 共享 `element_id` 从 `ELEMENTS` 取；动态 ID 稳定、同卡唯一，与替换、删除和换卡逻辑一致。
 - 空 Markdown 使用占位，终态关闭 streaming；缺失值显示 `MISS`/`—`。优先考虑手机窄屏，按钮文案简短。
-- 模型面板为账号 → 模型 → effort，action 携带 `panel_id`、`source_id`，拒绝过期 panel。
+- 模型面板首页用独立的展开式折叠面板承载 `claude`、`codex`、`dsh` 各组：浅蓝标题背景、边框和 `Agent · 名称` 标题，Token Source 行放在组内，不能将两层名称平铺成同级粗体。再进入模型 → effort；action 携带 `panel_id`、`source_id`，拒绝过期 panel。
+- 所有来源区分两类动作：接口项显示/隐藏（`model_add` / `model_remove`），列表外记录补录/删除（`model_custom_prompt` / `model_custom_remove`）。`origin` 决定行按钮，`custom_models` 持久化补录；未知能力显示 MISS，不能把已登记当成可运行。OpenRouter 默认九项，其他来源跟随接口目录。删除仍被会话选用的补录项时拒绝操作；过期来源版本和跨页动作同样拒绝。
+- footer 模型标识固定为 `agent · 模型名/effort`（agent 小写）。窗口额度沿用 `4.1h·7%·[6.9d·17%]` 的紧凑倒计时格式，不改成“额度 5h 已用…”或加入月度工具明细；余额显示 `余额 $…` / `余额 ¥…`。失败显示 MISS，不附加套餐、累计消费或解释性括号。
 - Codex `request_user_input` 和 Claude `AskUserQuestion` 共用问答卡，保留各自回包语义、历史回答和自定义输入入口。
 - `tool.ts` 生成工具摘要，`shell-command.ts` 解析 Bash、PowerShell 及引号包装后的首行 `# desc:`。Claude TaskCreate/Update/List/Get 在 `task-board.ts` 中累积为完整任务板。
 - `background.ts` 消费 Claude `task_*` 和 Codex collab 事件。子 Agent 细节进入 active/pending 后台状态，终态历史卡停止计时刷新。

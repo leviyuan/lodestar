@@ -78,7 +78,8 @@ async function fetchDeepseekModels(baseUrl: string, apiKey: string): Promise<Tok
   })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
   const json: any = await res.json()
-  const data: any[] = Array.isArray(json?.data) ? json.data : []
+  if (!Array.isArray(json?.data)) throw new Error('DeepSeek models 缺少 data 数组')
+  const data: any[] = json.data
   return data
     .filter(m => m && typeof m.id === 'string' && m.id)
     .map(m => ({ model: m.id, display: m.id, efforts: CLAUDE_EFFORTS, defaultEffort: 'high' as const }))
@@ -87,39 +88,36 @@ async function fetchDeepseekModels(baseUrl: string, apiKey: string): Promise<Tok
 const BALANCE_TIMEOUT_MS = 10_000
 
 /** GET {host}/user/balance(OpenAI 根路径,Bearer 认证)→ 剩余余额标量。
- *  DeepSeek 是充值余额模型(无配额百分比),故 planLabel 装余额、windows 空;
+ *  DeepSeek 是充值余额模型，返回结构化余额、windows 空;
  *  失败如实 MISS(no_fallbacks),绝不假数据。 */
 export async function fetchDeepseekBalance(baseUrl: string, apiKey: string): Promise<UsageSnapshotUnified> {
   let origin: string
   try {
     origin = new URL(baseUrl).origin
   } catch {
-    return { state: 'network', windows: [], reason: 'bad base_url' }
+    return { kind: 'balance', state: 'network', windows: [], reason: 'bad base_url' }
   }
   try {
     const res = await fetch(`${origin}/user/balance`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(BALANCE_TIMEOUT_MS),
     })
-    if (!res.ok) return { state: 'network', windows: [], reason: `HTTP ${res.status}` }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const json: any = await res.json()
     const infos: any[] = Array.isArray(json?.balance_infos) ? json.balance_infos : []
     const info = infos[0]
     const currency = typeof info?.currency === 'string' ? info.currency : ''
-    const sym = currency === 'CNY' ? '¥' : currency === 'USD' ? '$' : currency ? `${currency} ` : ''
     const total = info?.total_balance
-    if (typeof total !== 'string' && typeof total !== 'number') {
-      return { state: 'ok', windows: [], planLabel: '余额 —(无明细)' }
-    }
-    const avail = json?.is_available !== false
+    if (!currency || (typeof total !== 'string' && typeof total !== 'number')
+      || String(total).trim() === '' || !Number.isFinite(Number(total))) throw new Error('余额明细缺失或无效')
     return {
-      state: 'ok',
+      kind: 'balance', state: 'ok',
       windows: [],
-      planLabel: avail ? `剩余 ${sym}${total}` : `⚠️ 余额不足 ${sym}${total}`,
+      balance: { remaining: Number(total), currency },
     }
   } catch (e: any) {
     log(`deepseek readUsage MISS: ${e?.message ?? e}`)
-    return { state: 'network', windows: [], reason: e?.message ?? String(e) }
+    return { kind: 'balance', state: 'network', windows: [], reason: e?.message ?? String(e) }
   }
 }
 
@@ -152,11 +150,11 @@ registerTokenSourceFactory({
         try {
           const fetched = await fetchDeepseekModels(baseUrl, apiKey)
           // config models 键补充(同 glm 约定):端点列表缺模型时手动补登,去重合并。
-          const extra = parseModelList(cfg.models).filter(
+          const extra = [...new Set([...parseModelList(cfg.models), ...parseModelList(cfg.custom_models)])].filter(
             m => !fetched.some(f => f.model.toLowerCase() === m.toLowerCase()),
           )
           const extras: TokenSourceModel[] = extra.map(m => ({
-            model: m, display: m, efforts: CLAUDE_EFFORTS, defaultEffort: 'high',
+            model: m, display: m, efforts: CLAUDE_EFFORTS, defaultEffort: 'high', origin: 'custom',
           }))
           ts.models = [...fetched, ...extras]
           // 默认模型:config model 键优先;未配 → 版本号最新的(flash<pro 不成立,
@@ -200,7 +198,7 @@ registerTokenSourceFactory({
         return verifyModelExists(baseUrl, { 'x-api-key': apiKey }, model)
       },
       async readUsage(): Promise<UsageSnapshotUnified> {
-        if (!apiKey) return { state: 'no_credentials', windows: [] }
+        if (!apiKey) return { kind: 'balance', state: 'no_credentials', windows: [] }
         return fetchDeepseekBalance(baseUrl, apiKey)
       },
     }

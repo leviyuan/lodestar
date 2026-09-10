@@ -76,7 +76,9 @@ export interface ClaudeModelConfig {
  *  bin         — Claude 包装器，或 DeepSeek Harness 使用的 Node 可执行文件
  *  model       — 默认模型 slug(codex 下发 gpt-5.6-sol;claude 真实模型走 slots)
  *  effort      — 默认 effort
- *  models      — 可选模型列表(逗号分隔,如 'gpt-5.6-sol,gpt-5.5,gpt-5.4')
+ *  models      — OpenRouter 显式可选列表；GLM/DeepSeek 经验证的补录模型
+ *  hidden_models — 非 OpenRouter 来源从接口目录中隐藏的模型(逗号分隔)
+ *  custom_models — 所有来源的列表外补录记录(逗号分隔，不代表已验证可运行)
  *  slots       — claude 槽位映射 'opus=X,sonnet=Y,haiku=Z'
  *  usage       — 额度查询策略 'codex-rate-limit' | 'glm-coding-plan' | 'none' */
 export interface TokenSourceConfig {
@@ -90,6 +92,8 @@ export interface TokenSourceConfig {
   model?: string
   effort?: string
   models?: string
+  hidden_models?: string
+  custom_models?: string
   slots?: string
   usage?: string
   default?: boolean
@@ -170,7 +174,7 @@ function stripTomlComment(raw: string): string {
   return raw
 }
 
-function loadConfig(): LodestarConfig {
+export function loadConfig(): LodestarConfig {
   let raw: string
   try {
     raw = readFileSync(CONFIG_FILE, 'utf8')
@@ -263,7 +267,7 @@ function loadConfig(): LodestarConfig {
       if (!id) continue
       const cfg: TokenSourceConfig = {}
       for (const [rawKey, value] of Object.entries(section)) {
-        if (typeof value !== 'string' || value.length === 0) continue
+        if (typeof value !== 'string') continue
         const field = rawKey.trim()
         if (field === 'default') {
           cfg.default = value === 'true'
@@ -271,7 +275,7 @@ function loadConfig(): LodestarConfig {
           field === 'agent' || field === 'display' || field === 'auth' ||
           field === 'base_url' || field === 'auth_token' || field === 'api_key' ||
           field === 'bin' || field === 'model' || field === 'effort' ||
-          field === 'models' || field === 'slots' || field === 'usage'
+          field === 'models' || field === 'hidden_models' || field === 'custom_models' || field === 'slots' || field === 'usage'
         ) {
           ;(cfg as Record<string, string>)[field] = value
         }

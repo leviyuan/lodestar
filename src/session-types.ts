@@ -10,7 +10,7 @@ export interface TurnState {
    * 改写已经在跑的 turn footer。 */
   provider: AgentProvider
   model: string | null
-  effort: AgentReasoningEffort
+  effort: AgentReasoningEffort | null
   /** Feishu message_id of the card — needed for urgent_app push on clean
    * turn close. Kept separate from cardId because cardkit's stream APIs
    * operate on card_id but the urgent_app endpoint takes message_id. */

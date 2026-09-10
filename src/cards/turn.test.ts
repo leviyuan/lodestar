@@ -1,11 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 
-import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, modelEffortSelectionCard, modelResultCard, modelResultPanelElement, modelSelectionCard, statusCard, streamingOffSettings } from './console'
+import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, modelEffortSelectionCard, modelResultCard, modelResultPanelElement, modelSelectionCard, providerSelectionCard, statusCard, streamingOffSettings } from './console'
 import {
   askUserQuestionElement,
   contextCompactionElement,
   footerContextPercentLabel,
   footerTokenDetailLine,
+  footerModelLabel,
   goalElement,
   goalDisplaySignature,
   mainConversationCard,
@@ -15,6 +16,42 @@ import {
 import { editBatchElement, readBatchElement, summarizeToolInput, toolCallElement, toolCallPermissionElement } from './tool'
 
 describe('main conversation card rendering', () => {
+  test('upstream rows hide while custom rows delete, and every editable source offers registration', () => {
+    const card = modelSelectionCard({ sessionName: 'test', panelId: 'panel', sourceId: 'codex-sub', editable: true, allowCustom: true,
+      models: [
+        { provider: 'codex', sourceId: 'codex-sub', model: 'upstream', displayName: 'upstream', origin: 'upstream', efforts: [] },
+        { provider: 'codex', sourceId: 'codex-sub', model: 'custom', displayName: 'custom', origin: 'custom', efforts: [], unavailableReason: 'MISS' },
+      ] }) as any
+    const rows = card.body.elements[0].elements.filter((e: any) => e.tag === 'column_set')
+    expect(rows[0].columns[1].elements.at(-1).behaviors[0].value.kind).toBe('model_remove')
+    expect(rows[0].columns[1].elements.at(-1).text.content).toBe('隐藏')
+    expect(rows[1].columns[1].elements.at(-1).behaviors[0].value.kind).toBe('model_custom_remove')
+    expect(rows[1].columns[1].elements.at(-1).text.content).toBe('删除')
+    expect(JSON.stringify(card)).toContain('model_custom_prompt')
+  })
+  test('every footer uses the same agent and model identity format', () => {
+    expect(footerModelLabel('claude', 'claude:GLM-5.3[1m]', 'max')).toBe('claude · GLM-5.3/max')
+    expect(footerModelLabel('codex', 'gpt-5.6-sol', 'xhigh')).toBe('codex · gpt-5.6-sol/xhigh')
+    expect(footerModelLabel('dsh', 'glm-5.3', 'high')).toBe('dsh · glm-5.3/high')
+    expect(footerModelLabel('claude', 'xiaomi/mimo-v2.5-pro', 'default')).toBe('claude · xiaomi/mimo-v2.5-pro/default')
+    expect(footerModelLabel('dsh', null, null)).toBe('dsh · MISS/MISS')
+  })
+
+  test('MD gives agent groups distinct headers and containers while preserving source actions', () => {
+    const card = providerSelectionCard({ sessionName: 'test', panelId: 'p', providers: [
+      { provider: 'dsh', sourceId: 'dsh-glm', display: 'GLM Coding Plan', enabled: true, modelCount: 10 },
+      { provider: 'claude', sourceId: 'openrouter', display: 'OpenRouter', enabled: true, modelCount: 9 },
+      { provider: 'codex', sourceId: 'codex-sub', display: 'Codex 订阅', enabled: true, modelCount: 3 },
+      { provider: 'claude', sourceId: 'glm', display: 'GLM Coding Plan', enabled: true, modelCount: 10 },
+    ] }) as any
+    const elements = card.body.elements[0].elements
+    const groups = elements.filter((e: any) => e.tag === 'collapsible_panel')
+    expect(groups.map((e: any) => e.header.title.content)).toEqual(['**Agent · claude**', '**Agent · codex**', '**Agent · dsh**'])
+    expect(groups.every((e: any) => e.expanded && e.header.background_color === 'blue-50' && e.border.color === 'blue-100')).toBe(true)
+    expect(groups.map((e: any) => e.element_id)).toEqual(['model_agent_claude', 'model_agent_codex', 'model_agent_dsh'])
+    expect(groups.flatMap((g: any) => g.elements).map((e: any) => e.columns[1].elements[0].behaviors[0].value.source_id))
+      .toEqual(['openrouter', 'glm', 'codex-sub', 'dsh-glm'])
+  })
   test('starts with a stable footer status element and no disposable ticker', () => {
     const card = mainConversationCard({
       sessionName: 'probe',
@@ -212,6 +249,16 @@ describe('main conversation card rendering', () => {
       model: 'claude:default',
       effort: 'high',
     })).toContain('**🤖 当前模型 (Claude)**　`claude:default/high`')
+  })
+
+  test('model pagination carries the source and panel identity on navigation buttons', () => {
+    const card = modelSelectionCard({ sessionName: 'probe', panelId: 'page-panel', models: [],
+      pagination: { sourceId: 'openrouter', page: 1, totalPages: 3 } }) as any
+    const pager = card.body.elements[0].elements.find((element: any) => element.tag === 'column_set')
+    expect(pager.columns.map((column: any) => column.elements[0].behaviors[0].value)).toEqual([
+      { kind: 'model_page', source_id: 'openrouter', panel_id: 'page-panel', page: 0 },
+      { kind: 'model_page', source_id: 'openrouter', panel_id: 'page-panel', page: 2 },
+    ])
   })
 
   test('model command uses separate model and effort levels in one replaceable panel', () => {

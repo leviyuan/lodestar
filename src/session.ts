@@ -53,7 +53,7 @@ import {
 import { config } from './config'
 import { createAgentProcess } from './agent-launch'
 import { agentApiUrl } from './agent-runtime'
-import { getTokenSource, listEnabledTokenSourcesByAgent, waitForTokenSourceModelRefresh, type TokenSource } from './token-source'
+import { getTokenSource, listEnabledTokenSourcesByAgent, waitForTokenSourceModelRefresh, tokenSourceProcessRevision, tokenSourceRuntimeModel, type TokenSource } from './token-source'
 import {
   claudeTranscriptPath,
   type BgTaskStartedEvent,
@@ -518,14 +518,6 @@ export class Session {
         this.selectedModel = derivedTs.defaultModel
         this.selectedEffort = 'max'
       }
-      // 迁移:旧版持久化的 GLM model slug(GLM-5.2 / GLM-4.7)在切到 native 后(本机撤了
-      // GLM 改配真 Anthropic),透传给真 Anthropic 会因模型名不被支持而启动失败 → 归一到
-      // native 默认 SDK alias(opus),由 settings.json 的 ANTHROPIC_DEFAULT_*_MODEL 解析。
-      if (derivedTs.id === 'claude-native'
-        && this.selectedModel
-        && !derivedTs.models.some(m => m.model === this.selectedModel)) {
-        this.selectedModel = derivedTs.defaultModel
-      }
     }
     if (this.selectedModel) {
       log(`session "${sessionName}": restored selected provider=${this.selectedProvider} model=${this.selectedModel} effort=${this.selectedEffort ?? 'unset'}`)
@@ -650,7 +642,7 @@ export class Session {
   dshEffortForSpawn() {
     if (isDshReasoningEffort(this.selectedEffort)) return this.selectedEffort
     const source = this.currentTokenSource()
-    const entry = source?.models.find(model => model.model === (this.selectedModel ?? source.defaultModel))
+    const entry = source && tokenSourceRuntimeModel(source, this.selectedModel ?? source.defaultModel)
     if (!entry || !isDshReasoningEffort(entry.defaultEffort)) throw new Error('DSH model reasoning effort is unavailable')
     return entry.defaultEffort
   }
@@ -771,9 +763,14 @@ export class Session {
   }
 
   claudeEffortForSpawn(): ClaudeReasoningEffort {
-    return this.selectedProvider === 'claude' && isClaudeReasoningEffort(this.selectedEffort)
-      ? this.selectedEffort
-      : CLAUDE_EFFORT
+    if (this.selectedProvider === 'claude' && isClaudeReasoningEffort(this.selectedEffort)) return this.selectedEffort
+    const source = this.currentTokenSource()
+    if (this.selectedProvider === 'claude' && source?.agent === 'claude') {
+      const model = tokenSourceRuntimeModel(source, this.selectedModel ?? source.defaultModel)
+      if (!isClaudeReasoningEffort(model?.defaultEffort)) throw new Error('Claude 默认 effort MISS，请通过 model 面板明确选择')
+      return model.defaultEffort
+    }
+    return CLAUDE_EFFORT
   }
 
   currentModelLabel(): string | null {
@@ -785,7 +782,11 @@ export class Session {
     return raw?.replace(/^claude:/i, '').replace(/\[1m\]$/i, '') ?? null
   }
 
-  currentEffortLabel(): AgentReasoningEffort {
+  currentEffortLabel(): AgentReasoningEffort | null {
+    const source = this.currentTokenSource()
+    if (this.selectedProvider === 'claude' && source?.agent === 'claude') {
+      return this.selectedEffort ?? tokenSourceRuntimeModel(source, this.selectedModel ?? source.defaultModel)?.defaultEffort ?? null
+    }
     return this.selectedEffort
       ?? (this.selectedProvider === 'dsh' ? this.dshEffortForSpawn() : undefined)
       ?? this.proc?.lastEffort
@@ -809,25 +810,11 @@ export class Session {
     return { provider, model, effort }
   }
 
-  private modelEffortLabel(
-    selection: Pick<TurnState, 'provider' | 'model' | 'effort'> = this.currentTurn ?? this.runtimeModelSelection(),
-  ): string {
-    // [1m] 是给 CLI 的窗口记账后缀(spawn 侧内部细节),用户可见层剥掉 ——
-    // footer/console 显示干净的模型名(GLM-5.3 而非 GLM-5.3[1m])。
-    const shownModel = selection.provider === 'claude'
-      ? selection.model?.replace(/^claude:/i, '').replace(/\[1m\]$/i, '')
-      : selection.model
-    const label = shownModel ? `${shownModel}/${selection.effort}` : selection.effort
-    return selection.provider === 'claude'
-      ? `${agentProviderLabel(selection.provider)} · ${label}`
-      : label
-  }
-
   withModel(
     text: string,
     selection?: Pick<TurnState, 'provider' | 'model' | 'effort'>,
   ): string {
-    const label = this.modelEffortLabel(selection)
+    const label = this.modelLine(selection)
     return text.includes(label) ? text : `${text} · ${label}`
   }
 
@@ -853,9 +840,9 @@ export class Session {
   }
 
   private modelLine(
-    selection?: Pick<TurnState, 'provider' | 'model' | 'effort'>,
+    selection: Pick<TurnState, 'provider' | 'model' | 'effort'> = this.currentTurn ?? this.runtimeModelSelection(),
   ): string {
-    return this.modelEffortLabel(selection)
+    return cards.footerModelLabel(selection.provider, selection.model, selection.effort)
   }
 
   backendLabel(provider: AgentProvider = this.selectedProvider): string {
@@ -966,7 +953,7 @@ export class Session {
     if (ts) {
       // model = 用户面板选的具体 slug(gpt-5.6-sol / GLM-5.2[1m]);空 → fallback ts.defaultModel
       this.selectedModel = model || null
-      this.selectedEffort = effort ?? ts.models.find(m => m.model === model)?.defaultEffort ?? ts.models[0]?.defaultEffort ?? null
+      this.selectedEffort = effort ?? tokenSourceRuntimeModel(ts, model || ts.defaultModel)?.defaultEffort ?? null
     } else {
       this.selectedModel = provider === 'codex' ? null : model
       this.selectedEffort = provider === 'codex' ? null : effort
@@ -988,7 +975,7 @@ export class Session {
     // 否则热切换只改 model 不换 env → 模型名打到上一个 source 的 base_url(silent divergence)。
     const source = this.currentTokenSource()
     const revisionMatches = !this.procSourceRevisions.has(this.proc)
-      || this.procSourceRevisions.get(this.proc) === (source?.spawnRevision ?? null)
+      || this.procSourceRevisions.get(this.proc) === tokenSourceProcessRevision(source, this.selectedModel)
     if (
       this.proc.provider === this.selectedProvider
       && this.proc.tokenSourceId === this.selectedTokenSourceId
@@ -2434,6 +2421,15 @@ export class Session {
   onProviderSelect(sourceIdRaw: string, panelIdRaw = ''): Promise<ModelActionResult> {
     return sessionModel.onProviderSelect(this, sourceIdRaw, panelIdRaw)
   }
+  onModelPage(panelId: string, sourceId: string, page: number): Promise<ModelActionResult> {
+    return sessionModel.onModelPage(this, panelId, sourceId, page)
+  }
+  onModelAddOpen(panelId: string, sourceId: string): Promise<ModelActionResult> {
+    return sessionModel.onModelAddOpen(this, panelId, sourceId)
+  }
+  onModelListEdit(panelId: string, sourceId: string, model: string, action: 'add' | 'remove' | 'delete'): Promise<ModelActionResult> {
+    return this.runLifecycle('model-list-edit', () => sessionModel.onModelListEdit(this, panelId, sourceId, model, action))
+  }
   onModelPanelCancel(panelIdRaw = ''): Promise<ModelActionResult> {
     return sessionModel.onModelPanelCancel(this, panelIdRaw)
   }
@@ -2486,7 +2482,7 @@ export class Session {
       status: this.status,
       provider: runtime.provider,
       model: runtime.model ?? undefined,
-      effort: runtime.effort,
+      effort: runtime.effort ?? 'MISS',
       worktreeInstructionNotice: this.worktreeInstructionLoadedNotice(),
       peers: [...Session.all]
         .filter(s => s.isRunning())
@@ -4223,7 +4219,7 @@ export class Session {
       turn,
       provider: turnSelection.provider,
       model: turnSelection.model ?? undefined,
-      effort: turnSelection.effort,
+      effort: turnSelection.effort ?? 'MISS',
       kind: trigger,
       userInputs,
       initialFooter,
@@ -4474,7 +4470,7 @@ export class Session {
           turn: this.turnCounter,
           provider: turn.provider,
           model: turn.model ?? undefined,
-          effort: turn.effort,
+          effort: turn.effort ?? 'MISS',
           kind: 'card_full',
           userInputs: [],
         })
@@ -5448,7 +5444,9 @@ export class Session {
     const render = (): void => {
       if (turn.footerStatusLabel !== status) return
       const { label } = liveElapsed(Date.now() - turn.footerStatusStartedAt, liveElapsedMode())
-      void this.replaceFooterContent(turn.cardId, this.withModel(`${status} (${label})`))
+      const thinking = status === FOOTER_THINKING_PREFIX ? this.proc?.lastThinkingTokens : null
+      const progress = typeof thinking === 'number' ? ` · 约 ${thinking} tokens` : ''
+      void this.replaceFooterContent(turn.cardId, this.withModel(`${status}${progress} (${label})`))
     }
     const scheduleNext = (): void => {
       if (turn.footerStatusLabel !== status) return
@@ -5479,12 +5477,7 @@ export class Session {
     turn.footerStatusLabel = null
   }
 
-  /** turn footer 末尾的额度后缀,按当前 token source 渲染(不再硬编码 GLM):
-   *   claude source(glm/deepseek)→ ts.readUsage(轻量 HTTP):glm 显示 5h+周双窗口,
-   *                deepseek 等标量余额 source 显示 planLabel「剩余 ¥X」
-   *   codex        → 先在现有 codex 连接上 read rateLimits(权威多桶,毫秒级;
-   *                rolling 通知 limitId 不可信只当失效信号),显示服务端默认桶
-   * 拿不到数据返回空串;缺数据不硬凑 —— footer 不假数据 (no_fallbacks)。 */
+  /** 页脚只显示当前来源的额度或余额；数据读取失败明确显示 MISS。 */
   private async footerUsageSuffix(
     provider: AgentProvider,
     proc: AgentProcess | null,
@@ -5492,14 +5485,15 @@ export class Session {
     ts: TokenSource | undefined,
     cachedCodexUsage: UsageSnapshot | null,
   ): Promise<string> {
-    if (selectedTokenSourceId && (!ts || !ts.enabled || ts.agent !== provider)) return ''
+    if (selectedTokenSourceId && (!ts || !ts.enabled || ts.agent !== provider)) return '  |  额度 MISS'
     if (ts?.agent === provider && ts.enabled && (provider === 'claude' || provider === 'dsh')) {
       const snap = await ts.readUsage()
-      const fiveHour = snap.windows.find(w => w.kind === 'fiveHour')
-      const weekly = snap.windows.find(w => w.kind === 'weekly')
-      if (fiveHour || weekly) return this.fmtDualWindowSuffix(fiveHour ?? null, weekly ?? null)
-      // DeepSeek 等标量余额 source(无 5h 窗口)→ 显示 planLabel(余额);失败/无数据不假数据
-      return snap.state === 'ok' && snap.planLabel ? `  |  ${snap.planLabel}` : ''
+      if (snap.state === 'ok' && snap.kind !== 'balance') {
+        const fiveHour = snap.windows.find(w => w.kind === 'fiveHour')
+        const weekly = snap.windows.find(w => w.kind === 'weekly')
+        if (fiveHour || weekly) return this.fmtDualWindowSuffix(fiveHour ?? null, weekly ?? null)
+      }
+      return `  |  ${cards.unifiedUsageSummary(snap)}`
     }
     if (provider === 'codex') {
       // turn 收尾:现有连接 read 端点刷新权威快照(整体替换桶 map),再渲染。
@@ -5507,37 +5501,30 @@ export class Session {
       const codexProc = proc?.isAlive() && proc.provider === 'codex' && proc.readRateLimits
         ? proc as CodexProcess : null
       const fresh = codexProc ? await refreshUsageFromConnection(() => codexProc.readRateLimits!()) : null
-      const u = fresh ?? cachedCodexUsage
-      return u?.state === 'ok' ? this.fmtDualWindowSuffix(u.fiveHour ?? null, u.weekly ?? null) : ''
+      const u = codexProc ? fresh : cachedCodexUsage
+      return u?.state === 'ok' ? this.fmtDualWindowSuffix(u.fiveHour ?? null, u.weekly ?? null) : '  |  额度 MISS'
     }
-    if (provider === 'dsh') return '  |  额度 MISS'
-    // claude 无匹配 token source(理论不发生,token source 总有)→ 回退 readGlmUsage 兼容
-    const g = await readGlmUsage()
-    return g.state === 'ok' ? this.fmtDualWindowSuffix(g.fiveHour ?? null, g.weekly ?? null) : ''
+    return '  |  额度 MISS'
   }
 
-  /** 双窗口额度 footer 后缀,codex/GLM 共用,形如 `4.1h·7%·[6.9d·17%]`:
-   * 5h 窗口(重置倒计时·已用%)+ 方括号内周窗口(重置倒计时·已用%)。
-   * Prolite 等套餐只有周窗口(无 5h)→ 退化为裸周窗口段 `[6.9d·9%]`。
-   * 缺哪段就省哪段(no_fallbacks 不假数据):两窗口都缺 → 空串;
-   * 某窗口 resetsAt 缺/已过期 → 该窗口只剩百分比。 */
+  /** 沿用原紧凑窗口格式：4.1h·7%·[6.9d·17%]；不添加周期标签或“已用”等文字。 */
   private fmtDualWindowSuffix(
     fiveHour: { percent: number | null; resetsAt: Date | null } | null,
     weekly: { percent: number | null; resetsAt: Date | null } | null,
   ): string {
-    const resetIn = (w: { resetsAt: Date | null }): string =>
-      w.resetsAt && w.resetsAt.getTime() > Date.now() ? cards.fmtResetIn(w.resetsAt) : ''
-    const seg = (w: { percent: number | null; resetsAt: Date | null } | null): string | null => {
-      if (w?.percent == null) return null
-      const ri = resetIn(w)
-      return ri ? `${ri}·${Math.round(w.percent)}%` : `${Math.round(w.percent)}%`
+    const segment = (window: { percent: number | null; resetsAt: Date | null } | null): string | null => {
+      if (!window) return null
+      if (window.percent == null) return 'MISS'
+      const reset = window.resetsAt && window.resetsAt.getTime() > Date.now() ? cards.fmtResetIn(window.resetsAt) : ''
+      const percent = `${Math.round(window.percent)}%`
+      return reset ? `${reset}·${percent}` : percent
     }
-    const five = seg(fiveHour)
-    const week = seg(weekly)
+    const five = segment(fiveHour)
+    const week = segment(weekly)
     if (five && week) return `  |  ${five}·[${week}]`
     if (five) return `  |  ${five}`
     if (week) return `  |  [${week}]`
-    return ''
+    return '  |  额度 MISS'
   }
 
   private waitForTurnCloses(): Promise<void> {

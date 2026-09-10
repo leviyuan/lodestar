@@ -89,7 +89,7 @@ type PendingServerToolInput = {
   input: unknown
 }
 
-export interface ClaudeSpawnOpts extends SpawnOpts {
+export interface ClaudeSpawnOpts extends Omit<SpawnOpts, 'effort'> {
   model?: string
   effort: ClaudeReasoningEffort
   /** Claude SDK conversation id to resume before optional forkSession. */
@@ -669,6 +669,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   lastAssistantUuid: string | null = null
   lastModel: string | null = null
   lastEffort: ClaudeReasoningEffort | null = null
+  lastThinkingTokens: number | null = null
   lastUsage: CodexUsage | null = null
   lastTotalUsage: CodexUsage | null = null
   lastResult: CodexResultMeta = {
@@ -711,6 +712,10 @@ export class ClaudeAgentProcess extends EventEmitter {
       // resolveClaudeExecutableConfig 在 [claude].bin 配错路径时同步抛出;
       // 必须在 try 内调用,确保错误走 error/exit 事件而非穿透到调用方。
       const executable = resolveClaudeExecutableConfig()
+      const baseEnv: Record<string, string | undefined> = { ...(process.env as Record<string, string>), PATH: buildClaudeSpawnPath(),
+        ...config.claude.env, ...(this.opts.hostEnv ?? {}) }
+      const env = this.opts.transformEnv ? this.opts.transformEnv(baseEnv) : baseEnv
+      if (this.opts.effort === 'default') env.CLAUDE_CODE_EFFORT_LEVEL = 'unset'
       log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} cwd=${this.opts.workDir} executable=${executable.description}`)
       this.query = query({
         prompt: this.input,
@@ -718,7 +723,9 @@ export class ClaudeAgentProcess extends EventEmitter {
           cwd: this.opts.workDir,
           abortController: this.abortController,
           ...(model ? { model } : {}),
-          effort: this.opts.effort as EffortLevel,
+          // 显式启动档位解除 CLI 的 Fable alias 启动固定档位；default 模式由真实
+          // 子进程环境中的 unset 阻止发送 effort，不能只省略选项（CLI 会补 high）。
+          effort: (this.opts.effort === 'default' ? 'high' : this.opts.effort) as EffortLevel,
           resume: this.opts.resumeSessionId,
           ...(this.opts.resumeSessionAt ? { resumeSessionAt: this.opts.resumeSessionAt } : {}),
           ...(this.opts.forkSession ? { forkSession: true } : {}),
@@ -729,19 +736,7 @@ export class ClaudeAgentProcess extends EventEmitter {
             ? { spawnClaudeCodeProcess: executable.spawnClaudeCodeProcess }
             : {}),
           permissionMode: CLAUDE_PERMISSION_MODE,
-          env: this.opts.transformEnv
-            ? this.opts.transformEnv({
-                ...(process.env as Record<string, string>),
-                PATH: buildClaudeSpawnPath(),
-                ...config.claude.env,
-                ...(this.opts.hostEnv ?? {}),
-              })
-            : {
-                ...(process.env as Record<string, string>),
-                PATH: buildClaudeSpawnPath(),
-                ...config.claude.env,
-                ...(this.opts.hostEnv ?? {}),
-              },
+          env,
           settingSources: [...settingSources] as SettingSource[],
           ...managedSkillOptions,
           tools: toolsOption,
@@ -883,14 +878,13 @@ export class ClaudeAgentProcess extends EventEmitter {
   async setModelSettings(model: string, effort: AgentReasoningEffort): Promise<void> {
     const claudeModel = resolveClaudeSdkModel(model)
     if (!isClaudeReasoningEffort(effort)) throw new Error(`invalid Claude effort: ${String(effort)}`)
+    if ((this.opts.effort === 'default') !== (effort === 'default')) {
+      throw new Error('effort 参数模式改变，需要使用新的启动环境恢复会话')
+    }
     if (!this.started) this.sendInitialize()
     if (!this.query) throw new Error('claude-agent-process: SDK query not initialized (sendInitialize failed or not called)')
     if (claudeModel) await this.query.setModel(claudeModel)
-    if (effort === 'max') {
-      await this.query.applyFlagSettings({ ultracode: true, effortLevel: null })
-    } else {
-      await this.query.applyFlagSettings({ effortLevel: effort, ultracode: null })
-    }
+    await this.query.applyFlagSettings({ effortLevel: effort === 'default' ? null : effort, ultracode: null })
     this.opts.model = model
     this.opts.effort = effort
     this.lastModel = claudeModel ? claudeModelKey(model) : 'claude:default'
@@ -1082,6 +1076,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       case 'session_state_changed':
         if (raw.state === 'running' && !this.turnActive) {
           this.turnActive = true
+          this.lastThinkingTokens = null
           // A checkpoint belongs to exactly one clean turn. Clear the prior
           // assistant UUID at the authoritative SDK turn boundary.
           this.lastAssistantUuid = null
@@ -1104,6 +1099,14 @@ export class ClaudeAgentProcess extends EventEmitter {
         return
       case 'api_retry':
         log(`claude-agent-process: api retry attempt=${raw.attempt}/${raw.max_retries} status=${raw.error_status} error=${raw.error}`)
+        return
+      case 'thinking_tokens':
+        if (typeof raw.estimated_tokens !== 'number' || !Number.isFinite(raw.estimated_tokens) || raw.estimated_tokens < 0) {
+          log('claude-agent-process: invalid thinking_tokens estimate')
+          return
+        }
+        this.lastThinkingTokens = raw.estimated_tokens
+        this.emit('thinking_progress', { estimatedTokens: raw.estimated_tokens })
         return
       case 'permission_denied':
         log(`claude-agent-process: permission denied ${raw.tool_name} ${raw.tool_use_id}: ${raw.message}`)
@@ -1163,6 +1166,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   private handleAssistantMessage(raw: any): void {
+    if (!raw.parent_tool_use_id) this.lastThinkingTokens = null
     const message = raw.message
     const parentToolUseId = typeof raw.parent_tool_use_id === 'string' && raw.parent_tool_use_id
       ? raw.parent_tool_use_id
@@ -1206,6 +1210,10 @@ export class ClaudeAgentProcess extends EventEmitter {
   private emitToolUseOnce(id: string, name: string, input: any, parentToolUseId: string | null): void {
     if (this.emittedToolUseIds.has(id)) return
     this.emittedToolUseIds.add(id)
+    if (!name.trim()) {
+      log(`claude-agent-process: tool_use ${id} has an empty name`)
+      name = 'MISS'
+    }
     // parentToolUseId:子 agent 内的工具调用 = 触发它的 Task tool_use id;主线程为 null。
     // session 据此把子 agent 的逐步过程累积进对应后台 task 的 steps[]。
     this.emit('tool_use', { id, name, input, parentToolUseId })

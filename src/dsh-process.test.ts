@@ -17,9 +17,9 @@ afterEach(async () => {
   if (failures.length) throw new AggregateError(failures, 'DSH test cleanup failed')
 })
 
-function completion(delta: object, finish = 'stop') {
+function completion(delta: object, finish = 'stop', model = 'deepseek-v4-flash') {
   return new Response([
-    `data: ${JSON.stringify({ id: 'test-completion', model: 'deepseek-v4-flash', choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`,
+    `data: ${JSON.stringify({ id: 'test-completion', model, choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`,
     `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: finish }], usage: {
       prompt_tokens: 100, completion_tokens: 10, total_tokens: 110, prompt_cache_hit_tokens: 40, prompt_cache_miss_tokens: 60,
     } })}\n\n`,
@@ -50,7 +50,7 @@ async function fixture(reply: (body: any, count: number) => Response | Promise<R
     cleanups.push(() => proc.kill())
     return proc
   }
-  return { dir, opts, requests, processFor }
+  return { dir, opts, requests, processFor, baseUrl: `http://127.0.0.1:${server.port}` }
 }
 
 function nextResult(proc: DshProcess): Promise<any> {
@@ -65,6 +65,35 @@ function nextResult(proc: DshProcess): Promise<any> {
 }
 
 describe('DSH native runtime through Lodestar bridge', () => {
+  test('GLM Coding Plan runs tools, changes effort and resumes through the native pi-ai adapter', async () => {
+    const f = await fixture((_body, count) => count === 1 ? completion({ tool_calls: [{ index: 0, id: 'glm-tool', type: 'function', function: {
+      name: 'bash', arguments: JSON.stringify({ command: '# desc: 验证 GLM 原生工具调用\nprintf glm-tool-proof', description: 'Return proof' }),
+    } }] }, 'tool_calls', 'glm-5.3') : completion({ content: `glm reply ${count}` }, 'stop', 'glm-5.3'))
+    const overrides: Partial<DshSpawnOptions> = { tokenSourceId: 'dsh-glm', model: 'glm-5.3', effort: 'low',
+      transformEnv: env => ({ ...env, LODESTAR_DSH_PROVIDER: 'zai-coding-cn', LODESTAR_DSH_GLM_API_KEY: 'glm-local-test-key',
+        LODESTAR_DSH_BASE_URL: f.baseUrl, LODESTAR_DSH_MODELS: '["glm-5.3"]', LODESTAR_DSH_DEFAULT_MODEL: 'glm-5.3' }) }
+    const proc = f.processFor(undefined, overrides)
+    await proc.initializationPromise()
+    expect((await proc.listModels()).map(m => m.model)).toEqual(['glm-5.3'])
+    let done = nextResult(proc)
+    proc.sendUserText('remember the GLM lighthouse and run the tool')
+    expect(await done).toMatchObject({ is_error: false })
+    expect(JSON.stringify(f.requests[1].messages)).toContain('glm-tool-proof')
+    expect(f.requests[0]).toMatchObject({ model: 'glm-5.3', reasoning_effort: 'low', thinking: { type: 'enabled' } })
+    await proc.setModelSettings('glm-5.3', 'max')
+    done = nextResult(proc); proc.sendUserText('continue at max')
+    expect(await done).toMatchObject({ is_error: false })
+    expect(f.requests[2].reasoning_effort).toBe('max')
+    const sessionId = proc.sessionId!
+    await proc.kill()
+    const resumed = f.processFor({ kind: 'resume', source: { provider: 'dsh', sessionId, cwd: f.dir } }, overrides)
+    await resumed.initializationPromise()
+    done = nextResult(resumed); resumed.sendUserText('recall the lighthouse')
+    expect(await done).toMatchObject({ is_error: false })
+    expect(JSON.stringify(f.requests[3].messages)).toContain('remember the GLM lighthouse')
+    expect(f.requests.every(body => body.model === 'glm-5.3')).toBe(true)
+  }, 30_000)
+
   test('background child tool content reaches the shared card store after the parent finishes', async () => {
     let parentRequests = 0
     let childRequests = 0

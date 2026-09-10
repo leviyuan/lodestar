@@ -21,7 +21,8 @@ import type { DshOpenOptions } from './dsh-protocol.ts'
 
 export const name = 'lodestar-bridge'
 export const inject = ['agents', 'llm', 'agentDefaultModel', 'sessionPersistence', 'tools', 'systemPrompt', 'userQuestions', 'compaction', 'shellEnv', 'attachments', 'sdkAppStartup']
-const PROVIDER = 'deepseek-official'
+const PROVIDER = process.env.LODESTAR_DSH_PROVIDER ?? 'deepseek-official'
+if (!['deepseek-official', 'zai-coding-cn', 'zai'].includes(PROVIDER)) throw new Error(`Unsupported DSH provider: ${PROVIDER}`)
 const DELEGATION_TOOLS = ['subagent', 'subagent_fork', 'workflow', 'ralph', 'send_message']
 
 export function apply(ctx: Context): void {

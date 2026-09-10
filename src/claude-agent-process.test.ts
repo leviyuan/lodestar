@@ -26,6 +26,44 @@ const { config } = await import('./config')
 beforeEach(() => resetClaudeContextWindowCache())
 
 describe('Claude model profiles', () => {
+  test('thinking estimates update progress without changing billed usage', () => {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high' }) as any
+    const progress: unknown[] = []
+    proc.on('thinking_progress', (event: unknown) => progress.push(event))
+    proc.handleMessage({ type: 'system', subtype: 'thinking_tokens', estimated_tokens: 123, estimated_tokens_delta: 4 })
+    expect(proc.lastThinkingTokens).toBe(123)
+    expect(proc.lastUsage).toBeNull()
+    expect(progress).toEqual([{ estimatedTokens: 123 }])
+    proc.handleMessage({ type: 'system', subtype: 'thinking_tokens', estimated_tokens: -1 })
+    expect(proc.lastThinkingTokens).toBe(123)
+  })
+
+  test('an empty upstream tool name remains visible as MISS with its original tool id', () => {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high' }) as any
+    const uses: unknown[] = []
+    proc.on('tool_use', (event: unknown) => uses.push(event))
+    proc.handleMessage({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'invalid-tool', name: '', input: {} }] } })
+    expect(uses).toEqual([{ id: 'invalid-tool', name: 'MISS', input: {}, parentToolUseId: null }])
+  })
+  test('hot settings preserve explicit max and reject a change requiring a different process environment', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high' }) as any
+    const updates: unknown[] = []
+    proc.started = true
+    proc.query = { setModel: async () => {}, applyFlagSettings: async (settings: unknown) => { updates.push(settings) } }
+    await proc.setModelSettings('moonshotai/kimi-k3', 'max')
+    await expect(proc.setModelSettings('xiaomi/mimo-v2.5-pro', 'default')).rejects.toThrow('启动环境')
+    await proc.setModelSettings('google/gemini-3.8-flash', 'high')
+    expect(updates).toEqual([
+      { effortLevel: 'max', ultracode: null },
+      { effortLevel: 'high', ultracode: null },
+    ])
+    expect(proc.lastEffort).toBe('high')
+    const nativeDefault = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'default' }) as any
+    nativeDefault.started = true
+    nativeDefault.query = proc.query
+    await nativeDefault.setModelSettings('minimax/minimax-m3', 'default')
+    expect(updates.at(-1)).toEqual({ effortLevel: null, ultracode: null })
+  })
   test('loads daemon-managed Skills as a plugin only when user settings are excluded', () => {
     expect(claudeManagedSkillOptions(['project', 'local'], '/data/lodestar-plugin')).toEqual({
       plugins: [{ type: 'local', path: '/data/lodestar-plugin', skipMcpDiscovery: true }],

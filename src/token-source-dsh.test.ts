@@ -18,7 +18,7 @@ describe('DeepSeek Harness source isolation', () => {
     const env = source.spawnEnv({ ANTHROPIC_API_KEY: 'old', ANTHROPIC_BASE_URL: 'old',
       DEEPSEEK_API_KEY: 'old', DSH_HOME: '/foreign/home', LODESTAR_AGENT_CAPABILITY: 'caller', PATH: '/bin' })
     expect(env).toEqual({ DEEPSEEK_API_KEY: 'configured-key', DEEPSEEK_BASE_URL: 'http://127.0.0.1:1234',
-      LODESTAR_DSH_NODE: '/explicit/node', LODESTAR_AGENT_CAPABILITY: 'caller', PATH: '/bin' })
+      LODESTAR_DSH_NODE: '/explicit/node', LODESTAR_DSH_PROVIDER: 'deepseek-official', LODESTAR_AGENT_CAPABILITY: 'caller', PATH: '/bin' })
   })
   test('registers the independent setup command', () => {
     expect(factory().setup?.commandSuffix).toBe('deepseek-harness')

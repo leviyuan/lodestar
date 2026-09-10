@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
 import { createAgentProcess } from './agent-launch'
-import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, type TokenSource } from './token-source'
+import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, tokenSourceFactories, type TokenSource } from './token-source'
+import './token-source-openrouter'
 
 for (const status of ['idle', 'loading', 'failed', 'ready'] as const) {
   test(`launch reports ${status} catalog state without substituting a model`, () => {
@@ -30,3 +31,23 @@ for (const status of ['idle', 'loading', 'failed', 'ready'] as const) {
     }
   })
 }
+
+test('the shared Claude launch passes the selected OpenRouter slug to its role environment and rejects undeclared effort', () => {
+  const previous = listTokenSources()
+  const source = tokenSourceFactories().find(entry => entry.kind === 'openrouter')!.build({ api_key: 'launch-test-key' })
+  source.models = [{ model: 'vendor/test', display: 'Test', efforts: ['medium'], defaultEffort: 'medium' }]
+  source.modelCatalogState = { status: 'ready', updatedAt: 1 }
+  registerTokenSource(source)
+  try {
+    const opts = { provider: 'claude' as const, workDir: '/tmp', tokenSourceId: 'openrouter', model: 'vendor/test', effort: 'medium' as const }
+    const created = createAgentProcess(opts)
+    const env = (created.process as any).opts.transformEnv({ ANTHROPIC_AUTH_TOKEN: 'previous-key' })
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('vendor/test')
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('launch-test-key')
+    expect((created.process as any).opts.settingSources).toEqual(['project', 'local'])
+    expect(() => createAgentProcess({ ...opts, effort: 'max' })).toThrow('model effort unavailable')
+  } finally {
+    resetTokenSourceRegistry()
+    for (const item of previous) registerTokenSource(item)
+  }
+})

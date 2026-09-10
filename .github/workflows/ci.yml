@@ -31,6 +31,8 @@ jobs:
           bun-version: 1.3.11
       - name: Install locked dependencies
         run: bun install --frozen-lockfile --ignore-scripts
+      - name: Check published runtime pins
+        run: bun scripts/sync-runtime-pins.ts --check
       - name: Typecheck
         run: bun run typecheck
       - name: Test
@@ -45,6 +47,7 @@ jobs:
           npm pack --pack-destination "$RUNNER_TEMP/lodestar-release/pack"
           npm install --prefix "$RUNNER_TEMP/lodestar-release/install" --ignore-scripts --no-fund --no-audit "$RUNNER_TEMP"/lodestar-release/pack/*.tgz
           npm audit --prefix "$RUNNER_TEMP/lodestar-release/install" --omit=dev
+          bun scripts/check-installed-package.ts "$RUNNER_TEMP/lodestar-release/install"
       - name: Set up minimum supported Node.js
         uses: actions/setup-node@v4
         with:

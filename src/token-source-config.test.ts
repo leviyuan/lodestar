@@ -31,6 +31,7 @@ function runConfigUpdate(work: string): void {
     }))
     mock.module(${JSON.stringify(join(import.meta.dir, 'token-source.ts'))}, () => ({
       refreshAllTokenSourceModels: () => { refreshes++; return refresh },
+      getTokenSource: () => undefined,
     }))
     const { addTokenSource } = await import(${JSON.stringify(join(import.meta.dir, 'token-source-config.ts'))})
     const { config } = await import(${JSON.stringify(join(import.meta.dir, 'config.ts'))})
@@ -77,5 +78,18 @@ test('does not rebuild or refresh when reading the configuration fails', () => {
     await assert.rejects(addTokenSource('glm', { auth_token: 'new-token' }), /ENOENT/)
     assert.equal(rebuilds, 0)
     assert.equal(refreshes, 0)
+  `)
+})
+
+test('persists an OpenRouter account and reloads its catalog settings', () => {
+  runConfigUpdate(`
+    releaseRefresh()
+    await addTokenSource('openrouter', { agent: 'claude', api_key: 'openrouter-test-key',
+      model: 'anthropic/test-model', effort: 'medium', models: 'anthropic/test-model' })
+    assert.deepEqual(config.token_sources.openrouter, { agent: 'claude', api_key: 'openrouter-test-key',
+      model: 'anthropic/test-model', effort: 'medium', models: 'anthropic/test-model' })
+    assert.equal(rebuilds, 1)
+    assert.equal(refreshes, 1)
+    assert.ok(readFileSync(configFile, 'utf8').includes('[token_source.glm]'))
   `)
 })

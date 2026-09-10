@@ -9,7 +9,7 @@ import { DshProcess } from './dsh-process'
 import { ClaudeAgentProcess, assertClaudeCodeAvailable } from './claude-agent-process'
 import { CodexProcess, isCodexReasoningEffort } from './codex-process'
 import type { ConversationLaunch } from './conversation'
-import { getTokenSource } from './token-source'
+import { getTokenSource, tokenSourceProcessRevision, tokenSourceRuntimeModel } from './token-source'
 
 export interface AgentLaunchOptions {
   provider: AgentProvider
@@ -49,19 +49,24 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
     throw new Error(`model catalog is not ready for ${source.id}: ${source.modelCatalogState.status}`)
   }
   const requestedModel = opts.model ?? source?.defaultModel
-  if (source && requestedModel && !source.models.some(entry => entry.model === requestedModel)) {
+  const sourceRevision = tokenSourceProcessRevision(source, requestedModel)
+  const entry = source && tokenSourceRuntimeModel(source, requestedModel)
+  if (source && requestedModel && !entry) {
     throw new Error(`model is not present in token source ${source.id}: ${requestedModel}`)
+  }
+  if (entry && (entry.unavailableReason || !entry.efforts.length || (opts.effort !== undefined && !entry.efforts.includes(opts.effort)))) {
+    throw new Error(`model effort unavailable: ${source!.id}/${requestedModel}/${opts.effort ?? 'MISS'}`)
   }
   const model = source && requestedModel
     ? source.resolveSpawnModel(requestedModel)
     : requestedModel
   if (requestedModel && !model) throw new Error(`model did not resolve: ${opts.tokenSourceId ?? 'default'}/${requestedModel}`)
-  const transformEnv = source ? (base: Record<string, string | undefined>) => source.spawnEnv(base) : undefined
+  const transformEnv = source ? (base: Record<string, string | undefined>) => source.spawnEnv(base, model) : undefined
 
   if (opts.provider === 'dsh') {
     if (!source || !model || !isDshReasoningEffort(opts.effort)) throw new Error('DSH requires a configured source, model and valid effort')
     return { process: new DshProcess({ ...opts, model, effort: opts.effort,
-      tokenSourceId: source.id, transformEnv }), sourceRevision: source.spawnRevision ?? null }
+      tokenSourceId: source.id, transformEnv }), sourceRevision }
   }
 
   if (opts.provider === 'claude') {
@@ -90,7 +95,7 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
         transformEnv,
         hostEnv: opts.hostEnv,
       }),
-      sourceRevision: source?.spawnRevision ?? null,
+      sourceRevision,
     }
   }
 
@@ -108,6 +113,6 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
       hostEnv: opts.hostEnv,
       serviceName: opts.serviceName,
     }),
-    sourceRevision: source?.spawnRevision ?? null,
+    sourceRevision,
   }
 }

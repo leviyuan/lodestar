@@ -2,7 +2,7 @@
 
 Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个群对应一个 `Session`，通过 Codex app-server、Claude Agent SDK 或 DeepSeek Harness 执行任务，以 Feishu Card Kit schema 2.0 展示结果。
 
-维护说明以 `AGENTS.md` 为入口。Codex、Claude、GLM、DeepSeek 和 Claude native 都是受支持能力；文档清理、缺少本机凭据或维护工具选择不构成删除后端的理由。
+维护说明以 `AGENTS.md` 为入口。Codex、Claude、GLM、DeepSeek、OpenRouter 和 Claude native 都是受支持能力；文档清理、缺少本机凭据或维护工具选择不构成删除后端的理由。
 
 ## 目录
 
@@ -28,8 +28,9 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 ## 模块边界
 
 - 一个群只有一个 Session 和一个当前主进程。Codex 使用 app-server JSON-RPC，Claude/GLM/DeepSeek/native 使用 Agent SDK streaming input，DSH 使用独立 Node 子进程和 Cordis stdio 桥接；不引入 tmux、JSONL 队列或旁路进程控制。
-- DSH 的 `deepseek-harness` 来源独立于 Claude 兼容的 `deepseek`。运行时锁定版本，子进程需要 Node 22.19+（22.x）或 24+；`src/dsh-bridge.ts` 仅在该子进程加载。
+- DSH 的 `deepseek-harness` 来源独立于 Claude 兼容的 `deepseek`；`dsh-glm` 通过原生 pi-ai 适配器接入 GLM Coding Plan，可复用 `glm` 凭据。运行时锁定版本，子进程需要 Node 22.19+（22.x）或 24+；`src/dsh-bridge.ts` 仅在该子进程加载。
 - Token Source 统一管理账号、凭据、模型目录、启动环境和额度。模型与 Agent 身份动态读取该目录，沿用目录声明的 effort；来源禁用或刷新失败显示 `MISS`。新增来源通过 factory 注册。
+- MD 首页按 `claude`、`codex`、`dsh` 分组。OpenRouter 保留默认九项，其他来源默认展示接口列表。接口项用隐藏/显示，列表外记录用补录/删除；所有来源支持 `custom_models`，未知能力显示 MISS。隐藏不改运行模型，删除补录项须保护正在选用的会话并清理悬空配置。footer 固定为 `agent · 模型名/effort`；窗口额度保留原紧凑倒计时格式 `4.1h·7%·[6.9d·17%]`，余额显示 `余额 $…` / `余额 ¥…`。OpenRouter 用 `/credits` 查账户余额，以实际响应判断权限。
 - `AgentService` 的委派进程与主会话共用启动入口。委派仅一层：主 Agent 可并行派工、续跑与输入回填；被委派的 Agent 不得通过 Lodestar 或原生 Agent 工具继续委派。具体生命周期约束见 `src/AGENTS.md`。
 - `managed-skills.ts` 同源生成 Codex/Claude standalone Skill 和 Claude 本地插件。GLM/DeepSeek 通过插件加载 Skill，不为此重新引入 user settings 和凭据。
 - 同 provider/source 调用 `setModelSettings`；Claude 后续 turn 生效，Codex 持久设置在重启后生效。跨 provider/source 只在空闲时换进程，resume id 按 provider 隔离。
@@ -56,4 +57,5 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - 真实飞书、Agent 登录、Card action、建群/解散和 worktree smoke 需要明确目标群、账号及副作用；涉及 live daemon 仍按上节授权。
 - 发布前通过 `bun test` 与 `bun run build`。未指定 minor/major 时只升 patch；同一版本发布 npm 和 GitHub Packages，推送 `main` 和 tag，创建 GitHub Release。
 - `mathjax-full` 随包附带修复后的传递依赖。发布前实际安装 tarball 并运行 `npm audit --omit=dev`，不能只检查源码目录的 overrides 和 Bun 锁文件。
+- DSH 插件包族和安全 overrides 的版本同时固定到发布依赖声明，消费者不会继承依赖包的 overrides。更新依赖后运行 `bun scripts/sync-runtime-pins.ts`，再用 Bun 同步锁文件；升级 DSH 必须整族一起升级。tarball 验收检查实际安装的 DSH 包族版本并启动已安装包的目录查询。
 - 没有 `gh` 时使用 GitHub REST，临时认证文件用后删除。Release 标题、功能说明和验证结果使用中文，模型名与代码标识符可保留原文；发布前检查没有整段英文说明。

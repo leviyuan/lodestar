@@ -10,10 +10,11 @@
 - Codex 的 `Selected model is at capacity` 按用户要求持续退避重试（5s 起、60s 封顶），保留当前任务和模型，直到成功或用户停止；等待状态需显示。仅在 `turn/completed` 确认失败或 `turn/start` 明确拒绝后重试，已接受的输入通过原 thread 续跑，不重放原任务；其他错误仍正常结算。
 - Claude 使用 `query()` streaming input。`permissionMode: default` 下普通工具由 `canUseTool` 放行，`AskUserQuestion` 等待回答；保留 `task_*`、`compact_boundary`、resume/fork 和项目配置。
 - DSH 通过 `dsh-runtime.ts` 启动锁定版本的 Node runtime，`dsh-bridge.ts` 直接调用原生 Agent/持久化/提问服务。恢复点与结果分别经过 flush；只以真实结束原因结算。取消原因须保持不可变，避免 Node fetch 附加 stack 后被原生日志拒绝。
-- DSH 模型目录和 effort 来自原生 LLM 服务；同轮请求固定路由。`DSH_LODESTAR_AGENT_CONTEXT` 由 ShellEnv 仅注入运行时根 Agent，原生子 Agent 不能继承主会话 capability 或继续委派。
+- DSH 模型能力和 effort 来自原生 LLM 服务；`dsh-glm` 以 GLM Coding Plan 接口模型与原生 pi-ai 目录交叉核验，未知能力显示 MISS。同轮请求固定路由，`LODESTAR_DSH_*` 由选定来源注入，不能串用 DeepSeek/GLM 凭据。`DSH_LODESTAR_AGENT_CONTEXT` 由 ShellEnv 仅注入运行时根 Agent，原生子 Agent 不能继承主会话 capability 或继续委派。
 - DSH/SDK 子工具的返回值可能是内容块数组，后台卡须先规范成文本摘要。图片编码按字节判断，不能信任飞书下载文件的 `.png` 后缀。桥接致命错误不得伪装成预期退出。
-- Token Source factory 管理 enabled、模型刷新、spawn env、模型解析、settings 来源和额度。GLM/DeepSeek 清除冲突 Anthropic env 后注入凭据，默认读取 project/local；native 读取 user。跨 source 必须换进程。
-- 主会话的模型面板是 source → model → effort。同源设置走 `setModelSettings`；跨 provider/source 或 Claude profile 的切换在 turn、开卡或排队期间拒绝，空闲时终止不匹配进程。
+- Token Source factory 管理 enabled、模型刷新、spawn env、模型解析、settings 来源和额度。GLM/DeepSeek/OpenRouter 清除冲突 Anthropic env 后注入凭据，默认读取 project/local；native 读取 user。跨 source 必须换进程。OpenRouter 默认九模型，排除 OpenAI/GLM/DeepSeek，MD 可增删且空列表必须持久化；账户余额取 `/credits` 的 `total_credits - total_usage`，不改用 `/key` 的限额或用量。`default` effort 表示不发该参数，需按 `modelEnvironmentRevision` 比较启动环境，不能简化为省略 SDK 选项或原进程直接改环境。
+- 主会话 MD 按 Agent 分组 source，再进入 model → effort。`withModelVisibility` 区分接口项和补录项：接口项显示/隐藏；所有来源的 `custom_models` 支持补录/删除。未知能力只保留 MISS 记录，不能猜 effort；上游收录同名模型后按接口项管理。OpenRouter 维护默认九项起步的显式列表，其余来源跟随接口目录并过滤 `hidden_models`。隐藏不改运行配置；删除补录项须保护正在选用的会话，并清理悬空默认/slots。同源设置走 `setModelSettings`；跨 provider/source 或 Claude profile 的切换在 turn、开卡或排队期间拒绝，空闲时终止不匹配进程。
+- `md` 先等待目录刷新再生成账号卡，刷新失败显示 MISS，不能将加载中清空的数组显示为零模型。`debug-model.ts` 仅为本机模型测试提供白名单事件与脱敏状态；实际动作仍经过 daemon 的正常 Card action 队列。
 - `fk`、`bk` 和进程停止后的 `rs` 使用原生会话能力：Claude transcript + `forkSession/resumeSessionAt`，Codex `thread/list` + `thread/fork(lastTurnId)`。checkpoint 包含 provider、源会话、cwd 和原生锚点。Claude fork 在首条输入前保存 pending launch，得到新 session id 后才清除。不得扫描或复制 Codex rollout，也不能把 fork 失败当成 resume。
 
 ## 委派 Agent
@@ -30,6 +31,7 @@
 ## 卡片与持久化
 
 - 生产 Card Kit mutation 经 per-card queue，在执行时分配 sequence。需要据结果更新 rendered 或持久状态的事务使用 checked API。
+- footer 模型标识共用 `footerModelLabel`：小写 `claude` / `codex` / `dsh` 加 ` · 模型名/effort`。窗口额度保留 `4.1h·7%·[6.9d·17%]` 的原紧凑格式，不增加“额度 / 已用 / 周期标签 / 月度工具”等文字；余额使用结构化快照与 `unifiedUsageSummary`。不将 `planLabel` 当金额，不附加套餐、累计消费或括号说明；失败显示 MISS。
 - 卡片必须先 `recordCardCreated` 再写入；关闭后的迟到写入不能隐式重建状态。分页没有整轮次数上限；单项失败与续卡失败不能封死整轮，后续实际内容可再次写入。
 - 公式在 Markdown code range 外识别：简单 inline 转 Unicode，其余经 MathJax → SVG → Resvg。中文使用 SVG `<text>` 和系统字体；不使用字符占位或 path swap。
 - 含公式的段落由固定 id 的顶层 `column_set` 承载，先放原始 Markdown，渲染后以一次 checked PUT 替换有序的 markdown/image 子元素。失败保留原文，不逐图追加或触发整卡换卡。

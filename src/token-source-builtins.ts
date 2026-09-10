@@ -9,13 +9,16 @@ import {
   tokenSourceFactories,
 } from './token-source'
 import { readClaudeSettingsEnv } from './glm-usage'
+import { withModelVisibility } from './token-source-visibility'
 
 // provider 模块 —— import 即登记到 factory registry(副作用)。
 import './token-source-codex'
 import './token-source-glm'
 import './token-source-native'
 import './token-source-deepseek'
+import './token-source-openrouter'
 import './token-source-dsh'
+import './token-source-dsh-glm'
 
 /** 遍历已登记 factory 构建 source 实例,注册到 instance registry。
  *  daemon 启动调;飞书改 token source 配置后也可重调(热更新)。 */
@@ -28,7 +31,7 @@ export function buildTokenSourcesFromConfig(): number {
     const cfg = def.configSectionId ? ((config.token_sources ?? {})[def.configSectionId] ?? {}) : {}
     // config.toml 没配时,若本机 settings.json 命中本 source 的 detect host,自动启用(凭据从 settings.json 取)
     const detected = def.detect?.fromSettingsEnv(settingsEnv) ?? null
-    const source = def.build(cfg, detected)
+    const source = withModelVisibility(def.build(cfg, detected), cfg)
     source.spawnRevision = tokenSourceSpawnRevision(def.kind, cfg, detected)
     return source
   })
@@ -38,7 +41,7 @@ export function buildTokenSourcesFromConfig(): number {
     const hasClaudeSource = sources.some(s => s.agent === 'claude' && s.enabled && s.kind !== 'claude-native')
     native.enabled = !hasClaudeSource
     native.modelCatalogState = {
-      status: native.enabled ? 'ready' : 'disabled',
+      status: native.enabled ? 'idle' : 'disabled',
       updatedAt: Date.now(),
     }
   }

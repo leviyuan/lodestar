@@ -1,4 +1,4 @@
-import { registerTokenSourceFactory, scrubAnthropicEnv, type TokenSource } from './token-source'
+import { registerTokenSourceFactory, scrubDshEnv, tokenSourceRuntimeModels, type TokenSource } from './token-source'
 import { isDshReasoningEffort } from './agent-process'
 import { queryDshRuntime } from './dsh-runtime'
 import { DSH_HOME_DIR } from './paths'
@@ -15,11 +15,11 @@ registerTokenSourceFactory({
       enabled: !!apiKey, models: [], defaultModel: cfg.model?.trim() ?? '',
       modelCatalogState: { status: apiKey ? 'idle' : 'disabled', updatedAt: Date.now() },
       spawnEnv(base) {
-        const env = scrubAnthropicEnv(base)
-        for (const key of Object.keys(env)) if (key.startsWith('DSH_') || key.startsWith('DEEPSEEK_') || key === 'LODESTAR_DSH_NODE') delete env[key]
+        const env = scrubDshEnv(base)
         if (!apiKey) throw new Error('DeepSeek Harness API key is missing')
         env.DEEPSEEK_API_KEY = apiKey
         env.DEEPSEEK_BASE_URL = baseUrl
+        env.LODESTAR_DSH_PROVIDER = 'deepseek-official'
         if (cfg.bin) env.LODESTAR_DSH_NODE = cfg.bin
         return env
       },
@@ -53,8 +53,8 @@ registerTokenSourceFactory({
           throw error
         }
       },
-      resolveSpawnModel(model) { return source.models.find(entry => entry.model === model)?.model },
-      readUsage() { return apiKey ? fetchDeepseekBalance(baseUrl, apiKey) : Promise.resolve({ state: 'no_credentials', windows: [] }) },
+      resolveSpawnModel(model) { return tokenSourceRuntimeModels(source).find(entry => entry.model === model)?.model },
+      readUsage() { return apiKey ? fetchDeepseekBalance(baseUrl, apiKey) : Promise.resolve({ kind: 'balance', state: 'no_credentials', windows: [] }) },
     }
     return source
   },

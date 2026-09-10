@@ -22,6 +22,24 @@ export interface DshRuntimeOptions {
   patches?: string[]
 }
 
+export function dshProviderPatches(env: Record<string, string | undefined>): object[] {
+  const provider = env.LODESTAR_DSH_PROVIDER ?? 'deepseek-official'
+  if (provider === 'deepseek-official') return []
+  if (provider !== 'zai-coding-cn' && provider !== 'zai') throw new Error(`Unsupported DSH provider: ${provider}`)
+  const modelIds: unknown = env.LODESTAR_DSH_MODELS === undefined ? undefined : JSON.parse(env.LODESTAR_DSH_MODELS)
+  if (modelIds !== undefined && (!Array.isArray(modelIds) || !modelIds.every(id => typeof id === 'string' && id))) {
+    throw new Error('Invalid DSH GLM model catalog')
+  }
+  return [
+    { id: 'llm-deepseek', disabled: true },
+    { id: 'llm-pi-ai', disabled: false, config: { providers: { [provider]: {
+      apiKeyEnv: 'LODESTAR_DSH_GLM_API_KEY', baseURL: env.LODESTAR_DSH_BASE_URL,
+      reasoning: 'high', ...(Array.isArray(modelIds) ? { models: modelIds.map(id => ({ id })) } : {}),
+    } } } },
+    { id: 'agent-default-model', config: { provider, model: env.LODESTAR_DSH_DEFAULT_MODEL ?? '' } },
+  ]
+}
+
 function projectMcpRows(cwd: string, profile?: ProjectProfile): object[] {
   if (profile?.loadProjectMcp === false) return []
   let raw: string
@@ -65,6 +83,7 @@ export class DshRuntime extends EventEmitter {
     const manifestPath = require.resolve('@deepseek-ai/dsh/package.json')
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
     if (manifest.version !== DSH_VERSION) throw new Error(`DSH runtime version mismatch: expected ${DSH_VERSION}, got ${manifest.version}`)
+    const providerPatches = dshProviderPatches(opts.env)
     const home = opts.home ?? DSH_HOME_DIR
     mkdirSync(home, { recursive: true, mode: 0o700 })
     const mcp = projectMcpRows(opts.cwd, opts.profile)
@@ -78,6 +97,7 @@ export class DshRuntime extends EventEmitter {
       { id: 'skill-filesystem', config: { includeDefaultRoots: true, ...(opts.managedSkillDir ? { customSkillDirs: [opts.managedSkillDir] } : {}) } },
       { insert: [{ id: 'lodestar-bridge', name: bridge },
         { id: 'lodestar-ask-user', name: '@deepseek-ai/dsh-tool-ask-user' }, ...mcp] },
+      ...providerPatches,
     ]
     const patchPath = join(this.launchDir, 'bridge.patch.yml')
     writeFileSync(patchPath, JSON.stringify(patch), { mode: 0o600 })
