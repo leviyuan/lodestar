@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { snapshotFromReadResponse, observeRateLimitsNotification, refreshUsageFromConnection, peekUsage, invalidateCodexUsage } from './usage'
+import { snapshotFromReadResponse, observeRateLimitsNotification, refreshUsageFromConnection, peekUsage, peekSuccessfulUsage, invalidateCodexUsage } from './usage'
 
 describe('quota account isolation', () => {
   test('successful Plus reads without 5h consistently expose a full short window to footer and hi', () => {
@@ -24,15 +24,21 @@ describe('quota account isolation', () => {
     const cachedA = peekUsage('account-a'); const cachedB = peekUsage('account-b')
     expect(cachedA?.state === 'ok' && cachedA.fiveHour?.percent).toBe(10)
     expect(cachedB?.state === 'ok' && cachedB.fiveHour?.percent).toBe(80)
+    expect(cachedA).toBe(peekSuccessfulUsage('account-a'))
+    expect(cachedB).toBe(peekSuccessfulUsage('account-b'))
     invalidateCodexUsage('account-a'); invalidateCodexUsage('account-b')
   })
   test('a late response from before reauthentication cannot repopulate the cache', async () => {
+    await refreshUsageFromConnection(async () => ({ rateLimits: { primary: { usedPercent: 30, windowDurationMins: 300 } } }), 'relogin')
+    expect(peekSuccessfulUsage('relogin')).not.toBeNull()
     let release!: (value: any) => void
     const pending = refreshUsageFromConnection(() => new Promise(resolve => { release = resolve }), 'relogin')
     invalidateCodexUsage('relogin')
+    expect(peekSuccessfulUsage('relogin')).toBeNull()
     release({ rateLimits: { primary: { usedPercent: 12, windowDurationMins: 300 } } })
     expect(await pending).toBeNull()
     expect(peekUsage('relogin')).toBeNull()
+    expect(peekSuccessfulUsage('relogin')).toBeNull()
   })
 })
 
@@ -48,11 +54,26 @@ describe('quota transient failures', () => {
     expect(snapshot).toMatchObject({ state: 'ok', weekly: { percent: 19 } })
   })
 
-  test('persistent network failures stop after three attempts and remain visible', async () => {
+  test('persistent network failures remain visible and retain the successful snapshot only for startup', async () => {
+    const account = 'cached-startup'
+    const cached = await refreshUsageFromConnection(async () => ({ rateLimits: { planType: 'pro',
+      primary: { usedPercent: 30, windowDurationMins: 10080, resetsAt: 1_900_000_000 } } }), account)
     let calls = 0
-    const snapshot = await refreshUsageFromConnection(async () => { calls++; throw new Error('error sending request') })
+    const snapshot = await refreshUsageFromConnection(async () => { calls++; throw new Error('error sending request') }, account)
     expect(calls).toBe(3)
     expect(snapshot).toBeNull()
+    expect(peekUsage(account)).toBeNull()
+    expect(cached).toBe(peekSuccessfulUsage(account))
+    invalidateCodexUsage(account)
+  })
+
+  test('an invalid quota response is shown as MISS while the previous successful observation remains cached', async () => {
+    const account = 'invalid-refresh'
+    const cached = await refreshUsageFromConnection(async () => ({ rateLimits: { primary: { usedPercent: 12, windowDurationMins: 300 } } }), account)
+    expect(await refreshUsageFromConnection(async () => ({}), account)).toMatchObject({ state: 'network' })
+    expect(peekUsage(account)).toMatchObject({ state: 'network' })
+    expect(cached).toBe(peekSuccessfulUsage(account))
+    invalidateCodexUsage(account)
   })
 
   test('authentication failures are reported immediately', async () => {

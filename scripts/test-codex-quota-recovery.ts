@@ -76,8 +76,11 @@ writeFileSync(join(home, 'config.toml'), [
   'env_http_headers = { "X-Lodestar-Test-Account" = "LODESTAR_TEST_QUOTA_ACCOUNT" }',
   `[projects.${JSON.stringify(cwd)}]`, 'trust_level = "trusted"', '',
 ].join('\n'))
+const cachedQuotas = new Map(ids.map(id => [id, snapshotFromReadResponse(limits(id))]))
+let quotaReads = 0
 const scheduler = new CodexAccountScheduler({ accounts: () => codexAccounts.list(),
-  usage: async id => snapshotFromReadResponse(limits(id)), identity: id => id,
+  usage: async id => { quotaReads++; return snapshotFromReadResponse(limits(id)) },
+  cachedUsage: id => cachedQuotas.get(id) ?? null, identity: id => id,
   compatible: async () => null, pendingLogin: () => false, now: Date.now, stateFile: join(root, 'blocks.json') })
 const osEnv = Object.fromEntries(['PATH', 'HOME', 'USER', 'TMPDIR', 'SystemRoot', 'ComSpec', 'APPDATA', 'LOCALAPPDATA']
   .map(key => [key, process.env[key]]))
@@ -103,6 +106,7 @@ try {
   })
   void done.catch(() => {})
   proc.sendInitialize(); await proc.initializationPromise()
+  assert.equal(quotaReads, 0, 'startup queried quota despite having a usable cache')
   const thread = proc.sessionId
   proc.sendUserText('Append exactly one done line to exactly-once.txt, then report success. Preserve completed work after any quota interruption.')
   await done

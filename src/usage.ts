@@ -64,7 +64,16 @@ export type UsageSnapshot =
     }
 
 const caches = new Map<string, UsageSnapshot>()
+// Startup may use the last successful observation even when a later quota query fails.
+// Keep it separate from the latest result so hi/footer still report that failure.
+const successfulCaches = new Map<string, Extract<UsageSnapshot, { state: 'ok' }>>()
 const inFlights = new Map<string, Promise<UsageSnapshot>>()
+
+function cacheUsage(accountId: string, snapshot: UsageSnapshot): void {
+  caches.set(accountId, snapshot)
+  if (snapshot.state === 'ok') successfulCaches.set(accountId, snapshot)
+  else if (snapshot.state === 'no_credentials' || snapshot.state === 'auth_failed') successfulCaches.delete(accountId)
+}
 
 export class AppServerOnce extends EventEmitter {
   private proc: ChildProcessByStdio<Writable, Readable, Readable>
@@ -355,6 +364,11 @@ export function peekUsage(accountId = DEFAULT_CODEX_ACCOUNT): UsageSnapshot | nu
   return caches.get(accountId) ?? null
 }
 
+/** Startup scheduling only: no request, no TTL, and never substitutes for a fresh UI read. */
+export function peekSuccessfulUsage(accountId = DEFAULT_CODEX_ACCOUNT): Extract<UsageSnapshot, { state: 'ok' }> | null {
+  return successfulCaches.get(accountId) ?? null
+}
+
 export function readUsage(accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot> {
   const pending = inFlights.get(accountId)
   if (pending) return pending
@@ -365,17 +379,15 @@ export function readUsage(accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnaps
       return { state: 'network', reason: String(e) }
     }).then((snapshot): UsageSnapshot => {
       if ((usageGenerations.get(accountId) ?? 0) !== generation) return { state: 'auth_failed' }
-      caches.set(accountId, snapshot)
+      cacheUsage(accountId, snapshot)
       return snapshot
     }).finally(() => { if (inFlights.get(accountId) === promise) inFlights.delete(accountId) })
   inFlights.set(accountId, promise)
   return promise
 }
 
-/** 用现有 codex app-server 连接拉权威快照并整体替换 cache。给 turn 收尾
- * 用(通知只当失效信号):不 spawn 新进程,毫秒级;失败返回 null 让
- * 调用方省略额度段(no_fallbacks,不拿旧值冒充——cache 保留但 footer
- * 按调用方约定处理)。 */
+/** 用现有连接刷新额度；失败返回 null，hi/footer 显示 MISS。
+ * 上次成功快照单独保留给启动选号，重新登录时一起失效。 */
 export function refreshUsageFromConnection(request: (method: string, params: any) => Promise<any>, accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot | null> {
   const pending = refreshInFlights.get(accountId)
   if (pending) return pending
@@ -384,7 +396,7 @@ export function refreshUsageFromConnection(request: (method: string, params: any
     .then((limitsRes: any) => {
       if ((usageGenerations.get(accountId) ?? 0) !== generation) return null
       const snap = snapshotFromReadResponse(limitsRes)
-      if ((usageGenerations.get(accountId) ?? 0) === generation) caches.set(accountId, snap)
+      if ((usageGenerations.get(accountId) ?? 0) === generation) cacheUsage(accountId, snap)
       if (snap.state !== 'ok') log(`usage: refresh from connection: ${snap.state === 'network' ? snap.reason : snap.state}`)
       return snap
     })
@@ -403,6 +415,7 @@ const usageGenerations = new Map<string, number>()
 export function invalidateCodexUsage(accountId: string): void {
   usageGenerations.set(accountId, (usageGenerations.get(accountId) ?? 0) + 1)
   caches.delete(accountId)
+  successfulCaches.delete(accountId)
   inFlights.delete(accountId)
   refreshInFlights.delete(accountId)
 }

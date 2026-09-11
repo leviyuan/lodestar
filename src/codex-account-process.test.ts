@@ -74,6 +74,7 @@ describe('Codex account process ownership and recovery', () => {
   })
   test('accepted quota failure resumes the same thread after confirmed exit, without replaying input/files', async () => {
     const h = harness(); h.proc.sendInitialize(); await h.proc.initializationPromise()
+    expect(h.options[0].preferCachedUsage).toBe(true)
     h.proc.sendUserText('perform one irreversible operation', ['/private/input'])
     h.children[0].emit('assistant_text', { text: 'work already done' })
     h.children[0].quota(); await flush()
@@ -142,6 +143,7 @@ describe('Codex account process ownership and recovery', () => {
     h.proc.sendUserText('queued original'); await h.proc.quotaWaitPromise()
     expect(h.events).toEqual([]); expect(h.children).toHaveLength(0); expect(h.proc.turnRetry?.reason).toBe('quota')
     resume(); await h.proc.initializationPromise()
+    expect(h.options.map(opts => opts.preferCachedUsage)).toEqual([true, false])
     expect(h.events).toEqual(['init']); expect(h.children[0].sent.map(s => s.text)).toEqual(['queued original'])
   })
   test('stop while all accounts are exhausted cancels the wait and never resumes later', async () => {

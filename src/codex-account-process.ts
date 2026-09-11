@@ -99,12 +99,13 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
   }
   private async choose(preferred?: string | null, failedAccountId?: string): Promise<CodexAccountDecision & { selected: CodexAccountCandidate }> {
     const options: CodexSelectionOptions = { model: this.opts.model || this.lastModel || '', effort: this.opts.effort ?? this.lastEffort ?? undefined,
-      preferred, failedAccountId, signal: this.lifetime.signal }
+      preferred, failedAccountId, preferCachedUsage: true, signal: this.lifetime.signal }
     while (true) {
       const decision = await this.scheduler().choose(options)
       delete options.failedAccountId
       this.lifetime.signal.throwIfAborted()
       if (decision.selected) return { ...decision, selected: decision.selected }
+      options.preferCachedUsage = false
       const detail = decision.candidates.map(c => `${c.account.name}：${c.reason ?? c.state}`).join('；')
       if (decision.retryAt === undefined) throw new Error(`没有可用的 Codex 账号；${detail}`)
       const delay = Math.max(1000, Math.min(60_000, decision.retryAt - Date.now()))
@@ -130,7 +131,7 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
     bindProcessCodexAccount(this, decision.selected.account.id, false)
     this.wire(child)
     this.emit('codex_account_changed', { accountId: decision.selected.account.id, previousAccountId,
-      diagnostics: decision.candidates.filter(c => c.state === 'miss' && !c.duplicateOf)
+      diagnostics: decision.candidates.filter(c => c.usage !== null && c.state === 'miss' && !c.duplicateOf)
         .map(c => `${c.account.name}：${c.reason}`) })
     this.lifetime.signal.throwIfAborted()
     child.sendInitialize()

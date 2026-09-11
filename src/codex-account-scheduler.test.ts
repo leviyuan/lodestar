@@ -13,18 +13,68 @@ function quota(plan: string, used = 0, hours = 24): Extract<UsageSnapshot, { sta
   return { state: 'ok', subscriptionType: plan, fiveHour: null,
     weekly: { percent: used, resetsAt: new Date(NOW + hours * 3_600_000), durationMins: 10080 }, fetchedAt: NOW }
 }
-function harness(input: Record<string, UsageSnapshot>) {
+function harness(input: Record<string, UsageSnapshot>, cached: Record<string, UsageSnapshot> = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codex-scheduling-')); roots.push(root)
   const stateFile = join(root, 'blocks.json')
   const unavailable = new Map<string, string>()
   const pending = new Set<string>()
   const scheduler = new CodexAccountScheduler({ accounts: () => Object.keys(input).map(id => ({ id, name: id })),
-    usage: async id => input[id], identity: id => id, compatible: async id => unavailable.get(id) ?? null,
+    usage: async id => input[id], cachedUsage: id => cached[id] ?? null,
+    identity: id => id, compatible: async id => unavailable.get(id) ?? null,
     pendingLogin: id => pending.has(id), now: () => NOW, stateFile })
   return { scheduler, input, unavailable, pending, stateFile }
 }
 
 describe('weekly quota scheduling', () => {
+  test('startup ranks successful caches without querying quota or waiting for uncached accounts', async () => {
+    const cached = { plus: quota('plus'), pro: { ...quota('pro'), fetchedAt: NOW - 12 * 3600_000 } }
+    const h = harness({ plus: { state: 'network' }, pro: { state: 'network' }, cold: { state: 'network' } }, cached)
+    const reader = spyOn((h.scheduler as any).deps, 'usage').mockRejectedValue(new Error('quota endpoint unavailable'))
+    const choice = await h.scheduler.choose({ model: 'model', preferCachedUsage: true })
+    expect(choice.selected?.account.id).toBe('pro')
+    expect(choice.selected?.usage).toBe(cached.pro)
+    expect(choice.candidates.find(c => c.account.id === 'cold')?.usage).toBeNull()
+    expect(reader).not.toHaveBeenCalled()
+  })
+  test('explicit quota queries still refresh and report errors despite a successful startup cache', async () => {
+    const h = harness({ pro: { state: 'network', reason: 'quota request failed' } }, { pro: quota('pro') })
+    const reader = spyOn((h.scheduler as any).deps, 'usage')
+    const choice = await h.scheduler.choose({ model: 'model' })
+    expect(reader).toHaveBeenCalledTimes(1)
+    expect(choice.selected).toBeNull()
+    expect(choice.candidates[0]).toMatchObject({ state: 'miss', reason: 'quota request failed' })
+  })
+  test('missing, expired or exhausted caches refresh when none can supply a launch candidate', async () => {
+    const cases: Array<Record<string, UsageSnapshot>> = [{}, { pro: quota('pro', 0, 0) }, { pro: quota('pro', 100) }]
+    for (const cached of cases) {
+      const h = harness({ pro: quota('pro') }, cached)
+      const reader = spyOn((h.scheduler as any).deps, 'usage')
+      expect((await h.scheduler.choose({ model: 'model', preferCachedUsage: true })).selected?.account.id).toBe('pro')
+      expect(reader).toHaveBeenCalledTimes(1)
+    }
+  })
+  test('cached quota cannot clear confirmed exhaustion, even if its old percentage is lower', async () => {
+    const h = harness({ pro: quota('pro', 80), plus: quota('plus') }, { pro: quota('pro', 10), plus: quota('plus') })
+    h.scheduler.block((await h.scheduler.choose({ model: 'model' })).selected!, 'model')
+    const reader = spyOn((h.scheduler as any).deps, 'usage')
+    const cached = await h.scheduler.choose({ model: 'model', preferCachedUsage: true })
+    expect(cached.selected?.account.id).toBe('plus')
+    expect(cached.candidates[0].state).toBe('exhausted')
+    expect(JSON.parse(readFileSync(h.stateFile, 'utf8')).blocks).toHaveLength(1)
+    expect(reader).not.toHaveBeenCalled()
+    h.input.pro = quota('pro', 10)
+    expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('pro')
+    expect(JSON.parse(readFileSync(h.stateFile, 'utf8')).blocks).toEqual([])
+  })
+  test('cached startup still checks login, identity, model compatibility and Ultra eligibility', async () => {
+    const cached = { one: { ...quota('pro'), accountFingerprint: 'same' },
+      alias: { ...quota('pro'), accountFingerprint: 'same' }, badModel: quota('pro'), loggingIn: quota('pro'), plus: quota('plus') }
+    const h = harness(cached, cached)
+    h.unavailable.set('badModel', 'effort unavailable'); h.pending.add('loggingIn')
+    const choice = await h.scheduler.choose({ model: 'model', effort: 'ultra', preferCachedUsage: true })
+    expect(choice.selected?.account.id).toBe('one')
+    expect(choice.candidates.map(c => c.state)).toEqual(['ready', 'miss', 'miss', 'miss', 'excluded'])
+  })
   test('weights quota by 1 / 5 / 20, caps Plus by its short window, and always picks the highest score', async () => {
     const { scheduler } = harness({ plus: quota('plus', 0, 10), five: quota('prolite', 50, 10), twenty: quota('pro', 75, 10) })
     const normal = await scheduler.choose({ model: 'gpt-6-astra', effort: 'max' })
