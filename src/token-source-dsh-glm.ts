@@ -1,11 +1,12 @@
 import { config, type TokenSourceConfig } from './config'
 import { isDshReasoningEffort } from './agent-process'
-import { registerTokenSourceFactory, scrubDshEnv, tokenSourceRuntimeModels, type TokenSource, type TokenSourceModel } from './token-source'
+import { registerTokenSourceFactory, scrubDshEnv, tokenSourceRuntimeModels, type TokenSource } from './token-source'
 import { queryDshRuntime } from './dsh-runtime'
 import type { DshModel } from './dsh-protocol'
 import { DSH_HOME_DIR } from './paths'
 import { fetchGlmUsage, isGlmBaseUrl } from './glm-usage'
 import { glmUsageToUnified } from './token-source-glm'
+import { modelList, customModelEfforts } from './token-source-visibility'
 
 /** Coding Plan 的 OpenAI 入口，与 Claude 的 Anthropic 入口共用同一账号。 */
 export function glmCodingBaseUrl(raw: string): string {
@@ -46,6 +47,7 @@ registerTokenSourceFactory({
     const source: TokenSource = {
       id: 'dsh-glm', kind: 'dsh-glm', agent: 'dsh', display: cfg.display?.trim() || 'GLM Coding Plan',
       enabled: !!key, models: [], defaultModel: cfg.model?.trim().toLowerCase() ?? '',
+      modelEnvironmentRevision() { return JSON.stringify([...(allowedModels ?? [])].sort()) },
       modelCatalogState: { status: key ? 'idle' : 'disabled', updatedAt: Date.now() },
       spawnEnv(baseEnv) {
         if (!key) throw new Error('DSH GLM Coding Plan API key is missing')
@@ -63,26 +65,27 @@ registerTokenSourceFactory({
         if (!source.enabled) { source.modelCatalogState = { status: 'disabled', updatedAt: Date.now() }; return }
         source.modelCatalogState = { status: 'loading', updatedAt: null }
         try {
-          const [account, native]: [Awaited<ReturnType<typeof fetchGlmCodingModels>>, DshModel[]] = await Promise.all([
-            fetchGlmCodingModels(base, key),
-            queryDshRuntime({ cwd: DSH_HOME_DIR, env: source.spawnEnv(process.env), profile: { loadProjectMcp: false } }, 'model/list'),
-          ])
-          source.models = account.map(entry => {
-            const match = native.find(model => model.model === entry.model)
-            const efforts = match?.efforts.filter(isDshReasoningEffort) ?? []
-            if (!match || !efforts.length) return { ...entry, efforts: [], defaultEffort: null,
-              unavailableReason: 'DSH 原生目录未声明此模型的能力' } satisfies TokenSourceModel
-            const effort = cfg.effort?.trim() || match.defaultEffort
-            return { ...entry, display: match.display, efforts,
-              defaultEffort: isDshReasoningEffort(effort) && efforts.includes(effort) ? effort : null }
-          })
-          allowedModels = source.models.filter(model => !model.unavailableReason).map(model => model.model)
-          if (!allowedModels.length) throw new Error('账号模型与 DSH 原生能力目录没有可用交集')
+          const account = await fetchGlmCodingModels(base, key)
+          const entries = [...account]
+          for (const model of [...modelList(cfg.models), ...modelList(cfg.custom_models)]) {
+            if (!entries.some(entry => entry.model.toLowerCase() === model.toLowerCase())) entries.push({ model, display: model })
+          }
+          allowedModels = entries.map(entry => entry.model)
           if (!cfg.model?.trim()) {
             const version = (id: string) => Number(id.match(/\d+(?:\.\d+)?/)?.[0] ?? -1)
-            source.defaultModel = [...allowedModels].sort((a, b) => version(b) - version(a))[0]!
+            source.defaultModel = [...account].sort((a, b) => version(b.model) - version(a.model))[0]!.model
           }
-          if (!allowedModels.includes(source.defaultModel)) throw new Error('DSH GLM 默认模型未获账号及原生目录确认')
+          const native: DshModel[] = await queryDshRuntime({ cwd: DSH_HOME_DIR,
+            env: source.spawnEnv(process.env), profile: { loadProjectMcp: false } }, 'model/list')
+          source.models = entries.map(entry => {
+            const match = native.find(model => model.model === entry.model)
+            const request = customModelEfforts(source, cfg)
+            const efforts = match ? match.efforts.filter(isDshReasoningEffort) : request.efforts
+            const effort = cfg.effort?.trim() || match?.defaultEffort || request.defaultEffort
+            return { ...entry, display: match?.display ?? entry.display, efforts,
+              defaultEffort: isDshReasoningEffort(effort) && efforts.includes(effort) ? effort : null,
+              origin: account.some(item => item.model === entry.model) ? 'upstream' as const : 'custom' as const }
+          })
           source.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
         } catch (error) {
           source.models = []; allowedModels = []

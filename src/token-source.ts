@@ -14,11 +14,11 @@ export interface TokenSourceModel {
   model: string
   display: string
   efforts: AgentReasoningEffort[]
-  /** null 表示上游未声明后端可用的默认档位，不能替换成猜测值。 */
+  /** 模型默认或用户/Agent 选定的请求档位；null 表示需要手动选择。 */
   defaultEffort: AgentReasoningEffort | null
   /** 真实 turn 已观测到 1M 上下文；undefined 表示未确认，仅供面板展示。 */
   context1m?: boolean
-  /** 显式选入但未获上游目录确认的模型，仅作为 MISS 项展示，不能启动。 */
+  /** 账号或业务规则明确拒绝的模型；目录外的手动补录不因此禁用。 */
   unavailableReason?: string
   origin?: 'upstream' | 'custom'
 }
@@ -56,6 +56,8 @@ export interface UsageSnapshotUnified {
   windows: UsageWindowUnified[]
   reason?: string
   fetchedAt?: number
+  /** Codex 账号可用的额度重置卡次数，仅在 hi 中展示。 */
+  resetCredits?: number | null
 }
 
 // ── env helper(各 source 共享:scrub 残留凭据防 A 账号夹带 B 的 key) ─────
@@ -112,7 +114,7 @@ export interface TokenSource {
   /** 启动/刷新时拉模型填 models。失败如实留空(MISS),绝不假数据。 */
   refreshModels(): Promise<void>
   /** 面板手动补录模型名时的存在性校验(端点 200/1214 判别)。
-   *  未声明时允许登记补录记录，但能力未知的模型保持 MISS。 */
+   *  未声明时允许手动补录并选择 Agent 请求档位，实际请求错误由后端报告。 */
   verifyModel?(model: string): Promise<'exists' | 'not_found' | 'no_verdict'>
   validateCustomModelId?(model: string): void
   spawnEnv(base: Env, model?: string): Env

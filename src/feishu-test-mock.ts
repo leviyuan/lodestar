@@ -17,6 +17,11 @@ import type { ConversationBranchBase, PendingConversationLaunch } from './conver
 export const sentCards: object[] = []
 export const sentTexts: string[] = []
 export const sentRawTexts: string[] = []
+export const sentImages: Array<[string, string]> = []
+export const uploadedImages: string[] = []
+export const sentLocalFiles: Array<[string, string]> = []
+let imageUploadHandler: ((path: string) => Promise<string | null>) | null = null
+export function setImageUploadHandler(handler: ((path: string) => Promise<string | null>) | null): void { imageUploadHandler = handler }
 export const updatedCards: Array<[string, object]> = []
 export const addedReactions: Array<[string, string]> = []
 export const deletedReactions: Array<[string, string]> = []
@@ -50,7 +55,7 @@ export const projectProfiles = new Map<string, { cwd?: string }>()
 export function resetFeishuMock(): void {
   for (const arr of [
     sentCards, sentTexts, sentRawTexts, updatedCards, addedReactions, deletedReactions, boundResumes, clearedResumes, urgentPushes,
-    clearedTurnAnchorSessions, seededTurnAnchors,
+    clearedTurnAnchorSessions, seededTurnAnchors, sentImages, uploadedImages, sentLocalFiles,
   ]) {
     arr.length = 0
   }
@@ -61,6 +66,7 @@ export function resetFeishuMock(): void {
   resumeWriteError = null
   turnAnchorWriteError = null
   updateCardHandler = null
+  imageUploadHandler = null
   branchBaseBySession.clear()
   pendingConversationLaunchBySession.clear()
 }
@@ -74,6 +80,12 @@ mock.module('./feishu', () => ({
   },
   getSessionModelSelection: (sessionName: string) => modelSelections.get(sessionName) ?? null,
   getTenantToken: async () => 'tenant-token',
+  uploadImageKey: async (path: string) => {
+    uploadedImages.push(path)
+    return imageUploadHandler ? imageUploadHandler(path) : 'img_generated'
+  },
+  sendImage: async (chatId: string, key: string) => { sentImages.push([chatId, key]); return `om_image_${sentImages.length}` },
+  uploadAndSend: async (chatId: string, path: string) => { sentLocalFiles.push([chatId, path]); return true },
   preferredChatForSession: new Map(),
   sendCard: async (_chatId: string, card: object) => {
     sentCards.push(card)

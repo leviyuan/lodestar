@@ -44,7 +44,7 @@ function runSelectionTest(work: string): void {
   } finally { rmSync(root, { recursive: true, force: true }) }
 }
 
-test('concurrent model additions preserve the nine defaults and both new selections', () => {
+test('concurrent model additions preserve all defaults and both new selections', () => {
   runSelectionTest(`
     await Promise.all([
       editTokenSourceModels('openrouter', 'qwen/extra-a', 'add'),
@@ -55,7 +55,7 @@ test('concurrent model additions preserve the nine defaults and both new selecti
     await assert.rejects(editTokenSourceModels('openrouter', 'openai/excluded', 'add'), /允许添加/)
     await assert.rejects(editTokenSourceModels('openrouter', 'unknown/model', 'add'), /允许添加/)
     await assert.rejects(editTokenSourceModels('openrouter', 'qwen/extra-a', 'add'), /已在/)
-    assert.equal(source().models.length, 11)
+    assert.equal(source().models.length, defaults.length + 2)
   `)
 })
 
@@ -92,7 +92,7 @@ test('a saved edit reports refresh failure and clears stale model capabilities',
     assert.deepEqual(source().modelSelection.availableModels, [])
     httpFailure = false
     await source().refreshModels()
-    assert.equal(source().models.length, 10)
+    assert.equal(source().models.length, defaults.length + 1)
   `)
 })
 
@@ -125,7 +125,7 @@ test('the MD panel adds and removes models, rejects forged actions and keeps an 
     assert.equal((await session.onModelListEdit('panel', 'openrouter', 'openai/excluded', 'add')).ok, false)
     assert.equal((await session.onModelListEdit('panel', 'openrouter', 'qwen/extra-a', 'add')).ok, true)
     assert.equal(peer.modelPanels.has('other'), false)
-    assert.equal(source().models.length, 10)
+    assert.equal(source().models.length, defaults.length + 1)
     session.selectedProvider = 'claude'
     session.selectedTokenSourceId = 'openrouter'
     session.selectedModel = 'qwen/extra-a'

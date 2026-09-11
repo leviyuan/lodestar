@@ -5,6 +5,7 @@ import {
   modelSelections, sentCards, sentRawTexts, sentTexts, updatedCards, urgentPushes,
   setResumeWriteError, setTurnAnchorWriteError, setUpdateCardHandler,
   turnAnchorsBySession, resumeRefs, pendingConversationLaunchBySession,
+  sentImages, uploadedImages, sentLocalFiles, setImageUploadHandler,
 } from './feishu-test-mock'
 
 const { Session } = await import('./session')
@@ -218,6 +219,112 @@ async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<vo
     await new Promise(resolve => setTimeout(resolve, 1))
   }
 }
+
+describe('generated image delivery', () => {
+  test('card rotation waits for the generated image on the old tool card', async () => {
+    const session = new Session('image-rotation', 'chat_id') as any
+    const oldCardId = 'card_image_rotation_old'
+    const turn = turnState(oldCardId)
+    session.currentTurn = turn
+    cardkit.recordCardCreated(oldCardId, 1)
+    let release!: (key: string) => void
+    setImageUploadHandler(() => new Promise(resolve => { release = resolve }))
+    try {
+      sessionTools.addTool(session, 'image-call', 'ImageGeneration', { revisedPrompt: 'Prompt before rotation' })
+      sessionTools.completeTool(session, 'image-call', '/tmp/rotated-image.png', false)
+      await cardkit.flush(oldCardId)
+      session.startMidTurnRotate(turn)
+      await waitUntil(() => turn.cardId !== oldCardId)
+      const rotating = turn.rotating
+      expect(rotating).not.toBeNull()
+      release('img_before_rotation')
+      await rotating
+      expect(calls.some(call => call.path === `/cards/${oldCardId}/elements/tool_0` && String(call.body?.element).includes('img_before_rotation'))).toBe(true)
+      expect(sentImages).toEqual([])
+      expect(turn.outboundSentPaths.has('/tmp/rotated-image.png')).toBe(true)
+    } finally {
+      release?.('img_before_rotation')
+      if (turn.rotating) await turn.rotating
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(oldCardId); await cardkit.dispose(turn.cardId); session.dispose()
+    }
+  })
+
+  test('renders the completed prompt and picture in the tool fold without a separate image message', async () => {
+    const session = new Session('image-fold', 'chat_id') as any
+    const turn = turnState('card_image_fold')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    try {
+      sessionTools.addTool(session, 'image-call', 'ImageGeneration', { status: 'inProgress', prompt: 'Original prompt' })
+      sessionTools.completeTool(session, 'image-call', '/tmp/generated.png', false, { status: 'completed', revisedPrompt: 'Actual image prompt' })
+      await sessionTools.waitForImageDeliveries(turn)
+      await cardkit.flush(turn.cardId)
+      const update = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/elements/tool_0')).at(-1)!
+      const element = JSON.parse(update.body.element)
+      expect(element.expanded).toBe(false)
+      expect(element.header.title.content).not.toContain('Actual image prompt')
+      expect(element.elements[0].content).toContain('Original prompt')
+      expect(element.elements[0].content).toContain('Actual image prompt')
+      expect(element.elements[1]).toMatchObject({ tag: 'img', img_key: 'img_generated', preview: true })
+      expect(uploadedImages).toEqual(['/tmp/generated.png'])
+      expect(sentImages).toEqual([])
+      expect(turn.outboundSentPaths.has('/tmp/generated.png')).toBe(true)
+      session.sendOutboundPath('/tmp/generated.png', 'duplicate marker')
+      expect(sentLocalFiles).toEqual([])
+    } finally { session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+
+  test('a rejected inline image uses the already uploaded image as one standalone message', async () => {
+    const session = new Session('image-separate', 'chat_id') as any
+    const turn = turnState('card_image_separate')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const normalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'PUT' && String(init.body).includes('img_generated')) {
+        return Response.json({ code: 200570, msg: 'inline image rejected' })
+      }
+      return normalFetch(input, init)
+    }) as typeof fetch
+    try {
+      sessionTools.addTool(session, 'image-call', 'ImageGeneration', { revisedPrompt: 'Prompt stays folded' })
+      sessionTools.completeTool(session, 'image-call', '/tmp/generated.png', false)
+      await sessionTools.waitForImageDeliveries(turn)
+      expect(sentImages).toEqual([['chat_id', 'img_generated']])
+      expect(uploadedImages).toHaveLength(1)
+      expect(sentLocalFiles).toEqual([])
+      const update = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/elements/tool_0')).at(-1)!
+      expect(JSON.parse(update.body.element).elements[0].content).toContain('图片已单独发送')
+    } finally { globalThis.fetch = normalFetch; session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+
+  test('turn close waits for image delivery before retiring its card', async () => {
+    const session = new Session('image-close', 'chat_id') as any
+    const turn = turnState('card_image_close')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    session.selectedProvider = 'codex'; session.selectedTokenSourceId = null
+    session.currentTokenSource = () => undefined
+    cardkit.recordCardCreated(turn.cardId, 1)
+    let release!: (key: string) => void
+    setImageUploadHandler(() => new Promise(resolve => { release = resolve }))
+    try {
+      sessionTools.addTool(session, 'image-call', 'ImageGeneration', { revisedPrompt: 'Delayed image' })
+      sessionTools.completeTool(session, 'image-call', '/tmp/delayed.png', false)
+      let closed = false
+      const close = session.closeTurnCard().then(() => { closed = true })
+      await Bun.sleep(10)
+      expect(closed).toBe(false)
+      release('img_delayed')
+      await close
+      expect(closed).toBe(true)
+      expect(turn.outboundSentPaths.has('/tmp/delayed.png')).toBe(true)
+      expect(calls.some(call => call.method === 'PUT' && String(call.body?.element).includes('img_delayed'))).toBe(true)
+      expect(sentImages).toEqual([])
+    } finally { release?.('img_delayed'); await sessionTools.waitForImageDeliveries(turn); session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+})
 
 describe('Session fresh conversation state', () => {
   for (const provider of ['codex', 'claude'] as const) {
@@ -1535,7 +1642,8 @@ describe('Session provider switching', () => {
       expect(JSON.stringify(last.card)).toContain('vendor/model-44')
       expect(JSON.stringify(last.card)).not.toContain('vendor/model-0')
       expect((await session.onModelSelect('vendor/model-0', 'openrouter-page', '', { provider: 'claude' })).ok).toBe(false)
-      expect((await session.onModelSelect('vendor/model-44', 'openrouter-page', '', { provider: 'claude' })).ok).toBe(true)
+      // 单档位会直接应用，因此也必须检查刷新后的真实目录，不能应用旧快照。
+      expect((await session.onModelSelect('vendor/model-44', 'openrouter-page', '', { provider: 'claude' })).ok).toBe(false)
       expect((await session.onModelEffortSelect('vendor/model-44', 'high', 'openrouter-page', '', 'claude')).ok).toBe(false)
       for (const page of [-1, 3, 0.5, NaN]) expect((await session.onModelPage('openrouter-page', 'openrouter', page)).ok).toBe(false)
       expect((await session.onModelPage('openrouter-page', 'glm', 0)).ok).toBe(false)
@@ -1573,7 +1681,7 @@ describe('Session provider switching', () => {
     }
   })
 
-  test('switching between explicit and native-default effort replaces only the idle process and preserves its resume id', async () => {
+  test('selecting a native-default model skips effort and replaces only the idle process while preserving its resume id', async () => {
     const previous = listTokenSources()
     const source = { id: 'openrouter-env', kind: 'openrouter', agent: 'claude' as const, display: 'OpenRouter', enabled: true,
       spawnRevision: 'account', modelEnvironmentRevision: (model: string) => model === 'vendor/default' ? 'unset' : 'level',
@@ -1593,12 +1701,50 @@ describe('Session provider switching', () => {
       session.selectedModel = 'vendor/level'; session.selectedEffort = 'high'
       session.modelPanels.set('mode-panel', { models: [{ provider: 'claude', sourceId: source.id, model: 'vendor/default',
         displayName: 'Default', efforts: [{ effort: 'default' }] }] })
-      const result = await session.onModelEffortSelect('vendor/default', 'default', 'mode-panel', '', 'claude')
+      const result = await session.onModelSelect('vendor/default', 'mode-panel', '', { provider: 'claude' })
       expect(result.ok).toBe(true)
+      expect(JSON.stringify(result.card)).not.toContain('选择 effort')
+      expect(session.selectedModel).toBe('vendor/default')
+      expect(session.selectedTokenSourceId).toBe(source.id)
+      expect(session.modelPanels.has('mode-panel')).toBe(false)
       expect(proc.setModelSettingsCalls).toEqual([])
       expect(proc.killCalls).toBe(1)
       expect(session.selectedEffort).toBe('default')
       expect(boundResumes).toContainEqual([session.sessionName, 'preserved-session', 'claude'])
+    } finally {
+      session.dispose()
+      resetTokenSourceRegistry()
+      for (const entry of previous) registerTokenSource(entry)
+    }
+  })
+
+  test('selecting a newly registered DSH GLM model loads its new configuration and retains native history', async () => {
+    const previous = listTokenSources()
+    let catalogRevision = 'before-registration'
+    const source = { id: 'dsh-glm-new-model', kind: 'dsh-glm', agent: 'dsh' as const, display: 'GLM Coding Plan', enabled: true,
+      spawnRevision: 'account', modelEnvironmentRevision: () => catalogRevision,
+      models: ['glm-5.3', 'glm-manual'].map(model => ({ model, display: model, efforts: ['high' as const], defaultEffort: 'high' as const })),
+      defaultModel: 'glm-5.3', modelCatalogState: { status: 'ready' as const, updatedAt: 1 },
+      refreshModels: async () => {}, spawnEnv: (env: Record<string, string | undefined>) => env,
+      resolveSpawnModel: (model: string) => model, readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
+    }
+    registerTokenSource(source)
+    const session = new Session('dsh-glm-new-model', 'chat_id') as any
+    try {
+      const proc = new FakeAgentProc('dsh', 'preserved-dsh-session', source.id)
+      session.proc = proc
+      session.procSourceRevisions.set(proc, tokenSourceProcessRevision(source, 'glm-5.3'))
+      session.selectedProvider = 'dsh'; session.selectedTokenSourceId = source.id
+      session.selectedModel = 'glm-5.3'; session.selectedEffort = 'high'
+      catalogRevision = 'after-registration'
+      session.modelPanels.set('custom-model-panel', { models: [{ provider: 'dsh', sourceId: source.id, model: 'glm-manual',
+        displayName: 'Manual', efforts: [{ effort: 'high' }] }] })
+      const result = await session.onModelEffortSelect('glm-manual', 'high', 'custom-model-panel', '', 'dsh')
+      expect(result.ok).toBe(true)
+      expect(proc.setModelSettingsCalls).toEqual([])
+      expect(proc.killCalls).toBe(1)
+      expect(session.selectedModel).toBe('glm-manual')
+      expect(boundResumes).toContainEqual([session.sessionName, 'preserved-dsh-session', 'dsh'])
     } finally {
       session.dispose()
       resetTokenSourceRegistry()
@@ -1761,6 +1907,26 @@ describe('Session provider switching', () => {
     expect(result.card ? JSON.stringify(result.card) : '').toContain('选择 effort')
     expect(session.selectedModel).toBe('GLM-5.2')
     expect(session.selectedEffort).toBe('max')
+  })
+
+  test('one real effort applies directly, while an empty effort catalog cannot change the selection', async () => {
+    const session = new Session('single-effort', 'chat_id') as any
+    try {
+      session.selectedProvider = 'codex'; session.selectedTokenSourceId = 'codex-sub'
+      session.selectedModel = 'gpt-6-astra'; session.selectedEffort = 'max'
+      session.modelPanels.set('single', { models: [{ provider: 'claude', sourceId: 'glm', model: 'GLM-5.2',
+        displayName: 'GLM-5.2', efforts: [{ effort: 'max' }] }] })
+      const selected = await session.onModelSelect('GLM-5.2', 'single', '', { provider: 'claude' })
+      expect(selected.ok).toBe(true)
+      expect(session.selectedEffort).toBe('max')
+      expect(JSON.stringify(selected.card)).not.toContain('选择 effort')
+      session.modelPanels.set('empty', { models: [{ provider: 'claude', sourceId: 'glm', model: 'GLM-unknown',
+        displayName: 'GLM-unknown', efforts: [] }] })
+      const missing = await session.onModelSelect('GLM-unknown', 'empty', '', { provider: 'claude' })
+      expect(missing).toMatchObject({ ok: false, message: '模型未返回 effort' })
+      expect(session.selectedModel).toBe('GLM-5.2')
+      expect(session.selectedEffort).toBe('max')
+    } finally { session.dispose() }
   })
 
   test('preserves a persisted GLM-5.2 slug instead of rewriting it to a legacy profile key', () => {

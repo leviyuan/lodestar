@@ -31,8 +31,8 @@ jobs:
           bun-version: 1.3.11
       - name: Install locked dependencies
         run: bun install --frozen-lockfile --ignore-scripts
-      - name: Check published runtime pins
-        run: bun scripts/sync-runtime-pins.ts --check
+      - name: Check security dependency declarations
+        run: bun scripts/sync-security-deps.ts --check
       - name: Typecheck
         run: bun run typecheck
       - name: Test

@@ -26,16 +26,16 @@ Token Source 管理账号凭据、模型目录、启动环境、默认模型、e
 | Codex subscription | 使用 Codex 登录态，模型来自 app-server `model/list` |
 | GLM Coding Plan | `[token_source.glm]` 或本机 Claude settings；模型来自兼容端点，可补录已验证模型 |
 | DeepSeek | `[token_source.deepseek]` 或本机 Claude settings；模型来自兼容端点，可补录已验证模型 |
-| OpenRouter | `[token_source.openrouter]` 或本机 Claude settings；默认九家各一模型，账号目录验证能力，MD 面板维护增删 |
-| DeepSeek Harness | `[token_source.deepseek-harness]`；模型、effort 与上下文容量来自锁定版本的 DSH 原生目录 |
+| OpenRouter | `[token_source.openrouter]` 或本机 Claude settings；默认十一家各一模型，账号目录验证能力，MD 面板维护增删 |
+| DeepSeek Harness | `[token_source.deepseek-harness]`；模型、effort 与上下文容量来自当前自动更新的 DSH 原生目录 |
 | DSH GLM Coding Plan | `[token_source.dsh-glm]` 或复用 `glm`；账号接口返回模型，DSH 原生适配器提供能力和推理档位 |
 | Claude native | 沿用本机 Claude 配置，目录来自 SDK `supportedModels()`；有其他已启用的 Claude 侧来源时让位 |
 
-`model` 首页用独立的展开式折叠面板展示 `claude`、`codex`、`dsh`。每组使用浅蓝标题背景、蓝色边框及 `Agent · 名称` 标题，Token Source 行放在组内，避免两层名称混成同级列表；组 ID 由 `ELEMENTS.modelAgentGroup` 生成。选择账号后进入模型 → effort，获取失败显示 `MISS`。同 provider/source 的切换调用 `setModelSettings`：Claude 和 DSH 从后续 turn 使用，Codex 保存选择并在重启进程后应用。跨 provider/source 或需要变更项目启动配置时，只能在空闲状态更换进程。
+`model` 首页用独立的展开式折叠面板展示 Claude Code、Codex、DeepSeek Harness，模型行右侧窄按钮用单字，补录、返回和翻页等宽按钮保留完整文字。两个 Agent 下的 DeepSeek 来源都显示为 DeepSeek，协议 id 保持不变。每组使用浅蓝标题背景、蓝色边框及 `Agent · 名称` 标题，Token Source 行放在组内，避免两层名称混成同级列表；组 ID 由 `ELEMENTS.modelAgentGroup` 生成。选择账号后进入模型列表，行间加分隔线；多个档位才展示 effort 卡，只有一个档位（含原生默认）直接应用，获取失败显示 `MISS`。同 provider/source 的切换调用 `setModelSettings`：Claude 和 DSH 从后续 turn 使用，Codex 保存选择并在重启进程后应用。跨 provider/source 或需要变更项目启动配置时，只能在空闲状态更换进程。
 
 2026-09-10 已在授权测试群验证该分组样式的真实卡片：原始结构保留 `blue-50` 标题背景、粗体 Agent 名称和 `blue-100` 边框，原有账号选择回调正常，当前模型设置未改变。
 
-除 OpenRouter 保留默认九项的显式列表外，所有来源由 `withModelVisibility` 在真实接口目录上应用 `hidden_models`。接口项通过显示/隐藏调整可见性，新增上游模型自动进入列表。所有来源都支持用 `custom_models` 补录列表外模型，`origin` 区分接口项和补录项；GLM / DeepSeek 会先做端点验证，其余未确认能力的记录保留 MISS，不能运行。接口收录同名模型后按接口项管理，不重复展示。
+除 OpenRouter 保留默认十一项的显式列表外，所有来源由 `withModelVisibility` 在真实接口目录上应用 `hidden_models`。接口项通过显示/隐藏调整可见性，新增上游模型自动进入列表。所有来源都支持用 `custom_models` 补录列表外模型，`origin` 区分接口项和补录项；GLM / DeepSeek 会先做端点验证，补录模型可直接选择请求档位使用，DSH 原生解析目录外模型，其余来源使用 Agent 请求档位；不能用目录白名单挡住用户补录。接口收录同名模型后按接口项管理，不重复展示。
 
 `tokenSourceRuntimeModel(s)` 使用完整能力目录，隐藏不修改会话、`model`、`effort`、slots 或启动配置指纹。`model_custom_remove` 只删除补录项，拒绝删接口项；删除前要求会话不再选用该项，并清理默认模型和 slots 的悬空引用。补录/删除和显示/隐藏均串行写配置，旧面板失效。
 
@@ -61,10 +61,10 @@ Claude 使用 `permissionMode: default`：普通工具在 `canUseTool` 中放行
 
 - 来源 id 为 `openrouter`，通过 factory 注册 `openrouter-setup`。默认根地址 `https://openrouter.ai/api`，粘贴的 `/api/v1` 会规范成 SDK 根地址。API key 注入 `ANTHROPIC_AUTH_TOKEN`，`ANTHROPIC_API_KEY` 显式置空，模型 slug 完整透传，不自动追加 `[1m]`。
 - 主会话和委派共用 `agent-launch.ts`，将所选模型传给 `spawnEnv`。辅助角色在进程启动时绑定所选模型，可用 `slots` 配置 opus/sonnet/haiku；主模型后续切换不改动进程启动时的辅助角色。
-- 默认列表由 `src/openrouter-defaults.ts` 固定为 Arena Agent Labs 的 2026-09-08 前 12 家代表模型，扣除 OpenAI、Z.ai / GLM、DeepSeek 后共九项，详见 README。账号目录来自 `GET /api/v1/models/user`，遵循账号供应商、隐私和 guardrail 设置；过滤被排除厂商、自动路由、非文本输出、无 tools 和 `:batch` 模型。厂商排除也在启动路由和 slot 校验中执行。
+- 默认列表由 `src/openrouter-defaults.ts` 固定为 Arena Agent Labs 的 2026-09-08 前 12 家代表模型，扣除 OpenAI、Z.ai / GLM、DeepSeek 后共九项，详见[账号与模型](models.md#openrouter)。账号目录来自 `GET /api/v1/models/user`，遵循账号供应商、隐私和 guardrail 设置；过滤被排除厂商、自动路由、非文本输出、无 tools 和 `:batch` 模型。厂商排除也在启动路由和 slot 校验中执行。
 - `modelSelection` 保存可见模型 id 和完整允许候选；`models` 只暴露面板可见项。`model_list_open` / `model_add` / `model_remove` 对应接口项显示/隐藏，服务端校验当前页、模式与配置版本。`model_custom_remove` 删除补录记录，不能用于接口项；厂商排除也应用于手动补录。
-- `models` 未配置时使用默认九项，空字符串表示用户主动清空，不能当作未配置。默认模型、effort、slots、Key 及相邻配置节保留；启动和 slots 按完整允许目录验证。上游不再返回的已选项显示 `unavailableReason`，不能启动，但可以删除。
-- effort 来自 `reasoning.supported_efforts`，仅暴露 Claude SDK 支持的档位；显式 `null` 表示全部网关档位。没有 effort 选择器的模型使用 `default`，含义是请求不携带 `output_config.effort`，不代表关闭推理。其他缺失的默认档位保留 `null`，要求用户明确选择。已选榜单代表模型使用榜单明确的档位或账号目录的默认档位。
+- `models` 未配置时使用默认十一项，空字符串表示用户主动清空，不能当作未配置。默认模型、effort、slots、Key 及相邻配置节保留；启动和 slots 按完整允许目录验证。上游不再返回的已选项显示 `unavailableReason`，不能启动，但可以删除。
+- effort 来自 `reasoning.supported_efforts`，仅暴露 Claude SDK 支持的档位；显式 `null` 表示全部网关档位。没有 effort 选择器的模型使用 `default`，含义是请求不携带 `output_config.effort`，不代表关闭推理，选择模型后直接应用并跳过 effort 卡。其他缺失的默认档位保留 `null`，要求用户明确选择。已选榜单代表模型使用榜单明确的档位或账号目录的默认档位。
 - Claude SDK 0.3.251 的 CLI 会为省略 effort 的自定义模型补 `high`，Fable alias 还存在启动档位固定行为。`default` 用显式启动档位解除固定，同时在真实子进程环境设置 `CLAUDE_CODE_EFFORT_LEVEL=unset`；已抓取实际请求验证不发送 effort。`settings.env` 不能替代真实环境，单纯省略选项也不成立。显式 `max` 通过 `effortLevel: 'max'` 下发，不能映射成 `ultracode`。
 - `modelEnvironmentRevision` 参与进程配置比较。`default` 与显式档位之间切换需要新进程环境，Session 在空闲时保存并恢复原生 session；相同模式继续走 `setModelSettings`。slots 不能混合两种参数模式，避免辅助任务继承不适用的环境。模型切换不触发 daemon 重启。
 - 余额直接来自 `GET /api/v1/credits`：`total_credits - total_usage`，USD。2026-09-10 使用现有推理 Key 实测返回 200，不根据文档中的管理 Key 说明预先拒绝请求。权限以实际 HTTP 结果为准；失败显示 `余额 MISS`，不能改用 `/key` 限额、单 Key 累计用量或旧余额。
@@ -80,7 +80,9 @@ Claude 使用 `permissionMode: default`：普通工具在 `canUseTool` 中放行
 
 最终九模型检查通过 9/9，共核验 19 次 Messages 请求。Qwen 有 1 次工具错误，修正后返回了正确文件内容；探针报告保留 `toolErrors` 和 `httpErrorsRecovered`，不抹去中间错误。
 
-可复现实测使用 `scripts/test-openrouter.ts`：显式提供私有 JSON 凭据文件（`api_key`）和输出目录，`--capture-requests` 校验实际请求，`--sequence` 验证同一会话按顺序恢复。探针只在私有临时目录操作随机文件；不连接飞书、不启动或重启 daemon。传输失败保留在报告并返回错误响应，最终失败以非零退出码报告。真实密钥、请求正文和 session id 不写入跟踪文件。
+2026-09-11 曾验证字节 Seed 2.1 Turbo、美团 LongCat 2.0、蚂蚁 Ling 3.0 Flash、阶跃 Step 3.7 Flash，SDK 实测通过 4/4，核验 8 次 Messages 请求；全部执行 Read 并返回正确随机值，三次跨模型原生 resume 保留同一会话和上一轮标记。前三项不发送 effort，阶跃发送 high。最终默认列表只追加字节和美团，蚂蚁和阶跃已移出。初测发生过目录连接中断、美团漏答上一轮标记；日志保留，明示双标记要求后复测通过。百度空路由、快手上游 400 的可用性限制见[模型说明](models.md#openrouter)。
+
+可复现实测使用 `scripts/test-openrouter.ts`：显式提供私有 JSON 凭据文件（`api_key`）、输出目录及 `--agent-runtimes` 指向的已安装 Agent 目录，`--capture-requests` 校验实际请求，`--sequence` 验证同一会话按顺序恢复。探针只在私有临时目录操作随机文件；不连接飞书、不启动或重启 daemon。传输失败保留在报告并返回错误响应，最终失败以非零退出码报告。真实密钥、请求正文和 session id 不写入跟踪文件。
 
 `scripts/test-model-panel-live.ts` 用已有 daemon 做群内回调测试：显式指定 `--chat-id` 和 `--extra-model`，通过权限 0600 的本机 debug socket 读取模型状态并注入有限的模型面板动作。服务端绑定已设置的群和操作用户，校验真实卡片所属群、所属应用及面板消息，再交给正常的 Card action admission、去重、群队列和呈现链路；不提供通用方法执行入口。此测试覆盖服务端回调与真实飞书消息更新，客户端点击手势另需人工或 UI 自动化验证。
 
@@ -92,9 +94,9 @@ SDK 结果到达时卡片可能还在异步查询余额，探针需等待同一�
 
 ## DeepSeek Harness 原生后端
 
-`DshProcess` 启动锁定版本 `0.1.5-alpha.2` 的 Node DSH 子进程，以 `sdk` profile 加载 `dsh-bridge` Cordis 插件，替换默认 SDK JSON-RPC server。Lodestar 的 stdio 协议只承载控制和事件；Agent 循环、工具执行、持久化及子 Agent 由 DSH 管理。
+`DshProcess` 启动自动更新到上游 `latest` 的 Node DSH 子进程，以 `sdk` profile 加载 `dsh-bridge` Cordis 插件，替换默认 SDK JSON-RPC server。Lodestar 的 stdio 协议只承载控制和事件；Agent 循环、工具执行、持久化及子 Agent 由 DSH 管理。
 
-发布依赖声明固定整个 DSH 插件包族及安全 overrides 的版本，`scripts/sync-runtime-pins.ts` 从已验证的 Bun 锁文件同步这些声明。只固定顶层 DSH 版本会让 npm 选择其他预发布子包，消费者也不会继承依赖包的 overrides。通过全新 tarball 安装、实际 DSH 包族版本、生产依赖审计和已安装运行时查询验证；原生依赖仍按安装平台分发。
+Agent 运行依赖由 `src/agent-updates.ts` 独立安装，daemon 启动时及每 6 小时检查 upstream latest，安装成功直接启用，旧任务继续使用各自目录。DSH 子包的 dist-tag 可能不同步，因此从主包最新版本递归读取 dependencies/peerDependencies/optionalDependencies，整族安装该次动态选中的版本。不存在兼容版本白名单；不兼容直接报告并后续适配。`dsh-bridge` 被放入选中运行目录，从同一依赖树加载，握手版本来自实际 package.json。开发依赖和 Bun 锁文件只是本地测试快照，不限制生产更新。普通安全 overrides 同时用于独立运行目录，tarball 验收真实执行更新器、包审计和原生查询。
 
 - `session/open` 完成原生 create/resume/fork 并 flush 后才公布恢复点。`rs` 通过原生持久化服务列出同工作目录会话；`fk/bk` 使用 `turn/end` 的事件序号作为 checkpoint，原生日志验证并加载分叉历史。
 - 实时文本来自 `agent/assistant-stream`，工具和计划来自会话事件。进入 idle 后等待持久化完成，再用真实 `turn/end` 原因结算；认证失败、token 耗尽及驱动异常均向调用方报告。
@@ -102,7 +104,7 @@ SDK 结果到达时卡片可能还在异步查询余额，探针需等待同一�
 - 提问通过 `user-questions/request` 停驻，复用飞书问答卡；回答按原始 question id 返回。主动和自动压缩使用 DSH compaction 服务与事件。
 - 模型与 effort 更新在下一轮应用，同一轮的工具续跑保持当前路由。`off` 是 DSH 原生推理选项。
 - `dsh-glm` 接入 Coding Plan 的 `/api/coding/paas/v4/models` 与 `/chat/completions`。显式配置优先，否则复用已有 GLM 账号；凭据变化参与 `spawnRevision`。`dsh-runtime` 通过私有 composition patch 启用原生 `llm-pi-ai` 的 `zai-coding-cn` / `zai` 路由并关闭 DeepSeek 适配器，patch 仅记录环境变量名，不写明文 Key。
-- GLM 可选列表以账号接口为准，能力、上下文和 effort 与原生目录交叉核验，不为未知模型猜参数。当前锁定版本对 GLM-4.5、GLM-4.5-Air、GLM-4.6、GLM-5 缺少能力声明，这些项显示可隐藏/恢复的 `MISS`；GLM-5.3 等已确认模型正常使用。`LODESTAR_DSH_*` 控制路由，跨来源先清除冲突环境，不能复用旧的 DeepSeek 凭据或默认模型。
+- GLM 可选列表来自账号接口并合并手动补录，通过 pi-ai models 配置提供请求档位，`supportsReasoningEffort` 明确启用所选档位的传递；本地安装目录未收录的新模型也能使用。`LODESTAR_DSH_*` 控制路由，跨来源先清除冲突环境，不能复用旧的 DeepSeek 凭据或默认模型。
 - 每个进程默认读取项目 `.mcp.json` 的 stdio/HTTP MCP，并加载 `.agents/skills`、`.dsh/skills` 和 Lodestar 管理的 Skill。项目 `tools` 和 `load_project_mcp` 对 DSH 生效。
 - 图片 MIME 由文件字节识别。飞书下载的 JPEG 可能使用 `.png` 文件名，不能据扩展名声明编码；无法识别的图片明确报错。
 - 运行状态保存在 `src/paths.ts` 的 `DSH_HOME_DIR`。不读取用户 DSH settings 或凭据文件；`DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL` 由选定账号显式注入。默认 telemetry 插件不加载。

@@ -1,7 +1,8 @@
 /** Isolate the Bun test process from real Lodestar credentials and XDG state. */
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const testRoot = mkdtempSync(join(tmpdir(), 'lodestar-test-'))
 const configFile = join(testRoot, 'config.toml')
@@ -29,6 +30,11 @@ writeFileSync(configFile, [
 writeFileSync(join(claudeConfigDir, 'settings.json'), '{"env":{}}\n')
 
 process.env.NODE_ENV = 'test'
+const testRuntime = join(testRoot, 'agent-runtime')
+mkdirSync(testRuntime)
+writeFileSync(join(testRuntime, 'package.json'), '{"private":true,"type":"module"}\n')
+symlinkSync(fileURLToPath(new URL('../node_modules', import.meta.url)), join(testRuntime, 'node_modules'), 'junction')
+process.env.LODESTAR_TEST_AGENT_RUNTIME_ROOT = testRuntime
 process.env.LODESTAR_CONFIG = configFile
 process.env.LODESTAR_DATA_DIR = dataDir
 process.env.CODEX_HOME = codexHome

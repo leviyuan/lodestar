@@ -425,16 +425,22 @@ export function unifiedUsageSummary(snap: UsageSnapshotUnified | undefined): str
     : snap.quota.remaining === null ? '额度 MISS'
     : `额度 ${money(snap.quota.remaining, snap.quota.currency)} / ${money(snap.quota.limit, snap.quota.currency)}`
   if (!snap.windows.length) return '额度 MISS'
-  return `额度 ${snap.windows.map(w => {
-    const value = typeof w.used === 'number' && typeof w.total === 'number' ? `${w.used}/${w.total}`
-      : w.percent === null ? 'MISS' : `${Math.round(w.percent)}%`
-    return `${w.label} 已用 ${value}`
-  }).join(' · ')}`
+  return `额度 ${snap.windows.map(usageWindowSummary).join(' · ')}`
+}
+
+function usageWindowSummary(w: UsageSnapshotUnified['windows'][number]): string {
+  const value = typeof w.used === 'number' && typeof w.total === 'number' ? `${w.used}/${w.total}`
+    : w.percent === null ? 'MISS' : `${Math.round(w.percent)}%`
+  return `${w.label} 已用 ${value}`
 }
 
 export function consoleUnifiedUsageContent(snap: UsageSnapshotUnified | undefined): string {
-  const summary = unifiedUsageSummary(snap)
-  return summary.replace(/^(额度|余额)/, '**📊 $1**')
+  const summary = snap?.state === 'ok' && snap.kind !== 'balance' && !snap.quota && snap.windows.length
+    ? ['**📊 额度**', ...snap.windows.map(usageWindowSummary)].join('\n')
+    : unifiedUsageSummary(snap).replace(/^(额度|余额)/, '**📊 $1**')
+  const resetCards = snap?.resetCredits === undefined ? ''
+    : `\n**重置卡**　${snap.resetCredits === null ? 'MISS' : `${snap.resetCredits} 次可用`}`
+  return summary + resetCards
 }
 
 /** 订阅额度行:有 unifiedUsage(tokenSource.readUsage)优先统一渲染;
@@ -512,7 +518,7 @@ export function providerSelectionCard(opts: ProviderSelectionCardOpts): object {
           element_id: ELEMENTS.modelAgentGroup(agent),
           expanded: true,
           header: {
-            title: { tag: 'markdown', content: `**Agent · ${agent}**` },
+            title: { tag: 'markdown', content: `**Agent · ${{ claude: 'Claude Code', codex: 'Codex', dsh: 'DeepSeek Harness' }[agent]}**` },
             background_color: 'blue-50',
           },
           border: { color: 'blue-100', corner_radius: '8px' },
@@ -538,7 +544,7 @@ function providerChoiceElement(p: ProviderChoice, panelId: string): object {
           tag: 'column', width: 'weighted', weight: 1,
           elements: [{
             tag: 'button',
-            text: { tag: 'plain_text', content: '启用' },
+            text: { tag: 'plain_text', content: '启' },
             type: 'primary',
             behaviors: [{ type: 'callback', value: { kind: 'token_source_enable', source_id: p.sourceId } }],
           }],
@@ -614,7 +620,7 @@ export function modelSelectionPanelElement(opts: ModelSelectionCardOpts): object
         tag: 'markdown',
         content: [
           `当前: ${settingsLine(opts.currentModel, opts.currentEffort)}`,
-          opts.mode === 'add' ? '显示账号接口中的模型。' : '接口模型可隐藏，补录模型可删除。选模型进入 effort 选择。',
+          opts.mode === 'add' ? '显示账号接口中的模型。' : '接口模型可隐藏，补录模型可删除。有多个 effort 档位时再选择档位。',
         ].join('\n'),
       },
       ...(opts.models.length
@@ -693,7 +699,7 @@ export function modelCustomPromptCard(sessionName: string, sourceDisplay: string
         tag: 'markdown',
         content: [
           `**直接回复模型名补录到 ${sourceDisplay}**`,
-          '仅补录接口列表外的模型。后端未确认的模型或 effort 会标为 MISS，记录可删除。',
+          '补录后可选择 effort 并使用；模型是否接受该档位由实际请求确认。',
           '_裸词命令(hi/stop/model 等)不受影响_',
         ].join('\n'),
       },
@@ -789,7 +795,7 @@ function modelChoiceElement(model: ModelChoice, panelId: string, mode?: 'select'
           tag: 'column', width: 'weighted', weight: 1,
           elements: [{
             tag: 'button',
-            text: { tag: 'plain_text', content: '启用' },
+            text: { tag: 'plain_text', content: '启' },
             type: 'primary',
             behaviors: [{ type: 'callback', value: { kind: 'token_source_enable', source_id: model.sourceId } }],
           }],
@@ -815,20 +821,20 @@ function modelChoiceElement(model: ModelChoice, panelId: string, mode?: 'select'
     tag: 'column_set',
     columns: [
       {
-        tag: 'column', width: 'weighted', weight: 4,
+        tag: 'column', width: 'weighted', weight: 4, vertical_align: 'center',
         elements: [{
           tag: 'markdown',
           content: [
             title,
-            inlineCode(model.model),
+            model.displayName && model.displayName !== model.model ? inlineCode(model.model) : '',
             flags.length ? flags.join(' · ') : '',
           ].filter(Boolean).join('\n') + desc,
         }],
       },
       {
-        tag: 'column', width: 'weighted', weight: 1,
+        tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
         elements: [
-          ...(mode === 'add' ? [listAction('model_add', '显示')]
+          ...(mode === 'add' ? [listAction('model_add', '显')]
             : model.unavailableReason ? [{ tag: 'markdown', content: '**MISS**' }] : [{
           tag: 'button',
           text: { tag: 'plain_text', content: '选' },
@@ -836,7 +842,7 @@ function modelChoiceElement(model: ModelChoice, panelId: string, mode?: 'select'
           behaviors: [{ type: 'callback', value: modelSelectActionValue(model, panelId) }],
           }]),
           ...(editable && mode !== 'add' ? [model.origin === 'custom'
-            ? listAction('model_custom_remove', '删除') : listAction('model_remove', '隐藏')] : []),
+            ? listAction('model_custom_remove', '删') : listAction('model_remove', '隐')] : []),
         ],
       },
     ],
@@ -850,7 +856,10 @@ function modelChoiceElements(models: ModelChoice[], panelId: string, mode?: 'sel
     { title: 'Claude Code 后端', models: models.filter(m => m.provider === 'claude') },
     { title: 'DeepSeek Harness', models: models.filter(m => m.provider === 'dsh') },
   ].filter(group => group.models.length > 0)
-  const flat = (ms: ModelChoice[]) => ms.flatMap(model => modelChoiceElement(model, panelId, mode, editable))
+  const flat = (ms: ModelChoice[]) => ms.flatMap((model, index) => [
+    ...(index ? [{ tag: 'hr' }] : []),
+    ...modelChoiceElement(model, panelId, mode, editable),
+  ])
   if (groups.length <= 1) return flat(models)
   const elements: object[] = []
   for (const group of groups) {

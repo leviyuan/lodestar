@@ -82,7 +82,7 @@ describe('Claude model profiles', () => {
     expect(executable).toEqual({ description: 'sdk-default' })
   })
 
-  test('runs Windows npm command shims through the SDK custom spawn hook', () => {
+  test('Windows default uses the managed SDK even when an unrelated global npm shim exists', () => {
     const binDir = 'C:\\Users\\me\\AppData\\Roaming\\npm'
     const shim = win32.join(binDir, 'claude.cmd')
     const executable = resolveClaudeExecutableConfig({
@@ -92,9 +92,7 @@ describe('Claude model profiles', () => {
       exists: path => path === shim,
     })
 
-    expect(executable.pathToClaudeCodeExecutable).toBe(shim)
-    expect(typeof executable.spawnClaudeCodeProcess).toBe('function')
-    expect(executable.description).toBe(`windows-shell-shim:${shim}`)
+    expect(executable).toEqual({ description: 'sdk-default' })
   })
 
   test('win32 native exe falls through to SDK default entry (not passed directly, so dialog tools work)', () => {

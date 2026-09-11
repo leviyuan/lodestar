@@ -968,14 +968,18 @@ export class Session {
     await this.runLifecycle('stop-idle-mismatched', () => this.stopIdleMismatchedProcessUnlocked())
   }
 
+  processSourceMatches(source: TokenSource | undefined, model?: string | null): boolean {
+    return !this.proc || !this.procSourceRevisions.has(this.proc)
+      || this.procSourceRevisions.get(this.proc) === tokenSourceProcessRevision(source, model)
+  }
+
   private async stopIdleMismatchedProcessUnlocked(): Promise<void> {
     if (!this.proc?.isAlive()) return
     // provider 或 token source 任一变化 = 进程 env 不再匹配 → idle 时杀掉,下轮重 spawn 换 env。
     // 同 provider 跨 source(GLM↔DeepSeek↔native)env(base_url/凭据)不同也必须重启,
     // 否则热切换只改 model 不换 env → 模型名打到上一个 source 的 base_url(silent divergence)。
     const source = this.currentTokenSource()
-    const revisionMatches = !this.procSourceRevisions.has(this.proc)
-      || this.procSourceRevisions.get(this.proc) === tokenSourceProcessRevision(source, this.selectedModel)
+    const revisionMatches = this.processSourceMatches(source, this.selectedModel)
     if (
       this.proc.provider === this.selectedProvider
       && this.proc.tokenSourceId === this.selectedTokenSourceId
@@ -2410,7 +2414,9 @@ export class Session {
   }
 
   onModelSelect(modelRaw: string, panelIdRaw = '', userOpenId = '', actionValue: any = null): Promise<ModelActionResult> {
-    return sessionModel.onModelSelect(this, modelRaw, panelIdRaw, userOpenId, actionValue)
+    return this.runLifecycle('model-select', () =>
+      sessionModel.onModelSelect(this, modelRaw, panelIdRaw, userOpenId, actionValue)
+    )
   }
 
   onModelEffortSelect(modelRaw: string, effortRaw: string, panelIdRaw = '', userOpenId = '', providerRaw = ''): Promise<ModelActionResult> {
@@ -3752,7 +3758,7 @@ export class Session {
       // 主线程 Task tool_use(触发子 agent):记 id 供 task_started 缺 tool_use_id 时兜底关联
       if (!parentToolUseId && (name === 'Task' || name === 'Agent')) this.lastMainTaskToolUseId = id
     })
-    on('tool_result', ({ tool_use_id, content, is_error, parentToolUseId }: any) => {
+    on('tool_result', ({ tool_use_id, content, is_error, parentToolUseId, input }: any) => {
       // 子 agent 内的工具结果同 tool_use:只回填后台 task steps,不上主卡面板。
       if (parentToolUseId && this.bgTaskOwns(parentToolUseId)) {
         this.applyBgStore(cards.applyBgToolResult(
@@ -3762,7 +3768,7 @@ export class Session {
         this.onBackgroundTaskChanged()
         return
       }
-      sessionTools.completeTool(this, tool_use_id, content, is_error)
+      sessionTools.completeTool(this, tool_use_id, content, is_error, input)
     })
     on('can_use_tool', (req: CanUseToolRequest) => {
       sessionPermission.renderPermission(this, req)
@@ -4640,6 +4646,7 @@ export class Session {
           // 旧卡 inflight 公式渲染先 drain(渲染 promise 只写捕获的
           // oldCardId,不会碰新卡)—— 不等的话下面原文 replace 会覆盖
           // 还没落地的渲染版,渲染晚到再写已被 dispose 拒绝(review #2)。
+          await sessionTools.waitForImageDeliveries(turn, oldCardId)
           const oldInflight = turn.mathRenderInflight?.get(oldCardId)
           if (oldInflight?.size) {
             await Promise.allSettled([...oldInflight])
@@ -5610,6 +5617,7 @@ export class Session {
     // rotating 落定后再终态化:turn.cardId 此时是新卡,再 stop 一次清掉 swap
     // 重启的 interval,终态 footer 也写在新卡上。
     if (turn.rotating) await turn.rotating
+    await sessionTools.waitForImageDeliveries(turn)
     this.stopFooterStatus(turn)
     const elapsed = ((Date.now() - turn.startedAt) / 1000).toFixed(1)
     const cardId = turn.cardId

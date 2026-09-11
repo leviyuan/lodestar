@@ -11,6 +11,8 @@ import { isAbsolute } from 'node:path'
 import { normalizeOutboundPath } from './outbound-markers'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
+import * as feishu from './feishu'
+import { log } from './log'
 import { announceAsk, askRenderState } from './session-ask'
 
 /** 过程元素(tool/assistant/plan/goal/context_compact)的插入锚点:实时任务总览区
@@ -202,10 +204,13 @@ function toolSummaryToPreview(turn: TurnState | null, name: string, input: any):
   cardkit.patchSummaryThrottled(turn.cardId, line)
 }
 
-export function completeTool(s: Session, toolUseId: string, content: any, isError: boolean): void {
+export function completeTool(s: Session, toolUseId: string, content: any, isError: boolean, finalInput?: any): void {
   if (!s.currentTurn) return
   const meta = s.currentTurn.toolByUseId.get(toolUseId)
   if (!meta) return
+  if (finalInput && typeof finalInput === 'object') {
+    meta.input = { ...meta.input, ...Object.fromEntries(Object.entries(finalInput).filter(([, value]) => value !== undefined)) }
+  }
   const output = typeof content === 'string'
     ? content
     : Array.isArray(content)
@@ -217,7 +222,11 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
   meta.isError = isError
   if (s.currentTurn.cardRotationFailed) s.maybeMidTurnRotate()
   const autoSendPath = autoSendPathFromToolResult(meta.name, output, isError)
-  if (autoSendPath) s.sendOutboundPath(autoSendPath, meta.name)
+  if (autoSendPath) {
+    deliverGeneratedImage(s, s.currentTurn, meta, autoSendPath)
+    startThinkingIfNoToolsRunning(s)
+    return
+  }
   // AskUserQuestion already had its final panel painted by resolveAsk
   // (✅ + the chosen option marked, others dimmed). The tool_result
   // arriving here is just the SDK's synthesised echo — re-rendering
@@ -252,6 +261,59 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
   const el = cards.toolCallElement(meta.i, meta.name, meta.input, output, isError ? '❌' : '✅', meta.resolvedNote)
   void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
   startThinkingIfNoToolsRunning(s)
+}
+
+/** Keep generated artwork and its prompt on the card that owns this tool. */
+function deliverGeneratedImage(s: Session, turn: TurnState, meta: TurnState['toolByUseId'] extends Map<string, infer M> ? M : never, path: string): void {
+  if (turn.outboundSeenPaths.has(path)) return
+  turn.outboundSeenPaths.add(path)
+  const cardId = turn.cardId
+  const elementId = cards.ELEMENTS.tool(meta.i)
+  const byCard = turn.imageDeliveryInflight ??= new Map()
+  const tasks = byCard.get(cardId) ?? new Set<Promise<void>>()
+  byCard.set(cardId, tasks)
+  const task = (async () => {
+    let imageKey: string | null = null
+    try { imageKey = await feishu.uploadImageKey(path) }
+    catch (error) { log(`generated image upload failed: ${error}`) }
+    if (imageKey) {
+      let landed = false
+      try {
+        landed = await cardkit.replaceElementChecked(cardId, elementId,
+          cards.toolCallElement(meta.i, meta.name, meta.input, meta.output ?? null, '✅', meta.resolvedNote, imageKey),
+          { notifyCardFailure: false })
+      } catch (error) { log(`generated image embed failed: ${error}`) }
+      if (landed) {
+        meta.imageKey = imageKey
+        turn.outboundSentPaths.add(path)
+        return
+      }
+      log(`generated image could not be embedded in card ${cardId}; sending it as a separate message`)
+    }
+    // The user explicitly prefers a separate image when embedding is unavailable.
+    const sent = imageKey ? await feishu.sendImage(s.chatId, imageKey) !== null : await feishu.uploadAndSend(s.chatId, path)
+    if (sent) turn.outboundSentPaths.add(path)
+    else log(`generated image delivery failed: ${path}`)
+    meta.resolvedNote = sent ? '图片已单独发送。' : '图片发送失败。'
+    await cardkit.replaceElementChecked(cardId, elementId,
+      cards.toolCallElement(meta.i, meta.name, meta.input, meta.output ?? null, sent ? '✅' : '❌', meta.resolvedNote),
+      { notifyCardFailure: false })
+    if (!sent && imageKey) await feishu.sendText(s.chatId, '❌ 生成图片发送失败，请稍后重试。')
+  })().catch(async error => {
+    log(`generated image delivery failed: ${error}`)
+    await feishu.sendText(s.chatId, `❌ 生成图片发送失败：${error instanceof Error ? error.message : String(error)}`)
+  })
+  tasks.add(task)
+  void task.finally(() => {
+    tasks.delete(task)
+    if (!tasks.size) byCard.delete(cardId)
+  }).catch(error => log(`generated image failure notice failed: ${error}`))
+}
+
+export async function waitForImageDeliveries(turn: TurnState, cardId?: string): Promise<void> {
+  const tasks = cardId ? [...(turn.imageDeliveryInflight?.get(cardId) ?? [])]
+    : [...(turn.imageDeliveryInflight?.values() ?? [])].flatMap(tasks => [...tasks])
+  await Promise.allSettled(tasks)
 }
 
 /** Task 工具完成:用单次调用的 input/output 累积进 session board,再渲染整个
@@ -366,7 +428,7 @@ export function rebuildToolsOnRotate(
     const ni = turn.toolCount++
     turn.toolByUseId.set(useId, { ...meta, i: ni })
     const status: '⏳' | '✅' | '❌' = !done ? '⏳' : (isError ? '❌' : '✅')
-    void cardkit.addElement(newCardId, cards.toolCallElement(ni, meta.name, meta.input, output, status, meta.resolvedNote), {
+    void cardkit.addElement(newCardId, cards.toolCallElement(ni, meta.name, meta.input, output, status, meta.resolvedNote, meta.imageKey), {
       type: 'insert_before', targetElementId: taskLiveAnchor(turn),
     })
   }

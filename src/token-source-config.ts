@@ -110,7 +110,7 @@ export function editTokenSourceModels(id: string, model: string, action: 'add' |
   })
 }
 
-/** 补录只保存接口外的记录；无验证能力的来源保留 MISS，不能冒充可运行模型。 */
+/** 补录接口外的模型；保留已有端点验证，并允许选择请求档位直接使用。 */
 export function registerCustomTokenSourceModel(id: string, raw: string): Promise<void> {
   return serializeConfigUpdate(async () => {
     const model = raw.trim()

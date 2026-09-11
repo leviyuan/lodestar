@@ -2,7 +2,6 @@ import type { DshReasoningEffort } from './agent-process'
 import type { ConversationLaunch } from './conversation'
 
 /** Lodestar owns this small protocol; DSH's preview APIs stay inside the child. */
-export const DSH_VERSION = '0.1.5-alpha.2'
 export const DSH_PROTOCOL_VERSION = 1
 export interface DshModel {
   model: string
@@ -11,6 +10,7 @@ export interface DshModel {
   defaultEffort: DshReasoningEffort
   contextWindow: number | null
   isDefault: boolean
+  isCustom?: boolean
 }
 export interface DshOpenOptions {
   cwd: string

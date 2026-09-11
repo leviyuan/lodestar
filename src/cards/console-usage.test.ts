@@ -2,6 +2,27 @@ import { describe, expect, test } from 'bun:test'
 import { consoleUnifiedUsageContent, unifiedUsageSummary } from './console'
 
 describe('consoleUnifiedUsageContent(额度渲染)', () => {
+  test('额度标题、各个窗口和重置卡分行，footer 摘要仍保持单行', () => {
+    const snapshot = { state: 'ok' as const, resetCredits: 0, windows: [
+      { kind: 'weekly', label: '默认配额 周', percent: 24, resetsAt: null },
+      { kind: 'fiveHour', label: 'GPT-5.3-Codex-Spark 5h', percent: 11, resetsAt: null },
+      { kind: 'weekly', label: 'GPT-5.3-Codex-Spark 周', percent: 25, resetsAt: null },
+    ] }
+    expect(consoleUnifiedUsageContent(snapshot).split('\n')).toEqual([
+      '**📊 额度**', '默认配额 周 已用 24%', 'GPT-5.3-Codex-Spark 5h 已用 11%',
+      'GPT-5.3-Codex-Spark 周 已用 25%', '**重置卡**　0 次可用',
+    ])
+    expect(unifiedUsageSummary(snapshot)).not.toContain('\n')
+  })
+
+  test('Codex reset credits appear in hi, including zero, without changing the footer summary', () => {
+    const snapshot = { state: 'ok' as const, windows: [{ kind: 'weekly', label: '周配额', percent: 22, resetsAt: null }], resetCredits: 0 }
+    expect(consoleUnifiedUsageContent(snapshot)).toContain('**重置卡**　0 次可用')
+    expect(consoleUnifiedUsageContent({ ...snapshot, resetCredits: 3 })).toContain('3 次可用')
+    expect(consoleUnifiedUsageContent({ ...snapshot, resetCredits: null })).toContain('重置卡**　MISS')
+    expect(unifiedUsageSummary(snapshot)).not.toContain('重置卡')
+  })
+
   test('只展示额度窗口和数值，不附加套餐说明', () => {
     const out = consoleUnifiedUsageContent({
       state: 'ok',

@@ -12,7 +12,7 @@
 
 | 项目 | 本次使用的环境或方法 |
 | --- | --- |
-| 原生依赖 | `@deepseek-ai/dsh@0.1.5-alpha.2`，相关桥接依赖锁定版本 |
+| 原生依赖 | `@deepseek-ai/dsh@0.1.5-alpha.2`（当次历史验收快照；当前生产策略为自动跟随 latest） |
 | 本机运行时 | Linux、Bun 1.3.11、Node 22.22.2 |
 | 模型 | DeepSeek-V4-Flash、DeepSeek-V4-Pro、DeepSeek-V4-Flash-Vision-Exp |
 | 推理设置 | 真实请求覆盖 `off`、`high`、`max`；支持值仍以模型目录为准 |

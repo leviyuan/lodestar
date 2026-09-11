@@ -161,7 +161,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
   sendHookResponse(): void { throw new Error('DSH does not issue hook callback requests') }
   async listModels(): Promise<AgentModel[]> {
     await this.runtime.initialize()
-    this.models = await this.runtime.request('model/list')
+    this.models = await this.runtime.request('model/list', { models: [this.lastModel ?? this.opts.model] })
     return this.models.map(m => ({ id: m.model, model: m.model, displayName: m.display, description: 'DeepSeek Harness',
       hidden: false, isDefault: m.isDefault, defaultReasoningEffort: m.defaultEffort,
       supportedReasoningEfforts: m.efforts.map(reasoningEffort => ({ reasoningEffort, description: '' })) }))

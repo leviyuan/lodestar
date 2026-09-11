@@ -20,6 +20,7 @@ import type { Readable, Writable } from 'node:stream'
 import { spawn as crossSpawn } from 'cross-spawn'
 import { config } from './config'
 import { log } from './log'
+import { agentBin } from './agent-updates'
 import {
   contextCompactionNoticeFromMessage,
   contextCompactionNoticeFromNotification,
@@ -44,29 +45,7 @@ import type {
 } from './claude-agent-process'
 
 export function resolveCodexBin(): string {
-  if (process.platform !== 'win32') {
-    const pinned = join(homedir(), '.local', 'npm-global', 'bin', 'codex')
-    if (existsSync(pinned)) return pinned
-    const local = join(homedir(), '.local', 'bin', 'codex')
-    if (existsSync(local)) return local
-  }
-  return whichCodex() ?? 'codex'
-}
-
-function whichCodex(): string | null {
-  const PATH = process.env.PATH ?? ''
-  if (!PATH) return null
-  const candidates = process.platform === 'win32'
-    ? ['codex.cmd', 'codex.bat', 'codex.exe', 'codex']
-    : ['codex']
-  for (const dir of PATH.split(delimiter)) {
-    if (!dir) continue
-    for (const name of candidates) {
-      const p = join(dir, name)
-      if (existsSync(p)) return p
-    }
-  }
-  return null
+  return agentBin('codex', 'codex')
 }
 
 function buildSpawnPath(): string {
@@ -875,6 +854,7 @@ export class CodexProcess extends EventEmitter {
       tool_use_id: item.id,
       content: mapped.output,
       is_error: mapped.isError,
+      ...(item.type === 'imageGeneration' ? { input: imageGenerationInput(item) } : {}),
     })
     if (item.type === 'imageGeneration') this.emittedImageGenerationIds.add(item.id)
   }
@@ -1231,10 +1211,7 @@ export class CodexProcess extends EventEmitter {
     this.emit('tool_use', {
       id: callId,
       name: 'ImageGeneration',
-      input: {
-        status,
-        revisedPrompt: imageGenerationRevisedPrompt(payload),
-      },
+      input: imageGenerationInput({ ...payload, status }),
     })
     this.emit('tool_result', {
       tool_use_id: callId,
@@ -2133,7 +2110,7 @@ function mapStartedItem(item: any, workDir: string): { name: string; input: any 
     case 'webSearch':
       return { name: 'WebSearch', input: { query: item.query, action: item.action } }
     case 'imageGeneration':
-      return { name: 'ImageGeneration', input: { status: item.status, revisedPrompt: imageGenerationRevisedPrompt(item) } }
+      return { name: 'ImageGeneration', input: imageGenerationInput(item) }
   }
   return null
 }
@@ -2141,6 +2118,11 @@ function mapStartedItem(item: any, workDir: string): { name: string; input: any 
 function imageGenerationRevisedPrompt(item: any): string | undefined {
   const prompt = item?.revisedPrompt ?? item?.revised_prompt
   return typeof prompt === 'string' && prompt ? prompt : undefined
+}
+
+function imageGenerationInput(item: any): object {
+  return { status: item.status, revisedPrompt: imageGenerationRevisedPrompt(item),
+    ...(typeof item?.prompt === 'string' && item.prompt ? { prompt: item.prompt } : {}) }
 }
 
 function findCodexRolloutFile(sessionId: string): string | null {

@@ -1425,7 +1425,7 @@ describe('codex process compaction notifications', () => {
     expect(compacted).toHaveLength(1)
   })
 
-  test('maps snake_case image generation fields to a sendable result path', () => {
+  test('retains the completed image prompt when the start event has no prompt', () => {
     const proc = Object.create(CodexProcess.prototype) as any
     const events: Array<[string, any]> = []
     proc.opts = { workDir: '/tmp' }
@@ -1440,7 +1440,6 @@ describe('codex process compaction notifications', () => {
         type: 'imageGeneration',
         id: 'img-1',
         status: 'inProgress',
-        revised_prompt: 'A cute cat curled up in a sunbeam.',
       },
       threadId: 'thread-5',
       turnId: 'turn-5',
@@ -1464,13 +1463,14 @@ describe('codex process compaction notifications', () => {
         name: 'ImageGeneration',
         input: {
           status: 'inProgress',
-          revisedPrompt: 'A cute cat curled up in a sunbeam.',
+          revisedPrompt: undefined,
         },
       }],
       ['tool_result', {
         tool_use_id: 'img-1',
         content: '/tmp/cat.png',
         is_error: false,
+        input: { status: 'completed', revisedPrompt: 'A cute cat curled up in a sunbeam.' },
       }],
     ])
   })

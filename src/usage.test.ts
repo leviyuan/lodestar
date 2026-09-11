@@ -1,8 +1,44 @@
 import { describe, expect, test } from 'bun:test'
 
-import { snapshotFromReadResponse, observeRateLimitsNotification } from './usage'
+import { snapshotFromReadResponse, observeRateLimitsNotification, refreshUsageFromConnection } from './usage'
+
+describe('quota transient failures', () => {
+  test('a transient request failure retries the same connection and returns the real quota', async () => {
+    let calls = 0
+    const snapshot = await refreshUsageFromConnection(async method => {
+      expect(method).toBe('account/rateLimits/read')
+      if (++calls === 1) throw new Error('failed to fetch codex rate limits: error sending request for url (https://chatgpt.com/backend-api/wham/usage)')
+      return { rateLimits: { limitId: 'codex', primary: { usedPercent: 19, windowDurationMins: 10080, resetsAt: 1789632148 } } }
+    })
+    expect(calls).toBe(2)
+    expect(snapshot).toMatchObject({ state: 'ok', weekly: { percent: 19 } })
+  })
+
+  test('persistent network failures stop after three attempts and remain visible', async () => {
+    let calls = 0
+    const snapshot = await refreshUsageFromConnection(async () => { calls++; throw new Error('error sending request') })
+    expect(calls).toBe(3)
+    expect(snapshot).toBeNull()
+  })
+
+  test('authentication failures are reported immediately', async () => {
+    let calls = 0
+    const snapshot = await refreshUsageFromConnection(async () => { calls++; throw new Error('HTTP 401 unauthorized') })
+    expect(calls).toBe(1)
+    expect(snapshot).toBeNull()
+  })
+})
 
 describe('usage read snapshot semantics', () => {
+  test('reads available quota-reset credits and never infers them from window reset times', () => {
+    const response = { rateLimits: { limitId: 'codex', primary: { usedPercent: 22, windowDurationMins: 10080, resetsAt: 1789632148 } } }
+    for (const count of [0, 3]) {
+      expect(snapshotFromReadResponse({ ...response, rateLimitResetCredits: { availableCount: count, credits: [] } }))
+        .toMatchObject({ state: 'ok', resetCredits: count })
+    }
+    expect(snapshotFromReadResponse(response)).toMatchObject({ state: 'ok', resetCredits: null })
+  })
+
   test('多桶 read 响应:默认桶跟随服务端顶层 rateLimits 指针,桶 map 全量保留', () => {
     // 2026-08-20 实测 pro 账号 read 端点:主桶(周)+ bengalfox(Spark 附加包,5h+周)。
     const snap = snapshotFromReadResponse({

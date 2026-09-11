@@ -809,24 +809,26 @@ function renderServerSideToolBody(name: string, input: any, output: string | nul
 }
 
 function summarizeImageGenerationInput(input: any): string {
-  const prompt = typeof input?.revisedPrompt === 'string' ? input.revisedPrompt : ''
   const status = typeof input?.status === 'string' ? input.status : ''
-  return prompt || status
+  return status
 }
 
-function renderImageGenerationBody(input: any, output: string | null, resolvedNote?: string): string {
+function renderImageGenerationBody(input: any, output: string | null, resolvedNote?: string, imageKey?: string): string {
   const lines: string[] = []
   if (input?.status) lines.push(`**状态**: ${inlineCode(input.status)}`)
+  if (input?.prompt) {
+    lines.push('', '**提示词**', fenceBlock(String(input.prompt)))
+  }
   if (input?.revisedPrompt) {
-    if (lines.length > 0) lines.push('')
-    lines.push('**提示词**')
-    lines.push(String(input.revisedPrompt).slice(0, 2000))
+    if (input.revisedPrompt !== input.prompt) {
+      lines.push('', input.prompt ? '**实际提示词**' : '**提示词**', fenceBlock(String(input.revisedPrompt)))
+    }
   }
   if (resolvedNote) {
     lines.push('')
     lines.push(resolvedNote)
   }
-  if (output != null && output.trim()) {
+  if (!imageKey && output != null && output.trim()) {
     lines.push('')
     lines.push('---')
     lines.push('**输出**')
@@ -883,6 +885,7 @@ export function toolCallElement(
   output: string | null,
   status: '⏳' | '✅' | '❌' = '⏳',
   resolvedNote?: string,
+  imageKey?: string,
 ): object {
   const rawSummary = isWebSearchTool(name) && output != null
     ? summarizeWebSearchOutput(input, output)
@@ -908,7 +911,7 @@ export function toolCallElement(
               : isMcpTool(name)
                 ? renderMcpBody(input, output, resolvedNote)
                 : isImageGenerationTool(name)
-                  ? renderImageGenerationBody(input, output, resolvedNote)
+                  ? renderImageGenerationBody(input, output, resolvedNote, imageKey)
                   : isFileReadTool(name)
                     ? renderReadBody(input, output, resolvedNote)
                     : isFileWriteTool(name)
@@ -935,6 +938,10 @@ export function toolCallElement(
     expanded: false,
     elements: [
       { tag: 'markdown', content: sanitizeMarkdownForCardKit(body) },
+      ...(isImageGenerationTool(name) && imageKey ? [{
+        tag: 'img', img_key: imageKey, alt: { tag: 'plain_text', content: '生成的图片' },
+        scale_type: 'fit_horizontal', preview: true,
+      }] : []),
     ],
   }
 }

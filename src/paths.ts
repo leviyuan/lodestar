@@ -71,6 +71,8 @@ export const AGENT_SESSION_IDS_FILE = join(DATA_DIR, 'agent-session-ids.json')
 export const MANAGED_CLAUDE_PLUGIN_DIR = join(DATA_DIR, 'managed-claude-plugin')
 /** Private Harness profiles, skills and native session persistence. */
 export const DSH_HOME_DIR = join(DATA_DIR, 'dsh')
+/** Automatically updated, immutable Agent runtime installations and status. */
+export const AGENT_RUNTIMES_DIR = join(DATA_DIR, 'agent-runtimes')
 /** 真实窗口观测缓存:key = `<sourceId>:<model>`(如 `glm:GLM-5.3`),value = 窗口
  *  token 数(200000 / 1000000)。来源 = 每轮真实 turn 的 SDK modelUsage.contextWindow
  *  (CLI 按 [1m] 后缀记 1M)。仅使用 SDK 明确上报的数值，错误文本不构成容量观测。 */

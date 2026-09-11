@@ -28,7 +28,7 @@ api_key="test-key"
     import { mock } from 'bun:test'
     const model = (id) => ({ model: id, display: id, efforts: ['high'], defaultEffort: 'high' })
     let promoted = false
-    mock.module(${modulePath('token-source-models.ts')}, () => ({ CLAUDE_EFFORTS: ['high'],
+    mock.module(${modulePath('token-source-models.ts')}, () => ({ CLAUDE_EFFORTS: ['max', 'high'],
       fetchCodexModels: async () => [model('codex-upstream'), ...(promoted ? [model('custom-test')] : [])],
       fetchNativeClaudeModels: async () => [model('opus')], fetchGlmModels: async () => [model('GLM-5.3')],
     }))
@@ -70,7 +70,10 @@ api_key="test-key"
       const entry = source.models.find(m => m.model === custom)
       assert.equal(entry.origin, 'custom', id)
       assert.ok(config.token_sources[id].custom_models.includes(custom), id)
-      if (!source.verifyModel) { assert.equal(entry.defaultEffort, null); assert.ok(entry.unavailableReason); }
+      assert.ok(entry.efforts.length > 0, id + ' 补录后必须能选择 effort')
+      assert.ok(entry.efforts.includes(entry.defaultEffort), id)
+      assert.equal(entry.unavailableReason, undefined, id)
+      assert.ok(source.resolveSpawnModel(custom), id + ' 补录后必须能解析启动模型')
       await assert.rejects(editTokenSourceModels(id, custom, 'remove'))
       await assert.rejects(removeCustomTokenSourceModel(id, before[0]), /不是补录项/)
       await editTokenSourceModels(id, before[0], 'remove')

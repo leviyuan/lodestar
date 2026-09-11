@@ -1,42 +1,18 @@
-/**
- * CLI entry for `lodestar-version` bin. 打印 npm 实际装的 lodestar 版本(读
- * 包根 package.json,而不是编译时内联的常量),顺带探测默认后端 Claude Code
- * 与可选 Codex CLI 的版本和 runtime,排障时一眼确认环境。
- */
-import { execSync } from 'node:child_process'
+/** Report the actual managed runtimes, not unrelated global CLI installations. */
 import { readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { AGENTS, agentRuntimeState } from './agent-updates'
 
-const C = { reset: '\x1b[0m', bold: '\x1b[1m', cyan: '\x1b[36m', green: '\x1b[32m', dim: '\x1b[2m' }
-
-function lodestarVersion(): string {
-  // dist/lodestar-version.js → 包根 package.json 是 ../package.json;开发时
-  // src/version-cli.ts 同样 ../package.json。两条路径都落在包根。
+const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+console.log(`Lodestar v${manifest.version}`)
+for (const agent of AGENTS) {
   try {
-    const here = dirname(fileURLToPath(import.meta.url))
-    const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8'))
-    return typeof pkg.version === 'string' ? pkg.version : '(unknown)'
-  } catch { return '(unknown)' }
+    const state = agentRuntimeState(agent)
+    if (!state) { console.log(`${agent}: MISS（尚未自动安装）`); continue }
+    if (state.error) { console.log(`${agent}: MISS（自动更新失败：${state.error}）`); process.exitCode = 1; continue }
+    const names = agent === 'dsh' ? ['@deepseek-ai/dsh'] : Object.keys(state.versions ?? {})
+    console.log(`${agent}: ${names.map(name => `${name}@${state.versions?.[name] ?? 'MISS'}`).join(', ')}`)
+    console.log(`  ${state.directory}`)
+  } catch (error) { console.error(`${agent}: MISS（${error}）`); process.exitCode = 1 }
 }
-
-function claudeVersion(): string {
-  // execSync 默认走 shell,Windows 上能直接跑 claude.cmd。
-  try {
-    const out = execSync('claude --version', { timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
-    return out || '(unknown)'
-  } catch { return '(未找到 / 未安装)' }
-}
-
-function codexVersion(): string {
-  // execSync 默认走 shell,Windows 上能直接跑 codex.cmd。
-  try {
-    const out = execSync('codex --version', { timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
-    return out || '(unknown)'
-  } catch { return '(未找到 / 未安装)' }
-}
-
-console.log(`${C.bold}Lodestar${C.reset} ${C.green}v${lodestarVersion()}${C.reset}`)
-console.log(`${C.dim}Claude Code:${C.reset} ${claudeVersion()}`)
-console.log(`${C.dim}Codex CLI:${C.reset}   ${codexVersion()}`)
-console.log(`${C.dim}Runtime:${C.reset}     ${process.version} (${process.platform}-${process.arch})`)
+console.log(`Runtime: ${process.version} (${process.platform}-${process.arch})`)

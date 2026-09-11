@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, modelEffortSelectionCard, modelResultCard, modelResultPanelElement, modelSelectionCard, providerSelectionCard, statusCard, streamingOffSettings } from './console'
+import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, modelCustomPromptCard, modelEffortSelectionCard, modelResultCard, modelResultPanelElement, modelSelectionCard, providerSelectionCard, statusCard, streamingOffSettings } from './console'
 import {
   askUserQuestionElement,
   contextCompactionElement,
@@ -16,6 +16,42 @@ import {
 import { editBatchElement, readBatchElement, summarizeToolInput, toolCallElement, toolCallPermissionElement } from './tool'
 
 describe('main conversation card rendering', () => {
+  test('narrow model row buttons use one character while wide actions keep full labels', () => {
+    const model = { provider: 'claude' as const, sourceId: 'glm', model: 'GLM-test', displayName: 'GLM-test',
+      efforts: [{ effort: 'high' as const, description: '', isDefault: true }] }
+    const opts = { sessionName: 'test', panelId: 'p', sourceId: 'glm', editable: true, allowCustom: true,
+      models: [model, { ...model, model: 'custom', origin: 'custom' as const }],
+      pagination: { sourceId: 'glm', page: 1, totalPages: 3 } }
+    const cards = [
+      providerSelectionCard({ sessionName: 'test', panelId: 'p', providers: [
+        { provider: 'claude', sourceId: 'glm', display: 'GLM', enabled: true, modelCount: 2 },
+        { provider: 'dsh', sourceId: 'deepseek-harness', display: 'DeepSeek', enabled: false, modelCount: 0 },
+      ] }),
+      modelSelectionCard(opts), modelSelectionCard({ ...opts, mode: 'add' }),
+      modelSelectionCard({ ...opts, editable: false }),
+      modelEffortSelectionCard({ sessionName: 'test', panelId: 'p', model }),
+      modelCustomPromptCard('test', 'GLM', 'p'),
+    ]
+    const labels: Record<string, string[]> = {}
+    const visit = (value: any): void => {
+      if (!value || typeof value !== 'object') return
+      if (value.tag === 'button') {
+        const kind = value.behaviors[0].value.kind
+        ;(labels[kind] ??= []).push(value.text.content)
+      }
+      for (const child of Object.values(value)) visit(child)
+    }
+    cards.forEach(visit)
+    for (const kind of ['provider_select', 'token_source_enable', 'model_select', 'model_add', 'model_remove', 'model_custom_remove', 'model_effort_select']) {
+      expect(labels[kind].every(label => /^\p{Script=Han}$/u.test(label))).toBe(true)
+    }
+    expect(labels.model_custom_prompt).toEqual(['补录模型', '补录模型', '补录模型'])
+    expect(labels.model_list_open).toEqual(['显示模型', '返回模型列表'])
+    expect(labels.model_page).toContain('上一页')
+    expect(labels.model_page).toContain('下一页')
+    expect(labels.model_panel_cancel).toEqual(['取消'])
+  })
+
   test('upstream rows hide while custom rows delete, and every editable source offers registration', () => {
     const card = modelSelectionCard({ sessionName: 'test', panelId: 'panel', sourceId: 'codex-sub', editable: true, allowCustom: true,
       models: [
@@ -24,9 +60,13 @@ describe('main conversation card rendering', () => {
       ] }) as any
     const rows = card.body.elements[0].elements.filter((e: any) => e.tag === 'column_set')
     expect(rows[0].columns[1].elements.at(-1).behaviors[0].value.kind).toBe('model_remove')
-    expect(rows[0].columns[1].elements.at(-1).text.content).toBe('隐藏')
+    expect(rows[0].columns[1].elements.at(-1).text.content).toBe('隐')
     expect(rows[1].columns[1].elements.at(-1).behaviors[0].value.kind).toBe('model_custom_remove')
-    expect(rows[1].columns[1].elements.at(-1).text.content).toBe('删除')
+    expect(rows[1].columns[1].elements.at(-1).text.content).toBe('删')
+    const elements = card.body.elements[0].elements
+    expect(elements[elements.indexOf(rows[0]) + 1]).toEqual({ tag: 'hr' })
+    expect(rows[0].columns.every((column: any) => column.vertical_align === 'center')).toBe(true)
+    expect(rows[0].columns[0].elements[0].content).toBe('**`upstream`**')
     expect(JSON.stringify(card)).toContain('model_custom_prompt')
   })
   test('every footer uses the same agent and model identity format', () => {
@@ -46,7 +86,7 @@ describe('main conversation card rendering', () => {
     ] }) as any
     const elements = card.body.elements[0].elements
     const groups = elements.filter((e: any) => e.tag === 'collapsible_panel')
-    expect(groups.map((e: any) => e.header.title.content)).toEqual(['**Agent · claude**', '**Agent · codex**', '**Agent · dsh**'])
+    expect(groups.map((e: any) => e.header.title.content)).toEqual(['**Agent · Claude Code**', '**Agent · Codex**', '**Agent · DeepSeek Harness**'])
     expect(groups.every((e: any) => e.expanded && e.header.background_color === 'blue-50' && e.border.color === 'blue-100')).toBe(true)
     expect(groups.map((e: any) => e.element_id)).toEqual(['model_agent_claude', 'model_agent_codex', 'model_agent_dsh'])
     expect(groups.flatMap((g: any) => g.elements).map((e: any) => e.columns[1].elements[0].behaviors[0].value.source_id))
@@ -969,12 +1009,22 @@ describe('other tool card rendering', () => {
     const el = toolCallElement(7, 'ImageGeneration', input, '/tmp/dashboard.png', '✅') as any
     const body = el.elements[0].content
 
-    expect(el.header.title.content).toBe('✅ 🔧 图片生成: A clean product photo of a status dashboard on a laptop.')
+    expect(el.header.title.content).toBe('✅ 🔧 图片生成: completed')
     expect(body).toContain('**状态**: `completed`')
     expect(body).toContain('**提示词**')
     expect(body).toContain('A clean product photo of a status dashboard on a laptop.')
     expect(body).toContain('**输出**')
     expect(body).not.toContain('"revisedPrompt"')
+  })
+
+  test('generated image fold contains the complete prompt and a previewable image', () => {
+    const prompt = 'Full image prompt '.repeat(220)
+    const element = toolCallElement(7, 'ImageGeneration', { revisedPrompt: prompt }, '/tmp/image.png', '✅', undefined, 'img_test') as any
+    expect(element.expanded).toBe(false)
+    expect(element.header.title.content).not.toContain(prompt.slice(0, 20))
+    expect(element.elements[0].content).toContain(prompt)
+    expect(element.elements[0].content).not.toContain('/tmp/image.png')
+    expect(element.elements[1]).toMatchObject({ tag: 'img', img_key: 'img_test', scale_type: 'fit_horizontal', preview: true })
   })
 
   test('renders agent calls with prompt and model labels', () => {

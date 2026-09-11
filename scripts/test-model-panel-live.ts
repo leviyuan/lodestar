@@ -23,6 +23,7 @@ if (!chatId?.startsWith('oc_') || !extraModel) throw new Error('需要 --chat-id
 const context = JSON.parse(readFileSync(DEBUG_CTX_FILE, 'utf8'))
 if (context.chat_id !== chatId) throw new Error('目标群与已设置的 debug context 不一致')
 const reportDir = mkdtempSync(join(tmpdir(), 'lodestar-md-live-'))
+console.log(JSON.stringify({ phase: 'started', reportDir }))
 const checks: string[] = []
 const sourceId = 'openrouter'
 const routesOnly = args.includes('--routes-only')
@@ -77,7 +78,21 @@ async function rawCard(messageId: string): Promise<any> {
   assert.ok(content, '卡片正文缺失')
   const envelope = JSON.parse(content)
   assert.equal(typeof envelope.json_card, 'string', '未返回原始卡片结构')
-  return JSON.parse(envelope.json_card)
+  const card = JSON.parse(envelope.json_card)
+  const modelPanel = card.body?.property?.elements?.find((element: any) => element.id === 'model_panel')
+  if (modelPanel) {
+    const visit = (element: any): void => {
+      if (!element || typeof element !== 'object') return
+      if (element.tag === 'button') {
+        const label = texts(element).join('')
+        const wideLabels = ['补录模型', '显示模型', '返回模型列表', '上一页', '下一页', '取消']
+        assert.ok(wideLabels.includes(label) || /^\p{Script=Han}$/u.test(label), `模型行按钮不是单字或宽按钮文案不完整：${label}`)
+      }
+      for (const child of Object.values(element)) visit(child)
+    }
+    visit(modelPanel)
+  }
+  return card
 }
 function texts(value: any): string[] {
   if (!value || typeof value !== 'object') return []
@@ -164,9 +179,9 @@ async function checkCustomRecord(source: DebugModelSnapshot['sources'][number]):
     let snapshot = await state()
     const entry = snapshot.sources.find(item => item.id === source.id)?.models.find(item => item.model === custom)
     assert.equal(entry?.origin, 'custom', '未保存独立补录记录')
-    assert.ok(entry.unavailable_reason, '未验证的补录模型没有明确标记 MISS')
+    assert.ok(!entry.unavailable_reason && entry.efforts.length > 0, '补录模型未提供可选的请求档位')
     assert.deepEqual(snapshot.selection, original)
-    assert.ok(texts(await rawCard(panel.message_id!)).join('').includes('MISS'), '补录结果卡未说明能力未知')
+    assert.ok(texts(await rawCard(panel.message_id!)).join('').includes('effort'), '补录后未进入 effort 选择')
     const refreshed = await openPanel()
     snapshot = await action(refreshed.panel, 'provider_select', { source_id: source.id })
     panel = await findModelPage(panelFrom(snapshot, refreshed.panel.panel_id), source.id, custom)
@@ -187,7 +202,7 @@ async function checkCustomRecord(source: DebugModelSnapshot['sources'][number]):
     } catch (error) { failure = failure ? new AggregateError([failure, error], '补录测试及恢复失败') : error }
   }
   if (failure) throw failure
-  checks.push(`${source.id} 列表外补录、持久化、MISS 呈现和删除`)
+  checks.push(`${source.id} 列表外补录、持久化、effort 选择和删除`)
 }
 
 async function checkRejectedRegistration(source: DebugModelSnapshot['sources'][number]): Promise<void> {
@@ -229,9 +244,14 @@ async function selectModel(source: string, model: string, effort: string): Promi
   }
   const choice = panel.models.find(entry => entry.model === model)
   assert.ok(choice?.provider && choice.efforts.includes(effort), '模型/档位不在当前目录中')
-  await action(panel, 'model_select', { source_id: source, provider: choice.provider, model })
-  assert.ok(texts(await rawCard(panel.message_id!)).join('').includes('选择 effort'), '飞书卡片未进入档位选择')
-  snapshot = await action(panel, 'model_effort_select', { source_id: source, provider: choice.provider, model, effort })
+  snapshot = await action(panel, 'model_select', { source_id: source, provider: choice.provider, model })
+  const effortPanel = texts(await rawCard(panel.message_id!)).join('').includes('选择 effort')
+  if (choice.efforts.length > 1) {
+    assert.ok(effortPanel, '飞书卡片未进入档位选择')
+    snapshot = await action(panel, 'model_effort_select', { source_id: source, provider: choice.provider, model, effort })
+  } else {
+    assert.equal(effortPanel, false, '无档位选择的模型没有跳过 effort 卡')
+  }
   assert.equal(snapshot.selection.source_id, source)
   assert.equal(snapshot.selection.model, model)
   assert.equal(snapshot.selection.effort, effort)
@@ -261,17 +281,26 @@ try {
   const rows = tree.body?.property?.elements?.[0]?.property?.elements ?? []
   const groups = rows.filter((row: any) => row.tag === 'collapsible_panel' && /^model_agent_/.test(row.id))
   assert.deepEqual(groups.map((group: any) => group.id), ['model_agent_claude', 'model_agent_codex', 'model_agent_dsh'], 'MD 首页没有独立的 Agent 分组')
+  for (const [i, name] of ['Claude Code', 'Codex', 'DeepSeek Harness'].entries()) {
+    assert.ok(texts(groups[i].property.header).join('').includes(name), `Agent 分组标题不正确：${name}`)
+  }
+  assert.equal(snapshot.sources.find(source => source.id === 'deepseek')?.display, 'DeepSeek')
+  assert.equal(snapshot.sources.find(source => source.id === 'deepseek-harness')?.display, 'DeepSeek')
   const sourceRows = groups.flatMap((group: any) => group.property?.elements ?? [])
   const row = sourceRows.find((row: any) => row.tag === 'column_set' && texts(row).includes(source.display))
-  assert.ok(row && texts(row).join('').includes('9 个模型'), '真实 MD 卡片没有显示九个模型')
-  checks.push('真实账号卡显示 9 个模型')
+  assert.ok(row && texts(row).join('').includes(`${baseline.length} 个模型`), '真实 MD 卡片没有显示正确模型数量')
+  checks.push(`真实账号卡显示 ${baseline.length} 个模型`)
   checks.push('MD 首页按 claude / codex / dsh 分组')
+  checks.push('模型行按钮为单字、宽按钮保留完整文字，两组 DeepSeek 来源名称一致')
 
   if (!routesOnly) {
     snapshot = await action(panel, 'provider_select')
     panel = panelFrom(snapshot, panel.panel_id)
     const modelCardText = texts(await rawCard(panel.message_id!)).join('')
     for (const model of baseline) assert.ok(modelCardText.includes(model), `卡片缺少 ${model}`)
+    assert.ok(modelCardText.includes('补录模型') && modelCardText.includes('显示模型'), '宽按钮缺少完整说明')
+    const modelRows = (await rawCard(panel.message_id!)).body.property.elements[0].property.elements
+    assert.equal(modelRows.filter((row: any) => row.tag === 'hr').length, panel.models.length - 1, '模型行之间缺少分隔线')
     snapshot = await action(panel, 'model_list_open', { mode: 'add' })
     panel = panelFrom(snapshot, panel.panel_id)
     if ((panel.total_pages ?? 1) > 1) {
@@ -294,7 +323,7 @@ try {
     snapshot = await action(panel, 'model_remove', { model: extraModel })
     assert.deepEqual(snapshot.sources.find(source => source.id === sourceId)?.models.map(model => model.model), baseline)
     additionAttempted = false
-    checks.push('真实回调添加/删除模型，恢复九项')
+    checks.push('真实回调添加/删除模型，恢复默认列表')
 
     for (const catalog of snapshot.sources.filter(item => item.enabled && item.id !== sourceId)) {
       assert.equal(catalog.status, 'ready', `${catalog.id} 目录未就绪`)
@@ -337,7 +366,8 @@ try {
       card = await settledCard(message.message_id)
       assert.ok(footerTexts(card).join('').includes(`${testProvider} · ${testModel}/${testEffort}`), '真实回复卡的 footer 模型格式不一致')
       const usageLine = footerTexts(card).at(-1) ?? ''
-      assert.ok(testSource === sourceId ? usageLine.includes('余额 $')
+      const balanceSource = ['openrouter', 'deepseek', 'deepseek-harness'].includes(testSource)
+      assert.ok(balanceSource ? /余额 [\$¥]/.test(usageLine)
         : /\|\s+\[?(?:[\d.]+[smhd]·)?\d+%/.test(usageLine), '真实回复卡未显示余额或紧凑额度')
       assert.ok(!texts(card).join('').includes('非账户余额'), '真实回复卡保留了额外余额说明')
       foundReply = true; break

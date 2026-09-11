@@ -1,10 +1,9 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { spawn as crossSpawn } from 'cross-spawn'
-import { delimiter, join, posix, win32 } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import {
-  query,
   type EffortLevel,
   type McpServerConfig,
   type ModelInfo,
@@ -16,6 +15,7 @@ import {
   type SpawnedProcess,
   type PermissionResult,
 } from '@anthropic-ai/claude-agent-sdk'
+import { agentPackagePath, loadClaudeSdk } from './agent-updates'
 import { config, type ProjectProfile } from './config'
 import { log } from './log'
 import {
@@ -142,14 +142,6 @@ type ClaudeExecutableConfig = {
   description: string
 }
 
-function pathDelimiterForPlatform(platform: NodeJS.Platform): string {
-  return platform === 'win32' ? ';' : ':'
-}
-
-function joinForPlatform(platform: NodeJS.Platform, ...parts: string[]): string {
-  return platform === 'win32' ? win32.join(...parts) : posix.join(...parts)
-}
-
 function windowsShellShim(path: string): boolean {
   const lower = path.toLowerCase()
   return lower.endsWith('.cmd') || lower.endsWith('.bat')
@@ -171,28 +163,9 @@ function spawnWindowsShellShim(options: ClaudeSdkSpawnOptions): SpawnedProcess {
   return child as unknown as SpawnedProcess
 }
 
-function findClaudeBin(lookup: ClaudePathLookup = {}): string | null {
-  const platform = lookup.platform ?? process.platform
-  const exists = lookup.exists ?? existsSync
-  const home = lookup.homeDir ?? homedir()
-  if (platform !== 'win32') {
-    const candidates = [
-      joinForPlatform(platform, home, '.local', 'npm-global', 'bin', 'claude'),
-      joinForPlatform(platform, home, '.local', 'bin', 'claude'),
-    ]
-    for (const candidate of candidates) if (exists(candidate)) return candidate
-  }
-  const found = whichClaude(lookup)
-  if (found) return found
-  return null
-}
-
 export function assertClaudeCodeAvailable(): void {
-  // The Agent SDK ships platform-specific native Claude Code binaries as
-  // optional dependencies. Do not reject startup just because no global
-  // `claude` command is on PATH; if the SDK binary is missing, query() will
-  // surface that concrete failure.
-  findClaudeBin()
+  resolveClaudeExecutableConfig()
+  agentPackagePath('claude', '@anthropic-ai/claude-agent-sdk')
 }
 
 export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): ClaudeExecutableConfig {
@@ -214,37 +187,10 @@ export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): Cl
     }
     return { pathToClaudeCodeExecutable: configured, description: `config:${configured}` }
   }
-  const bin = findClaudeBin(lookup)
-  if (!bin) return { description: 'sdk-default' }
-  if (platform === 'win32' && windowsShellShim(bin)) {
-    return {
-      pathToClaudeCodeExecutable: bin,
-      spawnClaudeCodeProcess: spawnWindowsShellShim,
-      description: `windows-shell-shim:${bin}`,
-    }
-  }
-  // 非 windows 且未配 [claude].bin:不设 pathToClaudeCodeExecutable。显式指定会让
+  // 未配 [claude].bin:使用自动更新的 SDK 自带程序。显式指定会让
   // claude 走 CLI 二进制的 stream-json 模式,该模式不下发 AskUserQuestion 等 dialog
   // 工具;SDK 默认入口才会下发。需要显式指定时用 [claude].bin(走 configured 分支)。
   return { description: 'sdk-default' }
-}
-
-function whichClaude(lookup: ClaudePathLookup = {}): string | null {
-  const platform = lookup.platform ?? process.platform
-  const PATH = lookup.pathEnv ?? process.env.PATH ?? ''
-  if (!PATH) return null
-  const exists = lookup.exists ?? existsSync
-  const candidates = platform === 'win32'
-    ? ['claude.exe', 'claude.cmd', 'claude.bat', 'claude']
-    : ['claude']
-  for (const dir of PATH.split(pathDelimiterForPlatform(platform))) {
-    if (!dir) continue
-    for (const name of candidates) {
-      const p = joinForPlatform(platform, dir, name)
-      if (exists(p)) return p
-    }
-  }
-  return null
 }
 
 export function buildClaudeSpawnPath(): string {
@@ -258,6 +204,7 @@ export function buildClaudeSpawnPath(): string {
   ]
   return [...new Set(entries.filter(Boolean))].join(delimiter)
 }
+
 
 function usageFromSdk(raw: any): CodexUsage | null {
   const out = usageFromTokenUsagePayload(raw)
@@ -657,6 +604,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   private readonly exitPromise: Promise<void>
   private resolveExit!: () => void
   private started = false
+  private queryStart?: Promise<void>
   private pendingPermissions = new Map<string, PendingControl>()
   private requestCounter = 0
   private cumulativeUsageFromResults: CodexUsage | null = null
@@ -692,6 +640,13 @@ export class ClaudeAgentProcess extends EventEmitter {
   sendInitialize(): void {
     if (this.started) return
     this.started = true
+    this.queryStart = this.initializeQuery().catch(error => {
+      this.emit('error', error instanceof Error ? error : new Error(String(error)))
+      this.finishExit(1, null)
+    })
+  }
+
+  private async initializeQuery(): Promise<void> {
     const model = resolveClaudeSdkModel(this.opts.model)
     const profile = this.opts.profile
     if (profile) {
@@ -712,6 +667,8 @@ export class ClaudeAgentProcess extends EventEmitter {
       // resolveClaudeExecutableConfig 在 [claude].bin 配错路径时同步抛出;
       // 必须在 try 内调用,确保错误走 error/exit 事件而非穿透到调用方。
       const executable = resolveClaudeExecutableConfig()
+      const { query } = await loadClaudeSdk()
+      if (!this.alive || this.abortController.signal.aborted) return
       const baseEnv: Record<string, string | undefined> = { ...(process.env as Record<string, string>), PATH: buildClaudeSpawnPath(),
         ...config.claude.env, ...(this.opts.hostEnv ?? {}) }
       const env = this.opts.transformEnv ? this.opts.transformEnv(baseEnv) : baseEnv
@@ -870,6 +827,7 @@ export class ClaudeAgentProcess extends EventEmitter {
 
   async listModels(): Promise<CodexModel[]> {
     if (!this.started) this.sendInitialize()
+    await this.queryStart
     if (!this.query) throw new Error('claude-agent-process: SDK query not initialized (sendInitialize failed or not called)')
     const models = await this.query.supportedModels()
     return models.map(mapModelInfo)
@@ -882,6 +840,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       throw new Error('effort 参数模式改变，需要使用新的启动环境恢复会话')
     }
     if (!this.started) this.sendInitialize()
+    await this.queryStart
     if (!this.query) throw new Error('claude-agent-process: SDK query not initialized (sendInitialize failed or not called)')
     if (claudeModel) await this.query.setModel(claudeModel)
     await this.query.applyFlagSettings({ effortLevel: effort === 'default' ? null : effort, ultracode: null })

@@ -4,6 +4,7 @@ import { queryDshRuntime } from './dsh-runtime'
 import { DSH_HOME_DIR } from './paths'
 import type { DshModel } from './dsh-protocol'
 import { fetchDeepseekBalance } from './token-source-deepseek'
+import { modelList } from './token-source-visibility'
 
 registerTokenSourceFactory({
   kind: 'deepseek-harness', configSectionId: 'deepseek-harness',
@@ -11,7 +12,7 @@ registerTokenSourceFactory({
     const apiKey = cfg.api_key?.trim() ?? ''
     const baseUrl = cfg.base_url?.trim() || 'https://api.deepseek.com'
     const source: TokenSource = {
-      id: 'deepseek-harness', kind: 'deepseek-harness', agent: 'dsh', display: cfg.display?.trim() || 'DeepSeek Harness',
+      id: 'deepseek-harness', kind: 'deepseek-harness', agent: 'dsh', display: cfg.display?.trim() || 'DeepSeek',
       enabled: !!apiKey, models: [], defaultModel: cfg.model?.trim() ?? '',
       modelCatalogState: { status: apiKey ? 'idle' : 'disabled', updatedAt: Date.now() },
       spawnEnv(base) {
@@ -28,7 +29,8 @@ registerTokenSourceFactory({
         source.modelCatalogState = { status: 'loading', updatedAt: null }
         try {
           const catalog: DshModel[] = await queryDshRuntime({ cwd: DSH_HOME_DIR,
-            env: source.spawnEnv(process.env), profile: { loadProjectMcp: false } }, 'model/list')
+            env: source.spawnEnv(process.env), profile: { loadProjectMcp: false } }, 'model/list',
+            { models: [...modelList(cfg.models), ...modelList(cfg.custom_models)] })
           if (!Array.isArray(catalog) || !catalog.length) throw new Error('DeepSeek Harness model catalog is empty')
           for (const entry of catalog) {
             if (!entry.model || !entry.efforts.length || !entry.efforts.every(isDshReasoningEffort)
@@ -38,12 +40,13 @@ registerTokenSourceFactory({
           }
           const defaultModel = cfg.model?.trim() || catalog.find(model => model.isDefault)?.model
           if (!defaultModel || !catalog.some(model => model.model === defaultModel)) throw new Error('DSH default model is not in its catalog')
-          source.models = catalog.map(({ model, display, efforts, defaultEffort }) => {
+          source.models = catalog.map(({ model, display, efforts, defaultEffort, isCustom }) => {
             const configured = cfg.effort?.trim()
             if (configured && (!isDshReasoningEffort(configured) || !efforts.includes(configured))) {
               throw new Error(`DSH model ${model} does not support configured effort ${configured}`)
             }
-            return { model, display, efforts, defaultEffort: configured ? configured as typeof defaultEffort : defaultEffort }
+            return { model, display, efforts, defaultEffort: configured ? configured as typeof defaultEffort : defaultEffort,
+              origin: isCustom ? 'custom' : 'upstream' }
           })
           source.defaultModel = defaultModel
           source.modelCatalogState = { status: 'ready', updatedAt: Date.now() }

@@ -1,9 +1,9 @@
 /** 真实 OpenRouter / Claude SDK smoke；读取私有 Key 文件，在临时目录执行 Read。
- * 用法：bun scripts/test-openrouter.ts --credential /abs/key.json --output-dir /abs/private-dir [--model vendor/model] [--capture-requests]
+ * 用法：bun scripts/test-openrouter.ts --credential /abs/key.json --output-dir /abs/private-dir --agent-runtimes /abs/agent-runtimes [--model vendor/model] [--capture-requests]
  * --sequence vendor/model,vendor/model 在同一原生会话中按顺序切换，验证 resume 和上下文。
  * 会产生模型调用费用；不连接飞书、不启动 daemon、不改生产会话状态。
  */
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { isAbsolute, resolve, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
@@ -11,10 +11,16 @@ const args = process.argv.slice(2)
 function option(name: string): string | undefined { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined }
 const credential = option('--credential')
 const output = option('--output-dir')
-if (!credential || !output || !isAbsolute(credential) || !isAbsolute(output)) throw new Error('必须提供 --credential 和 --output-dir 的绝对路径')
+const runtimes = option('--agent-runtimes')
+if (!credential || !output || !runtimes || !isAbsolute(credential) || !isAbsolute(output) || !isAbsolute(runtimes)) {
+  throw new Error('必须提供 --credential、--output-dir 和 --agent-runtimes 的绝对路径')
+}
 const root = resolve(output)
 mkdirSync(root, { recursive: true, mode: 0o700 })
 process.env.LODESTAR_DATA_DIR = join(root, 'state')
+mkdirSync(process.env.LODESTAR_DATA_DIR, { recursive: true, mode: 0o700 })
+// 复用明确指定的已安装 Agent，探针的其余状态仍写私有目录。
+symlinkSync(runtimes, join(process.env.LODESTAR_DATA_DIR, 'agent-runtimes'), 'dir')
 const key: unknown = JSON.parse(readFileSync(resolve(credential), 'utf8')).api_key
 if (typeof key !== 'string' || !key.trim()) throw new Error('私有凭据文件缺少 api_key')
 const { createAgentProcess } = await import('../src/agent-launch')
@@ -45,6 +51,7 @@ const gateway = args.includes('--capture-requests') ? Bun.serve({
         method: incoming.method, headers, body, signal: incoming.signal,
       })
       if (captured) captured.status = response.status
+      if (captured && !response.ok) captured.error = (await response.clone().text()).replaceAll(key, '[redacted]')
       const returned = new Headers(response.headers)
       returned.delete('content-encoding'); returned.delete('content-length')
       return new Response(response.body, { status: response.status, headers: returned })
@@ -69,10 +76,10 @@ try {
   if (filter && sequence) throw new Error('--model 和 --sequence 不能同时使用')
   const entries = sequence ? sequence.split(',').map(id => {
     const entry = OPENROUTER_DEFAULT_MODELS.find(entry => entry.model === id)
-    if (!entry) throw new Error(`顺序测试模型不在默认九项中: ${id}`)
+    if (!entry) throw new Error(`顺序测试模型不在默认列表中: ${id}`)
     return entry
   }) : filter ? OPENROUTER_DEFAULT_MODELS.filter(entry => entry.model === filter) : OPENROUTER_DEFAULT_MODELS
-  if (!entries.length) throw new Error('指定模型不在默认九项中')
+  if (!entries.length) throw new Error('指定模型不在默认列表中')
   const results: Array<Record<string, unknown>> = []
   let previousSessionId: string | undefined
   let previousMarker: string | undefined
@@ -98,15 +105,21 @@ try {
       proc.on('tool_result', event => { if (event.is_error) toolErrors++ })
       const handle = collectAgentTurn(proc,
         'Integration test. Read the file probe.txt in the current directory using the Read tool. '
-          + (previousMarker ? 'Reply with the previous turn\'s file marker from our conversation, then the current file marker, copied verbatim.' : 'Return its exact contents.')
+          + (previousMarker ? 'Your reply must contain exactly TWO markers on separate lines: first copy the previous turn\'s file marker from our conversation, then copy the current file marker. Do not omit either marker.' : 'Return its exact contents.')
           + ' Do not infer the contents, do not read any other files, and do not perform any other work.',
         {}, () => {})
       const timer = setTimeout(() => { void handle.cancel('OpenRouter smoke exceeded 90 seconds') }, 90_000)
       try {
         const completed = await handle.done
         if (!tools.includes('Read') || !completed.output.includes(nonce)) throw new Error('Read 工具与文件随机值校验失败')
-        if (previousMarker && (!completed.output.includes(previousMarker) || completed.sessionId !== previousSessionId)) {
-          throw new Error('原生 resume 未保留 session id 或上一轮上下文')
+        const resumed = !!previousSessionId
+        const historyPreserved = !previousMarker || completed.output.includes(previousMarker)
+        const sameSession = !previousSessionId || completed.sessionId === previousSessionId
+        // 下一轮的“上一轮”始终指实际完成的这一轮，避免一次漏答污染后续断言。
+        if (sequence) { previousSessionId = completed.sessionId; previousMarker = nonce }
+        Object.assign(result, { resumed, historyPreserved, sameSession })
+        if (!historyPreserved || !sameSession) {
+          throw new Error(`原生续聊校验失败：sameSession=${sameSession}, historyPreserved=${historyPreserved}`)
         }
         if (gateway) {
           const expected = entry.effort === 'default' ? undefined : entry.effort
@@ -120,8 +133,7 @@ try {
         }
         Object.assign(result, { ok: true, tools, toolErrors, seconds: completed.durationMs / 1000,
           usage: completed.usage, modelUsage: proc.lastModel, contextWindow: proc.lastContextWindow,
-          ...(previousSessionId ? { resumed: true, historyPreserved: true } : {}) })
-        if (sequence) { previousSessionId = completed.sessionId; previousMarker = nonce }
+        })
       } finally { clearTimeout(timer) }
     } catch (error) {
       Object.assign(result, { ok: false, tools, error: String(error).replaceAll(key, '[redacted]') })

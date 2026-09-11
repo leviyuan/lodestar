@@ -4,14 +4,16 @@
  * GLM key 写入本机 Claude settings，由 daemon 的 Token Source 检测并加载。
  */
 
-import { execSync, spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
+import { spawn as spawnCommand } from 'cross-spawn'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { createInterface } from 'node:readline/promises'
-import { delimiter, dirname, join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { CONFIG_DIR, CONFIG_FILE } from './paths'
 import { writeStateFileAtomic } from './state-store'
+import { agentBin, updateAgentRuntime } from './agent-updates'
 
 const C = {
   reset: '\x1b[0m',
@@ -56,48 +58,19 @@ function escapeTomlString(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 }
 
-// ── bin detection / install ────────────────────────────────────────
-function whichBin(name: string): string | null {
-  const PATH = process.env.PATH ?? ''
-  if (!PATH) return null
-  const candidates = process.platform === 'win32'
-    ? [`${name}.cmd`, `${name}.bat`, `${name}.exe`, name]
-    : [name]
-  for (const dir of PATH.split(delimiter)) {
-    if (!dir) continue
-    for (const cand of candidates) {
-      const p = join(dir, cand)
-      if (existsSync(p)) return p
-    }
-  }
-  return null
-}
-
-function npmInstallGlobal(pkg: string): Promise<boolean> {
-  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-  return new Promise((resolve) => {
-    const child = spawn(npm, ['install', '-g', `${pkg}@latest`], {
-      stdio: 'inherit',
-      shell: process.platform === 'win32',
-    })
-    child.on('exit', (code) => resolve(code === 0))
-    child.on('error', () => resolve(false))
-  })
-}
-
 // ── Codex CLI (optional second backend) ────────────────────────────
 function isCodexChatGPTLoggedIn(codexBin: string): boolean {
   try {
-    const out = execSync(`"${codexBin}" login status 2>&1`, { timeout: 10_000 }).toString()
+    const out = execFileSync(codexBin, ['login', 'status'], { timeout: 10_000, shell: process.platform === 'win32' }).toString()
     return /Logged in using ChatGPT/i.test(out)
   } catch { return false }
 }
 
 async function runCodexLogin(codexBin: string): Promise<boolean> {
   return new Promise((resolve) => {
-    const child = spawn(codexBin, ['login'], {
+    const child = spawnCommand(codexBin, ['login'], {
       stdio: 'inherit',
-      shell: process.platform === 'win32',
+      shell: false,
     })
     child.on('exit', (code) => resolve(code === 0))
     child.on('error', () => resolve(false))
@@ -288,25 +261,8 @@ export async function runSetup(): Promise<void> {
 
   // ── Step 1/4 ──────────────────────────────────────────────────
   step(1, 4, '准备 Claude Code CLI')
-  let claudeBin = whichBin('claude')
-  if (claudeBin) {
-    console.log(`${C.green}✓ claude CLI 已就位${C.reset}: ${C.dim}${claudeBin}${C.reset}`)
-  } else {
-    console.log(`${C.yellow}未在 PATH 找到 claude CLI, 自动安装...${C.reset}`)
-    console.log(`${C.dim}运行: npm install -g @anthropic-ai/claude-code@latest${C.reset}`)
-    console.log()
-    const ok = await npmInstallGlobal('@anthropic-ai/claude-code')
-    if (!ok) {
-      console.error(`\n${C.red}安装失败。${C.reset}`)
-      console.error('请手动运行后再开向导:')
-      console.error(`  ${C.cyan}npm install -g @anthropic-ai/claude-code@latest${C.reset}`)
-      console.error(`  ${C.cyan}lodestar-setup${C.reset}`)
-      rl.close()
-      process.exit(1)
-    }
-    claudeBin = whichBin('claude')
-    console.log(`${C.green}✓ 安装完成${C.reset}: ${C.dim}${claudeBin ?? '(应该装好了, 但 PATH 找不到 — 重开终端再试)'}${C.reset}`)
-  }
+  await updateAgentRuntime('claude', { report: message => console.log(message) })
+  console.log(`${C.green}✓ Claude Code / SDK 已更新${C.reset}: ${C.dim}${agentBin('claude', 'claude')}${C.reset}`)
   console.log()
   console.log(`${C.dim}下一步可选配 GLM Coding Plan 自动写入路由; 不配则用本机 Claude Code 现有配置。${C.reset}`)
   console.log(`${C.dim}记住: 别用 \`claude\` 走订阅 OAuth 登录 —— 订阅不支持本项目, 要用 API key。${C.reset}`)
@@ -339,15 +295,11 @@ export async function runSetup(): Promise<void> {
   console.log(`  ${C.dim}想用 Codex 的话, 登录 ChatGPT 订阅即可, 模型/effort 走 ~/.codex/config.toml, 群里发 model 切换。${C.reset}`)
   const wantCodex = await ask('现在顺便配置 Codex 后端吗?', { default: 'n' })
   if (wantCodex.toLowerCase() === 'y') {
-    let codexBin = whichBin('codex')
-    if (!codexBin) {
-      console.log(`${C.dim}未找到 codex CLI, 安装 @openai/codex...${C.reset}`)
-      const ok = await npmInstallGlobal('@openai/codex')
-      if (ok) codexBin = whichBin('codex')
-    }
-    if (codexBin && isCodexChatGPTLoggedIn(codexBin)) {
+    await updateAgentRuntime('codex', { report: message => console.log(message) })
+    const codexBin = agentBin('codex', 'codex')
+    if (isCodexChatGPTLoggedIn(codexBin)) {
       console.log(`${C.green}✓ Codex 已登录 ChatGPT${C.reset}`)
-    } else if (codexBin) {
+    } else {
       console.log(`${C.dim}启动 \`codex login\`...${C.reset}`)
       const ok = await runCodexLogin(codexBin)
       if (ok && isCodexChatGPTLoggedIn(codexBin)) {
@@ -355,8 +307,6 @@ export async function runSetup(): Promise<void> {
       } else {
         console.log(`${C.yellow}Codex 登录未完成 — 不影响默认 Claude 后端; 需要时随时跑 codex login。${C.reset}`)
       }
-    } else {
-      console.log(`${C.yellow}Codex 安装失败 — 不影响默认 Claude 后端; 需要时手动 npm i -g @openai/codex。${C.reset}`)
     }
   } else {
     console.log(`${C.dim}已跳过 Codex (需要时随时跑 codex login, 群里发 model 切)。${C.reset}`)

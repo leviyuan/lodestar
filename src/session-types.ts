@@ -35,12 +35,15 @@ export interface TurnState {
     resolvedNote?: string
     output?: string
     isError?: boolean
+    imageKey?: string
     /** Set when this tool is part of a merged file-tool batch (Read run or
      * Edit run) — points to the batch's slot in `toolBatches[i].items`.
      * completeTool uses it to update the right row instead of rendering
      * a standalone panel. */
     batchSlot?: number
   }>
+  /** Generated images finish uploading/rendering before their owning card closes. */
+  imageDeliveryInflight?: Map<string, Set<Promise<void>>>
   /** Current turn plan as reported by Codex app-server
    * turn/plan/updated. Deltas are only for the pre-authoritative
    * planning draft shown before this structure lands. */

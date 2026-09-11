@@ -1388,10 +1388,8 @@ export async function downloadAttachment(
 }
 
 // ── Outbound: upload + send file/image ────────────────────────────────
-// Lark caps message images at ~30 MB; files vary by tenant (default 30 MB).
-// We refuse anything above 30 MB up front rather than chasing per-tenant
-// limits and surfacing opaque API errors mid-upload.
-const MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+// 用户约定的飞书出站文件上限，普通文件、图片和卡内图片共同遵守。
+export const MAX_UPLOAD_BYTES = 30 * 1024 * 1024
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'])
 
 function looksLikeImage(filePath: string): boolean {

@@ -68,7 +68,7 @@ async function request(base: string, apiKey: string, path: string): Promise<unkn
   return response.json()
 }
 
-/** 仅收录可用于交互 Agent 的文本 + tools 模型，保留缺失 effort 的 MISS 状态。
+/** 仅收录可用于交互 Agent 的文本 + tools 模型；未细分档位时使用网关请求选项。
  * reasoning.supported_efforts 的 null 表示所有网关档位；省略表示无档位选择。
  * https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
  */
@@ -89,10 +89,10 @@ export async function fetchOpenRouterModels(base: string, apiKey: string): Promi
       || entry.id.endsWith(':batch') || seen.has(entry.id)) continue
     const reasoning = object(entry.reasoning) ? entry.reasoning : undefined
     const declared = reasoning?.supported_efforts
-    const efforts: ClaudeReasoningEffort[] = declared === null
+    const efforts: ClaudeReasoningEffort[] = declared === null || declared === undefined && entry.supported_parameters.includes('reasoning_effort')
       ? ['max', 'xhigh', 'high', 'medium', 'low']
       : Array.isArray(declared) ? [...new Set(declared.filter(e => e !== 'default' && isClaudeReasoningEffort(e)))] as ClaudeReasoningEffort[]
-      : declared === undefined && !entry.supported_parameters.includes('reasoning_effort') ? ['default'] : []
+      : ['default']
     const preset = OPENROUTER_DEFAULT_MODELS.find(preset => preset.model === entry.id)
     const defaultEffort = preset ? (efforts.includes(preset.effort) ? preset.effort : null)
       : efforts[0] === 'default' ? 'default'
@@ -175,7 +175,7 @@ registerTokenSourceFactory({
             }
             defaultEntry!.defaultEffort = cfg.effort
           }
-          // 空字符串是用户删除全部模型后的有效选择，不能重新填回默认九项。
+          // 空字符串是用户删除全部模型后的有效选择，不能重新填回默认列表。
           const selected = modelIds.map(id => {
             const model = catalog.find(m => m.model === modelId(id))
             if (!model) return { model: id, display: id, efforts: [], defaultEffort: null,

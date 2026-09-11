@@ -6,7 +6,8 @@
  * local `codex login` ChatGPT session.
  */
 
-import { spawn, type ChildProcessByStdio } from 'node:child_process'
+import type { ChildProcessByStdio } from 'node:child_process'
+import { spawn } from 'cross-spawn'
 import type { Readable, Writable } from 'node:stream'
 import { resolveCodexBin } from './codex-process'
 import { log } from './log'
@@ -41,6 +42,8 @@ export type UsageSnapshot =
       buckets?: UsageBucket[]
       /** 服务端在 read 响应里指定的默认桶 limitId(顶层 rateLimits 指针)。 */
       defaultLimitId?: string
+      /** 账号可用的额度重置卡次数；null 表示接口没有返回有效数值。 */
+      resetCredits?: number | null
       fetchedAt: number
     }
 
@@ -64,7 +67,7 @@ export class AppServerOnce {
   constructor() {
     this.proc = spawn(resolveCodexBin(), ['app-server', '--listen', 'stdio://'], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      shell: process.platform === 'win32',
+      shell: false,
     }) as ChildProcessByStdio<Writable, Readable, Readable>
     this.exitPromise = new Promise(resolve => { this.resolveExit = resolve })
     this.proc.stdout.on('data', (chunk: Buffer) => this.onStdout(chunk))
@@ -250,7 +253,7 @@ async function fetchUsage(): Promise<UsageSnapshot> {
     if (!account) return { state: 'no_credentials' }
     if (account.type !== 'chatgpt') return { state: 'auth_failed' }
 
-    const limitsRes = await withTimeout(app.request('account/rateLimits/read', {}), API_TIMEOUT_MS)
+    const limitsRes = await readRateLimitsWithRetry(() => app.request('account/rateLimits/read', {}))
     return snapshotFromReadResponse(limitsRes, account.planType)
   } catch (e: any) {
     log(`usage: codex app-server usage failed: ${e?.message ?? e}`)
@@ -273,6 +276,8 @@ export function snapshotFromReadResponse(limitsRes: any, planType?: string | nul
     weekly: def.weekly,
     buckets,
     defaultLimitId: def.limitId,
+    resetCredits: Number.isInteger(limitsRes?.rateLimitResetCredits?.availableCount) && limitsRes.rateLimitResetCredits.availableCount >= 0
+      ? limitsRes.rateLimitResetCredits.availableCount : null,
     fetchedAt: Date.now(),
   }
 }
@@ -306,7 +311,7 @@ export async function readUsage(): Promise<UsageSnapshot> {
  * 调用方省略额度段(no_fallbacks,不拿旧值冒充——cache 保留但 footer
  * 按调用方约定处理)。 */
 export function refreshUsageFromConnection(request: (method: string, params: any) => Promise<any>): Promise<UsageSnapshot | null> {
-  refreshInFlight ??= withTimeout(request('account/rateLimits/read', {}), API_TIMEOUT_MS)
+  refreshInFlight ??= readRateLimitsWithRetry(() => request('account/rateLimits/read', {}))
     .then((limitsRes: any) => {
       const snap = snapshotFromReadResponse(limitsRes)
       if (snap.state === 'ok') cache = snap
@@ -322,3 +327,18 @@ export function refreshUsageFromConnection(request: (method: string, params: any
 }
 
 let refreshInFlight: Promise<UsageSnapshot | null> | null = null
+
+/** 网络抖动重试同一个额度接口；认证错误和无效响应仍直接报告。 */
+async function readRateLimitsWithRetry(request: () => Promise<any>): Promise<any> {
+  const delays = [250, 750]
+  for (let attempt = 0; ; attempt++) {
+    try { return await withTimeout(request(), API_TIMEOUT_MS) }
+    catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const transient = /error sending request|timed? ?out|timeout|ECONNRESET|ETIMEDOUT|EAI_AGAIN|connection (?:reset|closed)|\b(?:429|502|503|504)\b/i.test(message)
+      if (!transient || attempt >= delays.length) throw error
+      log(`usage: rate limit request retry ${attempt + 1}/${delays.length}: ${message}`)
+      await new Promise(resolve => setTimeout(resolve, delays[attempt]))
+    }
+  }
+}

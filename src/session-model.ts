@@ -63,7 +63,7 @@ function modelChoicesFor(s: Session, ts: TokenSource, entries = ts.models): card
       sourceId: ts.id,
       model: m.model,
       displayName: m.display,
-      description: m.unavailableReason ?? (m.efforts.length ? ts.display : `${ts.display} · effort MISS：上游未声明该后端支持的推理档位`),
+      description: m.unavailableReason ?? (m.efforts.length ? '' : 'effort MISS：上游未声明该后端支持的推理档位'),
       unavailableReason: m.unavailableReason,
       origin: m.origin,
       enabled: true,
@@ -335,6 +335,15 @@ export async function consumeModelCustomMessage(
       `**MISS**：${selected.unavailableReason ?? '后端未确认 effort'}。记录已保存，可在模型面板删除。`), `模型 ${model} 已补录，能力尚未确认。`)
     return true
   }
+  if (selected.efforts.length === 1) {
+    const result = await s.onModelEffortSelect(selected.model, selected.efforts[0].effort, pending.panelId, user, selected.provider)
+    await updateCardOrFallback(result.ok
+      ? cards.modelResultPanelElement({ sessionName: s.sessionName, provider: selected.provider,
+          model: selected.model, effort: selected.efforts[0].effort,
+          scope: modelSelectionScope(s, selected.provider ?? 'codex') })
+      : cards.modelCustomResultPanelElement(true, model, result.message), result.message)
+    return true
+  }
   await updateCardOrFallback(
     cards.modelEffortSelectionPanelElement({
       sessionName: s.sessionName,
@@ -388,7 +397,7 @@ function modelSelectionScope(s: Session, provider: AgentProvider): string {
   return `下次启动 ${agentProviderLabel(provider)} 时使用。`
 }
 
-/** 第2级点模型 → 第3级 effort 列表。 */
+/** 有多个档位才进入第3级；只有一个档位（含模型原生 default）时直接应用。 */
 export async function onModelSelect(
   s: Session,
   modelRaw: string,
@@ -414,6 +423,10 @@ export async function onModelSelect(
     return { ok: false, message: `${choice.displayName} 未配置,请先点「启用」` }
   }
   if (choice.efforts.length === 0) return { ok: false, message: '模型未返回 effort' }
+  if (choice.efforts.length === 1) {
+    // 复用正常选择的验证和持久化；当前调用已持有 Session 生命周期锁。
+    return onModelEffortSelect(s, model, choice.efforts[0].effort, panelIdRaw, _userOpenId, provider)
+  }
   return {
     ok: true,
     message: '',
@@ -465,7 +478,7 @@ export async function onModelEffortSelect(
     }
   }
   const sourceChanged = !!choice.sourceId && s.currentTokenSource()?.id !== choice.sourceId
-  const environmentChanged = !!source?.modelEnvironmentRevision
+  const environmentChanged = !s.processSourceMatches(source, model) || !!source?.modelEnvironmentRevision
     && source.modelEnvironmentRevision(s.currentModelLabel() ?? '') !== source.modelEnvironmentRevision(model)
   const selectionUnchanged = s.currentProvider() === provider &&
     !sourceChanged &&
@@ -498,6 +511,9 @@ export async function onModelEffortSelect(
   const modelChanged = s.currentModelLabel() !== model
   const profileChanged = modelChanged || sourceChanged
   const procBusy = !!(s.currentTurn || s.openingTurn || s.pendingUserMessageCount > 0 || s.pendingMidTurnMsgs.length > 0)
+  if (environmentChanged && s.proc?.isAlive() && procBusy) {
+    return { ok: false, message: '新模型需要更新进程配置，请等当前任务结束后再选择' }
+  }
   if (
     provider === 'claude' &&
     s.proc?.isAlive() &&

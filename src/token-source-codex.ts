@@ -36,12 +36,13 @@ function codexUsageToUnified(s: UsageSnapshot): UsageSnapshotUnified {
         : s.state === 'rate_limited' ? 'rate_limited'
         : 'network',
       windows: [],
+      resetCredits: null,
     }
   }
   const windows: UsageWindowUnified[] = []
   if (s.fiveHour) windows.push(windowToUnified(s.fiveHour, 'fiveHour', '5h 窗口'))
   if (s.weekly) windows.push(windowToUnified(s.weekly, 'weekly', '周配额'))
-  return { state: 'ok', planLabel: s.subscriptionType, windows, fetchedAt: s.fetchedAt }
+  return { state: 'ok', planLabel: s.subscriptionType, windows, fetchedAt: s.fetchedAt, resetCredits: s.resetCredits ?? null }
 }
 
 /** read 端点全量桶列表 → unified(console `hi` 面板可显示非默认桶,如 Spark

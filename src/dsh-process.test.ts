@@ -65,6 +65,33 @@ function nextResult(proc: DshProcess): Promise<any> {
 }
 
 describe('DSH native runtime through Lodestar bridge', () => {
+  test('a manually entered DeepSeek model outside the native list resolves effort and runs', async () => {
+    const model = 'deepseek-manual-catalog-probe'
+    const f = await fixture(() => completion({ content: 'custom model replied' }, 'stop', model))
+    const proc = f.processFor(undefined, { model, effort: 'max' })
+    await proc.initializationPromise()
+    const entry = (await proc.listModels()).find(entry => entry.model === model)
+    expect(entry?.supportedReasoningEfforts.map(entry => entry.reasoningEffort)).toContain('max')
+    const done = nextResult(proc)
+    proc.sendUserText('use the manually entered model')
+    expect(await done).toMatchObject({ is_error: false })
+    expect(f.requests[0]).toMatchObject({ model, reasoning_effort: 'max' })
+    expect(f.requests[0].dsh_plugin_packages?.packages.some((entry: any) => entry.name === '@leviyuan/lodestar' && entry.version)).toBe(true)
+  }, 30_000)
+
+  test('GLM Coding Plan models outside the installed pi-ai catalog accept the chosen effort', async () => {
+    const model = 'glm-manual-catalog-probe'
+    const f = await fixture(() => completion({ content: 'custom GLM replied' }, 'stop', model))
+    const proc = f.processFor(undefined, { tokenSourceId: 'dsh-glm', model, effort: 'high',
+      transformEnv: env => ({ ...env, LODESTAR_DSH_PROVIDER: 'zai-coding-cn', LODESTAR_DSH_GLM_API_KEY: 'local-test-key',
+        LODESTAR_DSH_BASE_URL: f.baseUrl, LODESTAR_DSH_MODELS: JSON.stringify([model]), LODESTAR_DSH_DEFAULT_MODEL: model }) })
+    await proc.initializationPromise()
+    const done = nextResult(proc)
+    proc.sendUserText('use the model missing from the installed catalog')
+    expect(await done).toMatchObject({ is_error: false })
+    expect(f.requests[0]).toMatchObject({ model, reasoning_effort: 'high', thinking: { type: 'enabled' } })
+  }, 30_000)
+
   test('GLM Coding Plan runs tools, changes effort and resumes through the native pi-ai adapter', async () => {
     const f = await fixture((_body, count) => count === 1 ? completion({ tool_calls: [{ index: 0, id: 'glm-tool', type: 'function', function: {
       name: 'bash', arguments: JSON.stringify({ command: '# desc: 验证 GLM 原生工具调用\nprintf glm-tool-proof', description: 'Return proof' }),
