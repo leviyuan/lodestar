@@ -42,14 +42,27 @@ projects_root = "/abs/projects"
 live_elapsed = "bucket"      # bucket 按档位刷新耗时；second 按秒刷新
 
 [projects.calculator]
-cwd = "/abs/projects/calculator"  # 对两个后端均生效
+cwd = "/abs/projects/calculator"  # 对所有后端均生效
 setting_sources = "project"       # Claude 后端；仅未绑定 Token Source 时使用
-strict_mcp = "true"               # 以下字段用于 Claude 主会话
-load_project_mcp = "true"
-tools = "Read,Write,Edit,Bash,Glob,Grep"
+strict_mcp = "true"               # Claude 主会话
+load_project_mcp = "true"         # Claude / DSH 主会话
+tools = "Read,Write,Edit,Bash,Glob,Grep"  # Claude / DSH 主会话
 
 [claude]
 bin = "/abs/path/to/claude-wrapper"  # 可选的 Claude 可执行文件
 ```
 
 账号配置、OpenRouter 默认模型和 DSH 接入见[模型与账号](models.md)。手动修改配置后需重启 daemon；群内设置自行保存。
+
+## 源码开发
+
+安装 Bun，在仓库根目录运行：
+
+```bash
+bun install
+bun run typecheck
+bun test
+bun run build
+```
+
+完成配置后用 `bun run start` 从源码启动。维护规则见[项目指引](../AGENTS.md)；真实飞书探针会操作目标群，使用前阅读[脚本说明](../scripts/AGENTS.md)。
