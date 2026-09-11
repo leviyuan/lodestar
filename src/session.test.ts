@@ -4161,6 +4161,8 @@ describe('Session lifecycle reliability', () => {
     const session = new Session('daemon-restore-input', 'chat_id') as any
     const ref = { provider: 'codex' as const, sessionId: 'saved-thread', cwd: session.workDir }
     session.selectedProvider = 'codex'
+    // Match the source-less fake process, independently of registry test order.
+    session.selectedTokenSourceId = null
     session.lastSessionRef = ref
     session.lastSessionId = ref.sessionId
     let releaseInit!: () => void
