@@ -10,9 +10,11 @@ AI 不是帮手，是倍率。它放大的不是体力，是你 —— 你的直
 
 ---
 
-在飞书群里使用 Codex、Claude Code 和 DeepSeek Harness。每个群对应一个项目目录和会话，回复、工具调用、图片、提问及后台任务通过卡片展示。
-
-支持 Codex 订阅、GLM Coding Plan、DeepSeek、OpenRouter 和 Claude native；[账号、模型与推理档位](docs/models.md)可在群里切换并保存。
+- **Agent**：在飞书群里使用 Codex、Claude Code 和 DeepSeek Harness。
+- **项目与会话**：每个群对应一个项目目录和会话。
+- **卡片交互**：展示回复、工具调用、图片、提问和后台任务。
+- **账号来源**：支持 Codex 订阅、GLM Coding Plan、DeepSeek、OpenRouter 和 Claude native。
+- **模型切换**：在群里选择并保存[账号、模型与推理档位](docs/models.md)。
 
 ## 快速开始
 
@@ -31,20 +33,9 @@ lodestar-setup
 | --- | --- | --- |
 | `hi` | — | 打开控制台，查看会话与额度 |
 | `model` | `md` | 选择账号、模型和推理档位 |
-| `stop` | `st` | 打断当前回复，取消排队消息 |
 | `kill` | `kl` | 关闭当前 Agent 进程，保留会话记录 |
-| `restart` | `rs` | 恢复当前会话；进程已停止时选择历史会话 |
-| `clear` | `cl` | 清空当前对话，开始新会话 |
-| `compact` | `cm` | 压缩上下文 |
-| `worktree [名称]` | `wt [名称]` | 查看工作区；带名称时创建或加入独立工作区 |
-| `btw` | — | 新建临时群与会话，共享当前工作目录 |
-| `fork` | `fk` | 从选定输入之前分叉，在临时群中继续 |
-| `back` | `bk` | 从选定输入之前分叉，在当前群中继续 |
-| `bye` | — | 停止会话并解散当前临时群 |
-| `agents` | `agent` | 查看可调用的 Agent 身份 |
-| `task` | — | 管理飞书任务清单绑定 |
 
-参数、使用条件和会话分支说明见[群内使用指南](docs/usage.md)。
+完整指令、参数与会话分支说明见[群内使用指南](docs/usage.md)。
 
 ## 附加能力
 
