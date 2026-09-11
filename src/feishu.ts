@@ -10,7 +10,7 @@ import { AGENT_PROVIDERS, isAgentProvider, isDshReasoningEffort } from './agent-
 import * as lark from '@larksuiteoapi/node-sdk'
 import { execSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, extname, isAbsolute, join } from 'node:path'
@@ -929,24 +929,24 @@ export function clearSessionConversationState(sessionName: string): void {
 // stay stopped after restart.
 
 export function writeAliveMarker(sessionNames: string[]): void {
-  try {
-    writeJsonStateAtomic(ALIVE_MARKER_FILE, sessionNames)
-  } catch (e) { log(`feishu: write alive marker failed: ${e}`) }
+  writeJsonStateAtomic(ALIVE_MARKER_FILE, sessionNames)
 }
 
 /** Read without unlinking. The daemon keeps this marker current while
  * running, so a rapid second restart cannot lose the revive list after
  * the first boot consumes it but exits before a clean shutdown. */
 export function readAliveMarker(): string[] {
-  if (!existsSync(ALIVE_MARKER_FILE)) return []
-  try {
-    const raw = readFileSync(ALIVE_MARKER_FILE, 'utf8')
-    const data = JSON.parse(raw)
-    return Array.isArray(data) ? data.filter((x: unknown): x is string => typeof x === 'string') : []
-  } catch (e) {
-    log(`feishu: read alive marker failed: ${e}`)
-    return []
+  let raw: string
+  try { raw = readFileSync(ALIVE_MARKER_FILE, 'utf8') }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw error
   }
+  const data: unknown = JSON.parse(raw)
+  if (!Array.isArray(data) || data.some(name => typeof name !== 'string' || !name.trim())) {
+    throw new Error('invalid alive session marker: expected non-empty session names')
+  }
+  return data
 }
 
 export function chatIdForSession(sessionName: string): string | null {

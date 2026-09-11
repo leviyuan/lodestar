@@ -7,6 +7,7 @@
 - 命令、模型、权限、工具、临时会话、worktree、Agent 身份和任务清单放在对应 `session-*.ts` helper；这些模块可协作访问 Session 的内部字段。
 - 修改 `AgentProcess` 时检查 Codex、Claude、Session 消费方和卡片。单端能力用明确分支或 capability 表达。
 - Codex 通过 app-server JSON-RPC 管理 thread、turn、权限、提问、plan/goal、usage、compaction 和 collab 子 Agent。未知或畸形 payload 要记录。
+- Codex 会话落盘确认的 `thread/read` 最多等 10 分钟，Session 初始化总保护为 12 分钟，覆盖两个 30 秒控制请求及本地处理。daemon 恢复使用 `restoreAfterDaemonRestart` 保留失败意图，成功恢复或用户明确启动/停止后才解除；不得让排队消息在恢复失败后清空原会话。
 - Codex 的 `Selected model is at capacity` 按用户要求持续退避重试（5s 起、60s 封顶），保留当前任务和模型，直到成功或用户停止；等待状态需显示。仅在 `turn/completed` 确认失败或 `turn/start` 明确拒绝后重试，已接受的输入通过原 thread 续跑，不重放原任务；其他错误仍正常结算。
 - Claude 使用 `query()` streaming input。`permissionMode: default` 下普通工具由 `canUseTool` 放行，`AskUserQuestion` 等待回答；保留 `task_*`、`compact_boundary`、resume/fork 和项目配置。
 - Agent 默认自动跟随 upstream latest，接受新版暂时不兼容并在后续适配；不得增加兼容版本白名单或因未经验证而阻止升级。`agent-updates.ts` 管理启动时及每 6 小时的更新、独立安装目录和失败状态；实际 CLI/SDK 加载必须使用它选中的目录，不能更新全局包却仍加载另一份旧依赖。

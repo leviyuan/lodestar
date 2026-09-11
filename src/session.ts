@@ -159,11 +159,11 @@ function mergeCompactionNotices(
 const FOOTER_THINKING_PREFIX = 'Thinking...'
 const FOOTER_WRITING = 'Writing...'
 const FOOTER_WORKING = 'Working...'
-/** Final transaction guard. Individual Codex control RPCs retain their 30s
- * method deadline, so a method-specific timeout surfaces first; 120s covers
- * initialize + thread launch + materialization read and any lifecycle defect. */
+/** Final transaction guard: two 30s control RPCs plus a materialization read
+ * of up to 10 minutes. Leave a minute for local lifecycle work so the exact
+ * method timeout can surface before this outer guard. */
 const CODEX_INIT_NOTICE_MS = 10_000
-const CODEX_INIT_TIMEOUT_MS = 120_000
+const CODEX_INIT_TIMEOUT_MS = 12 * 60_000
 /** 提前换卡，为在途写入和复杂嵌套元素留出余量。
  * Feishu 的容量按卡片结构计数；实际 300305 容量错误另触发换卡。 */
 const CARD_ELEMENT_SOFT_LIMIT = 50
@@ -484,6 +484,10 @@ export class Session {
    * and must not be guessed as zero. */
   private usageTotalsSeedUnknown = false
   private resumePersistenceError: string | null = null
+  /** A failed daemon recovery must not turn the next queued message into a
+   * fresh conversation. Retain this intent until an explicit lifecycle action
+   * or a successful recovery resolves it. */
+  private daemonRestoreRequired = false
   /** Set while the `compact` command owns a status card for a standalone
    * compaction. Suppresses the generic no-turn compaction text alert;
    * command feedback is rendered on that status card instead. */
@@ -574,9 +578,9 @@ export class Session {
    * only because the user's explicit stop could not yet be confirmed must not
    * undo that stop intent on the next boot. */
   shouldRevive(): boolean {
-    return this.isRunning()
+    return this.daemonRestoreRequired || (this.isRunning()
       && this.stoppingProc !== this.proc
-      && this.blockedProc !== this.proc
+      && this.blockedProc !== this.proc)
   }
   /** 从持久化 selection 推导 tokenSourceId;无匹配返回 default 或 null(走旧路径)。 */
   private deriveTokenSourceId(selection: { tokenSourceId?: string | null; provider?: string; model?: string | null } | null): string | null {
@@ -1361,6 +1365,7 @@ export class Session {
 
   // ── Lifecycle ──────────────────────────────────────────────────────
   private resetFreshConversationState(): void {
+    this.daemonRestoreRequired = false
     this.turnCounter = 0
     this.pendingConversationMaterialization = null
     feishu.replaceTurnAnchors(this.sessionName, [], { kind: 'fresh' }, null)
@@ -1531,6 +1536,7 @@ export class Session {
     }
     this.status = 'idle'
     this.startedAt = Date.now()
+    this.daemonRestoreRequired = false
     this.opts.onLifecycleChange?.()
     report?.(this.withModel(this.withWorktreeInstructionNotice(`✅ ${this.backendLabel()} 已就绪`)))
     return true
@@ -1637,6 +1643,7 @@ export class Session {
   private async stopUnlocked(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
     const announce = opts.announce ?? true
     const report = opts.onStatus
+    this.daemonRestoreRequired = false
     await this.cancelAgentRuns(reason)
     if (!this.proc) {
       this.status = 'stopped'
@@ -1753,6 +1760,24 @@ export class Session {
 
   async restart(resume = false, opts: LifecycleProgressOpts = {}): Promise<boolean> {
     return await this.runLifecycle('restart', () => this.restartUnlocked(resume, opts))
+  }
+
+  requireDaemonRestore(): void {
+    this.daemonRestoreRequired = true
+  }
+
+  async restoreAfterDaemonRestart(): Promise<boolean> {
+    return await this.runLifecycle('daemon-restore', async () => {
+      this.requireDaemonRestore()
+      if (!this.lastSessionRef && !this.pendingMaterializationLaunch()) {
+        const message = '❌ daemon 重启后没有可用的恢复点。请发送 rs 选择历史会话，或 hi 明确启动新会话。'
+        this.status = 'stopped'
+        this.opts.onLifecycleChange?.()
+        await feishu.sendText(this.chatId, message)
+        return false
+      }
+      return await this.restartUnlocked(true)
+    })
   }
 
   private async restartUnlocked(
@@ -2029,6 +2054,7 @@ export class Session {
       if (announceText) await feishu.sendText(this.chatId, msg)
       this.status = 'idle'
       this.startedAt = Date.now()
+      this.daemonRestoreRequired = false
       this.opts.onLifecycleChange?.()
       try { await closeInternalStatusCard(msg) } catch (error) {
         log(`session "${this.sessionName}": restart succeeded but status-card close failed: ${messageOf(error)}`)
@@ -2727,6 +2753,10 @@ export class Session {
     const blocked = this.blockedProcessMessage()
     if (blocked) {
       await feishu.sendText(this.chatId, `❌ ${blocked}。请重试 stop/restart，或等待旧进程退出。`)
+      return
+    }
+    if (this.daemonRestoreRequired) {
+      await feishu.sendText(this.chatId, '❌ daemon 重启后的会话恢复尚未成功，这条消息未送给 Agent。请发送 rs 选择历史会话，或 hi 明确启动新会话，然后重发消息。')
       return
     }
     // Garbage-collect leftover state from a batch the SDK abandoned —

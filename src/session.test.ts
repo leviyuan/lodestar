@@ -4157,6 +4157,143 @@ describe('Session live_elapsed second mode', () => {  test('second live_elapsed 
 })
 
 describe('Session lifecycle reliability', () => {
+  test('daemon recovery finishes the saved thread initialization before delivering a queued message', async () => {
+    const session = new Session('daemon-restore-input', 'chat_id') as any
+    const ref = { provider: 'codex' as const, sessionId: 'saved-thread', cwd: session.workDir }
+    session.selectedProvider = 'codex'
+    session.lastSessionRef = ref
+    session.lastSessionId = ref.sessionId
+    let releaseInit!: () => void
+    let spawned!: () => void
+    const spawnReady = new Promise<void>(resolve => { spawned = resolve })
+    const proc = new FakeAgentProc('codex', ref.sessionId)
+    proc.launchKind = 'resume'
+    proc.initialization = new Promise<void>(resolve => { releaseInit = resolve })
+    let spawnCount = 0
+    session.spawnAgent = (source: unknown) => {
+      expect(source).toEqual(ref)
+      spawnCount++
+      spawned()
+      return proc
+    }
+
+    const restoration = session.restoreAfterDaemonRestart()
+    await spawnReady
+    const message = session.onUserMessage('重启期间收到的消息')
+    await Promise.resolve()
+    expect(proc.sentTexts).toEqual([])
+    expect(session.shouldRevive()).toBe(true)
+    proc.emit('init', { session_id: ref.sessionId })
+    releaseInit()
+    try {
+      expect(await restoration).toBe(true)
+      await message
+      expect(spawnCount).toBe(1)
+      expect(proc.killCalls).toBe(0)
+      expect(proc.sentTexts).toEqual(['重启期间收到的消息'])
+      expect(session.lastSessionId).toBe(ref.sessionId)
+    } finally {
+      await session.stop('测试收尾', { announce: false })
+    }
+  })
+
+  test.each(['codex', 'claude', 'dsh'] as const)('failed %s daemon recovery blocks queued input and preserves the resume point until an explicit retry', async provider => {
+    const session = new Session(`daemon-restore-failure-${provider}`, 'chat_id') as any
+    const ref = { provider, sessionId: 'saved-thread', cwd: session.workDir }
+    session.selectedProvider = provider
+    if (provider === 'dsh') session.selectedEffort = 'off'
+    session.lastSessionRef = ref
+    session.lastSessionId = ref.sessionId
+    resumeRefs.set(`${session.sessionName}:${provider}`, ref)
+    let fail = true
+    let spawnCount = 0
+    session.spawnAgent = () => { spawnCount++; return new FakeAgentProc(provider, ref.sessionId) }
+    const init = async () => fail
+      ? { state: 'error', error: new Error('resume transport failed') }
+      : { state: 'init' }
+    session.waitForCodexInitialization = init
+    session.waitForProcEarlyFailure = init
+
+    expect(await session.restoreAfterDaemonRestart()).toBe(false)
+    expect(session.shouldRevive()).toBe(true)
+    await session.onUserMessage('不得开启新会话')
+    expect(spawnCount).toBe(1)
+    expect(session.proc).toBeNull()
+    expect(session.lastSessionId).toBe(ref.sessionId)
+    expect(resumeRefs.get(`${session.sessionName}:${provider}`)).toEqual(ref)
+    expect(sentTexts.join('\n')).toContain('这条消息未送给 Agent')
+    expect(clearedResumes).toEqual([])
+
+    fail = false
+    expect(await session.restart(true, { announce: false })).toBe(true)
+    expect(session.daemonRestoreRequired).toBe(false)
+    expect(session.lastSessionId).toBe(ref.sessionId)
+    await session.stop('测试收尾', { announce: false })
+    expect(session.shouldRevive()).toBe(false)
+  })
+
+  test('daemon recovery without a resume point never creates a fresh conversation implicitly', async () => {
+    const session = new Session('daemon-restore-missing', 'chat_id') as any
+    let spawns = 0
+    session.spawnAgent = () => { spawns++; return new FakeAgentProc('codex') }
+    expect(await session.restoreAfterDaemonRestart()).toBe(false)
+    await session.onUserMessage('不得创建新会话')
+    expect(spawns).toBe(0)
+    expect(session.shouldRevive()).toBe(true)
+    await session.stop('用户明确停止', { announce: false })
+    expect(session.shouldRevive()).toBe(false)
+  })
+
+  test('explicit fresh start clears a failed daemon recovery guard', async () => {
+    const session = new Session('daemon-restore-fresh', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    expect(await session.restoreAfterDaemonRestart()).toBe(false)
+    const proc = new FakeAgentProc('codex', 'new-thread')
+    proc.launchKind = 'fresh'
+    session.spawnAgent = () => proc
+    expect(await session.start({ announce: false })).toBe(true)
+    expect(session.daemonRestoreRequired).toBe(false)
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('the outer initialization guard allows a ten-minute materialization read to finish', async () => {
+    const session = new Session('daemon-restore-slow', 'chat_id') as any
+    let now = 0
+    let nextId = 1
+    const timers = new Map<number, { due: number; callback: () => void }>()
+    const timeout = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay: number) => {
+      const id = nextId++
+      timers.set(id, { due: now + delay, callback })
+      return id as unknown as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout)
+    const clear = spyOn(globalThis, 'clearTimeout').mockImplementation(((id: number) => { timers.delete(id) }) as typeof clearTimeout)
+    let ready!: () => void
+    const initialization = new Promise<void>(resolve => { ready = resolve })
+    let outcome: unknown = null
+    let notices = 0
+    try {
+      const waiting = session.waitForCodexInitialization(initialization, () => { notices++ })
+      void waiting.then((result: unknown) => { outcome = result })
+      for (const elapsed of [120_000, 660_000]) {
+        now = elapsed
+        for (const [id, timer] of timers) {
+          if (timer.due > now) continue
+          timers.delete(id)
+          timer.callback()
+        }
+        await Promise.resolve()
+        expect(outcome).toBeNull()
+      }
+      ready()
+      expect(await waiting).toEqual({ state: 'init', error: undefined })
+      expect(notices).toBe(1)
+      expect(timers.size).toBe(0)
+    } finally {
+      timeout.mockRestore()
+      clear.mockRestore()
+    }
+  })
+
   test('Codex init timeout is a failed start and never reports ready', async () => {
     const session = new Session('codex-timeout', 'chat_id') as any
     const proc = new FakeAgentProc('codex', null)
@@ -4175,7 +4312,7 @@ describe('Session lifecycle reliability', () => {
     expect(session.proc).toBeNull()
     expect(session.status).toBe('stopped')
     expect(statuses.some(status => status.includes('启动超时'))).toBe(true)
-    expect(statuses.some(status => status.includes('120 秒'))).toBe(true)
+    expect(statuses.some(status => status.includes('720 秒'))).toBe(true)
     expect(statuses.some(status => status.includes('已就绪'))).toBe(false)
   })
 

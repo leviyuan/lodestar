@@ -57,6 +57,7 @@ import {
   isStaleAtReceipt,
 } from './src/inbound-message'
 import { drainDynamicWork, trackWork } from './src/inflight-work'
+import { DaemonSessionRecovery } from './src/daemon-session-recovery'
 import {
   ActionDeduper,
   PerKeyActor,
@@ -90,21 +91,15 @@ let cleanupDone = false
 let shutdownRequested = false
 let shutdownPromise: Promise<void> | null = null
 let shutdownExitCode = 0
-let shutdownAliveSessionNames: string[] | null = null
 let stopAgentAutoUpdates: (() => void) | undefined
+let stopFeishuWs: (() => void) | undefined
 const agentUpdateAbort = new AbortController()
 const SHUTDOWN_DEADLINE_MS = 15_000
 const cleanup = () => {
   if (cleanupDone) return
   cleanupDone = true
-  // Snapshot which sessions are still alive so the next boot can
-  // revive them — only the ones still running at shutdown, NOT
-  // anything the user already `kill`-ed (those are absent from the
-  // sessions Map filter below and stay stopped after restart).
   try {
-    const alive = shutdownAliveSessionNames ?? currentAliveSessionNames()
-    feishu.writeAliveMarker(alive)
-    if (alive.length > 0) log(`alive marker: [${alive.join(', ')}]`)
+    sessionRecovery.persist()
   } catch (e) { log(`alive marker write failed: ${e}`) }
   try { unlinkSync(PID_FILE) } catch {}
   try { unlinkSync(DEBUG_SOCK_FILE) } catch {}
@@ -122,12 +117,15 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
   // Seal both message and action admission synchronously before taking the
   // dynamic work snapshot. Already-admitted tails remain drainable.
   chatActor.close()
-  // Snapshot before Session.stop() clears each process and invokes its
-  // lifecycle callback. This marker means "revive after daemon restart", not
-  // "still alive after graceful teardown".
-  shutdownAliveSessionNames = currentAliveSessionNames()
+  try { stopFeishuWs?.() }
+  catch (error) {
+    shutdownExitCode = 1
+    log(`shutdown WebSocket close failed: ${error}`)
+  }
+  // Keep boot's not-yet-restored names while admitted commands drain. Freeze
+  // only after that drain, so an already-accepted user kill is respected.
   try {
-    feishu.writeAliveMarker(shutdownAliveSessionNames)
+    sessionRecovery.persist()
   } catch (e) {
     log(`shutdown alive marker write failed: ${e}`)
     shutdownExitCode = 1
@@ -140,6 +138,7 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
           ...chatActor.pending(),
           ...inflightCardActions,
         ])
+        sessionRecovery.freezeForShutdown()
         const agentResults = await Promise.allSettled([
           agentService.shutdown(`daemon ${reason}`),
         ])
@@ -204,8 +203,17 @@ process.on('uncaughtException', e => {
 // ── Session registry ────────────────────────────────────────────────────
 const sessions = new Map<string, Session>()  // key = chatId
 const agentService = new AgentService()
-let pendingReviveSessionNames = new Set<string>()
 const chatActor = new PerKeyActor()
+const sessionRecovery = new DaemonSessionRecovery({
+  readMarker: feishu.readAliveMarker,
+  writeMarker: feishu.writeAliveMarker,
+  sessions: () => sessions.values(),
+  chatIdForSession: feishu.chatIdForSession,
+  sessionFor,
+  actor: chatActor,
+  isShuttingDown: () => shutdownRequested,
+  log,
+})
 const cardActionDeduper = new ActionDeduper(30_000)
 const inflightCardActions = new Set<Promise<unknown>>()
 const messageAdmission = createPerChatAdmission<any>({
@@ -236,25 +244,22 @@ function enqueueMessage(data: any, source = 'ws'): boolean {
   return true
 }
 
-function currentAliveSessionNames(): string[] {
-  const alive = new Set<string>()
-  for (const s of sessions.values()) if (s.shouldRevive()) alive.add(s.sessionName)
-  for (const name of pendingReviveSessionNames) alive.add(name)
-  return [...alive]
-}
-
 function writeCurrentAliveMarker(): void {
-  feishu.writeAliveMarker(currentAliveSessionNames())
+  sessionRecovery.persist()
 }
 
 const tempSessionRuntime = createTempSessionRuntime<Session>({
   registry: sessions,
-  createSession: (sessionName, chatId) => new Session(sessionName, chatId, {
-    onLifecycleChange: writeCurrentAliveMarker,
-    onCreateTempSession: createTempSession,
-    onDisbandTempSession: disbandTempSession,
-    onCancelAgentRuns: (name, chatId, reason) => agentService.cancelSessionRuns(name, chatId, reason),
-  }),
+  createSession: (sessionName, chatId) => {
+    const session = new Session(sessionName, chatId, {
+      onLifecycleChange: writeCurrentAliveMarker,
+      onCreateTempSession: createTempSession,
+      onDisbandTempSession: disbandTempSession,
+      onCancelAgentRuns: (name, chatId, reason) => agentService.cancelSessionRuns(name, chatId, reason),
+    })
+    sessionRecovery.transferPending(session)
+    return session
+  },
   ensureChatForSession: feishu.createTempChatForSession,
   disbandChatForSessionExact: feishu.disbandChatForSessionExact,
   chatIdForSession: feishu.chatIdForSession,
@@ -276,46 +281,6 @@ async function createTempSession(opts: CreateTempSessionOptions): Promise<Create
 
 async function disbandTempSession(chatName: string, expectedChatId: string): Promise<DisbandTempSessionResult> {
   return await tempSessionRuntime.disbandTempSession(chatName, expectedChatId)
-}
-
-/** Auto-restart any session that was alive when the previous daemon
- * went down. Driven by the marker file written in `cleanup` — that
- * file ONLY lists sessions that were running, so anything the user
- * had explicitly `kill`-ed before shutdown is intentionally absent
- * and stays stopped. Each revived session is `restart(true)`-ed in
- * parallel so one slow Codex init does not block the rest; Codex resumes
- * the saved thread id and the in-flight conversation continues without
- * the user typing anything. */
-async function reviveAliveSessions(): Promise<void> {
-  const names = [...new Set(feishu.readAliveMarker())]
-  if (names.length === 0) return
-  pendingReviveSessionNames = new Set(names)
-  log(`revive: ${names.length} session(s) marked alive on shutdown: ${names.join(', ')}`)
-  try {
-    await Promise.all(names.map(async sessionName => {
-      const chatId = feishu.chatIdForSession(sessionName)
-      if (!chatId) {
-        log(`revive: no chatId binding for "${sessionName}", skip`)
-        pendingReviveSessionNames.delete(sessionName)
-        writeCurrentAliveMarker()
-        return
-      }
-      const session = sessionFor(chatId, sessionName)
-      try {
-        const ok = await session.restart(true)
-        if (ok) log(`revive: spawned "${sessionName}" (chat ${chatId.slice(0, 8)}…)`)
-        else log(`revive: "${sessionName}" did not start`)
-      } catch (e) {
-        log(`revive: restart "${sessionName}" failed: ${e}`)
-      } finally {
-        pendingReviveSessionNames.delete(sessionName)
-        writeCurrentAliveMarker()
-      }
-    }))
-  } finally {
-    pendingReviveSessionNames.clear()
-    writeCurrentAliveMarker()
-  }
 }
 
 // ── Feishu `post` (rich-text) → Markdown ────────────────────────────────
@@ -1255,6 +1220,7 @@ function startDebugSocket(): void {
 
 async function boot(): Promise<void> {
   log(`lodestar-daemon: pid ${process.pid} starting`)
+  sessionRecovery.load()
   try { await updateAgentRuntimes({ report: log, signal: agentUpdateAbort.signal }) }
   catch (error) { log(`Agent 自动更新未完成，受影响的 Agent 将报告错误: ${error}`) }
   if (shutdownRequested) return
@@ -1262,26 +1228,32 @@ async function boot(): Promise<void> {
   // token source registry 先于 session 构建填充:session 构造会查 registry 推导 tokenSourceId。
   // config.toml [token_source.*] 在此落地为可用的 TokenSource。
   const { buildTokenSourcesFromConfig } = await import('./src/token-source-builtins')
+  if (shutdownRequested) return
   buildTokenSourcesFromConfig()
   // 先完成模型目录加载，再接受群消息和恢复会话。空的加载中目录不能用于
   // 判断已保存的模型是否存在；刷新失败由对应 source 保留明确错误。
   const { refreshAllTokenSourceModels } = await import('./src/token-source')
+  if (shutdownRequested) return
   await refreshAllTokenSourceModels()
+  if (shutdownRequested) return
   feishu.loadTempSessionLeases()
   feishu.loadSessionChatMap()
   feishu.loadSessionResumeMap()
   feishu.loadSessionTurnsMap()
   feishu.loadSessionModelMap()
   await feishu.refreshChatList()
+  if (shutdownRequested) return
   // 群名解析靠 chatNameCache,但新群/改名走 fetchChatName 点查,不依赖这里全量刷。
   // 5min 全量 chat.list 是纯空转(IM API 计入免费版配额),拉长到 30min 足够保持缓存新鲜。
   setInterval(() => { void feishu.refreshChatList() }, 30 * 60 * 1000)
   const { reconcileTasklistDeletions } = await import('./src/tasklist')
+  if (shutdownRequested) return
   try {
     await reconcileTasklistDeletions()
   } catch (e) {
     log(`tasklist deletion reconcile failed: ${e instanceof Error ? e.message : e}`)
   }
+  if (shutdownRequested) return
 
   // Lark WSClient sends pings every ~120s but doesn't verify pongs by default.
   // On a half-open TCP (NAT idle-kill, network blip) the socket stays OPEN and
@@ -1310,6 +1282,7 @@ async function boot(): Promise<void> {
     log(`[ws] rebuild requested before WS init — ${reason}`)
   }
   const scheduleWsRebuild = (reason: string, delayMs = 0, verifyAfter = false) => {
+    if (shutdownRequested) return
     const dueAt = Date.now() + delayMs
     if (scheduledRebuildTimer) {
       scheduledRebuildVerifyAfter ||= verifyAfter
@@ -1437,6 +1410,7 @@ async function boot(): Promise<void> {
   // removeAllListeners() before terminate(), so the old client fires no stray
   // reconnect. verifyAfter arms a post-rebuild check (only for active groups).
   rebuildWs = (reason: string, verifyAfter = false) => {
+    if (shutdownRequested) return
     if (rebuilding) { log(`[ws] rebuild skipped (already rebuilding) — ${reason}`); return }
     if (scheduledRebuildTimer) {
       clearTimeout(scheduledRebuildTimer)
@@ -1494,11 +1468,6 @@ async function boot(): Promise<void> {
   }
 
   ws = makeWs()
-  void ws.start({ eventDispatcher: dispatcher }).catch(e => {
-    log(`[ws] initial start failed: ${e}`)
-    scheduleWsRebuild(`initial start failed: ${e}`, SETTLE_MS, false)
-  })
-  log(`lodestar-daemon: WS start requested, watching ${feishu.chatNameCache.size} groups`)
 
   // Liveness watchdog for the OTHER failure mode the deaf-heal can't see: a
   // wedged handshake / zombie socket that leaves the client stuck OFF
@@ -1510,7 +1479,8 @@ async function boot(): Promise<void> {
   const WS_WATCHDOG_INTERVAL_MS = 15_000
   const WS_CONNECTING_GRACE_TICKS = 2
   let wsUnhealthyTicks = 0
-  setInterval(() => {
+  const wsWatchdog = setInterval(() => {
+    if (shutdownRequested) return
     const { state } = ws.getConnectionStatus()
     if (state === 'connected') { wsUnhealthyTicks = 0; return }
     if (state === 'failed' || state === 'idle') {
@@ -1525,17 +1495,13 @@ async function boot(): Promise<void> {
       rebuildWs(`watchdog: stuck in '${state}' ~${Math.round((WS_WATCHDOG_INTERVAL_MS * WS_CONNECTING_GRACE_TICKS) / 1000)}s`)
     }
   }, WS_WATCHDOG_INTERVAL_MS)
-
-  startDebugSocket()
-  // Reload persisted /notify button→callback registrations before the
-  // notify server starts serving, so a card tapped right after a daemon
-  // restart still routes to its caller. Prunes entries older than 7 days.
-  for (const reg of loadCallbacks()) {
-    // Restore visible UNKNOWN receipts for interrupted text deliveries. Use
-    // the same actor and shutdown tracking as live notification actions.
-    void trackCardActionWork(chatActor.enqueue(reg.chatId, () => notifyReplies.recover(reg)))
-      .catch(error => log(`notify-reply recovery failed: ${error instanceof Error ? error.message : error}`))
+  stopFeishuWs = () => {
+    clearInterval(wsWatchdog)
+    if (scheduledRebuildTimer) clearTimeout(scheduledRebuildTimer)
+    if (verifyTimer) clearTimeout(verifyTimer)
+    ws.close({ force: true })
   }
+  const recoveredCallbacks = loadCallbacks()
   startNotifyServer({
     bind: config.notify.bind,
     port: config.notify.port,
@@ -1564,10 +1530,20 @@ async function boot(): Promise<void> {
   ensureFeishuNotifySkill()
   ensureLodestarAgentSkill()
 
-  // Auto-revive sessions that were running when we last went down.
-  // Runs AFTER the WS is up so any 🔁 revive message lands in the
-  // right chat instead of disappearing into the void.
-  await reviveAliveSessions()
+  // Reserve recovery ahead of both messages and card actions in each chat's
+  // FIFO before ingress opens. Feishu REST status cards do not require WS.
+  const revival = sessionRecovery.enqueue()
+  void ws.start({ eventDispatcher: dispatcher }).catch(e => {
+    log(`[ws] initial start failed: ${e}`)
+    scheduleWsRebuild(`initial start failed: ${e}`, SETTLE_MS, false)
+  })
+  log(`lodestar-daemon: WS start requested, watching ${feishu.chatNameCache.size} groups`)
+  startDebugSocket()
+  for (const reg of recoveredCallbacks) {
+    void trackCardActionWork(chatActor.enqueue(reg.chatId, () => notifyReplies.recover(reg)))
+      .catch(error => log(`notify-reply recovery failed: ${error instanceof Error ? error.message : error}`))
+  }
+  await revival
 }
 
 boot().catch(e => {

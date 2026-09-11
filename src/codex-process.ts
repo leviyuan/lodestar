@@ -64,7 +64,7 @@ const CODEX_GENERATED_IMAGES_DIR = join(homedir(), '.codex', 'generated_images')
 // app-server control requests return an acknowledgement, not the whole model
 // turn. Bound them so a live PID with a dead transport cannot leak promises.
 const CODEX_REQUEST_TIMEOUT_MS = 30_000
-const CODEX_MATERIALIZATION_VERIFY_TIMEOUT_MS = 60_000
+const CODEX_MATERIALIZATION_VERIFY_TIMEOUT_MS = 10 * 60_000
 const CODEX_CAPACITY_RETRY_BASE_MS = 5_000
 const CODEX_CAPACITY_RETRY_MAX_MS = 60_000
 // The failed turn already contains the user's input and any completed work.

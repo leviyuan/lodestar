@@ -35,6 +35,8 @@ function runFreshState(
       loadSessionResumeMap,
       loadSessionTurnsMap,
       replaceTurnAnchors,
+      readAliveMarker,
+      writeAliveMarker,
       setPendingConversationLaunchChecked,
     } from ${JSON.stringify(feishuModule)}
     import { mkdirSync, readFileSync, rmSync } from 'node:fs'
@@ -66,6 +68,44 @@ function extract(result: FreshResult): any {
 }
 
 describe('session turn checkpoint persistence', () => {
+  test('the alive marker survives repeated reads and atomic writes across boots', () => {
+    const result = runFreshState(`
+      const first = readAliveMarker()
+      const second = readAliveMarker()
+      writeAliveMarker(['b'])
+      __out({ first, second, saved: __read('alive-on-shutdown.json'), nextBoot: readAliveMarker() })
+    `, { 'alive-on-shutdown.json': ['a', 'b'] })
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(extract(result)).toEqual({ first: ['a', 'b'], second: ['a', 'b'], saved: ['b'], nextBoot: ['b'] })
+  })
+
+  test('an invalid alive marker fails visibly instead of being treated as an empty recovery list', () => {
+    for (const marker of [{ a: true }, ['a', 7], ['']]) {
+      const result = runFreshState(`
+        let error = null
+        try { readAliveMarker() } catch (cause) { error = cause.message }
+        __out({ error, saved: __read('alive-on-shutdown.json') })
+      `, { 'alive-on-shutdown.json': marker })
+      expect(result.exitCode, result.stderr).toBe(0)
+      expect(extract(result)).toEqual({
+        error: 'invalid alive session marker: expected non-empty session names', saved: marker,
+      })
+    }
+  })
+
+  test('alive marker IO errors reach callers during both boot and shutdown', () => {
+    const result = runFreshState(`
+      mkdirSync(join(__dataDir, 'alive-on-shutdown.json'))
+      const errors = []
+      try { readAliveMarker() } catch (error) { errors.push(error.code) }
+      try { writeAliveMarker(['a']) } catch (error) { errors.push(error.code) }
+      __out(errors)
+    `)
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(extract(result)).toHaveLength(2)
+    expect(extract(result).every((code: unknown) => typeof code === 'string')).toBe(true)
+  })
+
   test('preserves DSH resume, off effort and native event checkpoints across reload', () => {
     const result = runFreshState(`
       loadSessionResumeMap()
