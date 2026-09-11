@@ -261,18 +261,20 @@ export async function updateAgentRuntimes(options: AgentUpdateOptions = {}): Pro
 }
 
 export function startAgentAutoUpdates(report: (message: string) => void, options: {
-  enabled?: boolean
-  update?: typeof updateAgentRuntimes
+  enabled?: Partial<Record<UpdatedAgent, boolean>>
+  update?: typeof updateAgentRuntime
 } = {}): () => void {
-  if (options.enabled !== true) return () => {}
-  const controller = new AbortController()
-  let pending: Promise<void> | undefined
-  const timer = setInterval(() => {
-    if (pending) return
-    pending = (options.update ?? updateAgentRuntimes)({ report, signal: controller.signal })
-      .catch(error => report(`Agent 自动更新未完成: ${errorMessage(error)}`))
-      .finally(() => { pending = undefined })
-  }, AGENT_UPDATE_INTERVAL_MS)
-  timer.unref()
-  return () => { clearInterval(timer); controller.abort() }
+  const stops = AGENTS.filter(agent => options.enabled?.[agent] === true).map(agent => {
+    const controller = new AbortController()
+    let pending: Promise<unknown> | undefined
+    const timer = setInterval(() => {
+      if (pending) return
+      pending = (options.update ?? updateAgentRuntime)(agent, { report, signal: controller.signal })
+        .catch(error => report(`${agent} 自动更新未完成: ${errorMessage(error)}`))
+        .finally(() => { pending = undefined })
+    }, AGENT_UPDATE_INTERVAL_MS)
+    timer.unref()
+    return () => { clearInterval(timer); controller.abort() }
+  })
+  return () => { for (const stop of stops) stop() }
 }

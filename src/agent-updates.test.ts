@@ -27,14 +27,15 @@ test('auto-update is disabled by default and never checks or schedules at startu
   const interval = spyOn(globalThis, 'setInterval')
   let checks = 0
   try {
-    startAgentAutoUpdates(() => {}, { update: async () => { checks++ } })()
-    startAgentAutoUpdates(() => {}, { enabled: false, update: async () => { checks++ } })()
+    const update = async () => { checks++; return { checkedAt: 0 } }
+    startAgentAutoUpdates(() => {}, { update })()
+    startAgentAutoUpdates(() => {}, { enabled: { codex: false, claude: false, dsh: false }, update })()
     expect(checks).toBe(0)
     expect(interval).not.toHaveBeenCalled()
   } finally { interval.mockRestore() }
 })
 
-test('opt-in auto-update starts only at the six-hour tick, avoids overlap, and cancels on stop', async () => {
+test.each(['codex', 'claude', 'dsh'] as const)('%s auto-update alone starts at the six-hour tick, avoids overlap, and cancels on stop', async agent => {
   let tick!: () => void
   const handle = { unref() {} } as ReturnType<typeof setInterval>
   const interval = spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void, delay: number) => {
@@ -49,11 +50,14 @@ test('opt-in auto-update starts only at the six-hour tick, avoids overlap, and c
   const done = new Promise<void>(resolve => { finish = resolve })
   let stop: (() => void) | undefined
   try {
-    stop = startAgentAutoUpdates(() => {}, { enabled: true, update: async options => {
+    stop = startAgentAutoUpdates(() => {}, { enabled: { [agent]: true }, update: async (updatedAgent, options) => {
+      expect(updatedAgent).toBe(agent)
       checks++
       signal = options?.signal
       await done
+      return { checkedAt: 0 }
     } })
+    expect(interval).toHaveBeenCalledTimes(1)
     expect(checks).toBe(0)
     tick()
     tick()
@@ -65,6 +69,52 @@ test('opt-in auto-update starts only at the six-hour tick, avoids overlap, and c
     stop?.()
     finish()
     await done
+    interval.mockRestore()
+    clear.mockRestore()
+  }
+})
+
+test('a pending Codex update and a failed Claude update do not block each other or enable DSH', async () => {
+  const ticks: Array<() => void> = []
+  const interval = spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void) => {
+    ticks.push(callback)
+    return { unref() {} } as ReturnType<typeof setInterval>
+  }) as typeof setInterval)
+  const clear = spyOn(globalThis, 'clearInterval').mockImplementation(() => {})
+  let finishCodex!: () => void
+  const codexDone = new Promise<void>(resolve => { finishCodex = resolve })
+  const checks: string[] = []
+  const signals = new Map<string, AbortSignal>()
+  const reports: string[] = []
+  let stop: (() => void) | undefined
+  try {
+    stop = startAgentAutoUpdates(message => { reports.push(message) }, {
+      enabled: { codex: true, claude: true, dsh: false },
+      update: async (agent, options) => {
+        checks.push(agent)
+        signals.set(agent, options!.signal!)
+        if (agent === 'codex') await codexDone
+        else throw new Error('Claude registry failed')
+        return { checkedAt: 0 }
+      },
+    })
+    expect(ticks).toHaveLength(2)
+    expect(checks).toEqual([])
+    ticks[0]()
+    ticks[1]()
+    await new Promise<void>(resolve => setImmediate(resolve))
+    expect(reports).toEqual(['claude 自动更新未完成: Claude registry failed'])
+    ticks[0]()
+    ticks[1]()
+    expect(checks).toEqual(['codex', 'claude', 'claude'])
+    expect(signals.get('codex')).not.toBe(signals.get('claude'))
+    stop()
+    expect(clear).toHaveBeenCalledTimes(2)
+    expect([...signals.values()].every(signal => signal.aborted)).toBe(true)
+  } finally {
+    stop?.()
+    finishCodex()
+    await codexDone
     interval.mockRestore()
     clear.mockRestore()
   }

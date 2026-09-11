@@ -80,14 +80,28 @@ describe('runtime agent_auto_update', () => {
   test('existing configurations disable Agent auto-update by default', () => {
     const result = loadFreshConfig()
     expect(result.exitCode).toBe(0)
-    expect(JSON.parse(result.stdout).runtime.agent_auto_update).toBe(false)
+    expect(JSON.parse(result.stdout).runtime.agent_auto_update).toEqual({ codex: false, claude: false, dsh: false })
   })
 
-  test('only an explicit true enables periodic updates', () => {
+  test.each(['codex', 'claude', 'dsh'] as const)('enabling %s leaves the other Agents disabled', agent => {
+    const result = loadFreshConfig(`[runtime.agent_auto_update]\n${agent} = true`)
+    expect(result.exitCode).toBe(0)
+    expect(result.stderr).toBe('')
+    expect(JSON.parse(result.stdout).runtime.agent_auto_update).toEqual({ codex: false, claude: false, dsh: false, [agent]: true })
+  })
+
+  test('accepts a mix of independent switches', () => {
+    const result = loadFreshConfig('[runtime.agent_auto_update]\ncodex = true\nclaude = false\ndsh = true')
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout).runtime.agent_auto_update).toEqual({ codex: true, claude: false, dsh: true })
+  })
+
+  test('migrates the legacy boolean without changing the configured update choice', () => {
     for (const value of ['true', 'false']) {
       const result = loadFreshConfig(`[runtime]\nagent_auto_update = ${value}`)
       expect(result.exitCode).toBe(0)
-      expect(JSON.parse(result.stdout).runtime.agent_auto_update).toBe(value === 'true')
+      expect(JSON.parse(result.stdout).runtime.agent_auto_update).toEqual({ codex: value === 'true', claude: value === 'true', dsh: value === 'true' })
+      expect(result.stderr).toContain('旧 agent_auto_update 总开关已按原值映射为三个开关')
     }
   })
 
@@ -95,6 +109,21 @@ describe('runtime agent_auto_update', () => {
     const result = loadFreshConfig('[runtime]\nagent_auto_update = "yes"')
     expect(result.exitCode).not.toBe(0)
     expect(result.stderr).toContain('[runtime].agent_auto_update must be true or false')
+  })
+
+  test('rejects invalid per-Agent values and unknown Agent names', () => {
+    const invalid = loadFreshConfig('[runtime.agent_auto_update]\nclaude = "yes"')
+    expect(invalid.exitCode).not.toBe(0)
+    expect(invalid.stderr).toContain('[runtime.agent_auto_update].claude must be true or false')
+    const unknown = loadFreshConfig('[runtime.agent_auto_update]\nclaud = true')
+    expect(unknown.exitCode).not.toBe(0)
+    expect(unknown.stderr).toContain('unknown [runtime.agent_auto_update] Agent "claud"')
+  })
+
+  test('rejects combining the legacy scalar with independent switches', () => {
+    const result = loadFreshConfig('[runtime]\nagent_auto_update = true\n[runtime.agent_auto_update]\ncodex = false')
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('cannot be combined')
   })
 })
 

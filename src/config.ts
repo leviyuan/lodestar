@@ -9,7 +9,11 @@
  *   [runtime]
  *   projects_root = "~/"      # optional, defaults to $HOME
  *   live_elapsed = "bucket"   # optional: "bucket"(default) | "second"
- *   agent_auto_update = false # opt in to six-hour checks; never checks at boot
+ *
+ *   [runtime.agent_auto_update] # opt in per Agent; never checks at boot
+ *   codex = false
+ *   claude = false
+ *   dsh = false
  *
  *   [notify]                  # all optional
  *   bind = "127.0.0.1"        # default 127.0.0.1 (loopback only)
@@ -34,7 +38,7 @@ export interface LodestarConfig {
   runtime: {
     projects_root: string
     /** Opt-in periodic Agent updates. Startup never checks or installs versions. */
-    agent_auto_update: boolean
+    agent_auto_update: Record<'codex' | 'claude' | 'dsh', boolean>
     /**
      * 活跃 footer / 后台卡 header 的耗时展示。
      * - `bucket`(默认):粗档位,只在档位边界 push,省飞书配额
@@ -197,9 +201,29 @@ export function loadConfig(): LodestarConfig {
     throw new Error(`lodestar: ${CONFIG_FILE} is missing [feishu].app_id / [feishu].app_secret`)
   }
   const projectsRoot = expandTilde(t.runtime?.projects_root ?? homedir())
-  const agentAutoUpdateRaw = t.runtime?.agent_auto_update ?? 'false'
-  if (agentAutoUpdateRaw !== 'true' && agentAutoUpdateRaw !== 'false') {
-    throw new Error(`lodestar: [runtime].agent_auto_update must be true or false, got "${agentAutoUpdateRaw}"`)
+  const agentAutoUpdate: LodestarConfig['runtime']['agent_auto_update'] = { codex: false, claude: false, dsh: false }
+  const agentAutoUpdateSection = t['runtime.agent_auto_update']
+  const legacyAgentAutoUpdate = t.runtime?.agent_auto_update
+  if (legacyAgentAutoUpdate !== undefined) {
+    if (agentAutoUpdateSection) {
+      throw new Error('lodestar: legacy [runtime].agent_auto_update cannot be combined with [runtime.agent_auto_update]')
+    }
+    if (legacyAgentAutoUpdate !== 'true' && legacyAgentAutoUpdate !== 'false') {
+      throw new Error(`lodestar: [runtime].agent_auto_update must be true or false, got "${legacyAgentAutoUpdate}"`)
+    }
+    // Migrate the previous boolean without changing an explicit update choice.
+    for (const agent of ['codex', 'claude', 'dsh'] as const) agentAutoUpdate[agent] = legacyAgentAutoUpdate === 'true'
+    process.stderr.write('lodestar: 旧 agent_auto_update 总开关已按原值映射为三个开关；请改用 [runtime.agent_auto_update] 的 codex、claude、dsh 配置。\n')
+  } else if (agentAutoUpdateSection) {
+    for (const [agent, value] of Object.entries(agentAutoUpdateSection)) {
+      if (agent !== 'codex' && agent !== 'claude' && agent !== 'dsh') {
+        throw new Error(`lodestar: unknown [runtime.agent_auto_update] Agent "${agent}"`)
+      }
+      if (value !== 'true' && value !== 'false') {
+        throw new Error(`lodestar: [runtime.agent_auto_update].${agent} must be true or false, got "${value}"`)
+      }
+      agentAutoUpdate[agent] = value === 'true'
+    }
   }
   const liveElapsedRaw = (t.runtime?.live_elapsed ?? 'bucket').trim().toLowerCase()
   if (liveElapsedRaw !== 'bucket' && liveElapsedRaw !== 'second') {
@@ -297,7 +321,7 @@ export function loadConfig(): LodestarConfig {
   const claudeBin = t.claude?.bin ? expandTilde(t.claude.bin) : undefined
   return {
     feishu: { app_id: appId, app_secret: appSecret },
-    runtime: { projects_root: projectsRoot, live_elapsed: liveElapsed, agent_auto_update: agentAutoUpdateRaw === 'true' },
+    runtime: { projects_root: projectsRoot, live_elapsed: liveElapsed, agent_auto_update: agentAutoUpdate },
     notify: { bind: notifyBind, port: notifyPort },
     codex: { env: codexEnv },
     claude: { bin: claudeBin, env: claudeEnv, models: claudeModelSections() },

@@ -30,7 +30,9 @@ lodestar-setup
 
 daemon 启动时不检查 Agent 版本，也不安装或更新 Agent。自动更新默认关闭；首次安装缺少运行文件或需要更新时，运行 `lodestar-update --agents-only`。手动更新和显式开启的自动更新都选择上游 `latest`，独立于 Lodestar 发版，不设置兼容版本白名单。
 
-如需定期更新，设置 `[runtime].agent_auto_update = true`：daemon 运行满 6 小时后首次检查，之后每 6 小时检查一次，启动阶段仍不检查。运行文件放在 Lodestar 数据目录的 `agent-runtimes/` 下，每个版本使用独立目录；更新只切换新进程所用的目录，保留正在运行任务的程序和 SDK。Windows 下也不覆盖、重命名或删除正在使用的旧版 EXE/DLL。取消安装时按安装器 PID 终止其进程树，并等待退出；若无法确认终止，保留可能被占用的临时目录并报告错误。
+Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`、`claude`、`dsh` 开关，未设置的项均为 `false`。设为 `true` 的 Agent 在 daemon 运行满 6 小时后首次检查，之后每 6 小时独立检查，启动阶段仍不检查；一个 Agent 更新较慢或失败不阻塞其他 Agent。旧版布尔总开关按原值兼容映射为三项并提示迁移，不可与新配置表混用。
+
+运行文件放在 Lodestar 数据目录的 `agent-runtimes/` 下，每个版本使用独立目录；更新只切换新进程所用的目录，保留正在运行任务的程序和 SDK。Windows 下也不覆盖、重命名或删除正在使用的旧版 EXE/DLL。取消安装时按安装器 PID 终止其进程树，并等待退出；若无法确认终止，保留可能被占用的临时目录并报告错误。
 
 查询或安装失败会明确报错，`lodestar-version` 可查看错误；不会静默改用旧安装。文件占用只做有限重试，最终失败仍显示。显式配置的 `[claude].bin` 按该路径执行。
 
@@ -44,7 +46,11 @@ daemon 启动时不检查 Agent 版本，也不安装或更新 Agent。自动更
 [runtime]
 projects_root = "/abs/projects"
 live_elapsed = "bucket"      # bucket 按档位刷新耗时；second 按秒刷新
-agent_auto_update = false   # 默认关闭；true 每 6 小时检查，启动时不检查
+
+[runtime.agent_auto_update] # 三项独立，默认关闭；启动时不检查
+codex = false
+claude = false
+dsh = false
 
 [projects.calculator]
 cwd = "/abs/projects/calculator"  # 对所有后端均生效
