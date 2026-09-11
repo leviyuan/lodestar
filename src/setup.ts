@@ -410,6 +410,7 @@ export async function runSetup(): Promise<void> {
     '',
     '[runtime]',
     `projects_root = "${escapeTomlString(projectsRoot)}"`,
+    'agent_auto_update = false',
     '',
   ]
   // Claude / GLM 路由由 ~/.claude/settings.json 管 (向导已写入或沿用你的

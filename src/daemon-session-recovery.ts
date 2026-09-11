@@ -23,7 +23,7 @@ export class DaemonSessionRecovery {
     log(message: string): void
   }) {}
 
-  /** Must run before the first boot await, including Agent auto-update. */
+  /** Must run before the first boot await, including model catalog loading. */
   load(): void {
     if (this.pending) throw new Error('session recovery already loaded')
     this.pending = new Set(this.deps.readMarker())

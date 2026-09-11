@@ -76,6 +76,28 @@ describe('runtime live_elapsed', () => {
   })
 })
 
+describe('runtime agent_auto_update', () => {
+  test('existing configurations disable Agent auto-update by default', () => {
+    const result = loadFreshConfig()
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout).runtime.agent_auto_update).toBe(false)
+  })
+
+  test('only an explicit true enables periodic updates', () => {
+    for (const value of ['true', 'false']) {
+      const result = loadFreshConfig(`[runtime]\nagent_auto_update = ${value}`)
+      expect(result.exitCode).toBe(0)
+      expect(JSON.parse(result.stdout).runtime.agent_auto_update).toBe(value === 'true')
+    }
+  })
+
+  test('rejects an invalid update preference instead of silently changing it', () => {
+    const result = loadFreshConfig('[runtime]\nagent_auto_update = "yes"')
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('[runtime].agent_auto_update must be true or false')
+  })
+})
+
 describe('TOML scalar parsing', () => {
   test('keeps # inside quoted credentials while stripping a real comment', () => {
     const result = loadFreshConfig(`

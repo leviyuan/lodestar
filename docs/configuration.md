@@ -28,7 +28,11 @@ lodestar-setup
 | `lodestar-version` | 查看 Lodestar、实际 Agent 版本、运行目录及更新错误 |
 | `lodestar-agent` | 由会话中的 Agent 调用其他模型执行任务 |
 
-Codex、Claude Code/Agent SDK、DSH 默认自动跟随上游 `latest`：daemon 启动时检查一次，之后每 6 小时检查并更新。运行文件放在 Lodestar 数据目录的 `agent-runtimes/` 下，更新完成后新进程使用新版，已有任务继续使用自己的版本目录。可用 `lodestar-update --agents-only` 立即检查并更新。Agent 更新独立于 Lodestar 发版，不需要先通过兼容性验收；新版不兼容时明确报错，后续更新 Lodestar 适配。查询或安装失败不会静默使用旧安装，`lodestar-version` 可查看错误。显式配置的 `[claude].bin` 仍按该路径执行。
+daemon 启动时不检查 Agent 版本，也不安装或更新 Agent。自动更新默认关闭；首次安装缺少运行文件或需要更新时，运行 `lodestar-update --agents-only`。手动更新和显式开启的自动更新都选择上游 `latest`，独立于 Lodestar 发版，不设置兼容版本白名单。
+
+如需定期更新，设置 `[runtime].agent_auto_update = true`：daemon 运行满 6 小时后首次检查，之后每 6 小时检查一次，启动阶段仍不检查。运行文件放在 Lodestar 数据目录的 `agent-runtimes/` 下，每个版本使用独立目录；更新只切换新进程所用的目录，保留正在运行任务的程序和 SDK。Windows 下也不覆盖、重命名或删除正在使用的旧版 EXE/DLL。取消安装时按安装器 PID 终止其进程树，并等待退出；若无法确认终止，保留可能被占用的临时目录并报告错误。
+
+查询或安装失败会明确报错，`lodestar-version` 可查看错误；不会静默改用旧安装。文件占用只做有限重试，最终失败仍显示。显式配置的 `[claude].bin` 按该路径执行。
 
 长期运行可交给 Linux `systemd --user`、macOS `launchd` 或 Windows 任务计划程序。daemon 重启后会恢复上次活跃的会话。
 
@@ -40,6 +44,7 @@ Codex、Claude Code/Agent SDK、DSH 默认自动跟随上游 `latest`：daemon �
 [runtime]
 projects_root = "/abs/projects"
 live_elapsed = "bucket"      # bucket 按档位刷新耗时；second 按秒刷新
+agent_auto_update = false   # 默认关闭；true 每 6 小时检查，启动时不检查
 
 [projects.calculator]
 cwd = "/abs/projects/calculator"  # 对所有后端均生效

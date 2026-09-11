@@ -22,15 +22,15 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - 凭据、本机配置、聊天成员、debug context 和 `~/.codex`、`~/.claude` 内容不得写入跟踪文件。
 - API、模型目录、额度、上传和进程启动失败必须记录并向调用方显示；缺失数据用 `MISS`，不能伪造成功或偷偷更换来源。仅允许对已知瞬态错误有限重试。
 - 保留已有改动。依赖变化用 Bun 同步 `bun.lock`，不手改锁文件。
-- Codex、Claude Code/Agent SDK、DSH 等 Agent 依赖默认自动跟随上游 `latest`，不等待 Lodestar 发版，不设置兼容版本白名单或旧版本上限。用户接受新版可能不兼容；发生不兼容时明确报错，由后续 Lodestar 更新适配，不能为规避适配而锁旧、降级、回退或恢复“先兼容验收才更新”的门槛。开发锁文件只记录测试依赖快照，不限制生产 Agent 更新。
+- 禁止在 daemon 启动时检查、安装或更新 Agent，自动更新默认关闭。手动或显式开启的定期更新选择上游 `latest`，不等待 Lodestar 发版，不设置兼容版本白名单或旧版本上限。用户接受新版可能不兼容；发生不兼容时明确报错，由后续 Lodestar 更新适配，不能为规避适配而锁旧、降级、回退或恢复“先兼容验收才更新”的门槛。开发锁文件只记录测试依赖快照，不限制生产 Agent 更新。
 - 工具卡片中的 shell 命令首行写 `# desc: <中文摘要>`，供 `src/cards/shell-command.ts` 提取标题。
 - Card action `kind`、共享 `element_id`、群命令、持久化格式和 Token Source id 是协议。改名时同步分发、迁移与测试。
 
 ## 模块边界
 
 - 一个群只有一个 Session 和一个当前主进程。Codex 使用 app-server JSON-RPC，Claude/GLM/DeepSeek/native 使用 Agent SDK streaming input，DSH 使用独立 Node 子进程和 Cordis stdio 桥接；不引入 tmux、JSONL 队列或旁路进程控制。
-- DSH 的 `deepseek-harness` 来源独立于 Claude 兼容的 `deepseek`；`dsh-glm` 通过原生 pi-ai 适配器接入 GLM Coding Plan，可复用 `glm` 凭据。运行时自动跟随 latest，子进程需要 Node 22.19+（22.x）或 24+；`src/dsh-bridge.ts` 仅在该子进程加载。
-- `agent-updates.ts` 在 daemon 启动时及每 6 小时更新三类 Agent，`lodestar-update --agents-only` 可立即更新。实际程序和 SDK 从独立版本目录加载；安装成功直接启用，新进程使用新版，已有进程保留其运行目录。安装或查询失败记录并向后续调用方报错；禁止用旧安装掩盖失败。自动更新 Agent 不重启 daemon。
+- DSH 的 `deepseek-harness` 来源独立于 Claude 兼容的 `deepseek`；`dsh-glm` 通过原生 pi-ai 适配器接入 GLM Coding Plan，可复用 `glm` 凭据。运行时经更新器选择 latest，子进程需要 Node 22.19+（22.x）或 24+；`src/dsh-bridge.ts` 仅在该子进程加载。
+- `agent-updates.ts` 仅在 `[runtime].agent_auto_update = true` 时每 6 小时更新三类 Agent，首次检查也在 6 小时后；默认关闭，`lodestar-update --agents-only` 可立即安装/更新。实际程序和 SDK 从独立版本目录加载；安装成功直接启用，新进程使用新版，已有进程保留其运行目录。Windows 不覆盖或删除使用中的 EXE/DLL；安装取消按精确 PID 终止安装器进程树，未确认退出不得清理其临时目录。文件占用有限重试，最终错误必须显示。安装或查询失败记录并向后续调用方报错；禁止用旧安装掩盖失败。自动更新 Agent 不重启 daemon。
 - Token Source 统一管理账号、凭据、模型目录、启动环境和额度。模型与 Agent 身份动态读取该目录，沿用目录声明的 effort；来源禁用或刷新失败显示 `MISS`。新增来源通过 factory 注册。
 - MD 首页按 Claude Code、Codex、DeepSeek Harness 分组，底层 Agent id 仍为 `claude`、`codex`、`dsh`。模型行右侧窄按钮用单字（选、显、隐、删），补录模型、显示模型、返回和翻页等宽按钮保留完整文案；模型行之间加分隔线，文字和按钮垂直居中；只有一个 effort 档位（含原生 default）时直接应用，多个档位才进入选择；两个 DeepSeek 来源都显示为 DeepSeek。OpenRouter 保留榜单九项并补充字节和美团，共十一项；蚂蚁和阶跃不列为默认，其他来源默认展示接口列表。接口项用隐藏/显示，列表外记录用补录/删除；所有来源支持 `custom_models`，补录后可选请求档位并直接使用，不能因目录未收录而清空 effort 或禁止选择。隐藏不改运行模型，删除补录项须保护正在选用的会话并清理悬空配置。footer 固定为 `agent · 模型名/effort`；Codex 额度对网络超时/请求抖动有限重试同一接口，最终失败才显示 MISS；窗口额度保留原紧凑倒计时格式 `4.1h·7%·[6.9d·17%]`，余额显示 `余额 $…` / `余额 ¥…`。OpenRouter 用 `/credits` 查账户余额，以实际响应判断权限。
 - `AgentService` 的委派进程与主会话共用启动入口。委派仅一层：主 Agent 可并行派工、续跑与输入回填；被委派的 Agent 不得通过 Lodestar 或原生 Agent 工具继续委派。具体生命周期约束见 `src/AGENTS.md`。

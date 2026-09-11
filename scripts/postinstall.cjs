@@ -31,6 +31,7 @@ function termWrite (msg) {
 termWrite('\n  \x1b[1m\x1b[36m✓ Lodestar 已安装\x1b[0m\n')
 termWrite('\n  \x1b[2m下一步: 在终端跑 \x1b[32mlodestar-daemon\x1b[0m\x1b[2m 进入配置向导\x1b[0m')
 termWrite('\n  \x1b[2m(首次运行会自动拉起向导; 也可直接跑 \x1b[32mlodestar-setup\x1b[0m\x1b[2m)\x1b[0m\n\n')
-termWrite('  Agent 在 daemon 启动时及每 6 小时自动更新；可运行 lodestar-update --agents-only 立即更新。\n\n')
+termWrite('  启动时不检查或更新 Agent，自动更新默认关闭。\n')
+termWrite('  安装/更新 Agent: lodestar-update --agents-only；定期更新可配置 [runtime].agent_auto_update = true。\n\n')
 
 process.exit(0)

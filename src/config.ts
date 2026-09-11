@@ -9,6 +9,7 @@
  *   [runtime]
  *   projects_root = "~/"      # optional, defaults to $HOME
  *   live_elapsed = "bucket"   # optional: "bucket"(default) | "second"
+ *   agent_auto_update = false # opt in to six-hour checks; never checks at boot
  *
  *   [notify]                  # all optional
  *   bind = "127.0.0.1"        # default 127.0.0.1 (loopback only)
@@ -32,6 +33,8 @@ export interface LodestarConfig {
   }
   runtime: {
     projects_root: string
+    /** Opt-in periodic Agent updates. Startup never checks or installs versions. */
+    agent_auto_update: boolean
     /**
      * 活跃 footer / 后台卡 header 的耗时展示。
      * - `bucket`(默认):粗档位,只在档位边界 push,省飞书配额
@@ -194,6 +197,10 @@ export function loadConfig(): LodestarConfig {
     throw new Error(`lodestar: ${CONFIG_FILE} is missing [feishu].app_id / [feishu].app_secret`)
   }
   const projectsRoot = expandTilde(t.runtime?.projects_root ?? homedir())
+  const agentAutoUpdateRaw = t.runtime?.agent_auto_update ?? 'false'
+  if (agentAutoUpdateRaw !== 'true' && agentAutoUpdateRaw !== 'false') {
+    throw new Error(`lodestar: [runtime].agent_auto_update must be true or false, got "${agentAutoUpdateRaw}"`)
+  }
   const liveElapsedRaw = (t.runtime?.live_elapsed ?? 'bucket').trim().toLowerCase()
   if (liveElapsedRaw !== 'bucket' && liveElapsedRaw !== 'second') {
     throw new Error(
@@ -290,7 +297,7 @@ export function loadConfig(): LodestarConfig {
   const claudeBin = t.claude?.bin ? expandTilde(t.claude.bin) : undefined
   return {
     feishu: { app_id: appId, app_secret: appSecret },
-    runtime: { projects_root: projectsRoot, live_elapsed: liveElapsed },
+    runtime: { projects_root: projectsRoot, live_elapsed: liveElapsed, agent_auto_update: agentAutoUpdateRaw === 'true' },
     notify: { bind: notifyBind, port: notifyPort },
     codex: { env: codexEnv },
     claude: { bin: claudeBin, env: claudeEnv, models: claudeModelSections() },

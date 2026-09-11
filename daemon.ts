@@ -47,7 +47,7 @@ import { ensureLodestarAgentSkill } from './src/agent-skill'
 import { ensureLodestarAgentCommand } from './src/managed-commands'
 import { config } from './src/config'
 import { log } from './src/log'
-import { startAgentAutoUpdates, updateAgentRuntimes } from './src/agent-updates'
+import { startAgentAutoUpdates } from './src/agent-updates'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
 import { checkPidGuard, writePidFile } from './src/pid-guard'
 import {
@@ -93,7 +93,6 @@ let shutdownPromise: Promise<void> | null = null
 let shutdownExitCode = 0
 let stopAgentAutoUpdates: (() => void) | undefined
 let stopFeishuWs: (() => void) | undefined
-const agentUpdateAbort = new AbortController()
 const SHUTDOWN_DEADLINE_MS = 15_000
 const cleanup = () => {
   if (cleanupDone) return
@@ -113,7 +112,6 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
   if (shutdownPromise) return shutdownPromise
   shutdownRequested = true
   stopAgentAutoUpdates?.()
-  agentUpdateAbort.abort()
   // Seal both message and action admission synchronously before taking the
   // dynamic work snapshot. Already-admitted tails remain drainable.
   chatActor.close()
@@ -1221,10 +1219,6 @@ function startDebugSocket(): void {
 async function boot(): Promise<void> {
   log(`lodestar-daemon: pid ${process.pid} starting`)
   sessionRecovery.load()
-  try { await updateAgentRuntimes({ report: log, signal: agentUpdateAbort.signal }) }
-  catch (error) { log(`Agent 自动更新未完成，受影响的 Agent 将报告错误: ${error}`) }
-  if (shutdownRequested) return
-  stopAgentAutoUpdates = startAgentAutoUpdates(log)
   // token source registry 先于 session 构建填充:session 构造会查 registry 推导 tokenSourceId。
   // config.toml [token_source.*] 在此落地为可用的 TokenSource。
   const { buildTokenSourcesFromConfig } = await import('./src/token-source-builtins')
@@ -1533,6 +1527,7 @@ async function boot(): Promise<void> {
   // Reserve recovery ahead of both messages and card actions in each chat's
   // FIFO before ingress opens. Feishu REST status cards do not require WS.
   const revival = sessionRecovery.enqueue()
+  stopAgentAutoUpdates = startAgentAutoUpdates(log, { enabled: config.runtime.agent_auto_update })
   void ws.start({ eventDispatcher: dispatcher }).catch(e => {
     log(`[ws] initial start failed: ${e}`)
     scheduleWsRebuild(`initial start failed: ${e}`, SETTLE_MS, false)

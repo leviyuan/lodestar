@@ -1,12 +1,13 @@
-/** Agent runtimes follow upstream latest independently of Lodestar releases. */
-import { createHash } from 'node:crypto'
+/** Explicit/opt-in Agent updates follow latest independently of Lodestar releases. */
+import { createHash, randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join, isAbsolute } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { spawn } from 'cross-spawn'
 import { AGENT_RUNTIMES_DIR } from './paths'
+import { AgentInstallTerminationError, installAgentPackages } from './agent-install'
+export { installAgentPackages } from './agent-install'
 
 export const AGENTS = ['codex', 'claude', 'dsh'] as const
 export type UpdatedAgent = typeof AGENTS[number]
@@ -53,14 +54,14 @@ function readState(agent: UpdatedAgent, root = AGENT_RUNTIMES_DIR): AgentRuntime
 
 export function agentRuntimeState(agent: UpdatedAgent): AgentRuntimeState | null { return readState(agent) }
 
-/** Synchronous constructors read the install selected by daemon startup/update. */
+/** Constructors only read the selected local install; they never check versions. */
 export function agentRuntimeRoot(agent: UpdatedAgent): string {
   // Tests explicitly use their own dependency tree; production never substitutes it.
   if (process.env.NODE_ENV === 'test' && process.env.LODESTAR_TEST_AGENT_RUNTIME_ROOT) {
     return process.env.LODESTAR_TEST_AGENT_RUNTIME_ROOT
   }
   const state = readState(agent)
-  if (state?.error) throw new Error(`${agent} 自动更新失败: ${state.error}`)
+  if (state?.error) throw new Error(`${agent} 更新失败: ${state.error}`)
   if (!state?.directory) throw new Error(`${agent} runtime 未安装，请运行 lodestar-update --agents-only`)
   return state.directory
 }
@@ -123,33 +124,35 @@ export async function resolveAgentPackages(agent: UpdatedAgent, read: (name: str
   return dependencies
 }
 
-export function installAgentPackages(directory: string, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('npm', ['install', '--prefix', directory, '--include=optional', '--no-fund', '--no-audit', `--registry=${REGISTRY}`],
-      { cwd: directory, stdio: ['ignore', 'pipe', 'pipe'], shell: false })
-    let output = ''
-    let failure: Error | undefined
-    const capture = (chunk: Buffer) => { output = (output + chunk.toString()).slice(-16_384) }
-    child.stdout!.on('data', capture)
-    child.stderr!.on('data', capture)
-    const cancel = () => { failure = new Error('Agent runtime install aborted'); child.kill('SIGTERM') }
-    signal?.addEventListener('abort', cancel, { once: true })
-    if (signal?.aborted) cancel()
-    const timer = setTimeout(() => { failure = new Error('Agent runtime install timed out after 5 minutes'); child.kill('SIGTERM') }, 300_000)
-    child.on('error', error => { failure = error })
-    child.once('close', code => {
-      clearTimeout(timer)
-      signal?.removeEventListener('abort', cancel)
-      if (failure || code !== 0) reject(new Error(`${failure?.message ?? `npm install exited ${code}`}\n${output}`))
-      else resolve()
-    })
-  })
+/** Windows scanners/file readers may briefly hold a rename target. Retry the
+ * same operation only; never delete the selected file to make a rename work. */
+export async function retryAgentFileOperation<T>(operation: () => Promise<T>, platform = process.platform): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try { return await operation() }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY', 'ENOTEMPTY'].includes(code ?? '') || attempt >= 5) throw error
+      await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)))
+    }
+  }
 }
 
 async function writeState(agentDirectory: string, state: AgentRuntimeState): Promise<void> {
-  const temp = join(agentDirectory, `current-${process.pid}-${Date.now()}.json`)
-  await writeFile(temp, JSON.stringify(state) + '\n', { mode: 0o600 })
-  await rename(temp, join(agentDirectory, 'current.json'))
+  const temp = join(agentDirectory, `current-${randomUUID()}.json`)
+  let failure: unknown
+  try {
+    await writeFile(temp, JSON.stringify(state) + '\n', { mode: 0o600 })
+    await retryAgentFileOperation(() => rename(temp, join(agentDirectory, 'current.json')))
+  } catch (error) {
+    failure = error
+    throw error
+  } finally {
+    try { await retryAgentFileOperation(() => rm(temp, { force: true })) }
+    catch (error) {
+      if (failure) throw new AggregateError([failure, error], `${errorMessage(failure)}; state temporary file cleanup failed: ${errorMessage(error)}`)
+      throw error
+    }
+  }
 }
 
 /** Directory lock also serializes a manual CLI update with the daemon timer. */
@@ -161,7 +164,7 @@ async function lock(directory: string, signal?: AbortSignal): Promise<() => Prom
     try {
       await mkdir(path)
       await writeFile(join(path, 'pid'), String(process.pid))
-      return () => rm(path, { recursive: true })
+      return () => retryAgentFileOperation(() => rm(path, { recursive: true }))
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
       try {
@@ -170,7 +173,7 @@ async function lock(directory: string, signal?: AbortSignal): Promise<() => Prom
         try { process.kill(pid, 0) }
         catch (cause) {
           if ((cause as NodeJS.ErrnoException).code !== 'ESRCH') throw cause
-          await rm(path, { recursive: true })
+          await retryAgentFileOperation(() => rm(path, { recursive: true }))
           continue
         }
       } catch (cause) {
@@ -188,6 +191,8 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
   await mkdir(directory, { recursive: true, mode: 0o700 })
   const unlock = await lock(directory, options.signal)
   let staging: string | undefined
+  let failure: unknown
+  let preserveStaging = false
   try {
     options.report?.(`${agent}: 检查 upstream latest`)
     const previous = readState(agent, root)
@@ -208,7 +213,8 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
         if (installed.version !== version) throw new Error(`npm installed ${name}@${installed.version}, expected ${version}`)
       }
       options.signal?.throwIfAborted()
-      await rename(staging, destination)
+      const completedInstall = staging
+      await retryAgentFileOperation(() => rename(completedInstall, destination))
       staging = undefined
     }
     const state = { directory: destination, versions, checkedAt: Date.now() }
@@ -217,11 +223,26 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
     return state
   } catch (error) {
     // Old processes own immutable paths. A failed refresh is visible and blocks new starts.
-    await writeState(directory, { checkedAt: Date.now(), error: errorMessage(error) })
+    failure = error
+    preserveStaging = error instanceof AgentInstallTerminationError
+    try { await writeState(directory, { checkedAt: Date.now(), error: errorMessage(error) }) }
+    catch (stateError) {
+      failure = new AggregateError([error, stateError], `${errorMessage(error)}; recording update failure also failed: ${errorMessage(stateError)}`)
+      throw failure
+    }
     throw error
   } finally {
-    try { if (staging) await rm(staging, { recursive: true }) }
-    finally { await unlock() }
+    const cleanupErrors: unknown[] = []
+    if (staging && !preserveStaging) {
+      const partialInstall = staging
+      try { await retryAgentFileOperation(() => rm(partialInstall, { recursive: true })) }
+      catch (error) { cleanupErrors.push(error) }
+    }
+    try { await unlock() } catch (error) { cleanupErrors.push(error) }
+    if (cleanupErrors.length) {
+      const errors = failure ? [failure, ...cleanupErrors] : cleanupErrors
+      throw new AggregateError(errors, errors.map(errorMessage).join('; '))
+    }
   }
 }
 
@@ -232,19 +253,23 @@ export async function updateAgentRuntimes(options: AgentUpdateOptions = {}): Pro
     const result = results[i]
     if (result.status === 'rejected') {
       const error = new Error(`${AGENTS[i]}: ${errorMessage(result.reason)}`)
-      options.report?.(`Agent 自动更新失败: ${error.message}`)
+      options.report?.(`Agent 更新失败: ${error.message}`)
       failures.push(error)
     }
   }
   if (failures.length) throw new AggregateError(failures, failures.map(error => error.message).join('\n'))
 }
 
-export function startAgentAutoUpdates(report: (message: string) => void): () => void {
+export function startAgentAutoUpdates(report: (message: string) => void, options: {
+  enabled?: boolean
+  update?: typeof updateAgentRuntimes
+} = {}): () => void {
+  if (options.enabled !== true) return () => {}
   const controller = new AbortController()
   let pending: Promise<void> | undefined
   const timer = setInterval(() => {
     if (pending) return
-    pending = updateAgentRuntimes({ report, signal: controller.signal })
+    pending = (options.update ?? updateAgentRuntimes)({ report, signal: controller.signal })
       .catch(error => report(`Agent 自动更新未完成: ${errorMessage(error)}`))
       .finally(() => { pending = undefined })
   }, AGENT_UPDATE_INTERVAL_MS)

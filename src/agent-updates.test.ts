@@ -1,12 +1,13 @@
-import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { afterEach, expect, spyOn, test } from 'bun:test'
+import { chmod, copyFile, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { resolveAgentPackages, updateAgentRuntime, updateAgentRuntimes } from './agent-updates'
+import { AGENT_UPDATE_INTERVAL_MS, retryAgentFileOperation, resolveAgentPackages, startAgentAutoUpdates, updateAgentRuntime, updateAgentRuntimes } from './agent-updates'
+import { AgentInstallTerminationError } from './agent-install'
 
 const temporary: string[] = []
 afterEach(async () => {
-  for (const path of temporary.splice(0)) await rm(path, { recursive: true })
+  for (const path of temporary.splice(0)) await retryAgentFileOperation(() => rm(path, { recursive: true }))
 })
 async function scratch(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'lodestar-agent-updates-test-'))
@@ -21,6 +22,121 @@ async function install(directory: string): Promise<void> {
     await writeFile(join(target, 'package.json'), JSON.stringify({ name, version }))
   }
 }
+
+test('auto-update is disabled by default and never checks or schedules at startup', () => {
+  const interval = spyOn(globalThis, 'setInterval')
+  let checks = 0
+  try {
+    startAgentAutoUpdates(() => {}, { update: async () => { checks++ } })()
+    startAgentAutoUpdates(() => {}, { enabled: false, update: async () => { checks++ } })()
+    expect(checks).toBe(0)
+    expect(interval).not.toHaveBeenCalled()
+  } finally { interval.mockRestore() }
+})
+
+test('opt-in auto-update starts only at the six-hour tick, avoids overlap, and cancels on stop', async () => {
+  let tick!: () => void
+  const handle = { unref() {} } as ReturnType<typeof setInterval>
+  const interval = spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void, delay: number) => {
+    expect(delay).toBe(AGENT_UPDATE_INTERVAL_MS)
+    tick = callback
+    return handle
+  }) as typeof setInterval)
+  const clear = spyOn(globalThis, 'clearInterval').mockImplementation(() => {})
+  let checks = 0
+  let signal: AbortSignal | undefined
+  let finish!: () => void
+  const done = new Promise<void>(resolve => { finish = resolve })
+  let stop: (() => void) | undefined
+  try {
+    stop = startAgentAutoUpdates(() => {}, { enabled: true, update: async options => {
+      checks++
+      signal = options?.signal
+      await done
+    } })
+    expect(checks).toBe(0)
+    tick()
+    tick()
+    expect(checks).toBe(1)
+    stop()
+    expect(signal?.aborted).toBe(true)
+    expect(clear).toHaveBeenCalledWith(handle)
+  } finally {
+    stop?.()
+    finish()
+    await done
+    interval.mockRestore()
+    clear.mockRestore()
+  }
+})
+
+test('Windows file sharing violations retry the same operation and still surface final failure', async () => {
+  let attempts = 0
+  expect(await retryAgentFileOperation(async () => {
+    if (++attempts < 3) throw Object.assign(new Error('temporarily locked'), { code: 'EPERM' })
+    return 'published'
+  }, 'win32')).toBe('published')
+  expect(attempts).toBe(3)
+  const error = Object.assign(new Error('file remains busy'), { code: 'EBUSY' })
+  attempts = 0
+  await expect(retryAgentFileOperation(async () => { attempts++; throw error }, 'win32')).rejects.toBe(error)
+  expect(attempts).toBe(6)
+  attempts = 0
+  await expect(retryAgentFileOperation(async () => { attempts++; throw error }, 'linux')).rejects.toBe(error)
+  expect(attempts).toBe(1)
+})
+
+test('unconfirmed installer termination preserves occupied staging files and records the failure', async () => {
+  const root = await scratch()
+  let partial = ''
+  await expect(updateAgentRuntime('codex', { root,
+    metadata: async name => ({ name, version: '1.0.0' }),
+    install: async directory => {
+      partial = directory
+      await writeFile(join(directory, 'installer-held.exe'), 'still owned by installer')
+      throw new AgentInstallTerminationError(`installer PID 12345 termination unconfirmed; partial directory retained: ${directory}`)
+    },
+  })).rejects.toThrow('termination unconfirmed')
+  expect(await readFile(join(partial, 'installer-held.exe'), 'utf8')).toBe('still owned by installer')
+  const state = JSON.parse(await readFile(join(root, 'codex/current.json'), 'utf8'))
+  expect(state.error).toContain(partial)
+  expect(state.directory).toBeUndefined()
+})
+
+test('updating while an old native executable is running never overwrites, moves, or deletes its runtime', async () => {
+  const root = await scratch()
+  const node = Bun.which('node')
+  if (!node) throw new Error('Node is required for the occupied-executable update test')
+  let version = '1.0.0'
+  const options = { root, metadata: async (name: string) => ({ name, version }),
+    install: async (directory: string) => {
+      await install(directory)
+      await copyFile(node, join(directory, 'agent.exe'))
+      await chmod(join(directory, 'agent.exe'), 0o700)
+    },
+  }
+  const first = await updateAgentRuntime('codex', options)
+  const running = Bun.spawn([join(first.directory!, 'agent.exe'), '-e',
+    'process.stdout.write("ready"); process.stdin.on("data", () => process.stdout.write("alive")); process.stdin.on("end", () => process.exit(0))',
+  ], { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' })
+  const reader = running.stdout.getReader()
+  try {
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe('ready')
+    version = '2.0.0'
+    const second = await updateAgentRuntime('codex', options)
+    expect(second.directory).not.toBe(first.directory)
+    await expect(updateAgentRuntime('codex', { ...options, metadata: async () => { throw new Error('registry offline') } })).rejects.toThrow('registry offline')
+    running.stdin.write('ping')
+    running.stdin.flush()
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe('alive')
+    expect(running.exitCode).toBeNull()
+    expect(JSON.parse(await readFile(join(first.directory!, 'node_modules/@openai/codex/package.json'), 'utf8')).version).toBe('1.0.0')
+  } finally {
+    running.stdin.end()
+    await running.exited
+    reader.releaseLock()
+  }
+}, 15_000)
 
 test('Claude Code and both SDKs independently follow latest, including future major versions', async () => {
   const requests: string[] = []
