@@ -31,7 +31,7 @@ function runConfigUpdate(work: string): void {
     }))
     mock.module(${JSON.stringify(join(import.meta.dir, 'token-source.ts'))}, () => ({
       refreshAllTokenSourceModels: () => { refreshes++; return refresh },
-      getTokenSource: () => undefined,
+      getTokenSourceForAccount: () => undefined,
     }))
     const { addTokenSource } = await import(${JSON.stringify(join(import.meta.dir, 'token-source-config.ts'))})
     const { config } = await import(${JSON.stringify(join(import.meta.dir, 'config.ts'))})

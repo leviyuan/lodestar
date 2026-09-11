@@ -1,11 +1,14 @@
 import { expect, test } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 test('all built-in sources separate custom registration/deletion from upstream visibility', () => {
   const dir = mkdtempSync(join(tmpdir(), 'lodestar-custom-model-test-'))
   const file = join(dir, 'config.toml')
+  const codexHome = join(dir, 'codex')
+  mkdirSync(codexHome)
+  writeFileSync(join(codexHome, 'auth.json'), '{}') // Credential discovery is local; model RPC stays mocked below.
   const modulePath = (name: string) => JSON.stringify(join(import.meta.dir, name))
   writeFileSync(file, `[feishu]
 app_id="test"
@@ -98,7 +101,7 @@ api_key="test-key"
   `
   try {
     const result = Bun.spawnSync({ cmd: [process.execPath, '--eval', script],
-      env: { ...process.env, LODESTAR_CONFIG: file, LODESTAR_DATA_DIR: join(dir, 'state') }, stdout: 'pipe', stderr: 'pipe' })
+      env: { ...process.env, CODEX_HOME: codexHome, LODESTAR_CONFIG: file, LODESTAR_DATA_DIR: join(dir, 'state') }, stdout: 'pipe', stderr: 'pipe' })
     expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })

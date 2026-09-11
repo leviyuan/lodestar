@@ -9,12 +9,19 @@ import { DshProcess } from './dsh-process'
 import { ClaudeAgentProcess, assertClaudeCodeAvailable } from './claude-agent-process'
 import { CodexProcess, isCodexReasoningEffort } from './codex-process'
 import type { ConversationLaunch } from './conversation'
-import { getTokenSource, tokenSourceProcessRevision, tokenSourceRuntimeModel } from './token-source'
+import { getTokenSourceForAccount, tokenSourceProcessRevision, tokenSourceRuntimeModel } from './token-source'
+import { bindProcessCodexAccount, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
+import { CodexAccountProcess } from './codex-account-process'
 
 export interface AgentLaunchOptions {
   provider: AgentProvider
   workDir: string
   tokenSourceId: string | null
+  codexAccountId?: string
+  /** null = automatic; an id = explicit first choice. Undefined is a raw control/test launch. */
+  codexAccountPreference?: string | null
+  /** Internal raw launch: user explicitly chose this account; let native Codex validate it. */
+  codexManualAccount?: boolean
   model?: string
   effort?: AgentReasoningEffort
   launch?: ConversationLaunch
@@ -36,28 +43,40 @@ export interface CreatedAgentProcess {
  * agents. Workers use the same coding tools, with further delegation disabled
  * according to the user's single-level delegation policy. */
 export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProcess {
-  const source = opts.tokenSourceId ? getTokenSource(opts.tokenSourceId) : undefined
+  if (opts.provider === 'codex' && opts.tokenSourceId === 'codex-sub' && opts.codexAccountPreference !== undefined) {
+    if (!opts.model && !opts.codexAccountPreference) throw new Error('Codex 自动选号需要明确模型')
+    const process = new CodexAccountProcess({
+      model: opts.model ?? '', effort: opts.effort, preferred: opts.codexAccountPreference,
+      workDir: opts.workDir, launch: opts.launch ?? { kind: 'fresh' },
+      create: (accountId, launch, manual, model, effort) => createAgentProcess({ ...opts, model, effort,
+        codexAccountPreference: undefined, codexManualAccount: manual, codexAccountId: accountId, launch }),
+    })
+    return { process, sourceRevision: null }
+  }
+  const accountId = opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT
+  const source = getTokenSourceForAccount(opts.tokenSourceId, accountId)
+  const manual = opts.provider === 'codex' && opts.tokenSourceId === 'codex-sub' && opts.codexManualAccount === true
   if (opts.tokenSourceId && !source) throw new Error(`token source not found: ${opts.tokenSourceId}`)
-  if (source && !source.enabled) throw new Error(`token source disabled: ${source.id}`)
+  if (source && !source.enabled && !manual) throw new Error(`token source disabled: ${source.id}`)
   if (source && source.agent !== opts.provider) {
     throw new Error(`token source ${source.id} belongs to ${source.agent}, not ${opts.provider}`)
   }
-  if (source?.modelCatalogState?.status === 'failed') {
+  if (!manual && source?.modelCatalogState?.status === 'failed') {
     throw new Error(`model catalog refresh failed for ${source.id}: ${source.modelCatalogState.error ?? 'MISS'}`)
   }
-  if (source?.modelCatalogState?.status === 'idle' || source?.modelCatalogState?.status === 'loading') {
+  if (!manual && (source?.modelCatalogState?.status === 'idle' || source?.modelCatalogState?.status === 'loading')) {
     throw new Error(`model catalog is not ready for ${source.id}: ${source.modelCatalogState.status}`)
   }
-  const requestedModel = opts.model ?? source?.defaultModel
+  const requestedModel = opts.model || source?.defaultModel || undefined
   const sourceRevision = tokenSourceProcessRevision(source, requestedModel)
-  const entry = source && tokenSourceRuntimeModel(source, requestedModel)
-  if (source && requestedModel && !entry) {
+  const entry = !manual && source && tokenSourceRuntimeModel(source, requestedModel)
+  if (!manual && source && requestedModel && !entry) {
     throw new Error(`model is not present in token source ${source.id}: ${requestedModel}`)
   }
-  if (entry && (entry.unavailableReason || !entry.efforts.length || (opts.effort !== undefined && !entry.efforts.includes(opts.effort)))) {
+  if (!manual && entry && (entry.unavailableReason || !entry.efforts.length || (opts.effort !== undefined && !entry.efforts.includes(opts.effort)))) {
     throw new Error(`model effort unavailable: ${source!.id}/${requestedModel}/${opts.effort ?? 'MISS'}`)
   }
-  const model = source && requestedModel
+  const model = !manual && source && requestedModel
     ? source.resolveSpawnModel(requestedModel)
     : requestedModel
   if (requestedModel && !model) throw new Error(`model did not resolve: ${opts.tokenSourceId ?? 'default'}/${requestedModel}`)
@@ -100,19 +119,19 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
   }
 
   if (opts.effort !== undefined && !isCodexReasoningEffort(opts.effort)) throw new Error(`invalid Codex effort: ${opts.effort}`)
-  return {
-    process: new CodexProcess({
-      workDir: opts.workDir,
-      model,
-      effort: opts.effort,
-      launch: opts.launch,
-      ...(opts.developerInstructions ? { appendSystemPrompt: opts.developerInstructions } : {}),
-      ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
-      tokenSourceId: source?.id ?? null,
-      transformEnv,
-      hostEnv: opts.hostEnv,
-      serviceName: opts.serviceName,
-    }),
-    sourceRevision,
-  }
+  const process = new CodexProcess({
+    workDir: opts.workDir,
+    model,
+    effort: opts.effort,
+    launch: opts.launch,
+    ...(opts.developerInstructions ? { appendSystemPrompt: opts.developerInstructions } : {}),
+    ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
+    tokenSourceId: source?.id ?? null,
+    transformEnv,
+    hostEnv: opts.hostEnv,
+    serviceName: opts.serviceName,
+    codexAccountId: accountId,
+  })
+  bindProcessCodexAccount(process, accountId)
+  return { process, sourceRevision }
 }

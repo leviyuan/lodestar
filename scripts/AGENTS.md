@@ -8,6 +8,9 @@
 | `test-inject.ts` | 向 debug context 指定的群发送可见消息，再注入正在运行的 daemon |
 | `test-mid-turn-rotation.ts` | 通过 debug socket 发送 `kill` 和长任务，读取日志 |
 | `cardkit-probe.ts` | 发多张测试卡，直调 Card Kit API |
+| `test-codex-account-cards.ts --unsent` | 当前应用下创建一个未发送的 Card Kit 对象，验收账号卡片各状态，关闭流式状态；不发群消息 |
+| `test-codex-multi-account.ts` | 私有默认/额外账号目录与 localhost 模型，验证三种 SQLite 配置下原生跨账号 resume；不使用真实凭据 |
+| `test-codex-quota-recovery.ts` | 私有目录、模拟额度与 localhost 模型，真实 Codex 执行一次文件追加后连续两次额度耗尽，验证自动换号、同 thread 续跑和操作不重复；不接触真实账号或 daemon |
 | `seed-debug-ctx.ts` | 查询群成员，将指定成员写入本机 debug context |
 | `test-openrouter.ts` | 使用明确提供的私有 Key 和 `--agent-runtimes` 目录做付费 API/SDK Read 实测；不连接飞书或 daemon，支持请求参数核验与原生 resume 序列 |
 | `test-dsh-glm.ts` | 使用已配置 GLM Coding Plan 做 DSH Read 与原生 resume 实测，只操作私有临时目录；不连接飞书或控制 daemon |

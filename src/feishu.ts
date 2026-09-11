@@ -32,6 +32,8 @@ import {
   TEMP_SESSION_LEASES_FILE,
 } from './paths'
 import { log } from './log'
+import { sync as spawnSync } from 'cross-spawn'
+import { codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
 import { writeJsonStateAtomic } from './state-store'
 import { neutralizeMarkdownImagesInCard } from './cards/elements'
 import {
@@ -1553,11 +1555,13 @@ export function provisionProject(workDir: string): void {
   try { execSync('git init -q', { cwd: workDir, stdio: 'ignore' }) } catch {}
 }
 
-export function isOpenAIChatGPTAuthenticated(): boolean {
-  try {
-    const out = execSync(`"${resolveCodexBin()}" login status 2>&1`, { timeout: 10_000 }).toString()
-    return /Logged in using ChatGPT/i.test(out)
-  } catch { return false }
+export function isOpenAIChatGPTAuthenticated(accountId = DEFAULT_CODEX_ACCOUNT): boolean {
+  const result = spawnSync(resolveCodexBin(), ['login', 'status', ...codexAccounts.cliArgs(accountId)], {
+    timeout: 10_000, shell: false, encoding: 'utf8',
+    env: codexAccounts.env(accountId, { ...process.env, ...config.codex.env }),
+  })
+  if (result.error) log(`codex login status failed: ${result.error.message}`)
+  return result.status === 0 && /Logged in using ChatGPT/i.test(`${result.stdout}\n${result.stderr}`)
 }
 
 export function sanitizeSessionName(raw: string): string {

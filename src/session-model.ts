@@ -2,7 +2,7 @@ import { isAgentProvider, isDshReasoningEffort } from './agent-process'
 import { randomUUID } from 'node:crypto'
 
 import { Session } from './session'
-import { listTokenSources, getTokenSource, refreshAllTokenSourceModels, type TokenSource } from './token-source'
+import { listTokenSources, refreshAllTokenSourceModels, type TokenSource } from './token-source'
 import { editTokenSourceModels, registerCustomTokenSourceModel, removeCustomTokenSourceModel } from './token-source-config'
 import { isCodexReasoningEffort } from './codex-process'
 import {
@@ -35,7 +35,7 @@ export const MODEL_PAGE_SIZE = 20
 // ── 第1级:账号(provider)选项 —— 每个 token source 一项 ─────
 function providerChoices(s: Session): cards.ProviderChoice[] {
   const cur = s.currentTokenSource()
-  return listTokenSources()
+  return listTokenSources().map(source => s.tokenSource(source.id)!)
     // native 是兜底项:仅在 enabled 时露面(本机未命中 Pro provider → 作为默认通路);
     // disabled 说明本机已用 GLM,此时它没意义,不显示灰项干扰选择。
     .filter(ts => ts.enabled || ts.kind !== 'claude-native')
@@ -107,7 +107,7 @@ export async function onProviderSelect(
   panelIdRaw = '',
 ): Promise<ModelActionResult> {
   const sourceId = sourceIdRaw.trim()
-  const ts = getTokenSource(sourceId)
+  const ts = s.tokenSource(sourceId)
   if (!ts) return { ok: false, message: `未知账号: ${sourceId}` }
   if (!ts.enabled) return { ok: false, message: `${ts.display} 未配置,请先点「启用」` }
   const panelId = panelIdRaw.trim()
@@ -152,7 +152,7 @@ export async function onModelPage(s: Session, panelId: string, sourceId: string,
 /** 可编辑来源的完整候选目录；不接受回调自行传入候选项或来源。 */
 export async function onModelAddOpen(s: Session, panelId: string, sourceId: string): Promise<ModelActionResult> {
   const panel = s.modelPanels.get(panelId)
-  const source = getTokenSource(sourceId)
+  const source = s.tokenSource(sourceId)
   if (!panel || panel.sourceId !== sourceId || !source?.enabled || !source.modelSelection) {
     return { ok: false, message: '模型管理面板已失效，请重新发送 md' }
   }
@@ -170,7 +170,7 @@ export async function onModelListEdit(
   s: Session, panelId: string, sourceId: string, model: string, action: 'add' | 'remove' | 'delete',
 ): Promise<ModelActionResult> {
   const panel = s.modelPanels.get(panelId)
-  const source = getTokenSource(sourceId)
+  const source = s.tokenSource(sourceId)
   if (!panel?.editable || panel.sourceId !== sourceId || !source?.modelSelection
     || panel.sourceRevision !== source.spawnRevision || panel.mode !== (action === 'add' ? 'add' : 'select')
     || !panel.models.some(entry => entry.model === model)) {
@@ -182,8 +182,8 @@ export async function onModelListEdit(
     if (users.length) return { ok: false, message: `补录模型仍被会话 ${users.map(session => session.sessionName).join('、')} 选用，请先切换再删除` }
   }
   try {
-    if (action === 'delete') await removeCustomTokenSourceModel(sourceId, model)
-    else await editTokenSourceModels(sourceId, model, action)
+    if (action === 'delete') await removeCustomTokenSourceModel(sourceId, model, s.codexAccountId())
+    else await editTokenSourceModels(sourceId, model, action, s.codexAccountId())
     // 其他面板的快照在列表变化后失效；不影响会话、进程和正在运行的 turn。
     for (const session of Session.all) {
       for (const [id, other] of session.modelPanels) {
@@ -206,7 +206,7 @@ export async function onModelCustomPrompt(
   panelIdRaw: string,
   cardMessageId = '',
 ): Promise<ModelActionResult> {
-  const ts = getTokenSource(sourceIdRaw.trim())
+  const ts = s.tokenSource(sourceIdRaw.trim())
   if (!ts) return { ok: false, message: `未知账号: ${sourceIdRaw}` }
   if (!ts.enabled) return { ok: false, message: `${ts.display} 未配置` }
   const panelId = panelIdRaw.trim()
@@ -233,7 +233,7 @@ export async function consumeModelCustomMessage(
   if (!pending) return false
   s.modelCustomPrompt = null  // 一次性:无论成败,应答态结束
   const model = text.trim()
-  const ts = getTokenSource(pending.sourceId)
+  const ts = s.tokenSource(pending.sourceId)
   // 更新补录卡的 panel(失败提示/成功转 effort);id_convert 失败如实 log,
   // 状态机照常走(卡片更新是呈现,不是数据路径)。
   const updateCard = async (panel: object): Promise<boolean> => {
@@ -306,7 +306,7 @@ export async function consumeModelCustomMessage(
     return true
   }
   try {
-    await registerCustomTokenSourceModel(ts.id, model)
+    await registerCustomTokenSourceModel(ts.id, model, s.codexAccountId())
   } catch (error) {
     log(`model-custom: config/refresh MISS (${messageOf(error)})`)
     await failCard(`配置写入或模型刷新失败：${messageOf(error)}`)
@@ -318,7 +318,7 @@ export async function consumeModelCustomMessage(
       if (panel.sourceId === ts.id && (session !== s || id !== pending.panelId)) session.modelPanels.delete(id)
     }
   }
-  const fresh = getTokenSource(ts.id)
+  const fresh = s.tokenSource(ts.id)
   if (!fresh || fresh.modelCatalogState?.status !== 'ready') {
     await failCard(fresh?.modelCatalogState?.error ?? '刷新后的账号目录不可用')
     return true
@@ -468,7 +468,7 @@ export async function onModelEffortSelect(
   if (!choice || !choice.efforts.some(item => item.effort === effort)) {
     return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在选项中` }
   }
-  const source = getTokenSource(choice.sourceId)
+  const source = s.tokenSource(choice.sourceId)
   if (source?.modelCatalogState) {
     if (!source.enabled || source.modelCatalogState.status !== 'ready') {
       return { ok: false, message: `模型目录 MISS：${source.modelCatalogState.error ?? source.modelCatalogState.status}` }
@@ -536,7 +536,7 @@ export async function onModelEffortSelect(
     // 不重注入 env,跨 source 会打到上一个 source 的 base_url(silent divergence)。
     if (s.proc?.isAlive() && s.proc.provider === provider && !sourceChanged && !environmentChanged) {
       const processModel = choice.sourceId
-        ? getTokenSource(choice.sourceId)?.resolveSpawnModel(model) ?? model
+        ? s.tokenSource(choice.sourceId)?.resolveSpawnModel(model) ?? model
         : model
       await withTimeout(s.proc.setModelSettings(processModel, effort), 20_000, 'thread/settings/update')
     }

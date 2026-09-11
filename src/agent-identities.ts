@@ -42,8 +42,8 @@ export function agentIdentityId(tokenSourceId: string, model: string): string {
   return `agent:${Buffer.from(`${tokenSourceId}\u0000${model}`, 'utf8').toString('base64url')}`
 }
 
-export function getAgentIdentityCatalog(): AgentIdentityCatalog {
-  return buildAgentIdentityCatalog(listTokenSources())
+export function getAgentIdentityCatalog(codexAccountId = 'default'): AgentIdentityCatalog {
+  return buildAgentIdentityCatalog(listTokenSources().map(source => source.forAccount?.(codexAccountId) ?? source))
 }
 
 export function buildAgentIdentityCatalog(sources: TokenSource[]): AgentIdentityCatalog {

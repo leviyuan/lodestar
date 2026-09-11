@@ -38,11 +38,11 @@ test('every delegated worker launch carries the policy and a worker role', () =>
     import { mock } from 'bun:test'
     import { EventEmitter } from 'node:events'
     const captured = []
-    mock.module('./src/token-source', () => ({ getTokenSource: () => ({ id: 'test-source' }) }))
+    mock.module('./src/token-source', () => ({ getTokenSourceForAccount: () => ({ id: 'test-source' }) }))
     mock.module('./src/agent-session-registry', () => ({ rememberAgentSession() {} }))
     mock.module('./src/agent-launch', () => ({ createAgentProcess: options => {
       captured.push({ allowDelegation: options.allowDelegation, instructions: options.developerInstructions,
-        role: options.hostEnv.LODESTAR_AGENT_ROLE, model: options.model, effort: options.effort })
+        role: options.hostEnv.LODESTAR_AGENT_ROLE, model: options.model, effort: options.effort, codexAccountId: options.codexAccountId })
       const proc = new EventEmitter()
       Object.assign(proc, { provider: options.provider, sessionId: 'test-session', alive: true,
         isAlive() { return this.alive }, sendInitialize() {},
@@ -54,7 +54,7 @@ test('every delegated worker launch carries the policy and a worker role', () =>
     const { startAgentWorker } = await import('./src/agent-runner')
     for (const provider of ['codex', 'claude']) {
       await startAgentWorker({ identity: { tokenSourceId: 'test-source', provider, model: 'worker-model', supportedEfforts: ['high'] },
-        effort: 'high', workDir: process.cwd(), prompt: 'task', developerInstructions: 'project rule',
+        effort: 'high', codexAccountId: 'named-work', workDir: process.cwd(), prompt: 'task', developerInstructions: 'project rule',
         hostEnv: { LODESTAR_AGENT_ROLE: 'main' } }).done
     }
     console.log(JSON.stringify(captured))
@@ -65,6 +65,7 @@ test('every delegated worker launch carries the policy and a worker role', () =>
     expect(launch.role).toBe('worker')
     expect(launch.model).toBe('worker-model')
     expect(launch.effort).toBe('high')
+    expect(launch.codexAccountId).toBe('named-work')
     expect(launch.instructions).toContain('project rule')
     expect(launch.instructions).toContain('must not create or invoke any further Agents or subagents')
   }

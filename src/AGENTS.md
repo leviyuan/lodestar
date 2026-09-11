@@ -19,6 +19,11 @@
 - `md` 先等待目录刷新再生成账号卡，刷新失败显示 MISS，不能将加载中清空的数组显示为零模型。`debug-model.ts` 仅为本机模型测试提供白名单事件与脱敏状态；实际动作仍经过 daemon 的正常 Card action 队列。
 - `fk`、`bk` 和进程停止后的 `rs` 使用原生会话能力：Claude transcript + `forkSession/resumeSessionAt`，Codex `thread/list` + `thread/fork(lastTurnId)`。checkpoint 包含 provider、源会话、cwd 和原生锚点。Claude fork 在首条输入前保存 pending launch，得到新 session id 后才清除。不得扫描或复制 Codex rollout，也不能把 fork 失败当成 resume。
 
+- Codex 多账号对外仍为 `codex-sub`，账号命令为 `codex-login [备注]`、`codex-login-cancel [备注]`、`codex-accounts`、`codex-account [备注]`、`codex-auto`。默认账号就是设备原生 CODEX_HOME；额外账号通过 `codex-accounts.ts` 管理独立认证与共享会话路径，禁止复制或覆盖默认认证。设备码登录交给原生 app-server，完成通知按 loginId 关联；同时收到登录成功和 account/updated(chatgpt) 后才读取账号，避免读到登录前的缓存空值。取消按发起者校验，停机收回登录进程。回复用原地更新的简洁卡片，终态移除验证码，取消复用原登录卡；同账号登录与新进程启动互斥。查询失败显示 MISS；列表按原生身份去重，hi 和 footer 仅显示实际进程所用账号，footer 保留原紧凑格式。
+- `codex-quota.ts` 按 Plus/prolite/pro 的 1/5/20 份周额度计算周剩余/距重置小时；Plus 的 5h 满窗是 0.15 份，分数取周速率和短窗速率较小值。所有模式降序选择，同分比较当前可连续使用额度。成功 Plus 响应缺短窗按满窗 0.15/5 计算，标记 `unreportedFull`，不造重置日期；请求失败或已返回窗口畸形仍 MISS。自动 Ultra 排除 Plus，要求周剩余至少 0.5 份；不足是 waiting，不是耗尽，普通模式仍可用。主会话与委派共用 `agent-launch.ts` → `CodexAccountProcess`。
+- 手动指定最高优先：`hi 备注` 通过 Session 生命周期只覆盖这次启动，已有其他账号则重启并 resume；`codex-account` 持久指定、`codex-auto` 清除。手动路径不读额度、不检查套餐、Ultra 门槛或本地模型目录；保留账号存在性、认证文件隔离、原生进程退出与登录写入互斥这些结构约束，真实错误交由 Codex 返回。自动路径仍检查模型与全部实际限额、身份、登录租约。运行中耗尽后转自动选择，手动原生默认模型在恢复时必须原样传给新进程，不能变成另一账号的默认模型。
+- 原生 `usageLimitExceeded` 只在主 turn 终态失败或明确 `turn/start` 拒绝后触发换号。`codex-account-process.ts` 保持同一逻辑任务，等待原生落盘与真实退出再替换子进程、resume 同一 thread；已接受任务只续跑，不重放输入。耗尽状态由 `codex-account-scheduler.ts` 原子保存，接口确认窗口恢复后解除；全部耗尽自动等待且可取消。初次等待通过显式 `quotaWaitPromise` 释放 Session actor，不能伪造 init 或占住 stop。网络、认证、普通 HTTP 429 不切号。委派分别记录实际账号；换号保留模型、effort、host capability、权限和工具入口，旧后台任务显式结算，旧进程迟到事件不得关闭新任务。
+
 ## 委派 Agent
 
 - `agent-*` 提供单层模型委派。只有主 Agent 能发起任务或续跑；同一任务的多个身份放在一个 run 内并发。被委派的 Agent 自行完成任务，需要额外派工时报告主 Agent。

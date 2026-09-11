@@ -2,12 +2,11 @@
  * Codex 订阅 token source(ChatGPT login)—— 自包含 provider 模块。
  *
  * 模型 = app-server `model/list` 动态拉(per-model effort、过滤 hidden);
- * 额度 = account/rateLimits/read(真);enabled = ~/.codex/auth.json 在。
+ * 额度 = account/rateLimits/read；默认账号由原生认证接口确认（含系统钥匙串）。
  * 模块加载时 registerTokenSourceFactory 声明式登记。
  */
 
 import { existsSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { config, type TokenSourceConfig } from './config'
 import {
@@ -21,6 +20,8 @@ import { readUsage, type UsageSnapshot, type UsageWindow } from './usage'
 import { fetchCodexModels } from './token-source-models'
 import type { AgentReasoningEffort } from './agent-process'
 import { log } from './log'
+import { codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
+import { withModelVisibility } from './token-source-visibility'
 
 type Env = Record<string, string | undefined>
 
@@ -60,11 +61,9 @@ export function codexBucketsToUnified(s: UsageSnapshot): UsageWindowUnified[] | 
   return out.length ? out : null
 }
 
-/** codex 本地登录态:~/.codex/auth.json 存在即视为已配置(廉价同步信号;
- *  订阅是否有效在 account/rateLimits 查询时如实暴露 MISS)。 */
-function codexLoggedIn(): boolean {
-  const codexHome = process.env.CODEX_HOME || join(homedir(), '.codex')
-  return existsSync(join(codexHome, 'auth.json'))
+/** Default auth can live in an OS keyring or managed store. Only the native account/read is authoritative. */
+function canReadCodexAccount(accountId: string): boolean {
+  return accountId === DEFAULT_CODEX_ACCOUNT || existsSync(join(codexAccounts.home(accountId), 'auth.json'))
 }
 
 registerTokenSourceFactory({
@@ -73,59 +72,82 @@ registerTokenSourceFactory({
   // display/model/effort/models(codex app-server 动态拉,config 只做 pin)。
   configSectionId: 'codex-sub',
   build: (cfg: TokenSourceConfig): TokenSource => {
-    const enabled = codexLoggedIn()
-    const cfgDefaultModel = cfg.model?.trim() || undefined
-    const cfgEffort = (cfg.effort?.trim() || undefined) as AgentReasoningEffort | undefined
-    const ts: TokenSource = {
-      id: 'codex-sub',
-      kind: 'codex-subscription',
-      agent: 'codex',
-      display: cfg.display?.trim() || 'Codex 订阅',
-      enabled,
-      models: [],
-      modelCatalogState: { status: enabled ? 'idle' : 'disabled', updatedAt: Date.now() },
-      defaultModel: cfgDefaultModel ?? '',
-      async refreshModels(): Promise<void> {
-        if (!ts.enabled) {
-          ts.models = []
-          ts.modelCatalogState = { status: 'disabled', updatedAt: Date.now() }
-          return
-        }
-        ts.modelCatalogState = { status: 'loading', updatedAt: null }
-        try {
-          ts.models = await fetchCodexModels()
-          // config effort pin:把订阅默认 effort 覆盖为用户选择(per-model 仍可用)。
-          if (cfgEffort) {
-            for (const m of ts.models) m.defaultEffort = cfgEffort
+    const children = new Map<string, { revision: string; source: TokenSource }>()
+    const make = (accountId: string): TokenSource => {
+      const enabled = canReadCodexAccount(accountId)
+      const cfgDefaultModel = cfg.model?.trim() || undefined
+      const cfgEffort = (cfg.effort?.trim() || undefined) as AgentReasoningEffort | undefined
+      const ts: TokenSource = {
+        id: 'codex-sub',
+        kind: 'codex-subscription',
+        agent: 'codex',
+        display: cfg.display?.trim() || 'Codex 订阅',
+        spawnRevision: JSON.stringify([cfg.model, cfg.effort, codexAccounts.revision(accountId)]),
+        enabled,
+        models: [],
+        modelCatalogState: { status: enabled ? 'idle' : 'disabled', updatedAt: Date.now() },
+        defaultModel: cfgDefaultModel ?? '',
+        async refreshModels(): Promise<void> {
+          ts.enabled = canReadCodexAccount(accountId)
+          if (!ts.enabled) {
+            ts.models = []
+            ts.modelCatalogState = { status: 'disabled', updatedAt: Date.now() }
+            return
           }
-          // 默认模型:config model 键优先;未配 → 动态列表第一个(app-server 自己
-          // 的首选顺序,订阅语义明确,不重排)。
-          if (!cfgDefaultModel) ts.defaultModel = ts.models[0]?.model ?? ''
-          ts.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
-        } catch (e: any) {
-          log(`codex-sub refreshModels MISS: ${e?.message ?? e}`)
-          ts.models = []
-          ts.modelCatalogState = { status: 'failed', updatedAt: Date.now(), error: e?.message ?? String(e) }
-        }
-      },
-      spawnEnv(base: Env): Env {
-        const out = scrubAnthropicEnv(base)
-        Object.assign(out, config.codex.env)
-        return out
-      },
-      resolveSpawnModel(model: string): string {
-        return model
-      },
-      async readUsage(): Promise<UsageSnapshotUnified> {
-        const snap = await readUsage()
-        const unified = codexUsageToUnified(snap)
-        // 多桶透出:read 端点全量桶(如 Spark 附加包)在 console 额度行各占一行,
-        // 服务端加/删桶自动跟进;单桶账号行为不变(就是默认桶的 5h+周)。
-        const all = codexBucketsToUnified(snap)
-        if (all) unified.windows = all
-        return unified
-      },
+          ts.modelCatalogState = { status: 'loading', updatedAt: null }
+          try {
+            ts.models = await fetchCodexModels(accountId)
+            // config effort pin:把订阅默认 effort 覆盖为用户选择(per-model 仍可用)。
+            if (cfgEffort) {
+              for (const m of ts.models) m.defaultEffort = cfgEffort
+            }
+            // 默认模型:config model 键优先;未配 → 动态列表第一个(app-server 自己
+            // 的首选顺序,订阅语义明确,不重排)。
+            if (!cfgDefaultModel) ts.defaultModel = ts.models[0]?.model ?? ''
+            ts.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
+          } catch (e: any) {
+            log(`codex-sub ${accountId} refreshModels MISS: ${e?.message ?? e}`)
+            ts.models = []
+            if (e?.code === 'CODEX_AUTH_MISSING') ts.enabled = false
+            ts.modelCatalogState = { status: ts.enabled ? 'failed' : 'disabled', updatedAt: Date.now(), error: e?.message ?? String(e) }
+          }
+        },
+        spawnEnv(base: Env): Env {
+          const out = scrubAnthropicEnv(base)
+          Object.assign(out, config.codex.env)
+          return codexAccounts.env(accountId, out)
+        },
+        resolveSpawnModel(model: string): string {
+          return model
+        },
+        async readUsage(): Promise<UsageSnapshotUnified> {
+          const snap = await readUsage(accountId)
+          const unified = codexUsageToUnified(snap)
+          // 多桶透出:read 端点全量桶(如 Spark 附加包)在 console 额度行各占一行,
+          // 服务端加/删桶自动跟进;单桶账号行为不变(就是默认桶的 5h+周)。
+          const all = codexBucketsToUnified(snap)
+          if (all) unified.windows = all
+          return unified
+        },
+      }
+      return ts
     }
-    return ts
+    const root = make(DEFAULT_CODEX_ACCOUNT)
+    root.forAccount = accountId => {
+      if (accountId === DEFAULT_CODEX_ACCOUNT) return root
+      const revision = codexAccounts.revision(accountId)
+      const current = children.get(accountId)
+      if (current?.revision === revision) return current.source
+      const source = withModelVisibility(make(accountId), cfg)
+      children.set(accountId, { revision, source })
+      return source
+    }
+    const refreshDefault = root.refreshModels.bind(root)
+    root.refreshModels = async () => {
+      await Promise.all([refreshDefault(), ...codexAccounts.list()
+        .filter(account => account.id !== DEFAULT_CODEX_ACCOUNT)
+        .map(account => root.forAccount!(account.id).refreshModels())])
+    }
+    return root
   },
 })

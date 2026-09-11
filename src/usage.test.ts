@@ -1,6 +1,40 @@
 import { describe, expect, test } from 'bun:test'
 
-import { snapshotFromReadResponse, observeRateLimitsNotification, refreshUsageFromConnection } from './usage'
+import { snapshotFromReadResponse, observeRateLimitsNotification, refreshUsageFromConnection, peekUsage, invalidateCodexUsage } from './usage'
+
+describe('quota account isolation', () => {
+  test('successful Plus reads without 5h consistently expose a full short window to footer and hi', () => {
+    const input = { rateLimits: { limitId: 'codex', planType: 'plus', primary: {
+      usedPercent: 20, windowDurationMins: 10080, resetsAt: 1_900_000_000 }, secondary: null } }
+    const snapshot = snapshotFromReadResponse(input)
+    if (snapshot.state !== 'ok') throw new Error('expected successful snapshot')
+    expect(snapshot.fiveHour).toEqual({ percent: 0, resetsAt: null, durationMins: 300, unreportedFull: true })
+    expect(snapshot.buckets?.[0].fiveHour).toEqual(snapshot.fiveHour)
+    const pro = snapshotFromReadResponse(input, 'pro')
+    expect(pro.state === 'ok' && pro.fiveHour).toBeNull()
+    expect(snapshotFromReadResponse({}, 'plus').state).toBe('network')
+  })
+  test('separate accounts never share in-flight requests or cached snapshots', async () => {
+    let release!: (value: any) => void
+    const a = refreshUsageFromConnection(() => new Promise(resolve => { release = resolve }), 'account-a')
+    const b = await refreshUsageFromConnection(async () => ({ rateLimits: { primary: { usedPercent: 80, windowDurationMins: 300 } } }), 'account-b')
+    expect(b?.state === 'ok' && b.fiveHour?.percent).toBe(80)
+    release({ rateLimits: { primary: { usedPercent: 10, windowDurationMins: 300 } } })
+    await a
+    const cachedA = peekUsage('account-a'); const cachedB = peekUsage('account-b')
+    expect(cachedA?.state === 'ok' && cachedA.fiveHour?.percent).toBe(10)
+    expect(cachedB?.state === 'ok' && cachedB.fiveHour?.percent).toBe(80)
+    invalidateCodexUsage('account-a'); invalidateCodexUsage('account-b')
+  })
+  test('a late response from before reauthentication cannot repopulate the cache', async () => {
+    let release!: (value: any) => void
+    const pending = refreshUsageFromConnection(() => new Promise(resolve => { release = resolve }), 'relogin')
+    invalidateCodexUsage('relogin')
+    release({ rateLimits: { primary: { usedPercent: 12, windowDurationMins: 300 } } })
+    expect(await pending).toBeNull()
+    expect(peekUsage('relogin')).toBeNull()
+  })
+})
 
 describe('quota transient failures', () => {
   test('a transient request failure retries the same connection and returns the real quota', async () => {

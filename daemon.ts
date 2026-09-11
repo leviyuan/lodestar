@@ -42,6 +42,8 @@ import { startNotifyServer } from './src/notify'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
 import { createNotifyReplyRuntime } from './src/notify-replies'
 import { AgentService } from './src/agent-service'
+import { codexLogins } from './src/codex-login'
+import { settleCodexAccountCards } from './src/session-codex-accounts'
 import { handleAgentRequest } from './src/agent-api'
 import { ensureLodestarAgentSkill } from './src/agent-skill'
 import { ensureLodestarAgentCommand } from './src/managed-commands'
@@ -139,11 +141,13 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
         sessionRecovery.freezeForShutdown()
         const agentResults = await Promise.allSettled([
           agentService.shutdown(`daemon ${reason}`),
+          codexLogins.shutdown(),
         ])
+        const accountCardResults = await Promise.allSettled([settleCodexAccountCards()])
         const sessionResults = await Promise.allSettled(
           [...sessions.values()].map(session => session.stop(`daemon ${reason}`, { announce: false })),
         )
-        return [...agentResults, ...sessionResults]
+        return [...agentResults, ...accountCardResults, ...sessionResults]
       })()
       let deadlineTimer: ReturnType<typeof setTimeout> | null = null
       const deadline = new Promise<'deadline'>(resolve => {

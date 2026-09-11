@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import { CONFIG_FILE } from './paths'
 import { config, loadConfig, reloadTokenSources, type TokenSourceConfig } from './config'
 import { buildTokenSourcesFromConfig } from './token-source-builtins'
-import { getTokenSource, refreshAllTokenSourceModels } from './token-source'
+import { getTokenSourceForAccount, refreshAllTokenSourceModels } from './token-source'
 import { writeStateFileAtomic } from './state-store'
 import { modelList } from './token-source-visibility'
 
@@ -83,9 +83,9 @@ export function addTokenSource(id: string, cfg: TokenSourceConfig): Promise<void
 }
 
 /** 所有群共用同一账号的列表；在队列内部读取最新列表，避免并发增删互相覆盖。 */
-export function editTokenSourceModels(id: string, model: string, action: 'add' | 'remove'): Promise<void> {
+export function editTokenSourceModels(id: string, model: string, action: 'add' | 'remove', accountId = 'default'): Promise<void> {
   return serializeConfigUpdate(async () => {
-    const source = getTokenSource(id)
+    const source = getTokenSourceForAccount(id, accountId)
     if (!source?.enabled || !source.modelSelection) throw new Error('此账号不支持维护可选模型列表')
     const selected = source.modelSelection.modelIds.filter(id => source.models.find(entry => entry.model === id)?.origin !== 'custom')
     if (action === 'add') {
@@ -105,17 +105,17 @@ export function editTokenSourceModels(id: string, model: string, action: 'add' |
       ? { hidden_models: (action === 'remove' ? [...new Set([...hidden, model])] : hidden.filter(id => id !== model)).join(',') }
       : { models: models.join(',') }
     await applyTokenSourceConfig(id, update)
-    const fresh = getTokenSource(id)
+    const fresh = getTokenSourceForAccount(id, accountId)
     if (fresh?.modelCatalogState?.status !== 'ready') throw new Error(`配置已保存，但目录刷新失败：${fresh?.modelCatalogState?.error ?? 'MISS'}`)
   })
 }
 
 /** 补录接口外的模型；保留已有端点验证，并允许选择请求档位直接使用。 */
-export function registerCustomTokenSourceModel(id: string, raw: string): Promise<void> {
+export function registerCustomTokenSourceModel(id: string, raw: string, accountId = 'default'): Promise<void> {
   return serializeConfigUpdate(async () => {
     const model = raw.trim()
     if (!model || model.length > 256 || /[\s,`<>\\\u0000-\u001f]/.test(model)) throw new Error('模型 ID 无效，请只填写一个完整模型名')
-    const source = getTokenSource(id)
+    const source = getTokenSourceForAccount(id, accountId)
     if (!source?.enabled) throw new Error('账号不可用')
     source.validateCustomModelId?.(model)
     const catalog = source.modelSelection?.availableModels ?? source.models
@@ -127,14 +127,14 @@ export function registerCustomTokenSourceModel(id: string, raw: string): Promise
     }
     const cfg = config.token_sources[id]
     await applyTokenSourceConfig(id, { custom_models: [...modelList(cfg?.custom_models), model].join(',') })
-    const fresh = getTokenSource(id)
+    const fresh = getTokenSourceForAccount(id, accountId)
     if (fresh?.modelCatalogState?.status !== 'ready') throw new Error(`补录已保存，但目录刷新失败：${fresh?.modelCatalogState?.error ?? 'MISS'}`)
   })
 }
 
-export function removeCustomTokenSourceModel(id: string, model: string): Promise<void> {
+export function removeCustomTokenSourceModel(id: string, model: string, accountId = 'default'): Promise<void> {
   return serializeConfigUpdate(async () => {
-    const source = getTokenSource(id)
+    const source = getTokenSourceForAccount(id, accountId)
     const entry = source?.modelSelection?.availableModels.find(entry => entry.model === model)
     if (!source?.enabled || entry?.origin !== 'custom') throw new Error('此模型不是补录项，请使用隐藏操作')
     const cfg = config.token_sources[id] ?? {}
@@ -147,7 +147,7 @@ export function removeCustomTokenSourceModel(id: string, model: string): Promise
       ...(cfg.slots ? { slots: cfg.slots.split(',').filter(slot => !refers(slot.slice(slot.indexOf('=') + 1))).join(',') } : {}),
     }
     await applyTokenSourceConfig(id, update)
-    const fresh = getTokenSource(id)
+    const fresh = getTokenSourceForAccount(id, accountId)
     if (fresh?.modelCatalogState?.status !== 'ready') throw new Error(`补录已删除，但目录刷新失败：${fresh?.modelCatalogState?.error ?? 'MISS'}`)
   })
 }

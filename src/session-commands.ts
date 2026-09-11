@@ -29,6 +29,18 @@ const CONTROL_COMMAND_ALIASES = new Map<string, ControlCommand>([
  * Codex's native type-ahead behavior) — explicit barge-out
  * needed a knob and `kill` (full subprocess teardown) is too heavy. */
 export async function runCommand(s: Session, raw: string, userOpenId = ''): Promise<boolean> {
+  const namedHi = raw.trim().match(/^hi[ \t]+([^\r\n]+)$/i)
+  if (namedHi) {
+    const { runCodexNamedHi } = await import('./session-codex-accounts')
+    await runCodexNamedHi(s, namedHi[1].trim())
+    return true
+  }
+  const accountCommand = raw.trim().match(/^codex-(login-cancel|login|accounts|account|auto)(?:[ \t]+([^\r\n]+))?$/i)
+  if (accountCommand) {
+    const { runCodexAccountCommand } = await import('./session-codex-accounts')
+    await runCodexAccountCommand(s, accountCommand[1].toLowerCase(), (accountCommand[2] ?? '').trim(), userOpenId)
+    return true
+  }
   const wt = raw.trim().match(/^(?:wt|worktree)(?:\s+(.+))?$/i)
   if (wt) {
     await s.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId)
@@ -100,6 +112,17 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
           await s.closeStatusCard(statusCard, lastStatus.startsWith('❌') ? lastStatus : '❌ 启动失败')
           return true
         }
+        if (s.proc?.turnRetry?.reason === 'quota') {
+          const waiting = '⏳ 等待额度恢复 · 可用后自动启动，stop 可取消'
+          if (statusCard) await s.closeStatusCard(statusCard, waiting)
+          else {
+            const { codexAccountCard } = await import('./cards/codex-account')
+            if (!await feishu.sendCard(s.chatId, codexAccountCard({ phase: 'checking', title: '等待额度', message: waiting }))) {
+              throw new Error('额度等待卡片发送失败')
+            }
+          }
+          return true
+        }
         if (statusCard) {
           await s.replaceStatusCardWithConsole(
             statusCard,
@@ -118,6 +141,14 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       return true
     case 'stop':
       await s.cancelAgentRuns('stop command')
+      if (s.proc?.turnRetry?.reason === 'quota') {
+        const card = await s.openStatusCard('stop', '🛑 停止额度等待')
+        try {
+          await s.stop('已取消额度恢复', { announce: !card, onStatus: value => s.setStatusCard(card, value) })
+          await s.closeStatusCard(card, '🛑 已取消额度恢复')
+        } catch (error) { await s.closeStatusCard(card, `❌ ${messageOf(error)}`); throw error }
+        return true
+      }
       // Soft barge-out: interrupt the current turn (if any) AND drop
       // the pending-message count so a stack of type-ahead doesn't
       // refire after the interrupt. Subprocess stays alive. Note: the

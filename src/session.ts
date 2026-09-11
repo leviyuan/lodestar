@@ -53,7 +53,9 @@ import {
 import { config } from './config'
 import { createAgentProcess } from './agent-launch'
 import { agentApiUrl } from './agent-runtime'
-import { getTokenSource, listEnabledTokenSourcesByAgent, waitForTokenSourceModelRefresh, tokenSourceProcessRevision, tokenSourceRuntimeModel, type TokenSource } from './token-source'
+import { getTokenSource, getTokenSourceForAccount, listEnabledTokenSourcesByAgent, waitForTokenSourceModelRefresh, tokenSourceProcessRevision, tokenSourceRuntimeModel, type TokenSource } from './token-source'
+import { codexAccounts, DEFAULT_CODEX_ACCOUNT, processCodexAccount } from './codex-accounts'
+import { codexAccountCard } from './cards/codex-account'
 import {
   claudeTranscriptPath,
   type BgTaskStartedEvent,
@@ -601,7 +603,20 @@ export class Session {
 
   /** 当前 token source(账号);未配返回 undefined → 调用方走旧路径 fallback。 */
   currentTokenSource(): TokenSource | undefined {
-    return getTokenSource(this.selectedTokenSourceId)
+    return this.tokenSource(this.selectedTokenSourceId)
+  }
+
+  /** Pending account selection takes effect only after the old process exits. */
+  private codexStartAccountOverride: string | undefined
+
+  codexAccountId(): string {
+    return this.proc?.isAlive() && this.proc.provider === 'codex'
+      ? processCodexAccount(this.proc) : this.codexStartAccountOverride ?? codexAccounts.selected(this.sessionName)
+  }
+
+  tokenSource(id: string | null | undefined): TokenSource | undefined {
+    const source = getTokenSource(id)
+    return source?.forAccount ? getTokenSourceForAccount(id, this.codexAccountId()) : source
   }
 
   currentProvider(): AgentProvider { return this.selectedProvider }
@@ -612,6 +627,8 @@ export class Session {
       tokenSourceId: this.selectedTokenSourceId,
       model: this.selectedModel,
       effort: this.selectedEffort,
+      ...(this.codexAccountId() === DEFAULT_CODEX_ACCOUNT ? {} : { codexAccountId: this.codexAccountId() }),
+      ...(codexAccounts.preferred(this.sessionName) === null ? { codexAccountAutomatic: true } : {}),
     }
   }
 
@@ -620,6 +637,7 @@ export class Session {
     if (this.isRunning() || this.currentTurn || this.openingTurn) {
       throw new Error('cannot change conversation routing while the session is running')
     }
+    if (routing.codexAccountId) codexAccounts.get(routing.codexAccountId)
     const source = getTokenSource(routing.tokenSourceId)
     if (source && source.agent !== routing.provider) {
       throw new Error(`token source "${source.id}" belongs to ${source.agent}, not ${routing.provider}`)
@@ -641,6 +659,9 @@ export class Session {
       routing.effort,
       routing.tokenSourceId,
     )
+    const accountId = routing.codexAccountId ?? DEFAULT_CODEX_ACCOUNT
+    if (routing.codexAccountAutomatic) codexAccounts.selectAuto(this.sessionName)
+    else if (codexAccounts.selected(this.sessionName) !== accountId) codexAccounts.select(this.sessionName, accountId)
   }
 
   dshEffortForSpawn() {
@@ -663,7 +684,7 @@ export class Session {
   /** Query Codex history without attaching the catalog process to this Session. */
   async listCodexConversations(): Promise<ConversationSummary[]> {
     if (this.selectedProvider !== 'codex') throw new Error('Codex history requested for a non-Codex session')
-    if (!feishu.isOpenAIChatGPTAuthenticated()) throw new Error('Codex 未登录 ChatGPT 账号')
+    if (!feishu.isOpenAIChatGPTAuthenticated(this.codexAccountId())) throw new Error('Codex 未登录 ChatGPT 账号')
     const raw = this.currentTokenSource()
     if (this.selectedTokenSourceId && (!raw || !raw.enabled)) {
       throw new Error(`token source "${this.selectedTokenSourceId}" 不可用，请重新配置或选择其他账号`)
@@ -674,6 +695,7 @@ export class Session {
       : undefined
     const proc = new CodexProcess({
       workDir: this.workDir,
+      codexAccountId: this.codexAccountId(),
       launch: { kind: 'fresh' },
       tokenSourceId: source?.id ?? null,
       transformEnv,
@@ -711,7 +733,7 @@ export class Session {
       }
       resolved = { ...ref, cwd: this.workDir }
     } else {
-      if (!feishu.isOpenAIChatGPTAuthenticated()) throw new Error('Codex 未登录 ChatGPT 账号')
+      if (!feishu.isOpenAIChatGPTAuthenticated(this.codexAccountId())) throw new Error('Codex 未登录 ChatGPT 账号')
       const raw = this.currentTokenSource()
       if (this.selectedTokenSourceId && (!raw || !raw.enabled)) {
         throw new Error(`token source "${this.selectedTokenSourceId}" 不可用，请重新配置或选择其他账号`)
@@ -719,6 +741,7 @@ export class Session {
       const source = raw?.enabled ? raw : undefined
       const proc = new CodexProcess({
         workDir: this.workDir,
+        codexAccountId: this.codexAccountId(),
         launch: { kind: 'fresh' },
         tokenSourceId: source?.id ?? null,
         transformEnv: source ? base => source.spawnEnv(base) : undefined,
@@ -760,7 +783,7 @@ export class Session {
       // 与 spawnAgent 一致只认 enabled source:disabled codex-sub(热重建后凭据失效)→ 不下发
       // effort,让 codex 走 ~/.codex/config.toml,避免「model 不下发但 effort 覆盖」的不一致。
       const ts = this.currentTokenSource()
-      if (!ts || !ts.enabled) return undefined
+      if (!ts || (!ts.enabled && ts.id !== 'codex-sub')) return undefined
       return isCodexReasoningEffort(this.selectedEffort) ? this.selectedEffort : CODEX_EFFORT
     }
     return CODEX_EFFORT
@@ -904,14 +927,17 @@ export class Session {
     // 只让 enabled source 参与 spawn。显式选择过但当前 disabled/missing 的
     // source 必须 fail closed；只有从未绑定 source 的 legacy 路径才允许裸跑。
     const raw = this.currentTokenSource()
-    if (this.selectedTokenSourceId && (!raw || !raw.enabled)) {
+    const codexPool = this.selectedProvider === 'codex' && this.selectedTokenSourceId === 'codex-sub'
+    if (this.selectedTokenSourceId && (!raw || (!raw.enabled && !codexPool))) {
       throw new Error(`token source "${this.selectedTokenSourceId}" 不可用，请重新配置或在 model 面板选择其他账号`)
     }
-    const ts = raw?.enabled ? raw : undefined
+    const ts = raw?.enabled || codexPool ? raw : undefined
     const created = createAgentProcess({
       provider: this.selectedProvider,
       workDir: this.workDir,
       tokenSourceId: ts?.id ?? null,
+      ...(this.selectedProvider === 'codex' ? { codexAccountId: codexAccounts.selected(this.sessionName) } : {}),
+      ...(codexPool ? { codexAccountPreference: this.codexStartAccountOverride ?? codexAccounts.preferred(this.sessionName) } : {}),
       model: ts ? (this.selectedModel ?? ts.defaultModel) : this.modelForSpawn(),
       effort: this.selectedProvider === 'dsh'
         ? this.dshEffortForSpawn()
@@ -973,6 +999,8 @@ export class Session {
   }
 
   processSourceMatches(source: TokenSource | undefined, model?: string | null): boolean {
+    if (this.proc?.quotaWaitPromise && !this.proc.sessionId && this.proc.turnRetry?.reason === 'quota') return true
+    if (this.proc?.sourceRevision) return this.proc.sourceRevision() === tokenSourceProcessRevision(source, model)
     return !this.proc || !this.procSourceRevisions.has(this.proc)
       || this.procSourceRevisions.get(this.proc) === tokenSourceProcessRevision(source, model)
   }
@@ -1382,6 +1410,40 @@ export class Session {
     return await this.runLifecycle('start', () => this.startUnlocked(opts))
   }
 
+  /** hi <name> is an explicit, one-start account override. Native errors remain authoritative. */
+  async startWithCodexAccount(accountId: string, opts: LifecycleProgressOpts = {}): Promise<boolean> {
+    return this.runLifecycle('hi-account', async () => {
+      codexAccounts.get(accountId)
+      if (this.selectedProvider !== 'codex') {
+        if (this.proc?.isAlive()) await this.stopUnlocked('切换到 Codex', { ...opts, announce: false })
+        const source = getTokenSourceForAccount('codex-sub', accountId)
+        const model = source?.defaultModel || null
+        feishu.replaceTurnAnchors(this.sessionName, [], null, null)
+        feishu.bindSessionModelChecked(this.sessionName, 'codex', model, null, 'codex-sub')
+        this.pendingConversationMaterialization = null
+        this.selectedProvider = 'codex'
+        this.selectedTokenSourceId = 'codex-sub'
+        this.selectedModel = model
+        this.selectedEffort = null
+        this.lastSessionRef = feishu.getSessionResumeRef(this.sessionName, 'codex')
+        this.lastSessionId = this.lastSessionRef?.sessionId ?? null
+      }
+      if (this.selectedTokenSourceId !== 'codex-sub') {
+        feishu.bindSessionModelChecked(this.sessionName, 'codex', this.selectedModel, this.selectedEffort, 'codex-sub')
+        this.selectedTokenSourceId = 'codex-sub'
+      }
+      this.codexStartAccountOverride = accountId
+      try {
+        if (this.proc?.isAlive() && this.proc.provider === 'codex' && processCodexAccount(this.proc) === accountId
+          && this.proc.turnRetry?.reason !== 'quota') {
+          opts.onStatus?.(`✅ 正在使用「${codexAccounts.get(accountId).name}」`)
+          return true
+        }
+        return this.proc?.isAlive() ? await this.restartUnlocked(true, opts) : await this.startUnlocked(opts)
+      } finally { this.codexStartAccountOverride = undefined }
+    })
+  }
+
   private async startUnlocked(opts: LifecycleProgressOpts = {}): Promise<boolean> {
     const announce = opts.announce ?? true
     const report = opts.onStatus
@@ -1406,12 +1468,15 @@ export class Session {
     }
     if (this.selectedProvider === 'codex') report?.('🔎 检查 Codex 登录')
     else report?.('🔎 检查 Claude Code')
-    if (this.selectedProvider === 'codex' && !feishu.isOpenAIChatGPTAuthenticated()) {
+    if (this.selectedProvider === 'codex' && this.selectedTokenSourceId !== 'codex-sub'
+      && !feishu.isOpenAIChatGPTAuthenticated(this.codexAccountId())) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
       report?.('❌ Codex 未登录 ChatGPT 账号')
       if (announce) {
-        await feishu.sendText(this.chatId, '❌ Codex 未登录 ChatGPT 账号。\n请在服务器上运行 `codex login` 后再试。')
+        const sent = await feishu.sendCard(this.chatId, codexAccountCard({ phase: 'warning', title: '需要登录',
+          hint: '默认：codex-login · 额外：codex-login 备注' }))
+        if (!sent) throw new Error('Codex 登录引导卡片发送失败')
       }
       return false
     }
@@ -1435,7 +1500,7 @@ export class Session {
     report?.(this.withModel(`🚀 启动 ${this.backendLabel()}`))
     let proc: AgentProcess
     try {
-      await waitForTokenSourceModelRefresh()
+      if (this.selectedProvider !== 'codex' || (!this.codexStartAccountOverride && codexAccounts.preferred(this.sessionName) === null)) await waitForTokenSourceModelRefresh()
       proc = this.spawnAgent()
     } catch (e) {
       const message = `${this.backendLabel()} 启动失败: ${messageOf(e)}`
@@ -1527,6 +1592,15 @@ export class Session {
       return false
     }
 
+    if (init.state === 'waiting_quota') {
+      this.status = 'starting'
+      this.startedAt = Date.now()
+      this.opts.onLifecycleChange?.()
+      report?.('⏳ 账号额度用尽 · 自动等待恢复，可用后继续')
+      if (announce) await feishu.sendCard(this.chatId, codexAccountCard({ phase: 'checking', title: '等待额度恢复',
+        message: '额度恢复后自动继续', hint: 'stop 可取消等待' }))
+      return true
+    }
     if (announce) {
       const modelLine = this.modelLine()
       await feishu.sendText(this.chatId, [
@@ -1552,10 +1626,10 @@ export class Session {
   private async waitForCodexInitialization(
     initialization: Promise<void>,
     onStillWaiting?: () => void,
-  ): Promise<{ state: 'init' | 'error' | 'timeout'; error?: unknown }> {
+  ): Promise<{ state: 'init' | 'error' | 'timeout' | 'waiting_quota'; error?: unknown }> {
     return await new Promise(resolve => {
       let settled = false
-      const finish = (state: 'init' | 'error' | 'timeout', error?: unknown) => {
+      const finish = (state: 'init' | 'error' | 'timeout' | 'waiting_quota', error?: unknown) => {
         if (settled) return
         settled = true
         clearTimeout(noticeTimer)
@@ -1574,6 +1648,7 @@ export class Session {
         () => finish('init'),
         error => finish('error', error),
       )
+      void this.proc?.quotaWaitPromise?.().then(() => finish('waiting_quota'), error => finish('error', error))
     })
   }
 
@@ -1972,7 +2047,7 @@ export class Session {
       report?.(this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}`))
       let proc: AgentProcess
       try {
-        await waitForTokenSourceModelRefresh()
+        if (this.selectedProvider !== 'codex' || (!this.codexStartAccountOverride && codexAccounts.preferred(this.sessionName) === null)) await waitForTokenSourceModelRefresh()
         proc = this.spawnAgent(prevSessionRef ?? undefined)
       } catch (e) {
         const finalStatus = `❌ ${this.backendLabel()} 恢复失败: ${messageOf(e)}`
@@ -2046,15 +2121,16 @@ export class Session {
         return false
       }
       const msg = this.withModel(this.withWorktreeInstructionNotice(
-        this.selectedProvider === 'claude' && init.state === 'ready'
+        init.state === 'waiting_quota' ? '⏳ 账号额度用尽 · 等待后自动恢复原会话'
+        : this.selectedProvider === 'claude' && init.state === 'ready'
           ? `✅ 已准备恢复上一会话 thread=${prevThreadLabel}`
           : `✅ 已恢复上一会话 thread=${prevThreadLabel}`,
       ))
       report?.(msg)
       if (announceText) await feishu.sendText(this.chatId, msg)
-      this.status = 'idle'
+      this.status = init.state === 'waiting_quota' ? 'starting' : 'idle'
       this.startedAt = Date.now()
-      this.daemonRestoreRequired = false
+      if (init.state !== 'waiting_quota') this.daemonRestoreRequired = false
       this.opts.onLifecycleChange?.()
       try { await closeInternalStatusCard(msg) } catch (error) {
         log(`session "${this.sessionName}": restart succeeded but status-card close failed: ${messageOf(error)}`)
@@ -2555,7 +2631,7 @@ export class Session {
     } else if (opts.provider === 'claude') {
       opts.glmUsage = await readGlmUsage()
     } else {
-      opts.usage = await readUsage()
+      opts.usage = await readUsage(this.codexAccountId())
     }
     const landed = await cardkit.replaceElementChecked(
       cardId,
@@ -3539,6 +3615,11 @@ export class Session {
       log(`session "${this.sessionName}": ${p.provider} process error: ${err}`)
     })
     on('init', () => {
+      if (p.provider === 'codex' && p.quotaWaitPromise) {
+        this.daemonRestoreRequired = false
+        if (this.status === 'starting') this.status = this.currentTurn ? 'working' : 'idle'
+        this.opts.onLifecycleChange?.()
+      }
       if (p.provider === 'codex' && p.launchKind === 'fresh') {
         this.clearResumeBindingForFreshCodex(p)
       } else {
@@ -3699,6 +3780,17 @@ export class Session {
     on('turn_retry', () => {
       if (this.currentTurn) this.startThinkingFooter(this.currentTurn)
     })
+    on('codex_account_changed', ({ accountId, diagnostics }) => {
+      log(`session "${this.sessionName}": Codex account=${accountId}`)
+      this.pendingAsks.clear()
+      this.pendingPermissions.clear()
+      if (diagnostics.length) {
+        void feishu.sendCard(this.chatId, codexAccountCard({ phase: 'warning', title: '部分账号 MISS',
+          message: `${diagnostics.length} 个账号未参与选择`, details: diagnostics.join('\n'), hint: '详情：codex-accounts' })).catch(error => {
+          log(`session "${this.sessionName}": 账号诊断卡失败: ${messageOf(error)}`)
+        })
+      }
+    })
     on('turn_started', ({ retry }) => {
       // Codex app-server emits init only at process startup, not for every
       // turn. turn_started is its authoritative claim for an input that was
@@ -3743,7 +3835,7 @@ export class Session {
       // Spark 桶内容会被贴上主桶标签)—— 通知不写 cache,只观察日志;
       // 权威状态在 turn 收尾用现有连接 read 端点整体刷新(closeTurnCard)。
       // claude 的 rate_limit_info 形状不同,同样不进 codex 快照。
-      if (p.provider === 'codex') observeRateLimitsNotification(rateLimits)
+      if (p.provider === 'codex') observeRateLimitsNotification(rateLimits, processCodexAccount(p))
     })
     on('thread_goal_updated', (goal: ThreadGoal) => {
       this.handleThreadGoalUpdated(goal)
@@ -5468,7 +5560,7 @@ export class Session {
     if (turn.cardRotationFailed) return
     const retry = turn.provider === 'codex' ? this.proc?.turnRetry : null
     if (retry) {
-      status = retry.phase === 'waiting'
+      status = retry.reason === 'quota' ? `⏳ ${retry.message}` : retry.phase === 'waiting'
         ? `⏳ 模型满载 · ${retry.delayMs / 1000}s 后重试 #${retry.attempt}`
         : `⏳ 模型满载 · 正在重试 #${retry.attempt}`
     }
@@ -5537,7 +5629,7 @@ export class Session {
       // 进程已死(中断/退出)时拿不到连接 → 用最近一次权威快照;没有就省略额度段。
       const codexProc = proc?.isAlive() && proc.provider === 'codex' && proc.readRateLimits
         ? proc as CodexProcess : null
-      const fresh = codexProc ? await refreshUsageFromConnection(() => codexProc.readRateLimits!()) : null
+      const fresh = codexProc ? await refreshUsageFromConnection(() => codexProc.readRateLimits!(), processCodexAccount(codexProc)) : null
       const u = codexProc ? fresh : cachedCodexUsage
       return u?.state === 'ok' ? this.fmtDualWindowSuffix(u.fiveHour ?? null, u.weekly ?? null) : '  |  额度 MISS'
     }
@@ -5612,8 +5704,10 @@ export class Session {
       lastTurnDelta: this.lastTurnDelta ? { ...this.lastTurnDelta } : null,
       lastTurnUsage: this.lastTurnUsage ? { ...this.lastTurnUsage } : null,
       tokenSourceId: this.selectedTokenSourceId,
-      tokenSource: this.currentTokenSource(),
-      codexUsage: peekUsage(),
+      tokenSource: proc?.provider === 'codex'
+        ? getTokenSourceForAccount(proc.tokenSourceId ?? this.selectedTokenSourceId, processCodexAccount(proc))
+        : this.currentTokenSource(),
+      codexUsage: peekUsage(processCodexAccount(proc)),
       currentBatchReactionIds: this.currentBatchReactionIds,
       pendingReactionIds: this.pendingReactionIds,
     }

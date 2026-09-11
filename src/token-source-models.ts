@@ -46,13 +46,12 @@ export async function fetchNativeClaudeModels(): Promise<TokenSourceModel[]> {
 }
 
 /** codex 订阅可用模型(app-server model/list),过滤 hidden,effort 用 per-model。 */
-export async function fetchCodexModels(): Promise<TokenSourceModel[]> {
-  const app = new AppServerOnce()
+export async function fetchCodexModels(accountId = 'default'): Promise<TokenSourceModel[]> {
+  const app = new AppServerOnce({ accountId })
   try {
-    await withTimeout(app.request('initialize', {
-      clientInfo: { name: 'lodestar-models', version: '0.0.0' },
-      capabilities: { experimentalApi: true, requestAttestation: false },
-    }))
+    await app.initialize('lodestar-models')
+    const account = await app.request('account/read', { refreshToken: false })
+    if (account?.account?.type !== 'chatgpt') throw Object.assign(new Error('Codex 订阅未登录；发送 codex-login 或 codex-login 备注完成授权'), { code: 'CODEX_AUTH_MISSING' })
     const res = await withTimeout(app.request('model/list', {}))
     if (!Array.isArray(res?.data)) throw new Error('Codex model/list 缺少 data 数组')
     const data: any[] = res.data

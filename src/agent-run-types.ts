@@ -51,6 +51,7 @@ export interface AgentWorkerResult {
   identityName: string
   tokenSourceId: string
   provider: 'codex' | 'claude' | 'dsh'
+  codexAccountId?: string
   model: string
   effort: string
   status: AgentWorkerStatus
@@ -71,6 +72,7 @@ export interface AgentWorkerResult {
 }
 
 export interface AgentRunSnapshot {
+  codexAccountId?: string
   runId: string
   sessionName: string
   chatId: string

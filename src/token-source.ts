@@ -90,6 +90,8 @@ export function scrubDshEnv(base: Env): Env {
 
 export interface TokenSource {
   id: string
+  /** One visible Codex source, with a separate native auth/catalog binding for each named account. */
+  forAccount?(accountId: string): TokenSource
   /** Stable fingerprint of fields that affect spawned process routing/env.
    * Registry rebuilds with the same effective config keep the same value;
    * credential/base-url/slot changes force an idle process replacement. */
@@ -197,6 +199,11 @@ export function registerTokenSource(s: TokenSource, opts?: { default?: boolean }
 
 export function getTokenSource(id: string | null | undefined): TokenSource | undefined {
   return id ? registry.get(id) : undefined
+}
+
+export function getTokenSourceForAccount(id: string | null | undefined, accountId = 'default'): TokenSource | undefined {
+  const source = getTokenSource(id)
+  return source?.forAccount ? source.forAccount(accountId) : source
 }
 
 export function listTokenSources(): TokenSource[] {

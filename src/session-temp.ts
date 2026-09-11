@@ -118,6 +118,8 @@ function panelMap(s: Session): Map<string, TempPanelState> {
 
 function sameRouting(a: ConversationRouting, b: ConversationRouting): boolean {
   return a.provider === b.provider
+    && (a.codexAccountId ?? 'default') === (b.codexAccountId ?? 'default')
+    && !!a.codexAccountAutomatic === !!b.codexAccountAutomatic
     && a.tokenSourceId === b.tokenSourceId
     && a.model === b.model
     && a.effort === b.effort

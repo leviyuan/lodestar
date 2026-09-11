@@ -135,6 +135,7 @@ auth_token = "test-token"
     const glm = getTokenSource('glm')
     const fake: any = {
       chatId: 'c', sessionName: 's', modelPanels: new Map(), modelCustomPrompt: null,
+      tokenSource: getTokenSource, codexAccountId: () => 'default',
       currentTokenSource: () => glm, currentModelLabel: () => 'GLM-5.2', currentEffortLabel: () => 'max', currentTurn: null,
     }
 

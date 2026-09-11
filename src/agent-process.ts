@@ -40,6 +40,7 @@ export interface AgentTurnRetry {
   attempt: number
   delayMs: number
   message: string
+  reason?: 'capacity' | 'quota'
 }
 
 export const CLAUDE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'default'] as const
@@ -94,6 +95,9 @@ export interface AgentProcess extends EventEmitter {
   lastContextTokens: number | null
   /** Codex-only transient status; absent for other backends. */
   turnRetry?: AgentTurnRetry | null
+  /** A managed Codex process can change account only after its native child has exited. */
+  sourceRevision?(): string | null
+  codexAccountSelectionMode?(): 'automatic' | 'manual' | null
 
   /** Start backend initialization. */
   sendInitialize(): void
@@ -101,6 +105,8 @@ export interface AgentProcess extends EventEmitter {
    * method-specific RPC failures before teardown. Claude stream init is
    * deferred until first input and therefore does not implement this hook. */
   initializationPromise?(): Promise<void>
+  /** Explicit waiting state releases the Session actor while quota resets; never claims native init. */
+  quotaWaitPromise?(): Promise<void>
   /** Codex launch/persistence metadata. Claude does not use these hooks. */
   readonly launchKind?: 'fresh' | 'resume' | 'fork'
   isConversationResumable?(): boolean
@@ -146,6 +152,7 @@ export type AgentProcessEventMap = {
   }
   turn_started: { turn_id?: string | null; thread_id?: string | null; retry?: boolean }
   turn_retry: AgentTurnRetry
+  codex_account_changed: { accountId: string; previousAccountId: string | null; diagnostics: string[] }
   token_usage: TokenUsageUpdated
   turn_plan_updated: TurnPlanUpdated
   plan_delta: PlanDelta

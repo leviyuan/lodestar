@@ -38,6 +38,8 @@ import {
   type ConversationSummary,
 } from './conversation'
 import { isAgentSession } from './agent-session-registry'
+import { bindProcessCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
+import { isCodexQuotaError } from './codex-quota'
 import type {
   BgTaskSettledEvent,
   BgTaskStartedEvent,
@@ -59,8 +61,8 @@ function buildSpawnPath(): string {
   ].filter(Boolean))].join(delimiter)
 }
 
-const CODEX_SESSIONS_DIR = join(homedir(), '.codex', 'sessions')
-const CODEX_GENERATED_IMAGES_DIR = join(homedir(), '.codex', 'generated_images')
+const CODEX_SESSIONS_DIR = join(codexAccounts.defaultHome, 'sessions')
+const CODEX_GENERATED_IMAGES_DIR = join(codexAccounts.defaultHome, 'generated_images')
 // app-server control requests return an acknowledgement, not the whole model
 // turn. Bound them so a live PID with a dead transport cannot leak promises.
 const CODEX_REQUEST_TIMEOUT_MS = 30_000
@@ -77,6 +79,7 @@ function isModelCapacityError(message: unknown): message is string {
 
 export interface SpawnOpts {
   workDir: string
+  codexAccountId?: string
   /** Explicit backend conversation lifecycle. */
   launch?: ConversationLaunch
   model?: string
@@ -258,6 +261,7 @@ export class CodexRpcResponseError extends Error {
     readonly requestId: string | number,
     readonly serverCode: number | null,
     readonly serverMessage: string,
+    readonly serverData?: unknown,
   ) {
     super(
       `codex app-server ${method} failed (id=${requestId}, code=${serverCode ?? 'MISS'}): ${serverMessage}`,
@@ -369,7 +373,7 @@ export class CodexProcess extends EventEmitter {
     this.tokenSourceId = opts.tokenSourceId ?? null
     this.launchKind = (opts.launch ?? { kind: 'fresh' }).kind
     const codexBin = resolveCodexBin()
-    const args = codexAppServerArgs(opts.allowDelegation !== false)
+    const args = [...codexAppServerArgs(opts.allowDelegation !== false), ...codexAccounts.cliArgs(opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)]
     log(`codex-process: spawn ${codexBin} app-server (cwd=${opts.workDir})`)
     const baseEnv = {
       ...(process.env as Record<string, string>),
@@ -378,7 +382,8 @@ export class CodexProcess extends EventEmitter {
       ...config.codex.env,
       ...(opts.hostEnv ?? {}),
     }
-    const spawnEnv = opts.transformEnv ? opts.transformEnv(baseEnv) : baseEnv
+    const spawnEnv = codexAccounts.env(opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT,
+      opts.transformEnv ? opts.transformEnv(baseEnv) : baseEnv)
     // cross-spawn resolves Windows .cmd shims without `shell:true`; keeping an
     // argv vector preserves quoted TOML values passed through --config.
     this.proc = crossSpawn(
@@ -393,6 +398,7 @@ export class CodexProcess extends EventEmitter {
     this.proc.on('exit', (code, signal) => this.handleChildExit(code, signal))
     this.proc.on('close', (code, signal) => this.handleChildClose(code, signal))
     this.proc.on('error', err => this.handleChildProcessError(err))
+    bindProcessCodexAccount(this, opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)
   }
 
   private handleStdinError(reason: unknown): void {
@@ -551,6 +557,7 @@ export class CodexProcess extends EventEmitter {
           msg.id,
           serverCode,
           serverMessage,
+          msg.error?.data,
         ))
       } else {
         pending.resolve(msg.result)
@@ -703,6 +710,8 @@ export class CodexProcess extends EventEmitter {
           subtype,
           is_error: isError,
           ...(isError && typeof error?.message === 'string' ? { error: error.message } : {}),
+          ...(status === 'failed' && completedTurnId && isCodexQuotaError(error)
+            ? { codexQuotaFailure: { accepted: true } } : {}),
           duration_ms: this.lastResult.duration_ms,
           usage: this.lastUsage,
           turn_id: completedTurnId,
@@ -1794,6 +1803,9 @@ export class CodexProcess extends EventEmitter {
       duration_ms: null,
       usage: this.lastUsage,
       error: message,
+      ...(e instanceof CodexRpcResponseError && e.method === 'turn/start' && attempt.inputText !== undefined
+        && (isCodexQuotaError(e.serverData) || isCodexQuotaError({ message: e.serverMessage }))
+        ? { codexQuotaFailure: { accepted: false, rejectedInput: attempt.inputText } } : {}),
     })
   }
 

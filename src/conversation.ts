@@ -57,6 +57,8 @@ export interface PendingConversationLaunch {
 /** Provider/model/account snapshot inherited by a newly-created temporary group. */
 export interface ConversationRouting {
   provider: AgentProvider
+  codexAccountId?: string
+  codexAccountAutomatic?: boolean
   tokenSourceId: string | null
   model: string | null
   effort: AgentReasoningEffort | null

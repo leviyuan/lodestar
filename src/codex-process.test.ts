@@ -169,6 +169,33 @@ function completeCapacityTurn(proc: any, error: any = { message: CAPACITY_MESSAG
   })
 }
 
+describe('native Codex quota terminal classification', () => {
+  test('early error never switches; only main-thread terminal failure carries accepted recovery metadata', async () => {
+    const { proc, events } = capacityHarness()
+    proc.sendUserText('one task'); await flushCapacityMicrotasks()
+    const error = { codexErrorInfo: 'usageLimitExceeded', message: "You've hit your usage limit." }
+    proc.handleNotification('error', { threadId: 'capacity-thread', turnId: proc.currentTurnId, error, willRetry: false })
+    expect(events.filter(([name]) => name === 'result')).toHaveLength(0)
+    completeCapacityTurn(proc, error)
+    expect(events.find(([name]) => name === 'result')?.[1]).toMatchObject({ is_error: true, codexQuotaFailure: { accepted: true } })
+  })
+  test('explicit turn/start rejection preserves unaccepted input including file hints', async () => {
+    const { proc, events } = capacityHarness(async () => {
+      throw new CodexRpcResponseError('turn/start', 1, -32000, 'usage denied', { codexErrorInfo: 'usageLimitExceeded' })
+    })
+    proc.sendUserText('one task', ['/input']); await flushCapacityMicrotasks()
+    expect(events.find(([name]) => name === 'result')?.[1]).toMatchObject({
+      codexQuotaFailure: { accepted: false, rejectedInput: '[file: /input]\n\none task' },
+    })
+  })
+  test('transport timeout and rate-limited control APIs cannot authorize replay', async () => {
+    const { proc, events } = capacityHarness(async () => { throw new Error('turn/start timed out HTTP 429') })
+    proc.sendUserText('one task'); await flushCapacityMicrotasks()
+    const result = events.find(([name]) => name === 'result')?.[1]
+    expect(result.is_error).toBe(true); expect(result.codexQuotaFailure).toBeUndefined()
+  })
+})
+
 describe('codex model capacity recovery', () => {
   test('waits for terminal failure, keeps one logical task open and continues its existing history', async () => {
     await withCapacityClock(async clock => {

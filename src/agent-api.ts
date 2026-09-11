@@ -37,7 +37,7 @@ export async function handleAgentRequest(
 
   if (req.method === 'GET' && url.pathname === '/agents/identities') {
     await pendingTokenSourceModelRefresh()
-    return send(200, serializeCatalog(getAgentIdentityCatalog()))
+    return send(200, serializeCatalog(getAgentIdentityCatalog(principal.session.codexAccountId())))
   }
   if (req.method === 'POST' && url.pathname === '/agents/runs') {
     try {

@@ -231,7 +231,8 @@ export class AgentService {
       if (!parent) throw new Error(`parent agent run not found: ${options.parentRunId}`)
       this.assertSameSession(parent, session)
     }
-    const catalog = this.deps.getCatalog()
+    const codexAccountId = session.codexAccountId()
+    const catalog = this.deps.getCatalog(codexAccountId)
     const identities = request.identityIds.map(id => {
       const identity = catalog.identities.find(item => item.id === id)
       if (!identity) throw new Error(`agent identity not found: ${id}`)
@@ -246,6 +247,7 @@ export class AgentService {
     const runId = `agent_${randomUUID()}`
     const snapshot: AgentRunSnapshot = {
       runId,
+      codexAccountId,
       sessionName: session.sessionName,
       chatId: session.chatId,
       workDir: session.workDir,
@@ -347,6 +349,7 @@ export class AgentService {
       if (run.cancelled) return
       const handle = this.deps.startWorker({
         identity,
+        codexAccountId: run.snapshot.codexAccountId,
         effort: worker.effort as AgentReasoningEffort,
         workDir: run.snapshot.workDir,
         prompt,
@@ -369,6 +372,11 @@ export class AgentService {
             void this.updateWorkerCard(run, worker)
           },
           onProgress: step => this.recordStep(run, worker, step),
+          onCodexAccount: accountId => {
+            if (run.cancelled) return
+            worker.codexAccountId = accountId
+            this.persist(run)
+          },
           onSession: sessionId => {
             if (worker.sessionId === sessionId) return
             worker.sessionId = sessionId

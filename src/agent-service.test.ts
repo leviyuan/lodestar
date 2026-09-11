@@ -15,6 +15,7 @@ const session = {
   sessionName: 'project', chatId: 'chat-1', workDir: '/repo',
   delegatedAgentDeveloperInstructions: () => '',
   worktreeProjectName: () => 'project',
+  codexAccountId: () => 'default',
 } as any
 
 function result(sessionId: string, output = 'done'): AgentWorkerResult {

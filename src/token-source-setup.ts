@@ -4,6 +4,7 @@ import * as feishu from './feishu'
 import { getTokenSource, tokenSourceFactories } from './token-source'
 import { addTokenSource } from './token-source-config'
 import type { Session } from './session'
+import { codexAccountCard } from './cards/codex-account'
 
 /** model 面板「启用」按钮回调:据 factory setup.hint 弹启用引导(codex/native 特例)。 */
 export async function onTokenSourceEnable(s: Session, sourceId: string): Promise<void> {
@@ -20,10 +21,9 @@ export async function onTokenSourceEnable(s: Session, sourceId: string): Promise
   if (def?.setup) {
     await feishu.sendText(s.chatId, def.setup.hint(ts.display))
   } else if (ts.kind === 'codex-subscription') {
-    await feishu.sendText(
-      s.chatId,
-      `${ts.display} 需要 ChatGPT 登录:在服务器执行 \`codex login\`,完成后按当前服务管理方式重启 daemon,或重发 \`model\` 刷新。`,
-    )
+    const sent = await feishu.sendCard(s.chatId, codexAccountCard({ phase: 'current', title: '添加账号',
+      message: '通过设备码完成浏览器授权', hint: '默认：codex-login · 额外：codex-login 备注' }))
+    if (!sent) throw new Error('Codex 登录引导卡片发送失败')
   } else if (ts.kind === 'claude-native') {
     // native 凭本机 Claude 配置自动启用/禁用,无独立「启用」操作(它就是默认通路)。
     await feishu.sendText(s.chatId, `${ts.display} 直接使用本机 Claude Code 配置,无需单独启用。`)

@@ -53,6 +53,8 @@ export const ELEMENTS = {
   /** Model command card — one replaceable panel for model → effort
    * multi-step selection inside a single card. */
   modelPanel: 'model_panel',
+  /** In-place status for codex-login/account/accounts command replies. */
+  codexAccountPanel: 'codex_account_panel',
   modelAgentGroup: (agent: string) => `model_agent_${agent}`,
   /** Basic project tasklist binding panel. */
   tasklistPanel: 'tasklist_panel',

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import type { Session } from './session'
 import { isAgentProvider } from './agent-process'
 import { listTokenSources } from './token-source'
+import { codexAccounts, processCodexAccount } from './codex-accounts'
 
 const MODEL_ACTIONS = new Set(['provider_select', 'model_select', 'model_effort_select',
   'model_page', 'model_list_open', 'model_add', 'model_remove', 'model_custom_remove', 'model_custom_prompt', 'model_panel_cancel'])
@@ -18,6 +19,12 @@ export function debugModelState(session: Session) {
   return {
     session_name: session.sessionName, chat_id: session.chatId, status: session.status,
     running: session.isRunning(),
+    native_session_id: session.proc?.sessionId ?? null,
+    codex_account: session.proc?.provider === 'codex' && session.proc.isAlive() ? {
+      name: codexAccounts.get(processCodexAccount(session.proc)).name,
+      mode: session.proc.codexAccountSelectionMode?.() ?? 'native',
+      policy: 'highest-score-plus-5h-ultra-pro-0.5',
+    } : null,
     busy: !!(session.currentTurn || session.openingTurn || session.pendingUserMessageCount || session.pendingMidTurnMsgs.length),
     awaiting_model_input: !!session.modelCustomPrompt,
     last_result: session.proc ? { anchor: session.proc.lastAssistantUuid,

@@ -3,6 +3,35 @@ import { createAgentProcess } from './agent-launch'
 import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, tokenSourceFactories, type TokenSource } from './token-source'
 import './token-source-openrouter'
 
+test('manual Codex launch bypasses failed catalogs and model restrictions while automatic launch still rejects them', () => {
+  const script = `
+    import { mock } from 'bun:test'
+    import { EventEmitter } from 'node:events'
+    import assert from 'node:assert/strict'
+    const captured = []
+    mock.module('./src/codex-process', () => ({
+      CodexProcess: class extends EventEmitter { constructor(opts) { super(); captured.push(opts) } isAlive() { return false } },
+      isCodexReasoningEffort: value => value === 'ultra', resolveCodexBin: () => 'unused',
+    }))
+    const { registerTokenSource } = await import('./src/token-source')
+    registerTokenSource({ id: 'codex-sub', kind: 'codex-subscription', agent: 'codex', enabled: false,
+      models: [], defaultModel: 'model', modelCatalogState: { status: 'failed', error: 'catalog unavailable' },
+      spawnEnv: env => env, resolveSpawnModel: () => { throw new Error('must not resolve unavailable catalog') } })
+    const { createAgentProcess } = await import('./src/agent-launch')
+    const opts = { provider: 'codex', tokenSourceId: 'codex-sub', workDir: '/repo', model: 'uncatalogued-model', effort: 'ultra' }
+    assert.throws(() => createAgentProcess(opts), /disabled/)
+    createAgentProcess({ ...opts, codexManualAccount: true, codexAccountId: 'explicit-account' })
+    assert.equal(captured.length, 1)
+    assert.equal(captured[0].model, 'uncatalogued-model')
+    assert.equal(captured[0].effort, 'ultra')
+    assert.equal(captured[0].codexAccountId, 'explicit-account')
+  `
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+    cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+  })
+  expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+})
+
 for (const status of ['idle', 'loading', 'failed', 'ready'] as const) {
   test(`launch reports ${status} catalog state without substituting a model`, () => {
     const previous = listTokenSources()

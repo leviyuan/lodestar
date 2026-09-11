@@ -5,7 +5,7 @@ import { rememberAgentSession } from './agent-session-registry'
 import type { AgentInputQuestion, AgentInputRequest, AgentStep } from './agent-run-types'
 import type { ConversationLaunch } from './conversation'
 import type { ProjectProfile } from './config'
-import { getTokenSource } from './token-source'
+import { getTokenSourceForAccount } from './token-source'
 import { DELEGATED_AGENT_INSTRUCTIONS } from './agent-skill'
 
 export interface AgentWorkerResult {
@@ -30,6 +30,7 @@ export interface AgentWorkerCallbacks {
   onNeedsInput?(request: AgentInputRequest): void
   onProgress?(step: AgentStep): void
   onSession?(sessionId: string): void
+  onCodexAccount?(accountId: string): void
 }
 
 export interface AgentWorkerHandle {
@@ -42,6 +43,7 @@ export interface AgentWorkerHandle {
 
 export function startAgentWorker(opts: {
   identity: AgentIdentity
+  codexAccountId?: string
   effort: AgentReasoningEffort
   workDir: string
   prompt: string
@@ -52,7 +54,7 @@ export function startAgentWorker(opts: {
   hostEnv: Record<string, string | undefined>
   callbacks?: AgentWorkerCallbacks
 }): AgentWorkerHandle {
-  const source = getTokenSource(opts.identity.tokenSourceId)
+  const source = getTokenSourceForAccount(opts.identity.tokenSourceId, opts.codexAccountId)
   if (!source) throw new Error(`agent token source not found: ${opts.identity.tokenSourceId}`)
   if (opts.identity.spawnRevision && source.spawnRevision !== opts.identity.spawnRevision) {
     throw new Error(`agent token source changed after identity discovery: ${source.id}`)
@@ -67,6 +69,9 @@ export function startAgentWorker(opts: {
     provider: opts.identity.provider,
     workDir: opts.workDir,
     tokenSourceId: opts.identity.tokenSourceId,
+    codexAccountId: opts.codexAccountId,
+    ...(opts.identity.provider === 'codex' && opts.identity.tokenSourceId === 'codex-sub'
+      ? { codexAccountPreference: null } : {}),
     model: opts.identity.model,
     effort: opts.effort,
     launch,
@@ -120,6 +125,7 @@ export function collectAgentTurn(
     proc.off('init', onInit)
     if (!proc.isAlive()) proc.off('error', onError)
     proc.off('turn_retry', onRetry)
+    proc.off('codex_account_changed', onAccount)
     proc.off('result', onResult)
     proc.off('exit', onExit)
   }
@@ -211,9 +217,15 @@ export function collectAgentTurn(
     if (error) void finish(error)
   }
   const onError = (error: unknown) => { lastError = error instanceof Error ? error : new Error(String(error)) }
+  const onAccount = (event: { accountId: string; diagnostics: string[] }) => {
+    if (settled) return
+    try { callbacks.onCodexAccount?.(event.accountId) }
+    catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
+    if (event.diagnostics.length) emitProgress({ at: new Date().toISOString(), phase: 'info', tool: '账号 MISS', detail: event.diagnostics.join('；') })
+  }
   const onRetry = (retry: AgentTurnRetry) => {
     emitProgress({
-      at: new Date().toISOString(), phase: 'info', tool: 'Codex 容量重试',
+      at: new Date().toISOString(), phase: 'info', tool: retry.reason === 'quota' ? 'Codex 额度换号' : 'Codex 容量重试',
       detail: retry.phase === 'waiting'
         ? `${retry.message} · ${retry.delayMs / 1000}s 后重试 #${retry.attempt}`
         : `正在重试 #${retry.attempt}`,
@@ -240,6 +252,7 @@ export function collectAgentTurn(
   proc.on('init', onInit)
   proc.on('error', onError)
   proc.on('turn_retry', onRetry)
+  proc.on('codex_account_changed', onAccount)
   proc.on('result', onResult)
   proc.on('exit', onExit)
   try {

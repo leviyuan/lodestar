@@ -6,7 +6,7 @@ let server: Server | null = null
 afterEach(() => { server?.close(); server = null })
 
 async function serve() {
-  const session = { sessionName: 'project', chatId: 'chat', workDir: '/repo' } as any
+  const session = { sessionName: 'project', chatId: 'chat', workDir: '/repo', codexAccountId: () => 'default' } as any
   let current: any = null
   const service = {
     rootPrincipal: () => ({ kind: 'session', session, depth: -1 }),
