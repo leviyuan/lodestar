@@ -1,3 +1,4 @@
+import { localFetch } from './network'
 /**
  * Persistent registration store for `/notify` cards that carry
  * interactive buttons.
@@ -376,7 +377,7 @@ export async function dispatchCallback(
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), CALLBACK_TIMEOUT_MS)
   try {
-    const res = await fetch(reg.callbackUrl, {
+    const res = await localFetch(reg.callbackUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),

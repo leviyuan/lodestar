@@ -1,3 +1,4 @@
+import { networkFetch } from './network'
 /**
  * DeepSeek token source(anthropic 兼容端点)—— 自包含 provider 模块。
  *
@@ -72,7 +73,7 @@ function isDeepseekBaseUrl(baseUrl: string): boolean {
 /** OpenAI 风格 GET {origin}/models → 模型 id 列表(anthropic 侧 /v1/models 是 404)。 */
 async function fetchDeepseekModels(baseUrl: string, apiKey: string): Promise<TokenSourceModel[]> {
   const origin = new URL(baseUrl).origin
-  const res = await fetch(`${origin}/models`, {
+  const res = await networkFetch(`${origin}/models`, {
     headers: { Authorization: `Bearer ${apiKey}` },
     signal: AbortSignal.timeout(10_000),
   })
@@ -98,7 +99,7 @@ export async function fetchDeepseekBalance(baseUrl: string, apiKey: string): Pro
     return { kind: 'balance', state: 'network', windows: [], reason: 'bad base_url' }
   }
   try {
-    const res = await fetch(`${origin}/user/balance`, {
+    const res = await networkFetch(`${origin}/user/balance`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(BALANCE_TIMEOUT_MS),
     })

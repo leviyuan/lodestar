@@ -1,3 +1,4 @@
+import { networkFetch } from './network'
 /**
  * lodestar-setup 交互向导；cli.ts 首次启动且配置缺失时也可调用。
  * 配置 Claude Code、可选 GLM API key 和 Codex、飞书应用及项目目录。
@@ -87,7 +88,7 @@ function claudeConfigDir(): string {
  *  不猜,让 lodestar 运行时自己的 config/env 决定)。 */
 async function fetchGlmSetupSlots(glmKey: string): Promise<Record<string, string> | null> {
   try {
-    const res = await fetch('https://open.bigmodel.cn/api/anthropic/v1/models', {
+    const res = await networkFetch('https://open.bigmodel.cn/api/anthropic/v1/models', {
       headers: { Authorization: `Bearer ${glmKey}` },
       signal: AbortSignal.timeout(10_000),
     })
@@ -186,7 +187,7 @@ function openBrowser(url: string): void {
 // ── Feishu credential check ────────────────────────────────────────
 async function testFeishuCreds(appId: string, appSecret: string): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
-    const res = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+    const res = await networkFetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ app_id: appId, app_secret: appSecret }),

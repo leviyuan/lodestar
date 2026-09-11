@@ -1,3 +1,4 @@
+import { networkFetch } from '../src/network'
 /** Card Kit schema/transaction acceptance. Creates one unsent card under the configured app; never sends an IM message. */
 import assert from 'node:assert/strict'
 import * as feishu from '../src/feishu'
@@ -31,7 +32,7 @@ let created = ''
 const card = await CodexAccountCard.open('UNSENT', { phase: 'connecting', flow: 'login', name: '验收' }, {
   sendCard: async (_chatId, json) => {
     const token = await feishu.getTenantToken()
-    const response = await fetch('https://open.feishu.cn/open-apis/cardkit/v1/cards', {
+    const response = await networkFetch('https://open.feishu.cn/open-apis/cardkit/v1/cards', {
       method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ type: 'card_json', data: JSON.stringify(json) }),
     })

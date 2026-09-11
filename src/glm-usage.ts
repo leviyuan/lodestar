@@ -1,3 +1,4 @@
+import { networkFetch } from './network'
 /**
  * GLM Coding Plan 用量快照 —— 给 `hi` console 面板的 claude/GLM 后端用。
  *
@@ -168,7 +169,7 @@ export async function fetchGlmUsage(baseUrlOverride?: string, tokenOverride?: st
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS)
   try {
-    const res = await fetch(url, {
+    const res = await networkFetch(url, {
       headers: {
         Authorization: token,
         'Content-Type': 'application/json',

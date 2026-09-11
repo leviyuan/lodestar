@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { networkFetch } from '../src/network'
 /**
  * Probe to figure out the right CardKit + IM combo.
  *
@@ -28,7 +29,7 @@ const [chatId] = matches[0]
 
 async function http(method: string, url: string, body?: object): Promise<any> {
   const token = await feishu.getTenantToken()
-  const res = await fetch(url, {
+  const res = await networkFetch(url, {
     method,
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     ...(body ? { body: JSON.stringify(body) } : {}),

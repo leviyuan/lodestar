@@ -1,3 +1,4 @@
+import { networkFetch } from './network'
 /** OpenRouter 的 Anthropic Messages 接入；模型目录和账户余额均从账号 API 获取。 */
 import type { TokenSourceConfig } from './config'
 import { isClaudeReasoningEffort, type ClaudeReasoningEffort } from './agent-process'
@@ -49,7 +50,7 @@ class OpenRouterHttpError extends Error {
 
 async function request(base: string, apiKey: string, path: string): Promise<unknown> {
   if (!apiKey) throw new Error('OpenRouter API key missing')
-  const response = await fetch(`${baseUrl(base)}/v1/${path}`, {
+  const response = await networkFetch(`${baseUrl(base)}/v1/${path}`, {
     headers: { Authorization: `Bearer ${apiKey}` },
     signal: AbortSignal.timeout(TIMEOUT_MS),
   })

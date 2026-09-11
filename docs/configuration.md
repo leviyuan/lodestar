@@ -65,6 +65,18 @@ bin = "/abs/path/to/claude-wrapper"  # 可选的 Claude 可执行文件
 
 账号配置、OpenRouter 默认模型和 DSH 接入见[模型与账号](models.md)。手动修改配置后需重启 daemon；群内设置自行保存。
 
+## HTTP 代理
+
+OpenRouter 的模型目录与余额查询，以及 Lodestar 自己发出的其他 HTTP 请求，共用相同的代理选择。无需开启 TUN，也不需要给每个 Token Source 单独配置代理。
+
+对每个目标地址，优先使用对应的 `HTTP_PROXY` / `HTTPS_PROXY`，未设置时使用 `ALL_PROXY`，都未设置时读取当前运行用户的系统代理。小写变量优先于大写，空值视为未设置。支持 HTTP 和 HTTPS 代理及 URL 中的用户名、密码；不要把凭据写入仓库。
+
+系统设置支持 Windows 当前用户的手动代理、macOS 网络代理，以及 Linux 的 GNOME/KDE 手动代理；最多缓存 30 秒。Linux 没有对应桌面设置时使用环境变量。PAC、自动发现、SOCKS 和 KDE 反向例外列表尚不支持，遇到这些配置会明确报错；系统设置读取失败或代理连接失败也不会自动直连。可用明确的 HTTP(S) 代理环境变量覆盖系统设置。
+
+`NO_PROXY` 支持逗号、空白或分号分隔的域名、子域名、端口、IPv4/IPv6 CIDR 和 `*`。回环地址始终直连，内部通知与 Agent capability 请求还会拒绝跳转到外网。外部请求重定向后重新判断代理，并在跨 origin 时清除认证信息。
+
+服务进程读取它自己的环境及运行用户的设置。在终端里 `export HTTPS_PROXY=...` 不会修改已经运行的 systemd/launchd/Windows 服务；应在对应服务的环境中设置。代理设置只作用于 Lodestar 自有 HTTP：Codex、Claude、DSH 与 npm 的网络继续遵循各自应用配置，飞书 SDK 的 HTTP/WebSocket 也保留其原生配置方式。`[claude.env]`、`[codex.env]` 不是 daemon 的全局代理设置。
+
 ## 源码开发
 
 安装 Bun，在仓库根目录运行：

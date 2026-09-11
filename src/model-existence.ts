@@ -1,3 +1,4 @@
+import { networkFetch } from './network'
 /**
  * 模型存在性校验 —— 用户面板输入列表外模型名时验证真伪,零猜测。
  *
@@ -28,7 +29,7 @@ export async function verifyModelExists(
   model: string,
 ): Promise<ModelExistence> {
   try {
-    const res = await fetch(messagesUrl(baseUrl), {
+    const res = await networkFetch(messagesUrl(baseUrl), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...authHeaders },
       body: JSON.stringify({ model, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),

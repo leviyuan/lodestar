@@ -2984,6 +2984,8 @@ describe('Session card pagination', () => {
       session.startWorkingFooter(turn)
       expect(turn.footerStatusHandle).toBeNull()
       // 续卡发送失败不证明旧卡全部不可写；新内容仍按实际写入结果处理。
+      // 网络路由解析是异步的，先等待 startWritingFooter 已排入的写入完成。
+      await cardkit.flush('card_dead')
       const before = calls.length
       await cardkit.replaceElement('card_dead', 'footer', { tag: 'markdown', element_id: 'footer', content: 'x' })
       await cardkit.addElement('card_dead', { tag: 'markdown', element_id: 'e_new', content: 'x' })

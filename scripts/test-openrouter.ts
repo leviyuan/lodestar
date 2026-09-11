@@ -1,3 +1,4 @@
+import { networkFetch } from '../src/network'
 /** 真实 OpenRouter / Claude SDK smoke；读取私有 Key 文件，在临时目录执行 Read。
  * 用法：bun scripts/test-openrouter.ts --credential /abs/key.json --output-dir /abs/private-dir --agent-runtimes /abs/agent-runtimes [--model vendor/model] [--capture-requests]
  * --sequence vendor/model,vendor/model 在同一原生会话中按顺序切换，验证 resume 和上下文。
@@ -47,7 +48,7 @@ const gateway = args.includes('--capture-requests') ? Bun.serve({
     headers.delete('host'); headers.delete('content-length')
     headers.set('accept-encoding', 'identity')
     try {
-      const response = await fetch(`https://openrouter.ai/api${url.pathname}${url.search}`, {
+      const response = await networkFetch(`https://openrouter.ai/api${url.pathname}${url.search}`, {
         method: incoming.method, headers, body, signal: incoming.signal,
       })
       if (captured) captured.status = response.status

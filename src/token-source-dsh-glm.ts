@@ -1,3 +1,4 @@
+import { networkFetch } from './network'
 import { config, type TokenSourceConfig } from './config'
 import { isDshReasoningEffort } from './agent-process'
 import { registerTokenSourceFactory, scrubDshEnv, tokenSourceRuntimeModels, type TokenSource } from './token-source'
@@ -18,7 +19,7 @@ export function glmCodingBaseUrl(raw: string): string {
 }
 
 export async function fetchGlmCodingModels(base: string, key: string): Promise<Array<{ model: string; display: string }>> {
-  const response = await fetch(`${base}/models`, { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(10_000) })
+  const response = await networkFetch(`${base}/models`, { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(10_000) })
   if (!response.ok) throw new Error(`GLM Coding Plan models HTTP ${response.status}`)
   const payload = await response.json()
   if (!Array.isArray(payload?.data) || !payload.data.length) throw new Error('GLM Coding Plan 模型目录为空或无效')

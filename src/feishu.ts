@@ -1,3 +1,4 @@
+import { networkFetch } from './network'
 import { AGENT_PROVIDERS, isAgentProvider, isDshReasoningEffort } from './agent-process'
 /**
  * Feishu (Lark) primitives: Lark client, tenant token cache, chat
@@ -135,7 +136,7 @@ export const client = new lark.Client({
 const RAW_FETCH_TIMEOUT_MS = 15_000
 
 function rawFetch(input: string | URL, init: RequestInit = {}): Promise<Response> {
-  return fetch(input, {
+  return networkFetch(input, {
     ...init,
     signal: init.signal ?? AbortSignal.timeout(RAW_FETCH_TIMEOUT_MS),
   })

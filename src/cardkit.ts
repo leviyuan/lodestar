@@ -1,3 +1,4 @@
+import { networkFetch } from './network'
 /**
  * Feishu Card Kit v1 wrapper.
  *
@@ -212,7 +213,7 @@ function attemptedContentFingerprint(s: CardState, elementId?: string, fingerpri
 
 async function call(method: string, path: string, body?: object): Promise<any> {
   const token = await getTenantToken()
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await networkFetch(`${BASE}${path}`, {
     method,
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     ...(body ? { body: JSON.stringify(body) } : {}),

@@ -1,3 +1,4 @@
+import { networkFetch } from './network'
 /**
  * Token source 模型列表拉取 —— 动态获取订阅真实模型,零写死。
  *
@@ -81,7 +82,7 @@ export async function fetchGlmModels(baseUrl: string, token: string): Promise<To
   const u = new URL(baseUrl)
   const path = u.pathname.replace(/\/+$/, '')
   const url = `${u.protocol}//${u.host}${path}/v1/models`
-  const res = await fetch(url, {
+  const res = await networkFetch(url, {
     headers: { Authorization: `Bearer ${token}` },
     signal: AbortSignal.timeout(TIMEOUT_MS),
   })

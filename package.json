@@ -1,6 +1,6 @@
 {
   "name": "@leviyuan/lodestar",
-  "version": "0.17.4",
+  "version": "0.17.5",
   "publishConfig": {
     "access": "public"
   },
@@ -73,8 +73,11 @@
     "cross-spawn": "^7.0.6",
     "fast-uri": "3.1.6",
     "hono": "4.13.5",
+    "http-proxy-agent": "^7.0.2",
+    "https-proxy-agent": "^7.0.6",
     "ip-address": "10.5.0",
     "mathjax-full": "^3.2.2",
+    "node-fetch": "^3.3.2",
     "protobufjs": "7.6.5",
     "qs": "6.16.0",
     "ws": "8.21.3",
@@ -338,5 +341,8 @@
   "trustedDependencies": [
     "@deepseek-ai/dsh-subprocess-local",
     "koffi"
-  ]
+  ],
+  "optionalDependencies": {
+    "undici": "^6.28.1"
+  }
 }

@@ -1,3 +1,4 @@
+import { networkFetch } from './network'
 /** Explicit/opt-in Agent updates follow latest independently of Lodestar releases. */
 import { createHash, randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
@@ -87,7 +88,7 @@ async function metadata(name: string, version: string, signal?: AbortSignal): Pr
   if (signal?.aborted) cancel()
   const timer = setTimeout(() => abort.abort(new Error('npm registry request timed out')), 30_000)
   try {
-    const response = await fetch(`${REGISTRY}/${encodeURIComponent(name)}/${encodeURIComponent(version)}`, { signal: abort.signal })
+    const response = await networkFetch(`${REGISTRY}/${encodeURIComponent(name)}/${encodeURIComponent(version)}`, { signal: abort.signal })
     if (!response.ok) throw new Error(`${name}@${version}: npm HTTP ${response.status}`)
     const value = await response.json() as Manifest
     if (value.name !== name || typeof value.version !== 'string' || !value.version) throw new Error(`Invalid npm manifest: ${name}@${version}`)

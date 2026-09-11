@@ -1,3 +1,4 @@
+import { localFetch } from './network'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
@@ -214,7 +215,7 @@ function cliContext(): CliContext {
 }
 
 async function requestJson(context: CliContext, method: string, path: string, body?: object): Promise<any> {
-  const response = await fetch(`${context.baseUrl}${path}`, {
+  const response = await localFetch(`${context.baseUrl}${path}`, {
     method,
     headers: {
       authorization: `Bearer ${context.capability}`,

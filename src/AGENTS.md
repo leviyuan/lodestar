@@ -37,6 +37,8 @@
 
 ## 卡片与持久化
 
+- Lodestar 自有出站 HTTP 统一使用 `network.ts` 的 `networkFetch`；本机 capability 和通知回调用 `localFetch`。`network-proxy.ts` 按协议环境变量、`ALL_PROXY`、当前用户的手动系统代理解析，统一大小写和绕过规则；系统查询失败、非法代理、未支持的 SOCKS/PAC 不得转为直连。每次重定向重新判断路由，跨 origin 清除认证，本机请求不得跳出 loopback。Agent 与飞书 SDK 自身网络由各自应用/SDK 配置，不改其全局环境。网络改动需运行真实本地代理测试，不能仅依赖 mock fetch。
+
 - `hi` 的 Codex 重置卡次数来自额度接口 `rateLimitResetCredits.availableCount`，保留合法的零，缺失用 MISS；不推算剩余次数，也不显示在 footer。hi 的每个额度窗口独占一行，footer 继续使用紧凑格式。
 - 生图完成事件补回的 prompt/revisedPrompt 要更新工具元数据。`session-tools.ts` 上传图片并通过 Card Kit 放入折叠面板，确认落地后才标记已交付；嵌入失败按用户约定单独发图。图片任务按原卡归属登记，关闭和换卡均须等待，避免图片在卡片退役后丢失。
 - `feishu.ts` 的 30 MB 上限覆盖所有出站文件和图片；`instructions.ts` 同步约束所有 Agent 的文件交付。
