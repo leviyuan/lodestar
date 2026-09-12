@@ -1,4 +1,6 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import * as fs from 'node:fs'
+import * as stateStore from './state-store'
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -15,6 +17,89 @@ function fixture() {
 }
 
 describe('Codex native and named accounts', () => {
+  test('deleting a named account removes its credentials and selections while preserving shared data and other accounts', () => {
+    const accounts = fixture()
+    const removed = accounts.ensure('不要了')
+    const kept = accounts.ensure('保留')
+    const home = accounts.prepareHome(removed.id)
+    const keptHome = accounts.prepareHome(kept.id)
+    writeFileSync(join(home, 'auth.json'), 'removed credentials')
+    writeFileSync(join(keptHome, 'auth.json'), 'kept credentials')
+    writeFileSync(join(home, 'sessions', 'history.jsonl'), 'shared history')
+    writeFileSync(join(home, 'thread-writer-locks', 'thread.lock'), 'shared lock')
+    writeFileSync(join(accounts.defaultHome, 'state.sqlite'), 'shared database')
+    accounts.select('one', removed.id)
+    accounts.select('__proto__', removed.id)
+    accounts.select('two', kept.id)
+    accounts.select('native', 'default')
+
+    expect(accounts.remove(removed.id)).toEqual({ account: removed, clearedSelections: 2 })
+    expect(existsSync(home)).toBe(false)
+    expect(readFileSync(join(keptHome, 'auth.json'), 'utf8')).toBe('kept credentials')
+    expect(readFileSync(join(keptHome, 'sessions', 'history.jsonl'), 'utf8')).toBe('shared history')
+    expect(readFileSync(join(keptHome, 'thread-writer-locks', 'thread.lock'), 'utf8')).toBe('shared lock')
+    expect(readFileSync(join(accounts.defaultHome, 'state.sqlite'), 'utf8')).toBe('shared database')
+    expect(readFileSync(join(accounts.defaultHome, 'auth.json'), 'utf8')).toBe('{"native":"must-not-change"}')
+    expect(readFileSync(join(accounts.defaultHome, 'config.toml'), 'utf8')).toBe('model = "test-model"\n')
+    const reloaded = new CodexAccounts(accounts.defaultHome, accounts.root, accounts.stateFile)
+    expect(reloaded.list().map(a => a.id)).toEqual(['default', kept.id])
+    expect(reloaded.preferred('one')).toBeNull()
+    expect(reloaded.preferred('__proto__')).toBeNull()
+    expect(reloaded.preferred('two')).toBe(kept.id)
+    expect(reloaded.preferred('native')).toBe('default')
+    expect(() => reloaded.env(removed.id, {})).toThrow('不存在')
+    expect(reloaded.ensure(removed.name).id).not.toBe(removed.id)
+  })
+  test('deletion also removes records left by a login that never created a home', () => {
+    const accounts = fixture()
+    const account = accounts.ensure('未完成登录')
+    expect(existsSync(accounts.home(account.id))).toBe(false)
+    accounts.remove(account.id)
+    expect(accounts.list().map(a => a.id)).toEqual(['default'])
+    expect(() => accounts.remove(account.id)).toThrow('不存在')
+    expect(() => accounts.remove('default')).toThrow('默认账号')
+    expect(existsSync(join(accounts.defaultHome, 'auth.json'))).toBe(true)
+  })
+  test('deletion refuses directory aliases and homes containing the native account', () => {
+    const accounts = fixture()
+    const account = accounts.ensure('unsafe')
+    mkdirSync(accounts.root)
+    const home = accounts.home(account.id)
+    symlinkSync(accounts.defaultHome, home, 'dir')
+    expect(() => accounts.remove(account.id)).toThrow('不是独立目录')
+    unlinkSync(home)
+    mkdirSync(home)
+    const same = new CodexAccounts(home, accounts.root, accounts.stateFile)
+    expect(() => same.remove(account.id)).toThrow('包含默认认证目录')
+    const nested = join(home, 'native'); mkdirSync(nested)
+    const inside = new CodexAccounts(nested, accounts.root, accounts.stateFile)
+    expect(() => inside.remove(account.id)).toThrow('包含默认认证目录')
+    expect(accounts.get(account.id)).toEqual(account)
+    expect(readFileSync(join(accounts.defaultHome, 'auth.json'), 'utf8')).toBe('{"native":"must-not-change"}')
+  })
+  test('filesystem and registry failures stay visible and leave a record that can be retried', () => {
+    const accounts = fixture()
+    const account = accounts.ensure('retry')
+    const home = accounts.prepareHome(account.id)
+    writeFileSync(join(home, 'auth.json'), 'private credentials')
+    accounts.select('one', account.id)
+    const remove = spyOn(fs, 'rmSync').mockImplementation(() => { throw new Error('EACCES test') })
+    try {
+      expect(() => accounts.remove(account.id)).toThrow('EACCES test')
+      expect(readFileSync(join(home, 'auth.json'), 'utf8')).toBe('private credentials')
+      expect(accounts.preferred('one')).toBe(account.id)
+    } finally { remove.mockRestore() }
+    const write = spyOn(stateStore, 'writeJsonStateAtomic').mockImplementation(() => { throw new Error('ENOSPC test') })
+    try {
+      expect(() => accounts.remove(account.id)).toThrow('账号文件已移除，但账号记录保存失败')
+      expect(existsSync(home)).toBe(false)
+      expect(accounts.get(account.id)).toEqual(account)
+      expect(accounts.preferred('one')).toBe(account.id)
+    } finally { write.mockRestore() }
+    accounts.remove(account.id)
+    expect(accounts.preferred('one')).toBeNull()
+    expect(accounts.list().map(a => a.id)).toEqual(['default'])
+  })
   test('named account aliases cannot redirect credential writes into the native account', () => {
     const accounts = fixture()
     const named = accounts.ensure('alias')
@@ -35,6 +120,7 @@ describe('Codex native and named accounts', () => {
       expect(isCodexLoginPending(account.id)).toBe(true)
       expect(() => reserveCodexLogin(account.id)).toThrow('已有登录任务')
       expect(() => accounts.env(account.id, {})).toThrow('正在登录')
+      expect(() => accounts.remove(account.id)).toThrow('正在登录')
       expect(accounts.env(account.id, {}, true, true).CODEX_HOME).toBe(accounts.home(account.id))
       expect(accounts.env('default', {}).CODEX_HOME).toBe(accounts.defaultHome)
     } finally { release() }

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { CODEX_ACCOUNTS_DIR, CODEX_ACCOUNTS_FILE } from './paths'
 import { writeJsonStateAtomic } from './state-store'
 
@@ -90,6 +90,38 @@ export class CodexAccounts {
     state.accounts.push(account)
     writeJsonStateAtomic(this.stateFile, state)
     return account
+  }
+  /** Remove only a managed account home; recursive removal unlinks shared paths without following them. */
+  remove(id: string): { account: CodexAccount; clearedSelections: number } {
+    const account = this.get(id)
+    if (id === DEFAULT_CODEX_ACCOUNT) throw new Error('默认账号由设备原生 Codex 管理，不能用此命令删除')
+    if (isCodexLoginPending(id)) throw new Error(`账号正在登录；先发送 codex-login-cancel ${account.name}`)
+    if (codexAccountInUse(id, true)) throw new Error('账号正在使用中；请先结束使用该账号的会话或委派任务，额度及模型查询结束后重试')
+    const state = this.read()
+    const home = this.home(id)
+    let stat
+    try { stat = lstatSync(home) } catch (error: any) { if (error.code !== 'ENOENT') throw error }
+    if (stat) {
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('额外账号目录不是独立目录，拒绝删除')
+      if (existsSync(this.defaultHome)) {
+        const nativeRelative = relative(realpathSync(home), realpathSync(this.defaultHome))
+        if (!nativeRelative || (!isAbsolute(nativeRelative) && nativeRelative !== '..' && !nativeRelative.startsWith(`..${sep}`))) {
+          throw new Error('额外账号目录包含默认认证目录，拒绝删除')
+        }
+      }
+      try { rmSync(home, { recursive: true }) }
+      catch (error) { throw new Error(`账号文件删除失败，账号记录已保留；${error}`) }
+    }
+    state.accounts = state.accounts.filter(a => a.id !== id)
+    let clearedSelections = 0
+    for (const [sessionName, selectedId] of Object.entries(state.selections)) {
+      if (selectedId !== id) continue
+      delete state.selections[sessionName]
+      clearedSelections++
+    }
+    try { writeJsonStateAtomic(this.stateFile, state) }
+    catch (error) { throw new Error(`账号文件已移除，但账号记录保存失败；请重试 codex-account-delete ${account.name}；${error}`) }
+    return { account, clearedSelections }
   }
   selected(sessionName: string): string {
     const selections = this.read().selections
@@ -204,15 +236,15 @@ export class CodexAccounts {
 export const codexAccounts = new CodexAccounts()
 const processAccounts = new WeakMap<object, string>()
 interface OwnedCodexProcess { isAlive(): boolean; once(event: 'exit', listener: () => void): unknown }
-const ownedProcesses = new Map<OwnedCodexProcess, string>()
+const boundProcesses = new Map<OwnedCodexProcess, { id: string; ownsNativeProcess: boolean }>()
 export function bindProcessCodexAccount(proc: OwnedCodexProcess, id: string, ownsNativeProcess = true): void {
   processAccounts.set(proc, id)
-  if (!ownsNativeProcess) return
-  if (!ownedProcesses.has(proc)) proc.once('exit', () => ownedProcesses.delete(proc))
-  ownedProcesses.set(proc, id)
+  if (!boundProcesses.has(proc)) proc.once('exit', () => boundProcesses.delete(proc))
+  boundProcesses.set(proc, { id, ownsNativeProcess })
 }
-export function codexAccountInUse(id: string): boolean {
-  return [...ownedProcesses].some(([proc, accountId]) => accountId === id && proc.isAlive())
+export function codexAccountInUse(id: string, includeWaitingTasks = false): boolean {
+  return [...boundProcesses].some(([proc, account]) => account.id === id
+    && (account.ownsNativeProcess || includeWaitingTasks) && proc.isAlive())
 }
 const loginLeases = new Map<string, symbol>()
 export function isCodexLoginPending(id: string): boolean { return loginLeases.has(id) }

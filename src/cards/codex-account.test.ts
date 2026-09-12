@@ -37,7 +37,7 @@ describe('compact Codex account cards', () => {
     expect(initial).toContain('ABCD-1234')
     expect(initial).toContain('打开授权页')
     expect(initial).toContain('blue-50')
-    for (const phase of ['success', 'cancelled', 'expired', 'error'] as const) {
+    for (const phase of ['success', 'deleted', 'cancelled', 'expired', 'error'] as const) {
       const final = JSON.stringify(codexAccountCard({ ...waiting, phase, message: phase === 'error' ? '连接失败' : undefined }))
       expect(final).not.toContain('ABCD-1234')
       expect(final).not.toContain('https://auth.openai.com')

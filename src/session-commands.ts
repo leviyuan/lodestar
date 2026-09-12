@@ -35,7 +35,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
     await runCodexNamedHi(s, namedHi[1].trim())
     return true
   }
-  const accountCommand = raw.trim().match(/^codex-(login-cancel|login|accounts|account|auto)(?:[ \t]+([^\r\n]+))?$/i)
+  const accountCommand = raw.trim().match(/^codex-(login-cancel|login|accounts|account-delete|account|auto)(?:[ \t]+([^\r\n]+))?$/i)
   if (accountCommand) {
     const { runCodexAccountCommand } = await import('./session-codex-accounts')
     await runCodexAccountCommand(s, accountCommand[1].toLowerCase(), (accountCommand[2] ?? '').trim(), userOpenId)

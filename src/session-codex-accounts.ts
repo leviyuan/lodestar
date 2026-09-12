@@ -8,6 +8,7 @@ import { codexAccountScheduler } from './codex-account-scheduler'
 import { CodexAccountCard } from './codex-account-card'
 import { codexAccountCard, type CodexAccountCardView } from './cards/codex-account'
 import { log } from './log'
+import { invalidateCodexUsage } from './usage'
 
 const loginReceipts = new Map<string, Promise<void>>()
 
@@ -60,11 +61,22 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
     return
   }
 
-  const name = command === 'login' ? argument || '默认' : command === 'account' ? argument || undefined : undefined
+  const name = command === 'login' ? argument || '默认' : command === 'account' || command === 'account-delete' ? argument || undefined : undefined
   const card = await CodexAccountCard.open(s.chatId, { phase: command === 'login' ? 'connecting' : 'checking', name,
     ...(command === 'login' ? { flow: 'login' as const } : {}),
     message: command === 'accounts' ? '正在读取各账号额度…' : command === 'login' ? '正在获取设备码…' : '正在核对账号…' })
   try {
+    if (command === 'account-delete') {
+      if (!argument) throw new Error('请指定要删除的账号；使用 codex-account-delete 备注')
+      const account = codexAccounts.find(argument)
+      if (loginReceipts.has(account.id)) throw new Error('账号登录或结果更新尚未结束；请先完成或取消登录后重试')
+      const { clearedSelections } = codexAccounts.remove(account.id)
+      invalidateCodexUsage(account.id)
+      await card.finish({ phase: 'deleted', name: account.name,
+        message: '已删除本地账号记录与独立凭据，共享会话历史保留。',
+        hint: clearedSelections ? `已清除 ${clearedSelections} 个群的指定，下次启动自动选号 · codex-accounts 查看` : 'codex-accounts 查看剩余账号' })
+      return
+    }
     if (command === 'accounts') {
       if (argument && !/^[1-9]\d*$/.test(argument)) throw new Error('页码无效；使用 codex-accounts [页码]')
       const page = argument ? Number(argument) : 1
@@ -77,7 +89,7 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
       await card.finish({ phase: 'accounts', total, currentId: s.codexAccountId(),
         ...(codexAccounts.preferred(s.sessionName) ? { selectedId: codexAccounts.selected(s.sessionName) } : {}), page,
         scheduling: { candidates: decision.candidates, ultra: effort === 'ultra' },
-        hint: '最高分优先 · hi 备注可直接指定账号' })
+        hint: '指定：hi 备注 · 删除：codex-account-delete 备注' })
       return
     }
     if (command === 'auto') {
@@ -141,5 +153,8 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
     loginReceipts.set(account.id, receipt)
     const release = () => { if (loginReceipts.get(account.id) === receipt) loginReceipts.delete(account.id) }
     void receipt.then(release, error => { log(`codex-login: terminal card write failed: ${error}`); release() })
-  } catch (error) { await card.finish(errorView(error, name)) }
+  } catch (error) {
+    log(`codex-${command}: ${error}`)
+    await card.finish(errorView(error, name))
+  }
 }

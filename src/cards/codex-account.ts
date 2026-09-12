@@ -4,7 +4,7 @@ import { ELEMENTS } from './elements'
 import { fmtResetIn } from './console'
 import type { CodexAccountCandidate } from '../codex-account-scheduler'
 
-export type CodexAccountPhase = 'connecting' | 'waiting' | 'checking' | 'success' | 'selected' | 'current' | 'accounts' | 'cancelled' | 'expired' | 'error' | 'warning'
+export type CodexAccountPhase = 'connecting' | 'waiting' | 'checking' | 'success' | 'selected' | 'current' | 'accounts' | 'deleted' | 'cancelled' | 'expired' | 'error' | 'warning'
 export interface CodexAccountCardView {
   phase: CodexAccountPhase
   flow?: 'login'
@@ -29,6 +29,7 @@ const PHASE = {
   connecting: ['🔄', '连接中', 'blue'], waiting: ['🔐', '等待授权', 'blue'], checking: ['🔎', '校验中', 'blue'],
   success: ['✅', '登录成功', 'green'], selected: ['🎯', '下次启动生效', 'green'], current: ['🧭', '当前账号', 'blue'],
   accounts: ['🗂', '账号与额度', 'blue'], cancelled: ['⏹', '已取消', 'grey'], expired: ['⌛', '等待超时', 'orange'],
+  deleted: ['🗑', '已删除', 'grey'],
   error: ['❌', '未完成', 'red'], warning: ['⚠️', '需要处理', 'orange'],
 } as const
 
@@ -127,10 +128,6 @@ function accountRows(view: CodexAccountCardView): object[] {
     row.push(muted(`${plan} · 重置卡 ${usage.resetCredits ?? 'MISS'}`))
     const windows = [windowCard(usage.fiveHour, '5h'), windowCard(usage.weekly, '周')].filter((w): w is object[] => w !== null)
     if (windows.length) row.push(columns(windows))
-    const extra = usage.buckets?.filter(bucket => bucket.limitId !== usage.defaultLimitId) ?? []
-    if (extra.length) row.push({ tag: 'collapsible_panel', expanded: false,
-      header: { title: { tag: 'plain_text', content: `其他额度 · ${extra.length}` } },
-      elements: extra.map(bucket => md(`${text(bucket.limitName ?? bucket.limitId)} · ${compactWindows(bucket.fiveHour, bucket.weekly)}`)) })
   }
   if (pages > 1) elements.push(muted(`${page}/${pages} 页 · ${page < pages ? `下一页 codex-accounts ${page + 1}` : '首页 codex-accounts'}`))
   return elements
@@ -139,12 +136,8 @@ function windowCard(window: UsageWindow | null, label: string): object[] | null 
   if (!window) return null
   const value = window.percent
   if (value === null || !Number.isFinite(value) || value < 0 || value > 100) return [md(`**${label} · MISS**`)]
-  const filled = Math.round(value / 100 * 8)
+  const filled = Math.round(value / 100 * 6)
   const color = value >= 100 ? 'red' : value >= 80 ? 'orange' : 'green'
-  return [md(`**${label} · ${Math.round(value)}%**\n<font color='${color}'>${'▰'.repeat(filled)}${'▱'.repeat(8 - filled)}</font>`),
+  return [md(`**${label} · ${Math.round(value)}%**\n<font color='${color}'>${'▰'.repeat(filled)}${'▱'.repeat(6 - filled)}</font>`),
     muted(window.unreportedFull ? '满窗 · 0.15 份' : window.resetsAt ? `${fmtResetIn(window.resetsAt)} 重置` : '重置时间 MISS')]
-}
-function compactWindows(short: UsageWindow | null, long: UsageWindow | null): string {
-  return [short ? `5h ${short.percent ?? 'MISS'}${short.percent === null ? '' : '%'}` : '',
-    long ? `周 ${long.percent ?? 'MISS'}${long.percent === null ? '' : '%'}` : ''].filter(Boolean).join(' · ')
 }

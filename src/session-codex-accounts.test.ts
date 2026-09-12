@@ -1,16 +1,17 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { resetFeishuMock, sentCards, sentTexts } from './feishu-test-mock'
 import { Session } from './session'
-import { bindProcessCodexAccount, codexAccounts, CodexAccounts } from './codex-accounts'
+import { bindProcessCodexAccount, codexAccounts, CodexAccounts, reserveCodexLogin } from './codex-accounts'
 import { codexLogins } from './codex-login'
 import * as accountCommands from './session-codex-accounts'
 import { CodexAccountCard } from './codex-account-card'
 import type { CodexAccountCardView } from './cards/codex-account'
 import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, type TokenSource } from './token-source'
+import { peekUsage, peekSuccessfulUsage, refreshUsageFromConnection } from './usage'
 
 let root: string
 let store: CodexAccounts
@@ -62,7 +63,7 @@ beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'session-codex-account-'))
   mkdirSync(join(root, 'native'))
   store = new CodexAccounts(join(root, 'native'), join(root, 'accounts'), join(root, 'state.json'))
-  for (const key of ['list', 'get', 'find', 'ensure', 'selected', 'preferred', 'selectAuto', 'select', 'recordLogin', 'home', 'revision'] as const) {
+  for (const key of ['list', 'get', 'find', 'ensure', 'remove', 'selected', 'preferred', 'selectAuto', 'select', 'recordLogin', 'home', 'revision'] as const) {
     spies.push(spyOn(codexAccounts, key).mockImplementation((...args: any[]) => (store[key] as any)(...args)))
   }
   previous = listTokenSources(); resetTokenSourceRegistry()
@@ -159,6 +160,7 @@ describe('bare Codex account commands', () => {
     expect(s.initCount).toBe(0)
     const replacements: string[] = []
     spies.push(spyOn(s, 'replaceStatusCardWithConsole').mockImplementation(async (_card: any, status: string) => { replacements.push(status) }))
+    spies.push(spyOn(s, 'openStatusCard').mockResolvedValue(null))
     await s.runCommand('hi', 'owner')
     expect(replacements).toEqual([])
     await s.runCommand('stop', 'owner')
@@ -190,7 +192,8 @@ describe('bare Codex account commands', () => {
     const dispatch = spyOn(accountCommands, 'runCodexAccountCommand').mockResolvedValue(undefined)
     spies.push(dispatch)
     for (const raw of ['login', 'login 工作', 'accounts', 'account', 'account default',
-      'login-cancel', 'login-cancel 工作', 'codex-login\n工作', 'codex-login 工作\n继续解释']) {
+      'login-cancel', 'login-cancel 工作', 'codex-login\n工作', 'codex-login 工作\n继续解释',
+      'account-delete 工作', 'codex-account-delete 工作\n继续解释']) {
       expect(await s.runCommand(raw, 'owner')).toBe(false)
     }
     expect(dispatch).not.toHaveBeenCalled()
@@ -201,6 +204,8 @@ describe('bare Codex account commands', () => {
       ['codex-accounts', 'accounts', ''],
       ['codex-account', 'account', ''],
       [' CODEX-ACCOUNT\tdefault ', 'account', 'default'],
+      ['codex-account-delete', 'account-delete', ''],
+      [' CODEX-ACCOUNT-DELETE\t工作 订阅 ', 'account-delete', '工作 订阅'],
     ]
     for (const [raw, command, argument] of commands) {
       expect(await s.runCommand(raw, 'owner')).toBe(true)
@@ -208,6 +213,76 @@ describe('bare Codex account commands', () => {
     }
     expect(sentTexts).toHaveLength(0)
     expect(sentCards).toHaveLength(0)
+  })
+
+  test('deletion clears selections and quota caches without requiring a model catalog or touching the live session', async () => {
+    const s = session()
+    const account = store.ensure('工作 订阅')
+    const home = store.prepareHome(account.id)
+    writeFileSync(join(home, 'auth.json'), 'temporary test credentials')
+    store.select(s.sessionName, account.id)
+    store.select('another-group', account.id)
+    const proc = new Proc(); procs.push(proc); bindProcessCodexAccount(proc, 'default'); s.proc = proc
+    s.tokenSource('codex-sub').models = []
+    s.tokenSource('codex-sub').modelCatalogState = { status: 'failed', error: 'offline' }
+    await refreshUsageFromConnection(async () => ({ rateLimits: { primary: { usedPercent: 15, windowDurationMins: 300 } } }), account.id)
+    expect(peekSuccessfulUsage(account.id)).not.toBeNull()
+    let release!: (value: any) => void
+    const pending = refreshUsageFromConnection(() => new Promise(resolve => { release = resolve }), account.id)
+
+    expect(await s.runCommand('codex-account-delete 工作 订阅', 'owner')).toBe(true)
+    expect(cardViews.at(-1)).toMatchObject({ phase: 'deleted', name: account.name })
+    expect(cardViews.at(-1)?.hint).toContain('2 个群')
+    expect(existsSync(home)).toBe(false)
+    expect(store.preferred(s.sessionName)).toBeNull()
+    expect(store.preferred('another-group')).toBeNull()
+    expect(proc.killCalls).toBe(0)
+    expect(s.proc).toBe(proc)
+    expect(peekUsage(account.id)).toBeNull()
+    expect(peekSuccessfulUsage(account.id)).toBeNull()
+    release({ rateLimits: { primary: { usedPercent: 20, windowDurationMins: 300 } } })
+    expect(await pending).toBeNull()
+    expect(peekSuccessfulUsage(account.id)).toBeNull()
+    expect(sentTexts).toHaveLength(0)
+  })
+
+  test('deletion requires a named account and rejects native, unknown, active, and login accounts', async () => {
+    const s = session()
+    const account = store.ensure('受保护')
+    for (const [raw, message] of [
+      ['codex-account-delete', '请指定'],
+      ['codex-account-delete default', '默认账号'],
+      ['codex-account-delete 默认', '默认账号'],
+      ['codex-account-delete missing', '不存在'],
+    ]) {
+      await s.runCommand(raw, 'owner')
+      expect(cardViews.at(-1)?.phase).toBe('error')
+      expect(cardViews.at(-1)?.message).toContain(message)
+    }
+    // A native child can belong to another group or a delegated task, without being this Session's proc.
+    const proc = new Proc(); procs.push(proc); bindProcessCodexAccount(proc, account.id)
+    await s.runCommand('codex-account-delete 受保护', 'owner')
+    expect(cardViews.at(-1)?.message).toBe('账号正在使用中')
+    expect(proc.killCalls).toBe(0)
+    expect(store.get(account.id)).toEqual(account)
+    await proc.kill()
+    // Waiting tasks keep an account reference after their native child exits, but may still reauthenticate.
+    const waiting = new Proc(); procs.push(waiting); bindProcessCodexAccount(waiting, account.id, false)
+    const releaseWaitingLogin = reserveCodexLogin(account.id)
+    releaseWaitingLogin()
+    await s.runCommand('codex-account-delete 受保护', 'owner')
+    expect(cardViews.at(-1)?.message).toBe('账号正在使用中')
+    expect(waiting.killCalls).toBe(0)
+    await waiting.kill()
+    const release = reserveCodexLogin(account.id)
+    try {
+      await s.runCommand('codex-account-delete 受保护', 'owner')
+      expect(cardViews.at(-1)?.message).toBe('账号正在登录')
+      expect(store.get(account.id)).toEqual(account)
+    } finally { release() }
+    await s.runCommand('codex-account-delete 受保护', 'owner')
+    expect(cardViews.at(-1)?.phase).toBe('deleted')
+    expect(() => store.get(account.id)).toThrow('不存在')
   })
 
   test('inherited default routing clears a previous named-account selection', () => {
@@ -276,6 +351,9 @@ describe('bare Codex account commands', () => {
     await s.runCommand('codex-login', 'owner')
     await s.runCommand('codex-login 第二订阅', 'owner')
     expect(started).toEqual(['default', store.find('第二订阅').id])
+    await s.runCommand('codex-account-delete 第二订阅', 'owner')
+    expect(cardViews.at(-1)?.phase).toBe('error')
+    expect(cardViews.at(-1)?.message).toContain('尚未结束')
     expect(cardViews.filter(v => v.phase === 'waiting').map(v => v.verification?.code)).toEqual(['TEST-CODE', 'TEST-CODE'])
     expect(cardViews.filter(v => v.phase === 'waiting').every(v => v.verification?.url === 'https://auth.openai.com/codex/device')).toBe(true)
     expect(sentTexts).toHaveLength(0)

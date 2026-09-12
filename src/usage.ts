@@ -15,7 +15,7 @@ import { EventEmitter } from 'node:events'
 import { StringDecoder } from 'node:string_decoder'
 import { createHash } from 'node:crypto'
 import { config } from './config'
-import { codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
+import { bindProcessCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
 import { plusFiveHourWindow } from './codex-quota'
 
 const API_TIMEOUT_MS = 10_000
@@ -114,6 +114,7 @@ export class AppServerOnce extends EventEmitter {
       }
       this.pending.clear()
       this.resolveExit()
+      this.emit('exit')
       this.emit('closed', error)
     }
     this.proc.on('error', error => finish(new Error(`codex app-server spawn failed: ${error.message}`)))
@@ -125,6 +126,8 @@ export class AppServerOnce extends EventEmitter {
     this.proc.on('close', (code, signal) => {
       finish(new Error(`codex app-server exited code=${code} signal=${signal}`))
     })
+    // Quota/model probes can refresh auth too; deletion must wait for their native process to close.
+    bindProcessCodexAccount(this, accountId)
   }
 
   private onStdout(chunk: Buffer): void {
