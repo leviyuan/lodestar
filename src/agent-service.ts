@@ -55,7 +55,7 @@ interface CreateRunOptions {
   parentRunId?: string
   parentKind?: 'follow_up'
   cancellationEpoch: number
-  resumeByIdentity?: Map<string, string>
+  resumeWorker?: AgentWorkerResult
 }
 
 export interface AgentServiceDeps {
@@ -103,6 +103,7 @@ export class AgentService {
   private readonly cancellationEpochBySession = new Map<string, number>()
   private startingWorkers = 0
   private readonly startingRunsBySession = new Map<string, number>()
+  private readonly startingNativeSessions = new Set<string>()
 
   constructor(private readonly deps: AgentServiceDeps = DEFAULT_DEPS) {
     this.loadDurableRuns()
@@ -118,6 +119,14 @@ export class AgentService {
 
   async startRun(principal: AgentPrincipal, request: AgentRunRequest): Promise<AgentRunSnapshot> {
     if (principal.kind !== 'session') throw new Error(NESTED_DELEGATION_ERROR)
+    if (request.sessionId !== undefined) {
+      if (!request.sessionId.trim()) throw new Error('agent session_id must be a non-empty string')
+      if (request.identityIds.length > 1) throw new Error('agent session continuation accepts at most one identity_id')
+      const { run, worker } = this.requireSessionRun(principal, request.sessionId, request.identityIds[0])
+      return this.followUp(principal, run.snapshot.runId, {
+        identityId: worker.identityId, prompt: request.prompt, effort: request.effort,
+      })
+    }
     const release = this.reserveCapacity(principal, request.identityIds.length)
     try {
       return await this.createRun(principal.session, request, {
@@ -143,7 +152,9 @@ export class AgentService {
     if (!worker.sessionId) throw new Error(`${worker.identityName} has no resumable native session id`)
     const effort = request.effort ?? worker.effort
     const release = this.reserveCapacity(principal, 1)
+    let releaseSession: (() => void) | undefined
     try {
+      releaseSession = this.reserveNativeSession(worker)
       return await this.createRun(principal.session, {
         identityIds: [worker.identityId],
         prompt: request.prompt,
@@ -152,9 +163,10 @@ export class AgentService {
         parentRunId: source.snapshot.runId,
         parentKind: 'follow_up',
         cancellationEpoch: this.currentCancellationEpoch(principal.session),
-        resumeByIdentity: new Map([[worker.identityId, worker.sessionId]]),
+        resumeWorker: worker,
       })
     } finally {
+      releaseSession?.()
       release()
     }
   }
@@ -227,7 +239,7 @@ export class AgentService {
     request: AgentRunRequest,
     options: CreateRunOptions,
   ): Promise<AgentRunSnapshot> {
-    this.pruneRuns()
+    this.pruneRuns(options.parentRunId)
     let parent: AgentRunRecord | undefined
     if (options.parentRunId) {
       parent = this.runs.get(options.parentRunId)
@@ -240,12 +252,17 @@ export class AgentService {
       const identity = catalog.identities.find(item => item.id === id)
       if (!identity) throw new Error(`agent identity not found: ${id}`)
       if (identity.status !== 'ready') throw new Error(`${identity.displayName}: ${identity.reason ?? identity.status}`)
+      const previous = options.resumeWorker
+      if (previous && (identity.id !== previous.identityId || identity.provider !== previous.provider
+        || identity.tokenSourceId !== previous.tokenSourceId || identity.model !== previous.model)) {
+        throw new Error('agent session identity changed; cannot resume with a different provider, source or model')
+      }
       return identity
     })
     const workers = identities.map(identity => workerSnapshot(
       identity,
       resolveEffort(identity, request.effort),
-      options.resumeByIdentity?.get(identity.id),
+      options.resumeWorker?.sessionId,
     ))
     const runId = `agent_${randomUUID()}`
     const snapshot: AgentRunSnapshot = {
@@ -307,7 +324,7 @@ export class AgentService {
     }
     this.persist(run)
     for (const identity of identities) {
-      const resumeSessionId = options.resumeByIdentity?.get(identity.id)
+      const resumeSessionId = options.resumeWorker?.sessionId
       void this.executeWorker(run, identity, request.prompt, resumeSessionId).catch(error => {
         log(`agent: run=${runId} worker=${identity.id} crashed: ${messageOf(error)}`)
       })
@@ -623,6 +640,42 @@ export class AgentService {
     return run
   }
 
+  private requireSessionRun(principal: AgentPrincipal, sessionId: string, identityId?: string): {
+    run: AgentRunRecord; worker: AgentWorkerResult
+  } {
+    const matches = [...this.runs.values()].flatMap(run => {
+      if (!this.canAccess(principal, run) || run.snapshot.workDir !== principal.session.workDir) return []
+      return run.snapshot.workers
+        .filter(worker => worker.sessionId === sessionId && (!identityId || worker.identityId === identityId))
+        .map(worker => ({ run, worker }))
+    })
+    if (!matches.length) throw new Error(`agent session not found in this Session${identityId ? ' for the requested identity' : ''}: ${sessionId}`)
+    if (new Set(matches.map(({ worker }) => worker.identityId)).size > 1) {
+      throw new Error('agent session id matches multiple identities; specify identity_id')
+    }
+    // Follow-up lineage breaks timestamp ties, including after durable history is reloaded.
+    const parents = new Set(matches.map(({ run }) => run.snapshot.parentRunId))
+    const latest = matches.filter(({ run }) => !parents.has(run.snapshot.runId))
+      .sort((a, b) => Date.parse(b.run.snapshot.createdAt) - Date.parse(a.run.snapshot.createdAt))[0]
+    if (!latest) throw new Error(`agent session history has no latest run: ${sessionId}`)
+    return latest
+  }
+
+  private reserveNativeSession(worker: AgentWorkerResult): () => void {
+    const key = JSON.stringify([worker.provider, worker.sessionId])
+    const occupied = [...this.runs.values()].some(run => run.snapshot.workers.some(other => {
+      if (other.provider !== worker.provider || other.sessionId !== worker.sessionId) return false
+      const handle = run.handles.get(other.identityId)
+      return !isWorkerTerminal(other.status) || !!handle && handle.isAlive?.() !== false
+    }))
+    if (this.startingNativeSessions.has(key) || occupied) {
+      throw new Error('agent session is already running or starting; wait for the current turn to finish')
+    }
+    // Reserve before card creation's first await; queued runs keep the session occupied afterward.
+    this.startingNativeSessions.add(key)
+    return () => { this.startingNativeSessions.delete(key) }
+  }
+
   private requireMutableDescendant(principal: AgentPrincipal, runId: string): AgentRunRecord {
     const run = this.requireAccessibleRun(principal, runId)
     if (principal.kind === 'worker' && run.snapshot.runId === principal.runId) {
@@ -779,10 +832,11 @@ export class AgentService {
     this.pruneRuns()
   }
 
-  private pruneRuns(): void {
+  private pruneRuns(protectedRunId?: string): void {
     if (this.runs.size <= MAX_RETAINED_RUNS) return
     const terminal = [...this.runs.values()]
-      .filter(run => isTerminal(run.snapshot.status) && run.handles.size === 0 && run.slotOwners.size === 0 && run.children.size === 0)
+      .filter(run => run.snapshot.runId !== protectedRunId && isTerminal(run.snapshot.status)
+        && run.handles.size === 0 && run.slotOwners.size === 0 && run.children.size === 0)
       .sort((a, b) => Date.parse(a.snapshot.finishedAt ?? a.snapshot.createdAt) - Date.parse(b.snapshot.finishedAt ?? b.snapshot.createdAt))
     for (const run of terminal) {
       if (this.runs.size <= MAX_RETAINED_RUNS) break

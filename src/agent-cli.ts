@@ -10,10 +10,12 @@ interface CliContext {
 interface PromptArgs {
   identityIds: string[]
   identityId: string
+  sessionId: string
   effort: string
   prompt: string
   noWait: boolean
   readStdin: boolean
+  json: boolean
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
@@ -42,7 +44,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     case 'status': {
       const runId = requiredArg(argv[0], 'status requires run_id')
       const data = await requestJson(context, 'GET', `/agents/runs/${encodeURIComponent(runId)}`)
-      process.stdout.write(formatRun(data))
+      printRun(data, argv.includes('--json'))
       if (data.status === 'failed' || data.status === 'cancelled') process.exitCode = 1
       return
     }
@@ -64,9 +66,10 @@ async function runCommand(context: CliContext, argv: string[]): Promise<void> {
     identity_ids: parsed.identityIds,
     prompt,
     ...(parsed.effort ? { effort: parsed.effort } : {}),
+    ...(parsed.sessionId ? { session_id: parsed.sessionId } : {}),
   }
   const started = await requestJson(context, 'POST', '/agents/runs', body)
-  await presentStartedRun(context, started, parsed.noWait)
+  await presentStartedRun(context, started, parsed.noWait, parsed.json)
 }
 
 async function followUpCommand(context: CliContext, argv: string[]): Promise<void> {
@@ -79,7 +82,7 @@ async function followUpCommand(context: CliContext, argv: string[]): Promise<voi
     ...(parsed.effort ? { effort: parsed.effort } : {}),
   }
   const started = await requestJson(context, 'POST', `/agents/runs/${encodeURIComponent(runId)}/follow-up`, body)
-  await presentStartedRun(context, started, parsed.noWait)
+  await presentStartedRun(context, started, parsed.noWait, parsed.json)
 }
 
 async function answerCommand(context: CliContext, argv: string[]): Promise<void> {
@@ -125,7 +128,7 @@ async function answerCommand(context: CliContext, argv: string[]): Promise<void>
 
 export function parsePromptArgs(argv: string[], identitiesRequired: boolean): PromptArgs {
   const out: PromptArgs = {
-    identityIds: [], identityId: '', effort: '', prompt: '', noWait: false, readStdin: false,
+    identityIds: [], identityId: '', sessionId: '', effort: '', prompt: '', noWait: false, readStdin: false, json: false,
   }
   const positional: string[] = []
   for (let i = 0; i < argv.length; i++) {
@@ -137,16 +140,23 @@ export function parsePromptArgs(argv: string[], identitiesRequired: boolean): Pr
         else out.identityId = next()
         break
       case '--effort': out.effort = next(); break
-      case '--prompt': out.prompt = next(); break
+      case '--session':
+        if (!identitiesRequired) throw new Error('--session is only supported by run; follow-up accepts a run_id')
+        if (out.sessionId) throw new Error('--session may only be specified once')
+        out.sessionId = next()
+        break
+      case '--prompt': next(); out.prompt = argv[i]!; break
       case '--stdin': out.readStdin = true; break
       case '--no-wait': out.noWait = true; break
+      case '--json': out.json = true; break
       default:
         if (arg.startsWith('-')) throw new Error(`unknown option: ${arg}`)
         positional.push(arg)
     }
   }
   out.identityIds = [...new Set(out.identityIds)]
-  if (identitiesRequired && out.identityIds.length === 0) throw new Error('run requires at least one --identity')
+  if (out.sessionId && out.identityIds.length > 1) throw new Error('--session accepts at most one --identity')
+  if (identitiesRequired && !out.sessionId && out.identityIds.length === 0) throw new Error('run requires at least one --identity')
   if (!out.prompt && positional.length) out.prompt = positional.join(' ')
   if (!out.prompt) out.readStdin = true
   return out
@@ -159,17 +169,17 @@ async function resolvePrompt(parsed: PromptArgs): Promise<string> {
   return prompt
 }
 
-async function presentStartedRun(context: CliContext, started: any, noWait: boolean): Promise<void> {
+async function presentStartedRun(context: CliContext, started: any, noWait: boolean, json: boolean): Promise<void> {
   const runId = String(started.run_id ?? '')
   if (!runId) throw new Error('agent API returned no run_id')
   if (noWait) {
     process.stdout.write(`${JSON.stringify(started, null, 2)}\n`)
     return
   }
-  await waitAndPrintRun(context, runId)
+  await waitAndPrintRun(context, runId, json)
 }
 
-async function waitAndPrintRun(context: CliContext, runId: string): Promise<void> {
+async function waitAndPrintRun(context: CliContext, runId: string, json = false): Promise<void> {
   let cancelling = false
   const cancel = () => {
     if (cancelling) return
@@ -186,7 +196,7 @@ async function waitAndPrintRun(context: CliContext, runId: string): Promise<void
     while (true) {
       const run = await requestJson(context, 'GET', `/agents/runs/${encodeURIComponent(runId)}`)
       if (run.status === 'needs_input' || run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') {
-        process.stdout.write(formatRun(run))
+        printRun(run, json)
         if (run.status === 'failed' || run.status === 'cancelled') process.exitCode = 1
         return
       }
@@ -248,6 +258,10 @@ function formatIdentities(value: any): string {
   return `${lines.join('\n')}\n`
 }
 
+function printRun(run: any, json: boolean): void {
+  process.stdout.write(json ? `${JSON.stringify(run, null, 2)}\n` : formatRun(run))
+}
+
 function formatRun(run: any): string {
   const lines = [
     `# Lodestar agent ${run.run_id ?? 'MISS'}`,
@@ -269,11 +283,20 @@ function formatRun(run: any): string {
       lines.push('', 'Answer with:', `lodestar-agent answer ${run.run_id} --identity '${worker.identity_id}' --request '${worker.pending_input.request_id}' --stdin`)
     }
     if (worker.output) lines.push('', worker.output)
+    if (worker.session_id && worker.identity_id
+      && ['completed', 'failed', 'cancelled'].includes(run.status)) {
+      lines.push('', 'Continue with:',
+        `lodestar-agent run --session ${shellQuote(worker.session_id)} --identity ${shellQuote(worker.identity_id)} --stdin`)
+    }
   }
   if (run.presentation_errors?.length) {
     lines.push('', 'Presentation errors:', ...run.presentation_errors.map((error: string) => `- ${error}`))
   }
   return `${lines.join('\n')}\n`
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`
 }
 
 async function readStdin(): Promise<string> {
@@ -292,11 +315,16 @@ function usage(): string {
   return [
     'Usage:',
     '  lodestar-agent identities [--json]',
-    '  lodestar-agent run --identity <id> [--identity <id>...] [--effort <level>] --stdin',
-    '  lodestar-agent follow-up <run_id> [--identity <id>] [--effort <level>] --stdin',
+    '  lodestar-agent run --identity <id> [--identity <id>...] [--effort <level>] [--json] --stdin',
+    '  lodestar-agent run --session <session_id> [--identity <id>] [--effort <level>] [--json] --stdin',
+    '  lodestar-agent follow-up <run_id> [--identity <id>] [--effort <level>] [--json] --stdin',
     '  lodestar-agent answer <run_id> [--identity <id>] --request <id> (--answer key=value | --stdin)',
-    '  lodestar-agent status <run_id>',
+    '  lodestar-agent status <run_id> [--json]',
     '  lodestar-agent cancel <run_id>',
+    '',
+    'Use --prompt <text> instead of --stdin for inline input. --no-wait returns the started run as JSON.',
+    '--session continues a delegated session in the same Lodestar Session and workspace.',
+    'Each turn has a new run_id; workers[].session_id identifies the native conversation.',
   ].join('\n')
 }
 

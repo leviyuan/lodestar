@@ -5,16 +5,19 @@ import { handleAgentRequest } from './agent-api'
 let server: Server | null = null
 afterEach(() => { server?.close(); server = null })
 
-async function serve() {
+async function serve(onStart?: (request: any) => void) {
   const session = { sessionName: 'project', chatId: 'chat', workDir: '/repo', codexAccountId: () => 'default' } as any
   let current: any = null
   const service = {
     rootPrincipal: () => ({ kind: 'session', session, depth: -1 }),
     principalForCapability: () => null,
     async startRun(_principal: any, request: any) {
+      onStart?.(request)
       current = {
         runId: 'agent_1', sessionName: 'project', chatId: 'chat', workDir: '/repo', prompt: request.prompt,
-        depth: 0, status: 'running', createdAt: new Date().toISOString(), workers: [],
+        depth: 0, status: 'running', createdAt: new Date().toISOString(), workers: [{
+          identityId: 'agent:a', status: 'running', sessionId: request.sessionId, output: request.prompt, steps: [],
+        }],
       }
       return current
     },
@@ -65,5 +68,24 @@ describe('delegated Agent HTTP API', () => {
     })
     expect(answer.status).toBe(200)
     expect((await fetch(`${base}/agents/runs/agent_1`, { method: 'DELETE', headers })).status).toBe(200)
+  })
+
+  test('accepts session_id plus new input and serializes the resumable session and content', async () => {
+    const requests: any[] = []
+    const base = await serve(request => requests.push(request))
+    const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' }
+    const response = await fetch(`${base}/agents/runs`, {
+      method: 'POST', headers, body: JSON.stringify({ session_id: 'native-sid', prompt: '  next\n' }),
+    })
+    expect(response.status).toBe(202)
+    expect(requests).toEqual([{ identityIds: [], sessionId: 'native-sid', prompt: '  next\n' }])
+    expect(await response.json()).toMatchObject({
+      workers: [{ session_id: 'native-sid', output: '  next\n' }],
+    })
+    const invalid = await fetch(`${base}/agents/runs`, {
+      method: 'POST', headers, body: JSON.stringify({ identity_ids: ['agent:a'], session_id: '', prompt: 'next' }),
+    })
+    expect(invalid.status).toBe(409)
+    expect(requests).toHaveLength(1)
   })
 })

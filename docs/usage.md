@@ -78,6 +78,22 @@ Linux/macOS 下，额外账号通过软链接共用默认账号的配置、会�
 
 被调用的 Agent 可以编辑文件、执行命令、使用 MCP 和 Skill；委派只允许一层，被调用的 Agent 不能继续派工。它们与主 Agent 共享工作区，修改会立即可见。运行状态和结果通过卡片展示；需要用户输入时暂停，由主 Agent 回填答案后继续。委派产生的会话不会混入主群的 `rs` 历史列表。
 
+首轮完成后，返回内容包含原生会话 ID（文本中的 `Session:`；JSON 中的 `workers[].session_id`）和本轮结果（`workers[].output`）。后续只需传入这个 ID 和新的一句输入：
+
+```bash
+# desc: 首轮调用并返回 JSON 结果
+lodestar-agent run --identity '<identity-id>' --prompt '完成第一步' --json
+```
+
+```bash
+# desc: 沿用历史会话继续第二轮
+lodestar-agent run --session '<session-id>' --prompt '根据上面的结果继续第二步' --json
+```
+
+第二轮及后续轮次恢复同一个后端原生会话，自动沿用原身份和上一轮的 effort，每轮产生新的 `run_id`。`--identity` 可省略，指定时必须与原身份一致；可用 `--effort` 显式选择本轮档位。多模型首轮会分别返回各 worker 的会话 ID，续跑时一次选择一个会话。也可继续使用 `lodestar-agent follow-up '<run-id>' --prompt '下一步'`；原 run 包含多个 Agent 时需用 `--identity` 指定。
+
+续跑要求原任务已经结束，且属于同一个 Lodestar 群会话和工作目录。持久化的委派历史仍可用时，daemon 重启后也可凭原会话 ID 继续；会话不存在、身份不可用或原生恢复失败会报错。同一个原生会话不能同时执行两轮。`run`、`follow-up`、`status` 支持 `--json`；使用 `--stdin` 可输入多行任务，`--no-wait` 立即返回启动状态，随后通过 `status <run-id>` 查询结果。
+
 `lodestar-agent` 只能在 Lodestar 管理的 Agent 进程里调用。命令用法见 [Agent Skill](../src/agent-skill.ts)。
 
 ## 飞书任务清单

@@ -4,6 +4,8 @@ export interface AgentRunRequest {
   identityIds: string[]
   prompt: string
   effort?: string
+  /** Resume a native session previously delegated by this Lodestar Session. */
+  sessionId?: string
 }
 
 export interface AgentFollowUpRequest {
@@ -101,11 +103,17 @@ export function parseAgentRunRequest(raw: unknown): AgentRunRequest {
       ? value.identityIds.map(String)
       : []
   const identityIds = [...new Set(ids.map(id => id.trim()).filter(Boolean))]
-  if (identityIds.length === 0) throw new Error('agent run requires at least one identity_id')
+  const rawSessionId = value.session_id !== undefined ? value.session_id : value.sessionId
+  const sessionId = optionalString(rawSessionId)
+  if (rawSessionId !== undefined && !sessionId) throw new Error('agent session_id must be a non-empty string')
+  if (value.session_id !== undefined && value.sessionId !== undefined
+    && value.session_id !== value.sessionId) throw new Error('conflicting agent session_id and sessionId')
+  if (sessionId && identityIds.length > 1) throw new Error('agent session continuation accepts at most one identity_id')
+  if (!sessionId && identityIds.length === 0) throw new Error('agent run requires at least one identity_id')
   if (identityIds.length > 64) throw new Error('agent run supports at most 64 identities')
   const prompt = requiredPrompt(value.prompt, 'agent run requires "prompt"')
   const effort = optionalString(value.effort)
-  return { identityIds, prompt, ...(effort ? { effort } : {}) }
+  return { identityIds, prompt, ...(effort ? { effort } : {}), ...(sessionId ? { sessionId } : {}) }
 }
 
 export function parseAgentFollowUpRequest(raw: unknown): AgentFollowUpRequest {

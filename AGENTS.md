@@ -57,6 +57,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 
 ## 验证与发布
 
+- Agent 功能的真实调用、续跑和 smoke 测试默认选 GLM Flash；每次先查询实时身份目录，选择 `ready` 项并沿用目录默认 effort。用户明确指定其他模型时按该次要求；GLM Flash 不可用时报告问题，不自动换模型。
 - 源码变更运行 `bun run typecheck` 和 `bun test`。构建入口、CLI、依赖或发布路径变更再运行 `bun run build`。
 - 共享 Session、Card Kit、飞书协议和持久状态变更最终跑全量测试。双后端接口变更覆盖 Codex、Claude、provider/source 切换和共享卡片。
 - 真实飞书、Agent 登录、Card action、建群/解散和 worktree smoke 需要明确目标群、账号及副作用；涉及 live daemon 仍按上节授权。

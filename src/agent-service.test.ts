@@ -182,6 +182,130 @@ describe('AgentService', () => {
     expect(calls).toEqual([{ prompt: 'first', resume: undefined }, { prompt: 'second', resume: 'sid-first' }])
   })
 
+  for (const provider of ['codex', 'claude', 'dsh'] as const) {
+    test(`${provider}: continues by session id for three turns including reloaded history`, async () => {
+      const selected = { ...identity(provider), provider }
+      const calls: Array<{ prompt: string; resume?: string; identity: string; effort: string }> = []
+      const startWorker: AgentServiceDeps['startWorker'] = opts => {
+        calls.push({ prompt: opts.prompt, resume: opts.resumeSessionId, identity: opts.identity.id, effort: opts.effort })
+        return resolvedHandle(result(opts.resumeSessionId ?? `sid-${provider}`, `reply: ${opts.prompt}`))
+      }
+      const { service, root } = harness({ identities: [selected], startWorker })
+      const first = await service.startRun(root, { identityIds: [selected.id], prompt: 'first' })
+      const firstResult = await waitFor(service, root, first.runId, 'completed')
+      const sessionId = firstResult.workers[0]!.sessionId!
+      const second = await service.startRun(root, { identityIds: [], sessionId, prompt: '  second\n', effort: 'low' })
+      const secondResult = await waitFor(service, root, second.runId, 'completed')
+      expect(secondResult).toMatchObject({ parentRunId: first.runId, parentKind: 'follow_up' })
+      expect(secondResult.workers[0]).toMatchObject({ sessionId, output: 'reply:   second\n', effort: 'low' })
+      expect(service.getRun(root, first.runId).workers[0]!.output).toBe('reply: first')
+
+      // Disk enumeration is not chronological. Lineage must win even with equal timestamps.
+      const history = [secondResult, firstResult].map(run => ({ ...run, createdAt: '2026-09-01T00:00:00Z' }))
+      const reloaded = harness({ identities: [selected], startWorker, loadArtifacts: () => history })
+      const third = await reloaded.service.startRun(reloaded.root, { identityIds: [], sessionId, prompt: 'third' })
+      const terminal = await waitFor(reloaded.service, reloaded.root, third.runId, 'completed')
+      expect(terminal).toMatchObject({ parentRunId: second.runId, parentKind: 'follow_up' })
+      expect(terminal.workers[0]).toMatchObject({ sessionId, effort: 'low', output: 'reply: third' })
+      expect(new Set([first.runId, second.runId, third.runId]).size).toBe(3)
+      expect(calls).toEqual([
+        { prompt: 'first', resume: undefined, identity: selected.id, effort: 'max' },
+        { prompt: '  second\n', resume: sessionId, identity: selected.id, effort: 'low' },
+        { prompt: 'third', resume: sessionId, identity: selected.id, effort: 'low' },
+      ])
+    })
+  }
+
+  test('resolves the right worker in a parallel run and rejects inaccessible or mismatched sessions', async () => {
+    let starts = 0
+    let cards = 0
+    const { service, root } = harness({
+      identities: [identity('a'), identity('b')],
+      sendCard: async () => `card-${++cards}`,
+      startWorker: opts => { starts++; return resolvedHandle(result(opts.resumeSessionId ?? `sid-${opts.identity.id}`)) },
+    })
+    const first = await service.startRun(root, { identityIds: ['agent:a', 'agent:b'], prompt: 'first' })
+    await waitFor(service, root, first.runId, 'completed')
+    for (const request of [
+      { identityIds: [], sessionId: 'missing', prompt: 'next' },
+      { identityIds: ['agent:b'], sessionId: 'sid-agent:a', prompt: 'next' },
+    ]) await expect(service.startRun(root, request)).rejects.toThrow('agent session not found')
+    for (const other of [{ chatId: 'other-chat' }, { sessionName: 'other-session' }, { workDir: '/other-repo' }]) {
+      const outsider = service.rootPrincipal({ ...session, ...other })
+      await expect(service.startRun(outsider, { identityIds: [], sessionId: 'sid-agent:a', prompt: 'next' }))
+        .rejects.toThrow('agent session not found')
+    }
+    expect(starts).toBe(2)
+    expect(cards).toBe(1)
+    const next = await service.startRun(root, { identityIds: [], sessionId: 'sid-agent:b', prompt: 'second' })
+    const terminal = await waitFor(service, root, next.runId, 'completed')
+    expect(terminal.workers).toHaveLength(1)
+    expect(terminal.workers[0]).toMatchObject({ identityId: 'agent:b', sessionId: 'sid-agent:b' })
+  })
+
+  test('rejects concurrent continuation during card creation and while the native session is running', async () => {
+    let enterCard!: () => void
+    let releaseCard!: () => void
+    const entered = new Promise<void>(resolve => { enterCard = resolve })
+    const released = new Promise<void>(resolve => { releaseCard = resolve })
+    const control = controlledHandle()
+    let cards = 0
+    let starts = 0
+    const { service, root } = harness({
+      sendCard: async () => {
+        if (++cards === 2) { enterCard(); await released }
+        return `message-${cards}`
+      },
+      startWorker: opts => ++starts === 2 ? control.handle : resolvedHandle(result(opts.resumeSessionId ?? 'sid')),
+    })
+    try {
+      const first = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'first' })
+      await waitFor(service, root, first.runId, 'completed')
+      const creating = service.startRun(root, { identityIds: [], sessionId: 'sid', prompt: 'second' })
+      await entered
+      await expect(service.followUp(root, first.runId, { prompt: 'duplicate' })).rejects.toThrow('already running or starting')
+      expect(cards).toBe(2)
+      releaseCard()
+      const second = await creating
+      await waitFor(service, root, second.runId, 'running')
+      await expect(service.followUp(root, first.runId, { prompt: 'still duplicate' })).rejects.toThrow('already running or starting')
+      await expect(service.startRun(root, { identityIds: [], sessionId: 'sid', prompt: 'too early' })).rejects.toThrow('terminal source run')
+      control.resolve(result('sid'))
+      await waitFor(service, root, second.runId, 'completed')
+      const third = await service.startRun(root, { identityIds: [], sessionId: 'sid', prompt: 'third' })
+      await waitFor(service, root, third.runId, 'completed')
+      expect(starts).toBe(3)
+    } finally { releaseCard(); await service.shutdown('test cleanup') }
+  })
+
+  test('releases a continuation reservation after card failure and rejects identity drift', async () => {
+    let cards = 0
+    let starts = 0
+    const selected = identity('a')
+    const { service, root } = harness({
+      identities: [selected], sendCard: async () => ++cards === 2 ? null : `message-${cards}`,
+      startWorker: opts => { starts++; return resolvedHandle(result(opts.resumeSessionId ?? 'sid')) },
+    })
+    const first = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'first' })
+    await waitFor(service, root, first.runId, 'completed')
+    await expect(service.startRun(root, { identityIds: [], sessionId: 'sid', prompt: 'second' })).rejects.toThrow('card creation failed')
+    for (const field of ['model', 'tokenSourceId', 'provider'] as const) {
+      const original = selected[field]
+      Object.assign(selected, { [field]: field === 'provider' ? 'codex' : 'changed' })
+      await expect(service.startRun(root, { identityIds: [], sessionId: 'sid', prompt: 'wrong identity' }))
+        .rejects.toThrow('identity changed')
+      Object.assign(selected, { [field]: original })
+    }
+    selected.status = 'catalog_failed'
+    await expect(service.startRun(root, { identityIds: [], sessionId: 'sid', prompt: 'unavailable' })).rejects.toThrow('catalog_failed')
+    selected.status = 'ready'
+    expect(starts).toBe(1)
+    expect(cards).toBe(2)
+    const second = await service.startRun(root, { identityIds: [], sessionId: 'sid', prompt: 'second' })
+    await waitFor(service, root, second.runId, 'completed')
+    expect(starts).toBe(2)
+  })
+
   test('delegated capabilities cannot create tasks or use follow-up to delegate again', async () => {
     const control = controlledHandle()
     let capability = ''
@@ -200,6 +324,8 @@ describe('AgentService', () => {
       for (let i = 0; i < 50 && !capability; i++) await new Promise(resolve => setTimeout(resolve, 1))
       const worker = service.principalForCapability(capability)!
       await expect(service.startRun(worker, { identityIds: ['agent:a'], prompt: 'nested' }))
+        .rejects.toThrow('cannot delegate again')
+      await expect(service.startRun(worker, { identityIds: [], sessionId: 'sid', prompt: 'nested resume' }))
         .rejects.toThrow('cannot delegate again')
       await expect(service.followUp(worker, parent.runId, { prompt: 'nested follow-up' }))
         .rejects.toThrow('cannot delegate again')
