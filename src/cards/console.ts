@@ -11,6 +11,9 @@ import type { GlmUsageSnapshot } from '../glm-usage'
 import type { UsageSnapshotUnified, TokenSourceModelCatalogState } from '../token-source'
 import type { AgentProvider } from '../agent-process'
 import { ELEMENTS } from './elements'
+import { fmtResetIn, usageWindowElements } from './usage'
+
+export { fmtResetIn } from './usage'
 
 export interface ConsoleOpts {
   sessionName: string
@@ -19,7 +22,7 @@ export interface ConsoleOpts {
   model?: string
   effort?: string
   worktreeInstructionNotice?: string | null
-  /** All sessions currently running Codex across every Feishu group
+  /** All sessions currently running across every Feishu group
    * this daemon owns. Each entry is a sibling project. Empty/undefined
    * → 渲染 `_无_`。The session matching this card's chat is
    * flagged `isCurrent` so the row can be marked. */
@@ -28,6 +31,8 @@ export interface ConsoleOpts {
     isCurrent: boolean
     status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
     uptimeMs?: number
+    /** Actual live Codex process account, independent of the next-start selection. */
+    codexAccountName?: string
   }>
   /** Subscription usage snapshot from Codex app-server. Undefined → omit row.
    * 仅 codex 后端渲染;claude/GLM 后端走 glmUsage。 */
@@ -151,18 +156,6 @@ function fmtUptime(ms: number): string {
   if (h < 24) return `${h}h ${m}m`
   const d = Math.floor(h / 24)
   return `${d}d ${h % 24}h`
-}
-
-/** Human-readable "time until" — null/past dates collapse to '已重置'.
- * h/d 段保留 1 位小数(`2.3h` / `5.4d`),m 段已经是整数分钟精度
- * 够细就不再加小数。 */
-export function fmtResetIn(date: Date | null): string {
-  if (!date) return '?'
-  const ms = date.getTime() - Date.now()
-  if (ms <= 0) return '已重置'
-  if (ms < 60 * 60 * 1000) return `${Math.max(1, Math.round(ms / 60_000))}m`
-  if (ms < 24 * 60 * 60 * 1000) return `${(ms / (60 * 60 * 1000)).toFixed(1)}h`
-  return `${(ms / (24 * 60 * 60 * 1000)).toFixed(1)}d`
 }
 
 const PEER_STATUS_EMOJI: Record<string, string> = {
@@ -353,7 +346,8 @@ export function consoleMainContent(opts: ConsoleOpts): string {
     const label = PEER_STATUS_LABEL[p.status] ?? p.status
     const up = p.uptimeMs != null && p.uptimeMs > 0 ? ` · ${fmtUptime(p.uptimeMs)}` : ''
     const mark = p.isCurrent ? ' · 当前' : ''
-    return `　· ${dot} \`${p.name}\` · ${label}${up}${mark}`
+    const account = p.codexAccountName === undefined ? '' : ` · Codex：${inlineCode(escapeMarkdown(p.codexAccountName))}`
+    return `　· ${dot} \`${p.name}\` · ${label}${up}${mark}${account}`
   }).join('\n')
 }
 
@@ -436,21 +430,39 @@ function usageWindowSummary(w: UsageSnapshotUnified['windows'][number]): string 
 
 export function consoleUnifiedUsageContent(snap: UsageSnapshotUnified | undefined): string {
   const summary = snap?.state === 'ok' && snap.kind !== 'balance' && !snap.quota && snap.windows.length
-    ? ['**📊 额度**', ...snap.windows.map(usageWindowSummary)].join('\n')
+    ? ['**📊 额度**', ...snap.windows.flatMap(w => usageWindowElements(w, w.label).map(element => element.content))].join('\n')
     : unifiedUsageSummary(snap).replace(/^(额度|余额)/, '**📊 $1**')
-  const resetCards = snap?.resetCredits === undefined ? ''
-    : `\n**重置卡**　${snap.resetCredits === null ? 'MISS' : `${snap.resetCredits} 次可用`}`
-  return summary + resetCards
+  const resetCards = consoleResetCreditsContent(snap)
+  return resetCards ? `${summary}\n${resetCards}` : summary
 }
 
-/** 订阅额度行:有 unifiedUsage(tokenSource.readUsage)优先统一渲染;
- * 否则按 provider 二元回退 Codex/GLM(兼容未配 token source 的旧路径)。 */
+function consoleResetCreditsContent(snap: UsageSnapshotUnified | undefined): string {
+  return snap?.resetCredits === undefined ? ''
+    : `**重置卡**　${snap.resetCredits === null ? 'MISS' : `${snap.resetCredits} 次可用`}`
+}
+
+/** Window quotas share the account card's bar style; each window gets its own row. */
 export function consoleUsageElement(opts: ConsoleOpts): object {
-  const content = consoleUnifiedUsageContent(opts.unifiedUsage)
+  const snap = opts.unifiedUsage
+  if (snap?.state === 'ok' && snap.kind !== 'balance' && !snap.quota && snap.windows.length) {
+    const elements: object[] = []
+    for (const window of snap.windows) {
+      if (elements.length) elements.push({ tag: 'hr' })
+      elements.push(...usageWindowElements(window, window.label))
+    }
+    const resetCards = consoleResetCreditsContent(snap)
+    if (resetCards) elements.push({ tag: 'hr' }, { tag: 'markdown', content: resetCards })
+    return {
+      tag: 'collapsible_panel', element_id: ELEMENTS.consoleUsage, expanded: true,
+      header: { title: { tag: 'plain_text', content: '📊 额度' }, background_color: 'blue-50' },
+      border: { color: 'blue-100', corner_radius: '8px' }, padding: '12px', vertical_spacing: '4px',
+      elements,
+    }
+  }
   return {
     tag: 'markdown',
     element_id: ELEMENTS.consoleUsage,
-    content,
+    content: consoleUnifiedUsageContent(snap),
   }
 }
 

@@ -38,6 +38,8 @@ export interface UsageWindowUnified {
   resetsAt: Date | null
   used?: number
   total?: number
+  /** Successful Plus response omitted 5h; preserve the full-window annotation without inventing a reset time. */
+  unreportedFull?: boolean
 }
 
 export type UsageStateUnified =

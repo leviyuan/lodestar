@@ -1,18 +1,58 @@
 import { describe, expect, test } from 'bun:test'
-import { consoleUnifiedUsageContent, unifiedUsageSummary } from './console'
+import { consoleUnifiedUsageContent, consoleUsageElement, unifiedUsageSummary } from './console'
 
 describe('consoleUnifiedUsageContent(额度渲染)', () => {
-  test('额度标题、各个窗口和重置卡分行，footer 摘要仍保持单行', () => {
+  test('hi uses the account bar style in separate window rows and keeps reset credits separate', () => {
     const snapshot = { state: 'ok' as const, resetCredits: 0, windows: [
       { kind: 'weekly', label: '默认配额 周', percent: 24, resetsAt: null },
       { kind: 'fiveHour', label: 'GPT-5.3-Codex-Spark 5h', percent: 11, resetsAt: null },
       { kind: 'weekly', label: 'GPT-5.3-Codex-Spark 周', percent: 25, resetsAt: null },
     ] }
-    expect(consoleUnifiedUsageContent(snapshot).split('\n')).toEqual([
-      '**📊 额度**', '默认配额 周 已用 24%', 'GPT-5.3-Codex-Spark 5h 已用 11%',
-      'GPT-5.3-Codex-Spark 周 已用 25%', '**重置卡**　0 次可用',
+    const panel = consoleUsageElement({ sessionName: 'test', status: 'idle', unifiedUsage: snapshot }) as any
+    expect(panel.element_id).toBe('console_usage')
+    expect(panel.tag).toBe('collapsible_panel')
+    expect(panel.expanded).toBe(true)
+    expect(panel.header.title.content).toBe('📊 额度')
+    expect(panel.header.background_color).toBe('blue-50')
+    expect(panel.elements.filter((e: any) => e.tag === 'markdown' && e.content.startsWith('**')).map((e: any) => e.content)).toEqual([
+      "**默认配额 周 · 24%**\n<font color='green'>▰▱▱▱▱▱</font>",
+      "**GPT-5.3-Codex-Spark 5h · 11%**\n<font color='green'>▰▱▱▱▱▱</font>",
+      "**GPT-5.3-Codex-Spark 周 · 25%**\n<font color='green'>▰▰▱▱▱▱</font>",
+      '**重置卡**　0 次可用',
     ])
+    expect(panel.elements.filter((e: any) => e.tag === 'hr')).toHaveLength(3)
+    expect(JSON.stringify(panel)).toContain('重置时间 MISS')
     expect(unifiedUsageSummary(snapshot)).not.toContain('\n')
+    expect(unifiedUsageSummary(snapshot)).not.toContain('▰')
+  })
+
+  test('quota colors, countdowns and missing data remain distinct', () => {
+    for (const [percent, bar] of [
+      [0, "<font color='green'>▱▱▱▱▱▱</font>"],
+      [50, "<font color='green'>▰▰▰▱▱▱</font>"],
+      [80, "<font color='orange'>▰▰▰▰▰▱</font>"],
+      [100, "<font color='red'>▰▰▰▰▰▰</font>"],
+    ] as const) {
+      const content = consoleUnifiedUsageContent({ state: 'ok', windows: [
+        { kind: 'fiveHour', label: '5h', percent, resetsAt: new Date(Date.now() + 4 * 3600_000) },
+      ] })
+      expect(content).toContain(bar)
+      expect(content).toContain('4.0h 重置')
+    }
+    for (const percent of [null, NaN, -1, 101]) {
+      const content = consoleUnifiedUsageContent({ state: 'ok', windows: [
+        { kind: 'fiveHour', label: '5h', percent, resetsAt: null },
+      ] })
+      expect(content).toContain('5h · MISS')
+      expect(content).not.toContain('▰')
+      expect(content).not.toContain('▱')
+    }
+    const failed = consoleUsageElement({ sessionName: 'test', status: 'idle', unifiedUsage: {
+      state: 'network', resetCredits: null, windows: [{ kind: 'fiveHour', label: 'stale', percent: 0, resetsAt: null }],
+    } }) as any
+    expect(failed.element_id).toBe('console_usage')
+    expect(failed.content).toBe('**📊 额度** MISS\n**重置卡**　MISS')
+    expect(failed.content).not.toContain('stale')
   })
 
   test('Codex reset credits appear in hi, including zero, without changing the footer summary', () => {

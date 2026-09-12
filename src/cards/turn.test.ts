@@ -206,6 +206,12 @@ describe('main conversation card rendering', () => {
     expect(card.body.elements[0].content).not.toContain('restart')
   })
 
+  test('standalone hi elements satisfy the Card Kit 20-character ID limit', () => {
+    const elements = consoleBodyElements({ sessionName: 'probe', status: 'idle' }) as any[]
+    for (const element of elements) expect(element.element_id).toMatch(/^[A-Za-z][A-Za-z0-9_]{0,19}$/)
+    expect(new Set(elements.map(element => element.element_id)).size).toBe(elements.length)
+  })
+
   test('console body can replace a status card footer in place', () => {
     const elements = consoleBodyElements({
       sessionName: 'probe',
@@ -218,6 +224,7 @@ describe('main conversation card rendering', () => {
         isCurrent: true,
         status: 'working',
         uptimeMs: 65_000,
+        codexAccountName: '工作订阅',
       }],
       sysinfo: {
         cpu: { cores: 8, load1: 0.42, load5: 0.37, load15: 0.29 },
@@ -252,6 +259,7 @@ describe('main conversation card rendering', () => {
     expect(elements[1].expanded).toBe(false)
     expect(elements[1].header.title.content).toBe('🗂 活跃项目 (1)')
     expect(elements[1].elements[0].content).toContain('`probe` · 工作中 · 1m · 当前')
+    expect(elements[1].elements[0].content).toContain(' · Codex：`工作订阅`')
     expect(elements[1].elements[0].content).not.toContain('gpt-5-codex')
 
     expect(elements[2].element_id).toBe('console_host')

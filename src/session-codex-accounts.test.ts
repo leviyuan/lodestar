@@ -187,6 +187,33 @@ describe('bare Codex account commands', () => {
     expect(suffix).not.toContain('份额')
   })
 
+  test('hi peer account names follow the live Codex process, including automatic switches', () => {
+    const active = store.ensure('实际账号')
+    const pending = store.ensure('下次账号')
+    const s = session()
+    const proc = new Proc() as any; procs.push(proc)
+    s.proc = proc
+    proc.codexAccountSelectionMode = () => null
+    expect(s.peerSnapshot().codexAccountName).toBeUndefined()
+    proc.codexAccountSelectionMode = () => 'automatic'
+    bindProcessCodexAccount(proc, active.id)
+    store.select(s.sessionName, pending.id)
+    expect(s.peerSnapshot().codexAccountName).toBe('实际账号')
+    bindProcessCodexAccount(proc, 'default')
+    expect(s.peerSnapshot().codexAccountName).toBe('默认')
+    proc.turnRetry = { reason: 'quota', phase: 'waiting' }
+    expect(s.peerSnapshot().codexAccountName).toBeUndefined()
+    proc.turnRetry = null
+    for (const provider of ['claude', 'dsh']) {
+      proc.provider = provider
+      expect(s.peerSnapshot().codexAccountName).toBeUndefined()
+    }
+    proc.provider = 'codex'
+    proc.alive = false
+    expect(s.peerSnapshot().codexAccountName).toBeUndefined()
+    proc.alive = true
+  })
+
   test('only codex-prefixed commands enter account management', async () => {
     const s = session()
     const dispatch = spyOn(accountCommands, 'runCodexAccountCommand').mockResolvedValue(undefined)

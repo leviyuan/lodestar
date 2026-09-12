@@ -1,7 +1,6 @@
 import type { CodexUsageTotal } from '../codex-account-usage'
-import type { UsageWindow } from '../usage'
 import { ELEMENTS } from './elements'
-import { fmtResetIn } from './console'
+import { usageWindowElements } from './usage'
 import type { CodexAccountCandidate } from '../codex-account-scheduler'
 
 export type CodexAccountPhase = 'connecting' | 'waiting' | 'checking' | 'success' | 'selected' | 'current' | 'accounts' | 'deleted' | 'cancelled' | 'expired' | 'error' | 'warning'
@@ -76,6 +75,19 @@ export function codexAccountPanel(view: CodexAccountCardView): object {
   if (view.plan || view.email) elements.push(md([view.plan?.toUpperCase(), view.email].filter(Boolean).map(value => text(value!)).join(' · ')))
   if (view.message) elements.push(md(text(view.message)))
   if (view.total) elements.push(...accountRows(view))
+  if (view.phase === 'accounts') elements.push({ tag: 'collapsible_panel', expanded: true,
+    header: { title: { tag: 'plain_text', content: '⌨️ Codex 命令' }, background_color: 'grey-50' },
+    border: { color: 'grey-100', corner_radius: '8px' }, padding: '8px', elements: [md([
+      '`hi` · 打开控制台；未运行时启动',
+      '`hi 备注` · 本次指定账号；换号时重启并续跑',
+      '`codex-login [备注]` · 设备码登录；省略备注为默认账号',
+      '`codex-login-cancel [备注]` · 取消本人在本群的登录；仅一个任务时可省略备注',
+      '`codex-accounts [页码]` · 查看账号、额度与调度顺序',
+      '`codex-account` · 查看当前账号与下次启动策略',
+      '`codex-account 备注` · 持久指定账号，下次启动生效',
+      '`codex-auto` · 清除指定，下次启动自动选择',
+      '`codex-account-delete 备注` · 删除额外账号',
+    ].join('\n')), muted('备注可用 default 指定设备默认账号；默认账号不可删除。')] })
   if (view.hint) elements.push(muted(view.hint))
   if (view.details) elements.push({ tag: 'collapsible_panel', expanded: false,
     header: { title: { tag: 'plain_text', content: '查看详情' } }, elements: [md(text(view.details))] })
@@ -126,18 +138,10 @@ function accountRows(view: CodexAccountCardView): object[] {
     const plan = usage.subscriptionType === 'pro' ? 'Pro 20×' : usage.subscriptionType === 'prolite' ? 'Pro 5×'
       : usage.subscriptionType === 'plus' ? 'Plus 1×' : usage.subscriptionType ?? '套餐 MISS'
     row.push(muted(`${plan} · 重置卡 ${usage.resetCredits ?? 'MISS'}`))
-    const windows = [windowCard(usage.fiveHour, '5h'), windowCard(usage.weekly, '周')].filter((w): w is object[] => w !== null)
+    const windows = ([[usage.fiveHour, '5h'], [usage.weekly, '周']] as const)
+      .flatMap(([window, label]) => window ? [usageWindowElements(window, label)] : [])
     if (windows.length) row.push(columns(windows))
   }
   if (pages > 1) elements.push(muted(`${page}/${pages} 页 · ${page < pages ? `下一页 codex-accounts ${page + 1}` : '首页 codex-accounts'}`))
   return elements
-}
-function windowCard(window: UsageWindow | null, label: string): object[] | null {
-  if (!window) return null
-  const value = window.percent
-  if (value === null || !Number.isFinite(value) || value < 0 || value > 100) return [md(`**${label} · MISS**`)]
-  const filled = Math.round(value / 100 * 6)
-  const color = value >= 100 ? 'red' : value >= 80 ? 'orange' : 'green'
-  return [md(`**${label} · ${Math.round(value)}%**\n<font color='${color}'>${'▰'.repeat(filled)}${'▱'.repeat(6 - filled)}</font>`),
-    muted(window.unreportedFull ? '满窗 · 0.15 份' : window.resetsAt ? `${fmtResetIn(window.resetsAt)} 重置` : '重置时间 MISS')]
 }

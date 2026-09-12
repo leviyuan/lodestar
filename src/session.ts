@@ -562,11 +562,15 @@ export class Session {
 
   /** Minimal cross-chat snapshot for the `hi` peer-list section.
    * `startedAt` stays private so this is the documented read path. */
-  peerSnapshot(): { name: string; status: Status; uptimeMs?: number } {
+  peerSnapshot(): { name: string; status: Status; uptimeMs?: number; codexAccountName?: string } {
     return {
       name: this.sessionName,
       status: this.status,
       uptimeMs: this.startedAt ? (Date.now() - this.startedAt) : undefined,
+      ...(this.proc?.isAlive() && this.proc.provider === 'codex'
+        && this.proc.codexAccountSelectionMode?.() !== null
+        && !(this.proc.turnRetry?.reason === 'quota' && this.proc.turnRetry.phase === 'waiting')
+        ? { codexAccountName: codexAccounts.get(processCodexAccount(this.proc)).name } : {}),
     }
   }
 

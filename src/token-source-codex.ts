@@ -26,7 +26,8 @@ import { withModelVisibility } from './token-source-visibility'
 type Env = Record<string, string | undefined>
 
 function windowToUnified(w: UsageWindow, kind: string, label: string): UsageWindowUnified {
-  return { kind, label, percent: w.percent, resetsAt: w.resetsAt }
+  return { kind, label, percent: w.percent, resetsAt: w.resetsAt,
+    ...(w.unreportedFull === undefined ? {} : { unreportedFull: w.unreportedFull }) }
 }
 
 function codexUsageToUnified(s: UsageSnapshot): UsageSnapshotUnified {

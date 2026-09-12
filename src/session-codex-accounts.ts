@@ -88,8 +88,7 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
         fingerprint: c.identity.startsWith('record:') ? null : c.identity }] : []))
       await card.finish({ phase: 'accounts', total, currentId: s.codexAccountId(),
         ...(codexAccounts.preferred(s.sessionName) ? { selectedId: codexAccounts.selected(s.sessionName) } : {}), page,
-        scheduling: { candidates: decision.candidates, ultra: effort === 'ultra' },
-        hint: '指定：hi 备注 · 删除：codex-account-delete 备注' })
+        scheduling: { candidates: decision.candidates, ultra: effort === 'ultra' } })
       return
     }
     if (command === 'auto') {

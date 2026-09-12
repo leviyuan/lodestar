@@ -1,4 +1,17 @@
 import { expect, test } from 'bun:test'
+import { codexBucketsToUnified } from './token-source-codex'
+import { consoleUnifiedUsageContent } from './cards/console'
+
+test('hi preserves a Plus full-window annotation through unified bucket conversion', () => {
+  const windows = codexBucketsToUnified({ state: 'ok', fiveHour: null, weekly: null, fetchedAt: 1,
+    defaultLimitId: 'codex', buckets: [{ limitId: 'codex', limitName: null, weekly: null,
+      fiveHour: { percent: 0, resetsAt: null, unreportedFull: true } }],
+  })!
+  expect(windows[0]).toMatchObject({ label: '默认配额 5h', percent: 0, resetsAt: null, unreportedFull: true })
+  const content = consoleUnifiedUsageContent({ state: 'ok', windows })
+  expect(content).toContain('满窗 · 0.15 份')
+  expect(content).not.toContain('重置')
+})
 
 test('native default auth works without auth.json while missing named credentials remain isolated', () => {
   const script = `
