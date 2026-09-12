@@ -24,6 +24,8 @@ import type { Session } from './session'
 import type { AgentReasoningEffort } from './agent-process'
 
 const GLOBAL_AGENT_CONCURRENCY = 8
+// Local delegation policy, not an upstream API quota. Shared across all Sessions/models.
+const TOKEN_SOURCE_AGENT_CONCURRENCY = new Map<string, number>([['openrouter', 2]])
 const NESTED_DELEGATION_ERROR = 'Delegated Agents cannot delegate again; ask the main Agent to assign additional work.'
 const MAX_RETAINED_RUNS = 512
 const MAX_WORKER_STEPS = 50
@@ -39,7 +41,7 @@ interface AgentRunRecord {
   session: Session | null
   cardId: string | null
   handles: Map<string, AgentWorkerHandle>
-  slotOwners: Set<string>
+  slotOwners: Map<string, string>
   capabilityByIdentity: Map<string, string>
   progressTimers: Map<string, ReturnType<typeof setTimeout>>
   children: Set<string>
@@ -96,7 +98,8 @@ export class AgentService {
   private readonly runs = new Map<string, AgentRunRecord>()
   private readonly capabilities = new Map<string, AgentPrincipal>()
   private activeTurns = 0
-  private readonly slotWaiters: Array<() => void> = []
+  private readonly activeTurnsBySource = new Map<string, number>()
+  private readonly slotWaiters: Array<{ tokenSourceId: string; resolve: () => void }> = []
   private readonly cancellationEpochBySession = new Map<string, number>()
   private startingWorkers = 0
   private readonly startingRunsBySession = new Map<string, number>()
@@ -277,7 +280,7 @@ export class AgentService {
       session,
       cardId,
       handles: new Map(),
-      slotOwners: new Set(),
+      slotOwners: new Map(),
       capabilityByIdentity: new Map(),
       progressTimers: new Map(),
       children: new Set(),
@@ -319,12 +322,12 @@ export class AgentService {
     resumeSessionId?: string,
   ): Promise<void> {
     const worker = run.snapshot.workers.find(item => item.identityId === identity.id)!
-    await this.acquireSlot(() => {
-      worker.queuedReason = `等待执行名额（最多同时运行 ${GLOBAL_AGENT_CONCURRENCY} 个 Agent）`
+    await this.acquireSlot(identity, reason => {
+      worker.queuedReason = reason
       this.persist(run)
       void this.updateWorkerCard(run, worker)
     })
-    run.slotOwners.add(identity.id)
+    run.slotOwners.set(identity.id, identity.tokenSourceId)
     if (run.cancelled) {
       this.releaseWorkerSlot(run, identity.id)
       return
@@ -697,23 +700,42 @@ export class AgentService {
     this.cancellationEpochBySession.set(key, (this.cancellationEpochBySession.get(key) ?? 0) + 1)
   }
 
-  private acquireSlot(onQueued: () => void): Promise<void> {
-    if (this.activeTurns < GLOBAL_AGENT_CONCURRENCY) {
-      this.activeTurns++
-      return Promise.resolve()
-    }
-    onQueued()
-    return new Promise(resolve => this.slotWaiters.push(resolve))
+  private tryAcquireSlot(tokenSourceId: string): boolean {
+    const sourceLimit = TOKEN_SOURCE_AGENT_CONCURRENCY.get(tokenSourceId)
+    const sourceTurns = this.activeTurnsBySource.get(tokenSourceId) ?? 0
+    if (this.activeTurns >= GLOBAL_AGENT_CONCURRENCY
+      || (sourceLimit !== undefined && sourceTurns >= sourceLimit)) return false
+    this.activeTurns++
+    this.activeTurnsBySource.set(tokenSourceId, sourceTurns + 1)
+    return true
   }
 
-  private releaseSlot(): void {
-    const next = this.slotWaiters.shift()
-    if (next) { next(); return }
+  private acquireSlot(identity: AgentIdentity, onQueued: (reason: string) => void): Promise<void> {
+    if (this.tryAcquireSlot(identity.tokenSourceId)) return Promise.resolve()
+    const sourceLimit = TOKEN_SOURCE_AGENT_CONCURRENCY.get(identity.tokenSourceId)
+    onQueued(sourceLimit !== undefined
+      ? `等待 ${identity.tokenSourceDisplay} 执行名额（同一来源最多同时运行 ${sourceLimit} 个 Agent）`
+      : `等待执行名额（最多同时运行 ${GLOBAL_AGENT_CONCURRENCY} 个 Agent）`)
+    return new Promise(resolve => this.slotWaiters.push({ tokenSourceId: identity.tokenSourceId, resolve }))
+  }
+
+  private releaseSlot(tokenSourceId: string): void {
     this.activeTurns--
+    decrementMap(this.activeTurnsBySource, tokenSourceId)
+    // A saturated source must not block other sources from using free global slots.
+    for (let i = 0; i < this.slotWaiters.length && this.activeTurns < GLOBAL_AGENT_CONCURRENCY;) {
+      const next = this.slotWaiters[i]!
+      if (!this.tryAcquireSlot(next.tokenSourceId)) { i++; continue }
+      this.slotWaiters.splice(i, 1)
+      next.resolve()
+    }
   }
 
   private releaseWorkerSlot(run: AgentRunRecord, identityId: string): void {
-    if (run.slotOwners.delete(identityId)) this.releaseSlot()
+    const tokenSourceId = run.slotOwners.get(identityId)
+    if (tokenSourceId === undefined) return
+    run.slotOwners.delete(identityId)
+    this.releaseSlot(tokenSourceId)
   }
 
   private loadDurableRuns(): void {
@@ -736,7 +758,7 @@ export class AgentService {
         session: null,
         cardId: null,
         handles: new Map(),
-        slotOwners: new Set(),
+        slotOwners: new Map(),
         capabilityByIdentity: new Map(),
         progressTimers: new Map(),
         children: new Set(),

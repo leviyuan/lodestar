@@ -29,7 +29,7 @@
 - `agent-*` 提供单层模型委派。只有主 Agent 能发起任务或续跑；同一任务的多个身份放在一个 run 内并发。被委派的 Agent 自行完成任务，需要额外派工时报告主 Agent。
 - 共用 `agent-launch.ts` 的 coding-agent 启动入口。主会话保留原生能力；委派进程只关闭继续委派的工具（Codex `multi_agent`、Claude `Agent`/`Task`），其余代码工具、MCP、Skill、模型与 effort 保持不变。
 - 每个 worker 获得独立、可撤销的 `LODESTAR_AGENT_*` capability，运行时拒绝其再次发起任务或续跑；Skill 与 worker 提示词同步声明禁止继续委派。历史父子记录仍可读取和清理。
-- 委派任务统一按全局并发槽排队并显示原因。取消未确认的进程必须继续保留 handle 与槽位，失败向 Session 传播，不能标成已取消后丢掉控制权。
+- 委派任务按全局 8 个并发槽和 Token Source 上限排队并显示原因；OpenRouter 在同一 daemon 的所有项目、模型间共用 2 个委派名额，这是本地策略而非上游额度。满额来源不得堵住其他来源。取消未确认的进程必须继续保留 handle 与槽位，失败向 Session 传播，不能标成已取消后丢掉控制权。
 - 提问进入 `needs_input`，answer 后恢复；非输入权限请求放行。委派任务不设整轮时长上限，不截断返回正文，结束由后端终态或用户取消决定；follow-up 复用 provider 原生 session。
 - 每次状态转换原子落盘；大 prompt/输出单独存入私有 artifact，快照不重复内嵌。委派 session id 单独登记，从主会话 `rs`/`fk` 历史排除。
 - 父 run 取消、Session stop/kill/restart 和 daemon shutdown 在首次 await 前关闭新建入口、吊销 capability，并递归回收后代进程。

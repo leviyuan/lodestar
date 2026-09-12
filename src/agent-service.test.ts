@@ -11,6 +11,10 @@ function identity(id: string, name = id): AgentIdentity {
   }
 }
 
+function openRouterIdentity(id: string): AgentIdentity {
+  return { ...identity(id), tokenSourceId: 'openrouter', tokenSourceDisplay: 'OpenRouter' }
+}
+
 const session = {
   sessionName: 'project', chatId: 'chat-1', workDir: '/repo',
   delegatedAgentDeveloperInstructions: () => '',
@@ -97,6 +101,14 @@ async function waitFor(
     await new Promise(resolve => setTimeout(resolve, 1))
   }
   throw new Error(`run ${runId} did not reach ${status}`)
+}
+
+async function waitForCondition(check: () => boolean): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    if (check()) return
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
+  throw new Error('Agent worker condition was not reached')
 }
 
 describe('AgentService', () => {
@@ -328,6 +340,168 @@ describe('AgentService', () => {
       for (let i = 0; i < 200 && controls.length < 9; i++) await new Promise(resolve => setTimeout(resolve, 1))
       expect(controls).toHaveLength(9)
     } finally {
+      await service.shutdown('test cleanup')
+    }
+  })
+
+  test('shares OpenRouter slots across projects and models without blocking other queued sources', async () => {
+    const router = ['router-a', 'router-b', 'router-c'].map(openRouterIdentity)
+    const others = Array.from({ length: 7 }, (_, i) => identity(`other-${i}`))
+    const controls = new Map<string, ReturnType<typeof controlledHandle>>()
+    const { service, root } = harness({
+      identities: [...router, ...others],
+      startWorker: opts => {
+        const control = controlledHandle()
+        controls.set(opts.identity.id, control)
+        return control.handle
+      },
+    })
+    const otherRoot = service.rootPrincipal({ ...session, sessionName: 'other-project', chatId: 'chat-2', workDir: '/other' })
+    try {
+      await service.startRun(root, { identityIds: router.slice(0, 2).map(item => item.id), prompt: 'first project' })
+      const queued = await service.startRun(otherRoot, {
+        identityIds: [router[2]!.id, ...others.map(item => item.id)], prompt: 'second project',
+      })
+      await waitForCondition(() => controls.size === 8)
+      const workers = service.getRun(otherRoot, queued.runId).workers
+      expect(workers[0]!.status).toBe('queued')
+      expect(workers[0]!.queuedReason).toContain('等待 OpenRouter 执行名额')
+      expect(workers.at(-1)!.status).toBe('queued')
+      expect(controls.has(router[2]!.id)).toBe(false)
+
+      controls.get(others[0]!.id)!.resolve(result('other-finished'))
+      await waitForCondition(() => controls.has(others[6]!.id))
+      expect(controls.has(router[2]!.id)).toBe(false)
+
+      controls.get(router[0]!.id)!.resolve(result('router-finished'))
+      await waitForCondition(() => controls.has(router[2]!.id))
+      expect(service.getRun(otherRoot, queued.runId).workers[0]!.queuedReason).toBeUndefined()
+    } finally {
+      await service.shutdown('test cleanup')
+    }
+  })
+
+  test.each(['completed', 'failed', 'cancelled'] as const)('releases OpenRouter slots after %s and skips cancelled queued tasks', async status => {
+    const identities = Array.from({ length: 4 }, (_, i) => openRouterIdentity(`router-${i}`))
+    const controls = new Map<string, ReturnType<typeof controlledHandle>>()
+    const { service, root } = harness({
+      identities,
+      startWorker: opts => {
+        const control = controlledHandle()
+        controls.set(opts.identity.id, control)
+        return control.handle
+      },
+    })
+    try {
+      const runs = []
+      for (const item of identities) runs.push(await service.startRun(root, { identityIds: [item.id], prompt: 'work' }))
+      await waitForCondition(() => controls.size === 2)
+      expect(service.getRun(root, runs[2]!.runId).status).toBe('queued')
+      expect(service.getRun(root, runs[3]!.runId).status).toBe('queued')
+      await service.cancelRun(root, runs[2]!.runId, 'cancel queued task')
+      const first = controls.get(identities[0]!.id)!
+      if (status === 'completed') first.resolve(result('first-finished'))
+      else if (status === 'failed') first.reject(new Error('upstream 429'))
+      else await service.cancelRun(root, runs[0]!.runId, 'cancel running task')
+      const terminal = await waitFor(service, root, runs[0]!.runId, status)
+      if (status === 'failed') expect(terminal.workers[0]!.error).toBe('upstream 429')
+      await waitForCondition(() => controls.has(identities[3]!.id))
+      expect(controls.has(identities[2]!.id)).toBe(false)
+      expect(controls.size).toBe(3)
+    } finally {
+      await service.shutdown('test cleanup')
+    }
+  })
+
+  test('keeps OpenRouter slots while waiting for input and queues native follow-ups', async () => {
+    const identities = ['router-a', 'router-b', 'router-c'].map(openRouterIdentity)
+    const controls = new Map<string, ReturnType<typeof controlledHandle>>()
+    let pending: any = null
+    let resumedSession: string | undefined
+    const { service, root } = harness({
+      identities,
+      startWorker: opts => {
+        if (opts.resumeSessionId) {
+          resumedSession = opts.resumeSessionId
+          return resolvedHandle(result(opts.resumeSessionId))
+        }
+        const control = controlledHandle()
+        controls.set(opts.identity.id, control)
+        if (opts.identity.id === identities[0]!.id) {
+          queueMicrotask(() => {
+            pending = { requestId: 'req-router', questions: [{ id: 'q1', question: 'Proceed?', options: [] }] }
+            opts.callbacks?.onNeedsInput?.(pending)
+          })
+          return {
+            ...control.handle,
+            pendingInput: () => pending,
+            answer: () => { pending = null; control.resolve(result('sid-router')) },
+          }
+        }
+        return control.handle
+      },
+    })
+    try {
+      const first = await service.startRun(root, { identityIds: [identities[0]!.id], prompt: 'ask if needed' })
+      await waitFor(service, root, first.runId, 'needs_input')
+      const second = await service.startRun(root, { identityIds: [identities[1]!.id], prompt: 'work' })
+      const third = await service.startRun(root, { identityIds: [identities[2]!.id], prompt: 'wait' })
+      await waitForCondition(() => controls.size === 2)
+      expect(service.getRun(root, third.runId).status).toBe('queued')
+      await service.answer(root, first.runId, { requestId: 'req-router', answers: { q1: 'yes' } })
+      await waitFor(service, root, first.runId, 'completed')
+      await waitForCondition(() => controls.size === 3)
+
+      const follow = await service.followUp(root, first.runId, { prompt: 'continue' })
+      expect(service.getRun(root, follow.runId).status).toBe('queued')
+      expect(resumedSession).toBeUndefined()
+      await service.cancelRun(root, second.runId, 'make room')
+      await waitFor(service, root, follow.runId, 'completed')
+      expect(resumedSession).toBe('sid-router')
+    } finally {
+      await service.shutdown('test cleanup')
+    }
+  })
+
+  test('retains an OpenRouter slot until cancellation confirms the process has stopped', async () => {
+    const identities = ['router-a', 'router-b', 'router-c'].map(openRouterIdentity)
+    const controls = new Map<string, ReturnType<typeof controlledHandle>>()
+    let alive = true
+    let rejectCancel = true
+    const { service, root } = harness({
+      identities,
+      startWorker: opts => {
+        const control = controlledHandle()
+        controls.set(opts.identity.id, control)
+        if (opts.identity.id !== identities[0]!.id) return control.handle
+        return {
+          ...control.handle,
+          isAlive: () => alive,
+          cancel: async () => {
+            if (rejectCancel) {
+              const error = new Error('kill was not confirmed')
+              control.reject(error)
+              throw error
+            }
+            alive = false
+          },
+        }
+      },
+    })
+    try {
+      const first = await service.startRun(root, { identityIds: [identities[0]!.id], prompt: 'work' })
+      await service.startRun(root, { identityIds: [identities[1]!.id], prompt: 'work' })
+      const third = await service.startRun(root, { identityIds: [identities[2]!.id], prompt: 'wait' })
+      await waitForCondition(() => controls.size === 2)
+      await expect(service.cancelRun(root, first.runId, 'stop')).rejects.toThrow('kill was not confirmed')
+      expect(service.getRun(root, third.runId).status).toBe('queued')
+      expect(controls.size).toBe(2)
+      rejectCancel = false
+      await service.cancelRun(root, first.runId, 'retry stop')
+      await waitForCondition(() => controls.size === 3)
+      expect(alive).toBe(false)
+    } finally {
+      rejectCancel = false
       await service.shutdown('test cleanup')
     }
   })
