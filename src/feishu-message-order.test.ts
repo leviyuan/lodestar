@@ -1,12 +1,17 @@
 import { expect, test } from 'bun:test'
+import { fileURLToPath } from 'node:url'
 
 // A subprocess avoids the shared ./feishu mock and exercises the real wrappers
 // with an entirely local SDK stub; no Feishu messages or requests are sent.
 test('Feishu sends participate in message ordering and tail reads reject incomplete responses', async () => {
   const proc = Bun.spawn([process.execPath, '--eval', `
     import assert from 'node:assert/strict'
-    import * as feishu from './src/feishu'
     import { withChatMessageOrder } from './src/chat-message-order'
+    assert.equal(process.env.NODE_ENV, 'test')
+    assert.ok(process.env.LODESTAR_CONFIG, 'the subprocess must inherit the isolated test config')
+    const feishu = await import('./src/feishu')
+    const { config } = await import('./src/config')
+    assert.equal(config.feishu.app_id, 'cli_test')
     globalThis.fetch = async () => { throw new Error('unexpected network request') }
     const events = []
     let listResponse = { code: 0, data: { items: [{ message_id: 'user-or-app-message' }] } }
@@ -39,7 +44,11 @@ test('Feishu sends participate in message ordering and tail reads reject incompl
     release()
     await Promise.all([placement, text, image, file])
     assert.deepEqual(events, ['interactive', 'text', 'image', 'file'])
-  `], { cwd: new URL('..', import.meta.url).pathname, stdout: 'pipe', stderr: 'pipe' })
+  `], {
+    cwd: fileURLToPath(new URL('..', import.meta.url)),
+    // Bun's default spawn environment does not include preload mutations.
+    env: { ...process.env }, stdout: 'pipe', stderr: 'pipe',
+  })
   const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()])
   expect(code, stderr).toBe(0)
 })
