@@ -28,17 +28,17 @@ const CONTROL_COMMAND_ALIASES = new Map<string, ControlCommand>([
  * auto-interrupt on mid-turn user messages was removed (matching
  * Codex's native type-ahead behavior) — explicit barge-out
  * needed a knob and `kill` (full subprocess teardown) is too heavy. */
-export async function runCommand(s: Session, raw: string, userOpenId = ''): Promise<boolean> {
+export async function runCommand(s: Session, raw: string, userOpenId = '', messageId?: string): Promise<boolean> {
   const namedHi = raw.trim().match(/^hi[ \t]+([^\r\n]+)$/i)
   if (namedHi) {
     const { runCodexNamedHi } = await import('./session-codex-accounts')
     await runCodexNamedHi(s, namedHi[1].trim())
     return true
   }
-  const accountCommand = raw.trim().match(/^codex-(login-cancel|login|accounts|account-delete|account|auto)(?:[ \t]+([^\r\n]+))?$/i)
+  const accountCommand = raw.trim().match(/^codex-(login-cancel|login|accounts|account-delete|account|auto|reset)(?:[ \t]+([^\r\n]+))?$/i)
   if (accountCommand) {
     const { runCodexAccountCommand } = await import('./session-codex-accounts')
-    await runCodexAccountCommand(s, accountCommand[1].toLowerCase(), (accountCommand[2] ?? '').trim(), userOpenId)
+    await runCodexAccountCommand(s, accountCommand[1].toLowerCase(), (accountCommand[2] ?? '').trim(), userOpenId, messageId)
     return true
   }
   const wt = raw.trim().match(/^(?:wt|worktree)(?:\s+(.+))?$/i)

@@ -2575,8 +2575,8 @@ export class Session {
   /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
    * plus their two-letter aliases where applicable.
    * Returns true if the command was consumed (don't forward to Codex). */
-  runCommand(raw: string, userOpenId = ''): Promise<boolean> {
-    return sessionCommands.runCommand(this, raw, userOpenId)
+  runCommand(raw: string, userOpenId = '', messageId?: string): Promise<boolean> {
+    return sessionCommands.runCommand(this, raw, userOpenId, messageId)
   }
 
   /** Build the hi-panel data snapshot for this session.

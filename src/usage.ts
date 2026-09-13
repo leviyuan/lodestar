@@ -75,6 +75,77 @@ function cacheUsage(accountId: string, snapshot: UsageSnapshot): void {
   else if (snapshot.state === 'no_credentials' || snapshot.state === 'auth_failed') successfulCaches.delete(accountId)
 }
 
+export type CodexResetOutcome = 'reset' | 'alreadyRedeemed' | 'nothingToReset' | 'noCredit'
+export interface CodexResetResult {
+  outcome: CodexResetOutcome
+  usage: UsageSnapshot
+  cleanupError?: string
+}
+type CodexResetClient = Pick<AppServerOnce, 'initialize' | 'request' | 'close'>
+const resetInFlights = new Map<string, { key: string; promise: Promise<CodexResetResult> }>()
+
+/** One logical redemption keeps its key across transport retries. Never infer the new quota. */
+export function consumeCodexResetCredit(
+  accountId: string,
+  idempotencyKey: string,
+  createClient: (accountId: string) => CodexResetClient = id => new AppServerOnce({ accountId: id }),
+): Promise<CodexResetResult> {
+  if (!accountId || !idempotencyKey.trim()) return Promise.reject(new Error('重置卡请求缺少账号或幂等标识'))
+  const pending = resetInFlights.get(accountId)
+  if (pending) return pending.key === idempotencyKey ? pending.promise
+    : Promise.reject(new Error('该账号正在使用重置卡，请等待结果后再操作'))
+  const promise = Promise.resolve().then(async () => {
+    const app = createClient(accountId)
+    let result: CodexResetResult | undefined
+    let failure: unknown
+    try {
+      await app.initialize('lodestar-codex-reset')
+      const account = (await app.request('account/read', {}))?.account
+      if (!account || account.type !== 'chatgpt') throw new Error('该账号未登录 ChatGPT 订阅，不能使用重置卡')
+      invalidateCodexUsage(accountId)
+      let response: any
+      try {
+        response = await requestRateLimitsWithRetry(() => app.request('account/rateLimitResetCredit/consume', { idempotencyKey }))
+      } catch (error) {
+        throw new Error(`重置卡请求未确认结果：${error instanceof Error ? error.message : String(error)}；请用 codex-accounts 核对额度与重置卡次数`, { cause: error })
+      } finally {
+        // A quota read started during redemption must not restore the pre-reset cache.
+        invalidateCodexUsage(accountId)
+      }
+      if (!['reset', 'alreadyRedeemed', 'nothingToReset', 'noCredit'].includes(response?.outcome)) {
+        throw new Error(`Codex 重置卡返回未知结果：${JSON.stringify(response)}；请用 codex-accounts 核对后再操作`)
+      }
+      const generation = usageGenerations.get(accountId)
+      let usage: UsageSnapshot
+      try {
+        usage = snapshotFromReadResponse(
+          await requestRateLimitsWithRetry(() => app.request('account/rateLimits/read', {})), account.planType)
+      } catch (error) {
+        usage = { state: 'network', reason: error instanceof Error ? error.message : String(error) }
+      }
+      if (usageGenerations.get(accountId) !== generation) usage = { state: 'auth_failed' }
+      else cacheUsage(accountId, usage)
+      if (usage.state !== 'ok') log(`codex-reset: ${accountId} quota refresh failed: ${usage.state === 'network' ? usage.reason : usage.state}`)
+      result = { outcome: response.outcome, usage }
+    } catch (error) {
+      failure = error
+      log(`codex-reset: ${accountId}: ${error}`)
+    }
+    try { await app.close() }
+    catch (error) {
+      const message = `控制连接关闭失败：${error instanceof Error ? error.message : String(error)}`
+      log(`codex-reset: ${accountId}: ${message}`)
+      // Preserve a confirmed redemption even if cleanup fails, so the receipt cannot suggest using another card.
+      if (result) result.cleanupError = message
+      else throw new AggregateError([failure, error], `${String(failure)}；${message}`)
+    }
+    if (!result) throw failure
+    return result
+  }).finally(() => { if (resetInFlights.get(accountId)?.promise === promise) resetInFlights.delete(accountId) })
+  resetInFlights.set(accountId, { key: idempotencyKey, promise })
+  return promise
+}
+
 export class AppServerOnce extends EventEmitter {
   private proc: ChildProcessByStdio<Writable, Readable, Readable>
   private buf = ''
@@ -325,7 +396,7 @@ async function fetchUsage(accountId: string): Promise<UsageSnapshot> {
     if (!account) return { state: 'no_credentials' }
     if (account.type !== 'chatgpt') return { state: 'auth_failed' }
 
-    const limitsRes = await readRateLimitsWithRetry(() => app.request('account/rateLimits/read', {}))
+    const limitsRes = await requestRateLimitsWithRetry(() => app.request('account/rateLimits/read', {}))
     return snapshotFromReadResponse(limitsRes, account.planType)
   } catch (e: any) {
     log(`usage: codex app-server usage failed: ${e?.message ?? e}`)
@@ -395,7 +466,7 @@ export function refreshUsageFromConnection(request: (method: string, params: any
   const pending = refreshInFlights.get(accountId)
   if (pending) return pending
   const generation = usageGenerations.get(accountId) ?? 0
-  const promise = readRateLimitsWithRetry(() => request('account/rateLimits/read', {}))
+  const promise = requestRateLimitsWithRetry(() => request('account/rateLimits/read', {}))
     .then((limitsRes: any) => {
       if ((usageGenerations.get(accountId) ?? 0) !== generation) return null
       const snap = snapshotFromReadResponse(limitsRes)
@@ -424,7 +495,7 @@ export function invalidateCodexUsage(accountId: string): void {
 }
 
 /** 网络抖动重试同一个额度接口；认证错误和无效响应仍直接报告。 */
-async function readRateLimitsWithRetry(request: () => Promise<any>): Promise<any> {
+async function requestRateLimitsWithRetry(request: () => Promise<any>): Promise<any> {
   const delays = [250, 750]
   for (let attempt = 0; ; attempt++) {
     try { return await withTimeout(request(), API_TIMEOUT_MS) }

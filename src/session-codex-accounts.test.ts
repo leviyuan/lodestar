@@ -12,6 +12,7 @@ import { CodexAccountCard } from './codex-account-card'
 import type { CodexAccountCardView } from './cards/codex-account'
 import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, type TokenSource } from './token-source'
 import { peekUsage, peekSuccessfulUsage, refreshUsageFromConnection } from './usage'
+import * as usageModule from './usage'
 
 let root: string
 let store: CodexAccounts
@@ -220,7 +221,7 @@ describe('bare Codex account commands', () => {
     spies.push(dispatch)
     for (const raw of ['login', 'login 工作', 'accounts', 'account', 'account default',
       'login-cancel', 'login-cancel 工作', 'codex-login\n工作', 'codex-login 工作\n继续解释',
-      'account-delete 工作', 'codex-account-delete 工作\n继续解释']) {
+      'account-delete 工作', 'codex-account-delete 工作\n继续解释', 'reset', 'codex-reset 工作\n继续解释']) {
       expect(await s.runCommand(raw, 'owner')).toBe(false)
     }
     expect(dispatch).not.toHaveBeenCalled()
@@ -233,13 +234,98 @@ describe('bare Codex account commands', () => {
       [' CODEX-ACCOUNT\tdefault ', 'account', 'default'],
       ['codex-account-delete', 'account-delete', ''],
       [' CODEX-ACCOUNT-DELETE\t工作 订阅 ', 'account-delete', '工作 订阅'],
+      ['codex-reset', 'reset', ''],
+      [' CODEX-RESET\t工作 订阅 ', 'reset', '工作 订阅'],
     ]
     for (const [raw, command, argument] of commands) {
-      expect(await s.runCommand(raw, 'owner')).toBe(true)
-      expect(dispatch).toHaveBeenLastCalledWith(s, command, argument, 'owner')
+      expect(await s.runCommand(raw, 'owner', 'message-123')).toBe(true)
+      expect(dispatch).toHaveBeenLastCalledWith(s, command, argument, 'owner', 'message-123')
     }
     expect(sentTexts).toHaveLength(0)
     expect(sentCards).toHaveLength(0)
+  })
+
+  test('reset targets the running account during a turn and keeps message retries idempotent', async () => {
+    const s = session()
+    const active = store.ensure('当前账号'); const next = store.ensure('下次账号')
+    const proc = new Proc(); procs.push(proc); bindProcessCodexAccount(proc, active.id)
+    s.proc = proc; s.turnActive = true; store.select(s.sessionName, next.id)
+    const consume = spyOn(usageModule, 'consumeCodexResetCredit').mockResolvedValue({ outcome: 'reset',
+      usage: { state: 'ok', fiveHour: null, weekly: { percent: 3, resetsAt: null }, resetCredits: 0, fetchedAt: 1 } })
+    spies.push(consume)
+    expect(await s.runCommand('codex-reset', 'owner', 'same-message')).toBe(true)
+    const key = consume.mock.calls[0][1]
+    expect(consume).toHaveBeenLastCalledWith(active.id, key)
+    expect(cardViews.at(-1)).toMatchObject({ phase: 'success', name: active.name, title: '额度已重置', resetUsage: { resetCredits: 0 } })
+    await s.runCommand('codex-reset', 'owner', 'same-message')
+    expect(consume).toHaveBeenLastCalledWith(active.id, key)
+    await s.runCommand('codex-reset', 'owner', 'new-message')
+    expect(consume.mock.calls[2][1]).not.toBe(key)
+    expect(store.preferred(s.sessionName)).toBe(next.id)
+    expect(proc.killCalls).toBe(0); expect(s.proc).toBe(proc)
+    s.turnActive = false
+  })
+
+  test('explicit reset works without a current process and reports every service outcome', async () => {
+    const s = session(); const account = store.ensure('工作 订阅')
+    const consume = spyOn(usageModule, 'consumeCodexResetCredit'); spies.push(consume)
+    for (const [outcome, phase, title] of [
+      ['alreadyRedeemed', 'success', '本次重置已完成'], ['nothingToReset', 'current', '无需重置'], ['noCredit', 'warning', '没有可用重置卡'],
+    ] as const) {
+      consume.mockResolvedValue({ outcome, usage: { state: 'ok', fiveHour: null, weekly: null, resetCredits: 0, fetchedAt: 1 } })
+      await s.runCommand('codex-reset 工作 订阅', 'owner', outcome)
+      expect(consume.mock.calls.at(-1)?.[0]).toBe(account.id)
+      expect(cardViews.at(-1)).toMatchObject({ phase, title, name: account.name })
+    }
+    await s.runCommand('codex-reset default', 'owner', 'default-message')
+    expect(consume.mock.calls.at(-1)?.[0]).toBe('default')
+    expect(s.proc).toBeNull(); expect(store.preferred(s.sessionName)).toBeNull()
+  })
+
+  test('reset refuses an unknown target, missing message ID, or unknown current account', async () => {
+    const s = session()
+    const consume = spyOn(usageModule, 'consumeCodexResetCredit'); spies.push(consume)
+    await s.runCommand('codex-reset', 'owner', 'not-running')
+    expect(JSON.stringify(sentCards.at(-1))).toContain('没有正在使用')
+    await s.runCommand('codex-reset default', 'owner')
+    expect(JSON.stringify(sentCards.at(-1))).toContain('缺少消息 ID')
+    await s.runCommand('codex-reset missing', 'owner', 'unknown-name')
+    expect(JSON.stringify(sentCards.at(-1))).toContain('不存在')
+    const proc = new Proc() as any; procs.push(proc); s.proc = proc
+    proc.provider = 'claude'
+    await s.runCommand('codex-reset', 'owner', 'wrong-provider')
+    proc.provider = 'codex'; proc.codexAccountSelectionMode = () => null
+    await s.runCommand('codex-reset', 'owner', 'selecting')
+    proc.codexAccountSelectionMode = () => 'automatic'; proc.turnRetry = { reason: 'quota', phase: 'waiting' }
+    await s.runCommand('codex-reset', 'owner', 'quota-wait')
+    expect(consume).not.toHaveBeenCalled()
+  })
+
+  test('confirmed reset remains visible when quota refresh or connection cleanup fails', async () => {
+    const s = session()
+    const consume = spyOn(usageModule, 'consumeCodexResetCredit').mockResolvedValue({ outcome: 'reset',
+      usage: { state: 'network', reason: 'quota offline' }, cleanupError: 'close rejected' })
+    spies.push(consume)
+    await s.runCommand('codex-reset default', 'owner', 'confirmed')
+    expect(cardViews.at(-1)).toMatchObject({ phase: 'warning', title: '额度已重置', message: '已使用 1 次重置卡。' })
+    expect(cardViews.at(-1)?.details).toContain('quota offline')
+    expect(cardViews.at(-1)?.details).toContain('close rejected')
+    consume.mockRejectedValue(new Error('upstream rejected reset'))
+    await s.runCommand('codex-reset default', 'owner', 'failed')
+    expect(cardViews.at(-1)).toMatchObject({ phase: 'error', message: 'upstream rejected reset' })
+  })
+
+  test('receipt delivery failure propagates without replacing a confirmed redemption with an error card', async () => {
+    const s = session()
+    spies.push(spyOn(usageModule, 'consumeCodexResetCredit').mockResolvedValue({ outcome: 'reset',
+      usage: { state: 'ok', fiveHour: null, weekly: null, resetCredits: 0, fetchedAt: 1 } }))
+    const attempts: CodexAccountCardView[] = []
+    spies.push(spyOn(CodexAccountCard, 'open').mockResolvedValue({
+      finish: async (view: CodexAccountCardView) => { attempts.push(view); throw new Error('receipt write rejected') },
+    } as unknown as CodexAccountCard))
+    await expect(s.runCommand('codex-reset default', 'owner', 'receipt-failed')).rejects.toThrow('receipt write rejected')
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]).toMatchObject({ phase: 'success', title: '额度已重置' })
   })
 
   test('deletion clears selections and quota caches without requiring a model catalog or touching the live session', async () => {

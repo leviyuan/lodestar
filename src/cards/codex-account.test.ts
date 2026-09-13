@@ -65,6 +65,7 @@ describe('compact Codex account cards', () => {
     expect(first).toContain('额度 MISS')
     expect(first).toContain('upstream offline')
     expect(first).toContain('codex-accounts 2')
+    expect(first).toContain('codex-reset [备注]')
     expect(first).not.toContain(`账号 ${CODEX_ACCOUNTS_PAGE_SIZE}`)
     expect(first).not.toContain('份额')
     const second = JSON.stringify(codexAccountCard({ phase: 'accounts', total, page: 2 }))
@@ -75,5 +76,15 @@ describe('compact Codex account cards', () => {
   test('rejects malformed authorization fields before creating unsafe card links', () => {
     expect(() => codexAccountCard({ ...waiting, verification: { url: 'javascript:alert(1)', code: 'CODE' } })).toThrow()
     expect(() => codexAccountCard({ ...waiting, verification: { url: 'https://auth.openai.com', code: '`<at id=all>' } })).toThrow()
+  })
+  test('reset receipts show authoritative windows, zero cards, and explicit missing data', () => {
+    const view: CodexAccountCardView = { phase: 'success', title: '额度已重置', message: '已使用 1 次重置卡。',
+      resetUsage: { state: 'ok', fiveHour: { percent: 4, resetsAt: null }, weekly: { percent: 7, resetsAt: null }, resetCredits: 0, fetchedAt: 1 } }
+    const card = JSON.stringify(codexAccountCard(view))
+    expect(card).toContain('0 次可用'); expect(card).toContain('5h · 4%'); expect(card).toContain('周 · 7%')
+    expect(card).not.toContain('登录成功')
+    const failed = JSON.stringify(codexAccountCard({ ...view, phase: 'warning', resetUsage: { state: 'network', reason: 'offline' }, details: 'offline' }))
+    expect(failed).toContain('额度已重置'); expect(failed).toContain('额度 MISS'); expect(failed).toContain('offline')
+    expect(failed).not.toContain('0 次可用')
   })
 })

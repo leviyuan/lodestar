@@ -19,7 +19,7 @@
 - `md` 先等待目录刷新再生成账号卡，刷新失败显示 MISS，不能将加载中清空的数组显示为零模型。`debug-model.ts` 仅为本机模型测试提供白名单事件与脱敏状态；实际动作仍经过 daemon 的正常 Card action 队列。
 - `fk`、`bk` 和进程停止后的 `rs` 使用原生会话能力：Claude transcript + `forkSession/resumeSessionAt`，Codex `thread/list` + `thread/fork(lastTurnId)`。checkpoint 包含 provider、源会话、cwd 和原生锚点。Claude fork 在首条输入前保存 pending launch，得到新 session id 后才清除。不得扫描或复制 Codex rollout，也不能把 fork 失败当成 resume。
 
-- Codex 多账号对外仍为 `codex-sub`，账号命令为 `codex-login [备注]`、`codex-login-cancel [备注]`、`codex-accounts`、`codex-account [备注]`、`codex-account-delete 备注`、`codex-auto`。删除只针对额外账号，清理独立目录、额度缓存与各群指定；保护默认账号和共享路径，被会话、委派、额度/模型查询或登录占用时拒绝。默认账号就是设备原生 CODEX_HOME；额外账号通过 `codex-accounts.ts` 管理独立认证与共享会话路径，禁止复制或覆盖默认认证。设备码登录交给原生 app-server，完成通知按 loginId 关联；同时收到登录成功和 account/updated(chatgpt) 后才读取账号，避免读到登录前的缓存空值。取消按发起者校验，停机收回登录进程。回复用原地更新的简洁卡片，终态移除验证码，取消复用原登录卡；同账号登录与新进程启动互斥。查询失败显示 MISS；列表按原生身份去重，hi 和 footer 仅显示实际进程所用账号，footer 保留原紧凑格式。
+- Codex 多账号对外仍为 `codex-sub`，账号命令为 `codex-login [备注]`、`codex-login-cancel [备注]`、`codex-accounts`、`codex-account [备注]`、`codex-account-delete 备注`、`codex-auto`、`codex-reset [备注]`。删除只针对额外账号，清理独立目录、额度缓存与各群指定；保护默认账号和共享路径，被会话、委派、额度/模型查询或登录占用时拒绝。默认账号就是设备原生 CODEX_HOME；额外账号通过 `codex-accounts.ts` 管理独立认证与共享会话路径，禁止复制或覆盖默认认证。设备码登录交给原生 app-server，完成通知按 loginId 关联；同时收到登录成功和 account/updated(chatgpt) 后才读取账号，避免读到登录前的缓存空值。取消按发起者校验，停机收回登录进程。回复用原地更新的简洁卡片，终态移除验证码，取消复用原登录卡；同账号登录与新进程启动互斥。查询失败显示 MISS；列表按原生身份去重，hi 和 footer 仅显示实际进程所用账号，footer 保留原紧凑格式。
 - `codex-quota.ts` 按 Plus/prolite/pro 的 1/5/20 份周额度计算周剩余/距重置小时；Plus 的 5h 满窗是 0.15 份，分数取周速率和短窗速率较小值。所有模式降序选择，同分比较当前可连续使用额度。成功 Plus 响应缺短窗按满窗 0.15/5 计算，标记 `unreportedFull`，不造重置日期；请求失败或已返回窗口畸形仍 MISS。自动 Ultra 排除 Plus，要求周剩余至少 0.5 份；不足是 waiting，不是耗尽，普通模式仍可用。主会话与委派共用 `agent-launch.ts` → `CodexAccountProcess`。
 - 手动指定最高优先：`hi 备注` 通过 Session 生命周期只覆盖这次启动，已有其他账号则重启并 resume；`codex-account` 持久指定、`codex-auto` 清除。手动路径不读额度、不检查套餐、Ultra 门槛或本地模型目录；保留账号存在性、认证文件隔离、原生进程退出与登录写入互斥这些结构约束，真实错误交由 Codex 返回。自动路径仍检查模型与全部实际限额、身份、登录租约。启动及换号优先用 daemon 内上次成功额度缓存，能选出账号就不查询额度，也不等其他账号补缓存；无可用缓存才刷新。网络刷新失败保留这份启动缓存，实时查询和 footer 仍报 MISS；重新登录清空两份缓存。旧缓存不得清除原生耗尽记录，主动查额度和耗尽等待轮询仍读实时接口。运行中耗尽后转自动选择，手动原生默认模型在恢复时必须原样传给新进程，不能变成另一账号的默认模型。
 - 原生 `usageLimitExceeded` 只在主 turn 终态失败或明确 `turn/start` 拒绝后触发换号。`codex-account-process.ts` 保持同一逻辑任务，等待原生落盘与真实退出再替换子进程、resume 同一 thread；已接受任务只续跑，不重放输入。耗尽状态由 `codex-account-scheduler.ts` 原子保存，接口确认窗口恢复后解除；全部耗尽自动等待且可取消。初次等待通过显式 `quotaWaitPromise` 释放 Session actor，不能伪造 init 或占住 stop。网络、认证、普通 HTTP 429 不切号。委派分别记录实际账号；换号保留模型、effort、host capability、权限和工具入口，旧后台任务显式结算，旧进程迟到事件不得关闭新任务。
@@ -41,7 +41,7 @@
 
 - Lodestar 自有出站 HTTP 统一使用 `network.ts` 的 `networkFetch`；本机 capability 和通知回调用 `localFetch`。`network-proxy.ts` 按协议环境变量、`ALL_PROXY`、当前用户的手动系统代理解析，统一大小写和绕过规则；系统查询失败、非法代理、未支持的 SOCKS/PAC 不得转为直连。每次重定向重新判断路由，跨 origin 清除认证，本机请求不得跳出 loopback。Agent 与飞书 SDK 自身网络由各自应用/SDK 配置，不改其全局环境。网络改动需运行真实本地代理测试，不能仅依赖 mock fetch。
 
-- `hi` 的 Codex 重置卡次数来自额度接口 `rateLimitResetCredits.availableCount`，保留合法的零，缺失用 MISS；不推算剩余次数，也不显示在 footer。hi 的每个额度窗口独占一行，footer 继续使用紧凑格式。
+- `hi` 的 Codex 重置卡次数来自额度接口 `rateLimitResetCredits.availableCount`，保留合法的零，缺失用 MISS；不推算剩余次数，也不显示在 footer。hi 的每个额度窗口独占一行，footer 继续使用紧凑格式。`codex-reset [备注]` 经 `usage.ts` 的原生控制连接使用一次重置卡，同账号并发使用互斥，同消息与有限网络重试复用幂等标识；消费后失效旧额度查询并重新读取。四种原生结果必须区分，已确认消费后发生刷新或连接关闭失败仍保留消费结果并显示错误。
 - 生图完成事件补回的 prompt/revisedPrompt 要更新工具元数据。`session-tools.ts` 上传图片并通过 Card Kit 放入折叠面板，确认落地后才标记已交付；嵌入失败按用户约定单独发图。图片任务按原卡归属登记，关闭和换卡均须等待，避免图片在卡片退役后丢失。
 - `feishu.ts` 的 30 MB 上限覆盖所有出站文件和图片；`instructions.ts` 同步约束所有 Agent 的文件交付。
 - 生产 Card Kit mutation 经 per-card queue，在执行时分配 sequence。需要据结果更新 rendered 或持久状态的事务使用 checked API。

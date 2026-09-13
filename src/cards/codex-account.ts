@@ -2,6 +2,7 @@ import type { CodexUsageTotal } from '../codex-account-usage'
 import { ELEMENTS } from './elements'
 import { usageWindowElements } from './usage'
 import type { CodexAccountCandidate } from '../codex-account-scheduler'
+import type { UsageSnapshot } from '../usage'
 
 export type CodexAccountPhase = 'connecting' | 'waiting' | 'checking' | 'success' | 'selected' | 'current' | 'accounts' | 'deleted' | 'cancelled' | 'expired' | 'error' | 'warning'
 export interface CodexAccountCardView {
@@ -22,6 +23,7 @@ export interface CodexAccountCardView {
   selectedId?: string
   page?: number
   scheduling?: { candidates: CodexAccountCandidate[]; ultra: boolean }
+  resetUsage?: UsageSnapshot
 }
 export const CODEX_ACCOUNTS_PAGE_SIZE = 4
 const PHASE = {
@@ -74,6 +76,15 @@ export function codexAccountPanel(view: CodexAccountCardView): object {
   }
   if (view.plan || view.email) elements.push(md([view.plan?.toUpperCase(), view.email].filter(Boolean).map(value => text(value!)).join(' · ')))
   if (view.message) elements.push(md(text(view.message)))
+  if (view.resetUsage) {
+    const usage = view.resetUsage
+    elements.push(md(`**重置卡**　${usage.state === 'ok' && usage.resetCredits != null ? `${usage.resetCredits} 次可用` : 'MISS'}`))
+    if (usage.state === 'ok') {
+      for (const [window, label] of [[usage.fiveHour, '5h'], [usage.weekly, '周']] as const) {
+        if (window) elements.push(...usageWindowElements(window, label))
+      }
+    } else elements.push(md('⚠️ 额度 MISS · 查看详情中的查询错误'))
+  }
   if (view.total) elements.push(...accountRows(view))
   if (view.phase === 'accounts') elements.push({ tag: 'collapsible_panel', expanded: true,
     header: { title: { tag: 'plain_text', content: '⌨️ Codex 命令' }, background_color: 'grey-50' },
@@ -83,6 +94,7 @@ export function codexAccountPanel(view: CodexAccountCardView): object {
       '`codex-login [备注]` · 设备码登录；省略备注为默认账号',
       '`codex-login-cancel [备注]` · 取消本人在本群的登录；仅一个任务时可省略备注',
       '`codex-accounts [页码]` · 查看账号、额度与调度顺序',
+      '`codex-reset [备注]` · 使用一次重置卡；省略备注为当前使用账号',
       '`codex-account` · 查看当前账号与下次启动策略',
       '`codex-account 备注` · 持久指定账号，下次启动生效',
       '`codex-auto` · 清除指定，下次启动自动选择',

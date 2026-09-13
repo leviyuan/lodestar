@@ -27,6 +27,13 @@ const frames: CodexAccountCardView[] = [
   { phase: 'cancelled', name: '验收', message: '登录已取消' },
   { phase: 'expired', name: '验收', message: '等待授权超时' },
   { phase: 'error', name: '验收', message: '连接失败', details: 'HTTP 503\n验收用错误详情，未使用真实账号。' },
+  { phase: 'checking', name: '重置卡验收', title: '正在使用重置卡', message: '正在提交重置请求…' },
+  { phase: 'success', name: '重置卡验收', title: '额度已重置', message: '已使用 1 次重置卡。', resetUsage: total.entries[0]!.usage },
+  { phase: 'success', name: '重置卡验收', title: '本次重置已完成', message: '本次请求此前已处理，没有重复使用重置卡。', resetUsage: total.entries[0]!.usage },
+  { phase: 'current', name: '重置卡验收', title: '无需重置', message: '当前没有符合条件的额度窗口，未使用重置卡。', resetUsage: total.entries[0]!.usage },
+  { phase: 'warning', name: '重置卡验收', title: '没有可用重置卡', message: '该账号没有可用的重置卡，额度未重置。', resetUsage: total.entries[0]!.usage },
+  { phase: 'warning', name: '重置卡验收', title: '额度已重置', message: '已使用 1 次重置卡。',
+    resetUsage: { state: 'network', reason: '验收用额度查询失败' }, details: '额度刷新失败：验收用额度查询失败\n控制连接关闭失败：验收用错误' },
 ]
 let created = ''
 const card = await CodexAccountCard.open('UNSENT', { phase: 'connecting', flow: 'login', name: '验收' }, {

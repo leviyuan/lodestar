@@ -42,6 +42,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - 出站文件不超过 30 MB（30 × 1024 × 1024 字节），Agent 交付前检查，发送层同步拦截；超限文件先压缩或分卷。`[[send: /abs/path]]` 发送为独立文件消息，正文保留标记作为回执；卡片模板不读取文件。
 - Codex 生图的提示词和图片默认放在同一个折叠面板，提示词包含完成事件补回的内容，不在折叠标题中展开。图片成功嵌入后不再单发；无法嵌入时按用户要求单独发图。关闭或换卡前等待所属图片上传和写入完成。
 - `hi` 展示 Codex 账号可用的重置卡次数，来源为 `account/rateLimits/read` 的 `rateLimitResetCredits.availableCount`；额度窗口在 hi 中逐行展示；这不是飞书换卡计数，也不加入回复 footer。
+- `codex-reset [备注]` 显式使用一次账号重置卡；省略备注只取当前运行账号，账号未知时要求指定。调用原生 `account/rateLimitResetCredit/consume`，同一消息及其网络重试复用幂等标识；按四种原生 outcome 展示结果，之后重新读额度，不能推算卡数或掩盖已扣卡后的刷新/关闭失败。
 
 ## 运行中的 daemon
 

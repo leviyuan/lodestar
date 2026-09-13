@@ -1,6 +1,7 @@
 import type { Session } from './session'
+import { createHash } from 'node:crypto'
 import * as feishu from './feishu'
-import { codexAccounts, codexAccountInUse } from './codex-accounts'
+import { codexAccounts, codexAccountInUse, processCodexAccount } from './codex-accounts'
 import { codexLogins } from './codex-login'
 import { getTokenSourceForAccount, waitForTokenSourceModelRefresh } from './token-source'
 import { aggregateCodexUsage } from './codex-account-usage'
@@ -8,7 +9,7 @@ import { codexAccountScheduler } from './codex-account-scheduler'
 import { CodexAccountCard } from './codex-account-card'
 import { codexAccountCard, type CodexAccountCardView } from './cards/codex-account'
 import { log } from './log'
-import { invalidateCodexUsage } from './usage'
+import { consumeCodexResetCredit, invalidateCodexUsage, type CodexResetOutcome } from './usage'
 
 const loginReceipts = new Map<string, Promise<void>>()
 
@@ -48,7 +49,11 @@ export async function settleCodexAccountCards(): Promise<void> {
 }
 
 /** Bare codex-* commands own one compact card. Account selection never mutates the live process. */
-export async function runCodexAccountCommand(s: Session, command: string, argument: string, userOpenId: string): Promise<void> {
+export async function runCodexAccountCommand(s: Session, command: string, argument: string, userOpenId: string, messageId?: string): Promise<void> {
+  if (command === 'reset') {
+    await runCodexResetCommand(s, argument, messageId)
+    return
+  }
   const owner = { chatId: s.chatId, userOpenId }
   if (command === 'login-cancel') {
     try {
@@ -156,4 +161,39 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
     log(`codex-${command}: ${error}`)
     await card.finish(errorView(error, name))
   }
+}
+
+const RESET_MESSAGES: Record<CodexResetOutcome, { phase: CodexAccountCardView['phase']; title: string; message: string }> = {
+  reset: { phase: 'success', title: '额度已重置', message: '已使用 1 次重置卡。' },
+  alreadyRedeemed: { phase: 'success', title: '本次重置已完成', message: '本次请求此前已处理，没有重复使用重置卡。' },
+  nothingToReset: { phase: 'current', title: '无需重置', message: '当前没有符合条件的额度窗口，未使用重置卡。' },
+  noCredit: { phase: 'warning', title: '没有可用重置卡', message: '该账号没有可用的重置卡，额度未重置。' },
+}
+
+async function runCodexResetCommand(s: Session, argument: string, messageId?: string): Promise<void> {
+  let account
+  try {
+    if (!messageId?.trim()) throw new Error('缺少消息 ID，未使用重置卡；请在群内发送 codex-reset [备注]')
+    if (!argument && (!s.proc?.isAlive() || s.proc.provider !== 'codex'
+      || s.proc.codexAccountSelectionMode?.() === null
+      || (s.proc.turnRetry?.reason === 'quota' && s.proc.turnRetry.phase === 'waiting'))) {
+      throw new Error('当前没有正在使用的 Codex 账号；请用 codex-reset 备注，或 codex-reset default 指定默认账号')
+    }
+    // Capture the actual account before the first await; a queued preference is not the active account.
+    account = argument ? codexAccounts.find(argument) : codexAccounts.get(processCodexAccount(s.proc))
+  } catch (error) { log(`codex-reset: ${error}`); await sendErrorCard(s, error); return }
+  const card = await CodexAccountCard.open(s.chatId, { phase: 'checking', name: account.name,
+    title: '正在使用重置卡', message: '正在提交重置请求…' })
+  let result
+  try {
+    const idempotencyKey = createHash('sha256').update(JSON.stringify(['lodestar-codex-reset', s.chatId, messageId])).digest('hex')
+    result = await consumeCodexResetCredit(account.id, idempotencyKey)
+  } catch (error) { log(`codex-reset: ${error}`); await card.finish(errorView(error, account.name)); return }
+  const view = RESET_MESSAGES[result.outcome]
+  const usageError = result.usage.state === 'ok' ? undefined
+    : `额度刷新失败：${result.usage.state === 'network' ? result.usage.reason ?? 'MISS' : result.usage.state}`
+  const details = [usageError, result.cleanupError].filter(Boolean).join('\n')
+  // A failed receipt write must not replace a confirmed redemption with a generic failure card.
+  await card.finish({ ...view, name: account.name, resetUsage: result.usage,
+    ...(details ? { phase: 'warning', details } : {}), hint: 'codex-accounts 查看各账号额度' })
 }

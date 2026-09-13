@@ -482,7 +482,7 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   // for project worktree/group orchestration. Post 富文本整段不可能正好
   // 等于这些 bare word,所以这里只对 text 触发。
   if (msgType === 'text' && text) {
-    if (await session.runCommand(text, userOpenId)) return
+    if (await session.runCommand(text, userOpenId, msgId)) return
   }
 
   // Pending text is consumed once: notification reply → Agent question.
