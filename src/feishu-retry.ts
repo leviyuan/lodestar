@@ -1,0 +1,70 @@
+import { log } from './log'
+
+const RETRY_DELAYS_MS = [1000, 4000]
+const TRANSIENT_HTTP_STATUS = new Set([408, 429, 500, 502, 503, 504])
+const TRANSIENT_NETWORK_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN',
+  'ConnectionRefused', // Bun fetch uses this instead of Node's ECONNREFUSED.
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
+])
+
+export class FeishuRequestError extends Error {
+  constructor(message: string, readonly status?: number, readonly code?: number, readonly retryAfter?: string | null) {
+    super(message)
+    this.name = 'FeishuRequestError'
+  }
+}
+
+function isTransient(error: any): boolean {
+  if (!error || typeof error !== 'object') return false
+  const status = error.response?.status ?? error.status
+  const code = error.response?.data?.code ?? error.code
+  // Feishu reports application/group rate limits as 99991400/230020, also on HTTP 400.
+  if (code === 99991400 || code === 230020 || TRANSIENT_HTTP_STATUS.has(status)) return true
+  if (typeof status === 'number' && status >= 400) return false
+  if (TRANSIENT_NETWORK_CODES.has(code) || error.name === 'TimeoutError') return true
+  // Native fetch wraps socket errors in cause; do not retry arbitrary TypeErrors,
+  // caller cancellation, certificate failures, local I/O or configuration errors.
+  return error.cause !== error && isTransient(error.cause)
+}
+
+function retryAfterMs(error: any): number {
+  const value = error?.retryAfter ?? error?.response?.headers?.['retry-after'] ?? error?.response?.headers?.['x-ogw-ratelimit-reset']
+  if (typeof value !== 'string' || !value.trim()) return 0
+  const seconds = Number(value)
+  const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value) - Date.now()
+  return Number.isFinite(delay) ? Math.max(0, delay) : 0
+}
+
+/** Retry the same operation, at most three attempts. Callers must make message
+ * creation idempotent and recreate consumed upload bodies on each attempt. */
+export async function withFeishuRetry<T>(label: string, operation: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try { return await operation() }
+    catch (error) {
+      const delay = Math.max(RETRY_DELAYS_MS[attempt] ?? 0, retryAfterMs(error))
+      const retry = isTransient(error) && attempt < RETRY_DELAYS_MS.length && delay <= 60_000
+      log(`feishu: ${label} attempt ${attempt + 1}/${RETRY_DELAYS_MS.length + 1} failed: ${error}; ${retry ? `retry in ${delay}ms` : 'FINAL'}`)
+      if (!retry) throw error
+      await new Promise(resolve => setTimeout(resolve, delay))
+    }
+  }
+}
+
+/** Keep HTTP failures (including non-JSON gateway responses) distinguishable
+ * from permanent API rejections and malformed success responses. */
+export async function readFeishuResponse(response: Response, label: string): Promise<any> {
+  const raw = await response.text()
+  const retryAfter = response.headers.get('retry-after') ?? response.headers.get('x-ogw-ratelimit-reset')
+  let data: any
+  try { data = JSON.parse(raw) }
+  catch {
+    throw new FeishuRequestError(`${label} HTTP ${response.status}: invalid JSON — ${raw.slice(0, 200)}`,
+      response.status, undefined, retryAfter)
+  }
+  if (!response.ok || data?.code !== 0) {
+    throw new FeishuRequestError(`${label} HTTP ${response.status} code=${data?.code ?? 'MISS'} msg=${data?.msg ?? 'MISS'}`,
+      response.status, data?.code, retryAfter)
+  }
+  return data
+}

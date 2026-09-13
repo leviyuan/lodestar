@@ -30,7 +30,9 @@ function windowToUnified(w: UsageWindow, kind: string, label: string): UsageWind
     ...(w.unreportedFull === undefined ? {} : { unreportedFull: w.unreportedFull }) }
 }
 
-function codexUsageToUnified(s: UsageSnapshot): UsageSnapshotUnified {
+/** Display only the authoritative main quota, as the footer and account cards do.
+ * Model-specific buckets remain in the snapshot for quota scheduling. */
+export function codexUsageToUnified(s: UsageSnapshot): UsageSnapshotUnified {
   if (s.state !== 'ok') {
     return {
       state: s.state === 'auth_failed' ? 'no_credentials'
@@ -45,21 +47,6 @@ function codexUsageToUnified(s: UsageSnapshot): UsageSnapshotUnified {
   if (s.fiveHour) windows.push(windowToUnified(s.fiveHour, 'fiveHour', '5h 窗口'))
   if (s.weekly) windows.push(windowToUnified(s.weekly, 'weekly', '周配额'))
   return { state: 'ok', planLabel: s.subscriptionType, windows, fetchedAt: s.fetchedAt, resetCredits: s.resetCredits ?? null }
-}
-
-/** read 端点全量桶列表 → unified(console `hi` 面板可显示非默认桶,如 Spark
- *  附加包)。空桶列表(旧快照/读取失败)返回 null,调用方省略。 */
-export function codexBucketsToUnified(s: UsageSnapshot): UsageWindowUnified[] | null {
-  if (s.state !== 'ok' || !s.buckets?.length) return null
-  const out: UsageWindowUnified[] = []
-  for (const b of s.buckets) {
-    const label = b.limitId === s.defaultLimitId
-      ? (b.limitName ?? '默认配额')
-      : (b.limitName ?? b.limitId)
-    if (b.fiveHour) out.push(windowToUnified(b.fiveHour, 'fiveHour', `${label} 5h`))
-    if (b.weekly) out.push(windowToUnified(b.weekly, 'weekly', `${label} 周`))
-  }
-  return out.length ? out : null
 }
 
 /** Default auth can live in an OS keyring or managed store. Only the native account/read is authoritative. */
@@ -122,13 +109,7 @@ registerTokenSourceFactory({
           return model
         },
         async readUsage(): Promise<UsageSnapshotUnified> {
-          const snap = await readUsage(accountId)
-          const unified = codexUsageToUnified(snap)
-          // 多桶透出:read 端点全量桶(如 Spark 附加包)在 console 额度行各占一行,
-          // 服务端加/删桶自动跟进;单桶账号行为不变(就是默认桶的 5h+周)。
-          const all = codexBucketsToUnified(snap)
-          if (all) unified.windows = all
-          return unified
+          return codexUsageToUnified(await readUsage(accountId))
         },
       }
       return ts

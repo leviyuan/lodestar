@@ -1,4 +1,5 @@
 import { networkFetch } from './network'
+import { FeishuRequestError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
 import { withChatMessageOrder } from './chat-message-order'
 import { AGENT_PROVIDERS, isAgentProvider, isDshReasoningEffort } from './agent-process'
 /**
@@ -143,6 +144,18 @@ function rawFetch(input: string | URL, init: RequestInit = {}): Promise<Response
   })
 }
 
+async function fetchFeishuJson(input: string, init: RequestInit, label: string): Promise<any> {
+  const signal = init.signal ?? AbortSignal.timeout(RAW_FETCH_TIMEOUT_MS)
+  try {
+    return await readFeishuResponse(await rawFetch(input, { ...init, signal }), label)
+  } catch (error) {
+    // node-fetch reports our deadline as AbortError, including during body reads.
+    // Restore only an actual timeout reason; caller cancellation stays permanent.
+    if (signal.aborted && signal.reason?.name === 'TimeoutError') throw signal.reason
+    throw error
+  }
+}
+
 // ── Tenant token (cached, used by raw fetch wrappers) ──────────────────
 let cachedToken = ''
 let tokenExpiry = 0
@@ -150,13 +163,12 @@ let tokenInFlight: Promise<string> | null = null
 export async function getTenantToken(): Promise<string> {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken
   tokenInFlight ??= (async () => {
-    const res = await rawFetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+    const data = await fetchFeishuJson('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ app_id: APP_ID, app_secret: APP_SECRET }),
-    })
-    const data = await res.json() as { code?: number; msg?: string; tenant_access_token?: string; expire?: number }
-    if (!res.ok || !data.tenant_access_token) {
-      throw new Error(`feishu: tenant token failed HTTP ${res.status} code=${data.code ?? 'MISS'} msg=${data.msg ?? 'MISS'}`)
+    }, 'tenant token')
+    if (typeof data.tenant_access_token !== 'string' || !data.tenant_access_token.trim()) {
+      throw new Error('feishu: tenant token MISS')
     }
     cachedToken = data.tenant_access_token
     tokenExpiry = Date.now() + Math.max(0, (data.expire ?? 7200) - 60) * 1000
@@ -1179,44 +1191,29 @@ export async function fetchChatName(chatId: string): Promise<string | null> {
 export * from './feishu-task'
 
 // ── Outbound: text + card ──────────────────────────────────────────────
-/** Retry delays for sendText/sendCard SDK calls. Three attempts total
- * (the leading 0 is the eager first try). Tuned for the bun+axios+lark-SDK
- * ECONNREFUSED transient we've been seeing — by ~5s the socket pool
- * usually recovers. Business errors (Feishu code != 0) are NOT retried;
- * only thrown network errors are. */
-const SEND_RETRY_DELAYS_MS = [0, 1000, 4000]
-
 async function sendViaSdkWithRetry(
-  what: 'text' | 'card',
+  what: 'Text' | 'Card' | 'Image' | 'File',
   chatId: string,
-  msgType: 'text' | 'interactive',
+  msgType: 'text' | 'interactive' | 'image' | 'file',
   content: string,
 ): Promise<string | null> {
   // Same uuid across retries → Feishu dedupes on its side so a successful-
   // but-response-lost first attempt doesn't produce a duplicate message.
   const uuid = randomUUID()
-  let lastErr: unknown = null
-  for (let i = 0; i < SEND_RETRY_DELAYS_MS.length; i++) {
-    if (SEND_RETRY_DELAYS_MS[i] > 0) {
-      await new Promise(r => setTimeout(r, SEND_RETRY_DELAYS_MS[i]))
-    }
-    try {
+  try {
+    return await withFeishuRetry(`send${what} chat=${chatId}`, async () => {
       const res: any = await client.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: { receive_id: chatId, msg_type: msgType, content, uuid },
       })
-      if (res?.code && res.code !== 0) {
-        log(`feishu: send${what === 'text' ? 'Text' : 'Card'} rejected chat=${chatId} code=${res.code} msg=${res.msg}`)
-        return null
+      if (res?.code !== 0) {
+        throw new FeishuRequestError(`send${what} code=${res?.code ?? 'MISS'} msg=${res?.msg ?? 'MISS'}`, undefined, res?.code)
       }
-      return res?.data?.message_id ?? null
-    } catch (e) {
-      lastErr = e
-      log(`feishu: send${what === 'text' ? 'Text' : 'Card'} attempt ${i + 1}/${SEND_RETRY_DELAYS_MS.length} chat=${chatId} failed: ${e}`)
-    }
-  }
-  log(`feishu: send${what === 'text' ? 'Text' : 'Card'} chat=${chatId} EXHAUSTED ${SEND_RETRY_DELAYS_MS.length} retries: ${lastErr}`)
-  return null
+      const messageId = res?.data?.message_id
+      if (typeof messageId !== 'string' || !messageId.trim()) throw new Error(`send${what} message_id MISS`)
+      return messageId
+    })
+  } catch { return null } // withFeishuRetry logs the final failure; callers surface null.
 }
 
 async function fetchChatStatus(chatId: string): Promise<{ name: string | null; status: string | null }> {
@@ -1235,12 +1232,12 @@ function isNormalChatStatus(status: string | null): boolean {
 }
 
 export async function sendText(chatId: string, text: string): Promise<string | null> {
-  return withChatMessageOrder(chatId, () => sendViaSdkWithRetry('text', chatId, 'text', JSON.stringify({ text })))
+  return withChatMessageOrder(chatId, () => sendViaSdkWithRetry('Text', chatId, 'text', JSON.stringify({ text })))
 }
 
 export async function sendCard(chatId: string, card: object): Promise<string | null> {
   return withChatMessageOrder(chatId, () => sendViaSdkWithRetry(
-    'card',
+    'Card',
     chatId,
     'interactive',
     JSON.stringify(neutralizeMarkdownImagesInCard(card)),
@@ -1417,27 +1414,34 @@ function looksLikeImage(filePath: string): boolean {
   return IMAGE_EXTS.has(extname(filePath).toLowerCase())
 }
 
-async function uploadImageMultipart(filePath: string): Promise<string | null> {
-  const token = await getTenantToken()
-  // Copy into an ArrayBuffer-backed view. Node 18's BlobPart typing correctly
-  // rejects Buffer's wider ArrayBufferLike backing (which may be shared).
-  const file = new Blob([Uint8Array.from(await readFile(filePath))])
-  const form = new FormData()
-  form.append('image_type', 'message')
-  form.append('image', file, basename(filePath))
-  // 公式图等 async 渲染路径依赖此上传完成;无超时的挂死上传会连坐
-  // closeTurnCard 的 drain(card review #5),15s 上限后失败可见。
-  const res = await rawFetch('https://open.feishu.cn/open-apis/im/v1/images', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}` },
-    body: form,
+async function uploadMultipart(filePath: string, type: 'image' | 'file'): Promise<string> {
+  const label = `upload${type === 'image' ? 'Image' : 'File'}`
+  let file: Blob | undefined
+  return withFeishuRetry(`${label} ${filePath}`, async () => {
+    // Keep the same bytes across retries, even if the local path is overwritten.
+    // Check the bytes as well as stat: the file may have grown since validation.
+    file ??= new Blob([Uint8Array.from(await readFile(filePath))])
+    if (file.size > MAX_UPLOAD_BYTES) throw new Error(`${basename(filePath)} 超过 30 MB`)
+    const token = await getTenantToken()
+    // Rebuild the multipart body; the immutable Blob can be reused. Its copied
+    // ArrayBuffer-backed view above also preserves Node 18 BlobPart compatibility.
+    const form = new FormData()
+    if (type === 'image') form.append('image_type', 'message')
+    else {
+      form.append('file_type', 'stream')
+      form.append('file_name', basename(filePath))
+    }
+    form.append(type, file, basename(filePath))
+    // Every attempt has its own 15s timeout, including response body reads.
+    const data = await fetchFeishuJson(`https://open.feishu.cn/open-apis/im/v1/${type}s`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+    }, label)
+    const key = data.data?.[`${type}_key`]
+    if (typeof key !== 'string' || !key.trim()) throw new Error(`${label} ${type}_key MISS`)
+    return key
   })
-  const data = await res.json() as any
-  if (data?.code !== 0) {
-    log(`feishu: uploadImage ${filePath} code=${data.code} msg=${data.msg}`)
-    return null
-  }
-  return data.data?.image_key ?? null
 }
 
 /** Upload a local image for embedding inside a Card Kit card. Returns the
@@ -1460,64 +1464,16 @@ export async function uploadImageKey(filePath: string): Promise<string | null> {
     log(`feishu: uploadImageKey stat failed — ${filePath}: ${e}`)
     return null
   }
-  return uploadImageMultipart(filePath)
-}
-
-async function uploadFileMultipart(filePath: string): Promise<string | null> {
-  const token = await getTenantToken()
-  const file = new Blob([Uint8Array.from(await readFile(filePath))])
-  const form = new FormData()
-  // 'stream' is the catch-all type and works for arbitrary binaries.
-  form.append('file_type', 'stream')
-  form.append('file_name', basename(filePath))
-  form.append('file', file, basename(filePath))
-  const res = await rawFetch('https://open.feishu.cn/open-apis/im/v1/files', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}` },
-    body: form,
-  })
-  const data = await res.json() as any
-  if (data?.code !== 0) {
-    log(`feishu: uploadFile ${filePath} code=${data.code} msg=${data.msg}`)
-    return null
-  }
-  return data.data?.file_key ?? null
+  try { return await uploadMultipart(filePath, 'image') }
+  catch { return null } // Final upload diagnostics are logged by withFeishuRetry.
 }
 
 export async function sendImage(chatId: string, imageKey: string): Promise<string | null> {
-  return withChatMessageOrder(chatId, () => sendImageOrdered(chatId, imageKey))
-}
-
-async function sendImageOrdered(chatId: string, imageKey: string): Promise<string | null> {
-  try {
-    const res: any = await client.im.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: { receive_id: chatId, msg_type: 'image', content: JSON.stringify({ image_key: imageKey }) },
-    })
-    if (res?.code && res.code !== 0) {
-      log(`feishu: sendImage rejected chat=${chatId} code=${res.code} msg=${res.msg}`)
-      return null
-    }
-    return res?.data?.message_id ?? null
-  } catch (e) { log(`feishu: sendImage failed chat=${chatId}: ${e}`); return null }
+  return withChatMessageOrder(chatId, () => sendViaSdkWithRetry('Image', chatId, 'image', JSON.stringify({ image_key: imageKey })))
 }
 
 export async function sendFile(chatId: string, fileKey: string): Promise<string | null> {
-  return withChatMessageOrder(chatId, () => sendFileOrdered(chatId, fileKey))
-}
-
-async function sendFileOrdered(chatId: string, fileKey: string): Promise<string | null> {
-  try {
-    const res: any = await client.im.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: { receive_id: chatId, msg_type: 'file', content: JSON.stringify({ file_key: fileKey }) },
-    })
-    if (res?.code && res.code !== 0) {
-      log(`feishu: sendFile rejected chat=${chatId} code=${res.code} msg=${res.msg}`)
-      return null
-    }
-    return res?.data?.message_id ?? null
-  } catch (e) { log(`feishu: sendFile failed chat=${chatId}: ${e}`); return null }
+  return withChatMessageOrder(chatId, () => sendViaSdkWithRetry('File', chatId, 'file', JSON.stringify({ file_key: fileKey })))
 }
 
 /** Upload a local file and post it as an image or file message in the
@@ -1529,33 +1485,35 @@ export async function uploadAndSend(chatId: string, filePath: string): Promise<b
   try {
     const stats = statSync(filePath)
     if (!stats.isFile()) {
+      log(`feishu: uploadAndSend not a file — ${filePath}`)
       await sendText(chatId, `❌ 出站文件: 路径不是文件 — ${filePath}`)
       return false
     }
     if (stats.size > MAX_UPLOAD_BYTES) {
+      log(`feishu: uploadAndSend oversize — ${filePath} (${stats.size}B)`)
       await sendText(chatId, `❌ 出站文件: ${basename(filePath)} 超过 30 MB (${(stats.size / 1024 / 1024).toFixed(1)} MB)`)
       return false
     }
   } catch (e) {
+    log(`feishu: uploadAndSend stat failed — ${filePath}: ${e}`)
     await sendText(chatId, `❌ 出站文件: 无法读取 ${filePath} (${e})`)
     return false
   }
-  const isImage = looksLikeImage(filePath)
+  const type = looksLikeImage(filePath) ? 'image' : 'file'
+  const label = type === 'image' ? '出站图片' : '出站文件'
   try {
-    if (isImage) {
-      const key = await uploadImageMultipart(filePath)
-      if (!key) { await sendText(chatId, `❌ 出站图片上传失败: ${basename(filePath)}`); return false }
-      const msgId = await sendImage(chatId, key)
-      return msgId != null
-    } else {
-      const key = await uploadFileMultipart(filePath)
-      if (!key) { await sendText(chatId, `❌ 出站文件上传失败: ${basename(filePath)}`); return false }
-      const msgId = await sendFile(chatId, key)
-      return msgId != null
+    const key = await uploadMultipart(filePath, type)
+    const msgId = await (type === 'image' ? sendImage(chatId, key) : sendFile(chatId, key))
+    if (!msgId) {
+      log(`feishu: uploadAndSend ${filePath} send failed after upload`)
+      await sendText(chatId, `❌ ${label}发送失败: ${basename(filePath)}（上传已完成）`)
+      return false
     }
+    log(`feishu: uploadAndSend ${filePath} delivered msg=${msgId}`)
+    return true
   } catch (e) {
     log(`feishu: uploadAndSend ${filePath} failed: ${e}`)
-    await sendText(chatId, `❌ 出站文件异常: ${basename(filePath)} — ${e}`)
+    await sendText(chatId, `❌ ${label}上传失败: ${basename(filePath)} — ${e}`)
     return false
   }
 }

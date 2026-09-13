@@ -42,8 +42,10 @@
 - Lodestar 自有出站 HTTP 统一使用 `network.ts` 的 `networkFetch`；本机 capability 和通知回调用 `localFetch`。`network-proxy.ts` 按协议环境变量、`ALL_PROXY`、当前用户的手动系统代理解析，统一大小写和绕过规则；系统查询失败、非法代理、未支持的 SOCKS/PAC 不得转为直连。每次重定向重新判断路由，跨 origin 清除认证，本机请求不得跳出 loopback。Agent 与飞书 SDK 自身网络由各自应用/SDK 配置，不改其全局环境。网络改动需运行真实本地代理测试，不能仅依赖 mock fetch。
 
 - `hi` 的 Codex 重置卡次数来自额度接口 `rateLimitResetCredits.availableCount`，保留合法的零，缺失用 MISS；不推算剩余次数，也不显示在 footer。hi 的每个额度窗口独占一行，footer 继续使用紧凑格式。`codex-reset [备注]` 经 `usage.ts` 的原生控制连接使用一次重置卡，同账号并发使用互斥，同消息与有限网络重试复用幂等标识；消费后失效旧额度查询并重新读取。四种原生结果必须区分，已确认消费后发生刷新或连接关闭失败仍保留消费结果并显示错误。
+- Codex 额度展示统一只用主额度的短时窗口和周窗口；`token-source-codex.ts` 不向统一展示导出 Spark（GPT-5.3）或其他模型的附加桶。全量桶继续供内部按模型调度，不能用附加桶替代缺失的主额度。
 - 生图完成事件补回的 prompt/revisedPrompt 要更新工具元数据。`session-tools.ts` 上传图片并通过 Card Kit 放入折叠面板，确认落地后才标记已交付；嵌入失败按用户约定单独发图。图片任务按原卡归属登记，关闭和换卡均须等待，避免图片在卡片退役后丢失。
 - `feishu.ts` 的 30 MB 上限覆盖所有出站文件和图片；`instructions.ts` 同步约束所有 Agent 的文件交付。
+- 文件/图片上传和所有 SDK 消息发送共用 `feishu-retry.ts`：已知网络瞬态错误、HTTP 408/429/500/502/503/504 和飞书限流码 99991400/230020 最多尝试 3 次（间隔 1s、4s，遵守不超过 60s 的 Retry-After/x-ogw-ratelimit-reset）；权限、参数、本地文件和畸形成功响应直接报错。上传重试重建 multipart 和超时信号，消息重试复用同一 UUID 与上传 key；上传成功后的发送失败也须在群里显示，不能只返回 false。
 - 生产 Card Kit mutation 经 per-card queue，在执行时分配 sequence。需要据结果更新 rendered 或持久状态的事务使用 checked API。
 - footer 模型标识共用 `footerModelLabel`：小写 `claude` / `codex` / `dsh` 加 ` · 模型名/effort`。窗口额度保留 `4.1h·7%·[6.9d·17%]` 的原紧凑格式，不增加“额度 / 已用 / 周期标签 / 月度工具”等文字；余额使用结构化快照与 `unifiedUsageSummary`。不将 `planLabel` 当金额，不附加套餐、累计消费或括号说明；失败显示 MISS。
 - 卡片必须先 `recordCardCreated` 再写入；关闭后的迟到写入不能隐式重建状态。分页没有整轮次数上限；单项失败与续卡失败不能封死整轮，后续实际内容可再次写入。

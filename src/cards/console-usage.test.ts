@@ -4,9 +4,8 @@ import { consoleUnifiedUsageContent, consoleUsageElement, unifiedUsageSummary } 
 describe('consoleUnifiedUsageContent(额度渲染)', () => {
   test('hi uses the account bar style in separate window rows and keeps reset credits separate', () => {
     const snapshot = { state: 'ok' as const, resetCredits: 0, windows: [
-      { kind: 'weekly', label: '默认配额 周', percent: 24, resetsAt: null },
-      { kind: 'fiveHour', label: 'GPT-5.3-Codex-Spark 5h', percent: 11, resetsAt: null },
-      { kind: 'weekly', label: 'GPT-5.3-Codex-Spark 周', percent: 25, resetsAt: null },
+      { kind: 'fiveHour', label: '5h 窗口', percent: 11, resetsAt: null },
+      { kind: 'weekly', label: '周配额', percent: 24, resetsAt: null },
     ] }
     const panel = consoleUsageElement({ sessionName: 'test', status: 'idle', unifiedUsage: snapshot }) as any
     expect(panel.element_id).toBe('console_usage')
@@ -15,12 +14,11 @@ describe('consoleUnifiedUsageContent(额度渲染)', () => {
     expect(panel.header.title.content).toBe('📊 额度')
     expect(panel.header.background_color).toBe('blue-50')
     expect(panel.elements.filter((e: any) => e.tag === 'markdown' && e.content.startsWith('**')).map((e: any) => e.content)).toEqual([
-      "**默认配额 周 · 24%**\n<font color='green'>▰▱▱▱▱▱</font>",
-      "**GPT-5.3-Codex-Spark 5h · 11%**\n<font color='green'>▰▱▱▱▱▱</font>",
-      "**GPT-5.3-Codex-Spark 周 · 25%**\n<font color='green'>▰▰▱▱▱▱</font>",
+      "**5h 窗口 · 11%**\n<font color='green'>▰▱▱▱▱▱</font>",
+      "**周配额 · 24%**\n<font color='green'>▰▱▱▱▱▱</font>",
       '**重置卡**　0 次可用',
     ])
-    expect(panel.elements.filter((e: any) => e.tag === 'hr')).toHaveLength(3)
+    expect(panel.elements.filter((e: any) => e.tag === 'hr')).toHaveLength(2)
     expect(JSON.stringify(panel)).toContain('重置时间 MISS')
     expect(unifiedUsageSummary(snapshot)).not.toContain('\n')
     expect(unifiedUsageSummary(snapshot)).not.toContain('▰')

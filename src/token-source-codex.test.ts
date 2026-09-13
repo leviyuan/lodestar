@@ -1,16 +1,50 @@
 import { expect, test } from 'bun:test'
-import { codexBucketsToUnified } from './token-source-codex'
-import { consoleUnifiedUsageContent } from './cards/console'
+import { codexUsageToUnified } from './token-source-codex'
+import { consoleUnifiedUsageContent, consoleUsageElement, unifiedUsageSummary } from './cards/console'
+import type { UsageSnapshot } from './usage'
 
-test('hi preserves a Plus full-window annotation through unified bucket conversion', () => {
-  const windows = codexBucketsToUnified({ state: 'ok', fiveHour: null, weekly: null, fetchedAt: 1,
+test('hi preserves a Plus main full-window annotation through unified conversion', () => {
+  const snapshot = codexUsageToUnified({ state: 'ok', weekly: null, fetchedAt: 1,
+    fiveHour: { percent: 0, resetsAt: null, unreportedFull: true },
     defaultLimitId: 'codex', buckets: [{ limitId: 'codex', limitName: null, weekly: null,
       fiveHour: { percent: 0, resetsAt: null, unreportedFull: true } }],
-  })!
-  expect(windows[0]).toMatchObject({ label: '默认配额 5h', percent: 0, resetsAt: null, unreportedFull: true })
-  const content = consoleUnifiedUsageContent({ state: 'ok', windows })
+  })
+  expect(snapshot.windows[0]).toMatchObject({ label: '5h 窗口', percent: 0, resetsAt: null, unreportedFull: true })
+  const content = consoleUnifiedUsageContent(snapshot)
   expect(content).toContain('满窗 · 0.15 份')
-  expect(content).not.toContain('重置')
+  expect(content).not.toContain('重置时间')
+})
+
+test('Codex quota displays only main windows, regardless of model-specific buckets', () => {
+  const main = {
+    limitId: 'codex', limitName: null,
+    fiveHour: { percent: 0, resetsAt: null }, weekly: { percent: 24, resetsAt: null },
+  }
+  const snapshot: Extract<UsageSnapshot, { state: 'ok' }> = {
+    state: 'ok', fiveHour: main.fiveHour, weekly: main.weekly, resetCredits: 2, fetchedAt: 1,
+    defaultLimitId: 'codex', buckets: [
+      { limitId: 'codex_bengalfox', limitName: 'GPT-5.3-Codex-Spark',
+        fiveHour: { percent: 11, resetsAt: null }, weekly: { percent: 25, resetsAt: null } },
+      main,
+      { limitId: 'another-model', limitName: 'Another model', fiveHour: { percent: 99, resetsAt: null }, weekly: null },
+    ],
+  }
+  for (const fiveHour of [main.fiveHour, null]) {
+    const unified = codexUsageToUnified({ ...snapshot, fiveHour })
+    expect(unified.windows.map(w => [w.kind, w.percent])).toEqual(fiveHour ? [['fiveHour', 0], ['weekly', 24]] : [['weekly', 24]])
+    expect(unified.resetCredits).toBe(2)
+    for (const content of [consoleUnifiedUsageContent(unified), unifiedUsageSummary(unified),
+      JSON.stringify(consoleUsageElement({ sessionName: 'test', status: 'idle', unifiedUsage: unified }))]) {
+      expect(content).toContain('24%')
+      expect(content).not.toMatch(/Spark|5\.3|bengalfox|Another model|11%|25%|99%/)
+    }
+  }
+  // Missing main quota stays MISS; auxiliary meters cannot stand in for it.
+  const missing = codexUsageToUnified({ ...snapshot, fiveHour: null, weekly: null })
+  expect(missing.windows).toEqual([])
+  expect(unifiedUsageSummary(missing)).toBe('额度 MISS')
+  expect(snapshot.buckets).toHaveLength(3)
+  expect(snapshot.buckets![0].fiveHour?.percent).toBe(11)
 })
 
 test('native default auth works without auth.json while missing named credentials remain isolated', () => {
