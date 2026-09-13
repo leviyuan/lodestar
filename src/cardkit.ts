@@ -14,8 +14,9 @@ import { networkFetch } from './network'
  *   - all writes for a card are serialized through a Promise queue
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { getTenantToken } from './feishu'
+import { FeishuRequestError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
 import { log } from './log'
 import { ELEMENTS, neutralizeMarkdownImagesInCard } from './cards/elements'
 
@@ -212,26 +213,39 @@ function attemptedContentFingerprint(s: CardState, elementId?: string, fingerpri
 }
 
 async function call(method: string, path: string, body?: object): Promise<any> {
-  const token = await getTenantToken()
-  const res = await networkFetch(`${BASE}${path}`, {
-    method,
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    ...(body ? { body: JSON.stringify(body) } : {}),
-    signal: AbortSignal.timeout(CARDKIT_FETCH_TIMEOUT_MS),
+  // Mutations carry a sequence; id_convert is a lookup and has no UUID field.
+  // Freeze the whole mutation before retrying: a lost acknowledgement must
+  // resend the same UUID, sequence and content for Feishu's idempotency check.
+  // A TTL reopen invokes call again, so that new operation gets a fresh UUID.
+  const payload = body ? JSON.stringify({
+    ...body,
+    ...('sequence' in body ? { uuid: randomUUID() } : {}),
+  }) : undefined
+  const label = `cardkit ${method} ${path}`
+  return withFeishuRetry(label, async () => {
+    const token = await getTenantToken()
+    const signal = AbortSignal.timeout(CARDKIT_FETCH_TIMEOUT_MS)
+    let res: Response | undefined
+    try {
+      res = await networkFetch(`${BASE}${path}`, {
+        method,
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        ...(payload !== undefined ? { body: payload } : {}),
+        signal,
+      })
+      return (await readFeishuResponse(res, label))?.data
+    } catch (error) {
+      // node-fetch turns deadline expiry into AbortError, including body reads.
+      // Restore the owned timeout reason; arbitrary cancellation is not retried.
+      if (signal.aborted && signal.reason?.name === 'TimeoutError') throw signal.reason
+      if (res && error instanceof FeishuRequestError) {
+        const logId = res.headers.get('x-tt-logid') ?? res.headers.get('x-request-id') ?? res.headers.get('request-id') ?? undefined
+        Object.assign(error, { httpStatus: res.status, logId })
+        if (logId) error.message += ` log_id=${logId}`
+      }
+      throw error
+    }
   })
-  const json = await res.json() as any
-  if (!res.ok || json?.code !== 0) {
-    const code = typeof json?.code === 'number' ? json.code : res.status
-    const logId = res.headers.get('x-tt-logid') ?? res.headers.get('x-request-id') ?? res.headers.get('request-id') ?? undefined
-    const e = new Error(
-      `cardkit ${method} ${path}: HTTP ${res.status} code=${String(json?.code ?? 'MISS')} msg=${json?.msg ?? 'MISS'}${logId ? ` log_id=${logId}` : ''}`,
-    ) as CardKitRequestError
-    e.code = code
-    e.httpStatus = res.status
-    e.logId = logId
-    throw e
-  }
-  return json?.data
 }
 
 function sleep(ms: number): Promise<void> {
@@ -263,9 +277,9 @@ async function reopenStreaming(cardId: string): Promise<void> {
 /** Run `op` inside the per-card queue. If it fails with code=300309
  * or 200850 (Feishu auto-closed / timed-out streaming after the 10-
  * minute TTL), reopen streaming inline and retry `op` exactly once.
- * Anything else — other failure, reopen failure, retry failure — is
- * logged and swallowed, matching the fire-and-forget contract every
- * cardkit op already has at the call sites. */
+ * Each call first exhausts its bounded, idempotent transport retries.
+ * Other failures, including failed reopens, are logged and reported through
+ * callbacks, matching the fire-and-forget contract at the call sites. */
 async function withReopenOnStreamingClosed(
   cardId: string,
   label: string,
@@ -379,8 +393,8 @@ export async function flush(cardId: string): Promise<void> {
 /** Add a new element to the card body or relative to a sibling.
  *
  * `onFailure` fires asynchronously (after promise queue settles) if the
- * element was NOT created — either the first attempt failed with a non-
- * 300309 error, or the retry-after-reopen also failed. Use it to invalidate
+ * element was NOT confirmed after transport retries and any TTL reopen.
+ * Use it to invalidate
  * any daemon-side reference to the element you tried to add (e.g. a segment
  * id), so subsequent writes don't keep PUTting content to a phantom element
  * that Feishu will silently reject. Default (no callback) preserves the

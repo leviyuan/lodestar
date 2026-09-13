@@ -46,7 +46,7 @@
 - 生图完成事件补回的 prompt/revisedPrompt 要更新工具元数据。`session-tools.ts` 上传图片并通过 Card Kit 放入折叠面板，确认落地后才标记已交付；嵌入失败按用户约定单独发图。图片任务按原卡归属登记，关闭和换卡均须等待，避免图片在卡片退役后丢失。
 - `feishu.ts` 的 30 MB 上限覆盖所有出站文件和图片；`instructions.ts` 同步约束所有 Agent 的文件交付。
 - 文件/图片上传和所有 SDK 消息发送共用 `feishu-retry.ts`：已知网络瞬态错误、HTTP 408/429/500/502/503/504 和飞书限流码 99991400/230020 最多尝试 3 次（间隔 1s、4s，遵守不超过 60s 的 Retry-After/x-ogw-ratelimit-reset）；权限、参数、本地文件和畸形成功响应直接报错。上传重试重建 multipart 和超时信号，消息重试复用同一 UUID 与上传 key；上传成功后的发送失败也须在群里显示，不能只返回 false。
-- 生产 Card Kit mutation 经 per-card queue，在执行时分配 sequence。需要据结果更新 rendered 或持久状态的事务使用 checked API。
+- 生产 Card Kit mutation 经 per-card queue，在执行时分配 sequence，并共用 `feishu-retry.ts` 的有限网络重试。一次请求的重试复用同一 UUID、sequence 和序列化内容，每次重建超时信号；TTL 重开及重开后的写入各分配新 UUID 和 sequence。重试耗尽才触发写入失败回调，不把网络错误当容量超限。需要据结果更新 rendered 或持久状态的事务使用 checked API。
 - footer 模型标识共用 `footerModelLabel`：小写 `claude` / `codex` / `dsh` 加 ` · 模型名/effort`。窗口额度保留 `4.1h·7%·[6.9d·17%]` 的原紧凑格式，不增加“额度 / 已用 / 周期标签 / 月度工具”等文字；余额使用结构化快照与 `unifiedUsageSummary`。不将 `planLabel` 当金额，不附加套餐、累计消费或括号说明；失败显示 MISS。
 - 卡片必须先 `recordCardCreated` 再写入；关闭后的迟到写入不能隐式重建状态。分页没有整轮次数上限；单项失败与续卡失败不能封死整轮，后续实际内容可再次写入。
 - 公式在 Markdown code range 外识别：简单 inline 转 Unicode，其余经 MathJax → SVG → Resvg。中文使用 SVG `<text>` 和系统字体；不使用字符占位或 path swap。

@@ -419,7 +419,7 @@ describe('checked card writes', () => {
       }, { notifyCardFailure: false })).toBe(false)
       await cardkit.dispose(cardId)
     }
-  })
+  }, 10_000) // A persistent HTTP 502 now exhausts the real 1s + 4s retry delays.
 
   test('a throwing card failure callback cannot poison the write queue', async () => {
     const cardId = 'card_throwing_failure_callback'
