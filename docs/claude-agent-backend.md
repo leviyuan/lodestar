@@ -101,7 +101,7 @@ Agent 运行依赖由 `src/agent-updates.ts` 独立安装，daemon 启动时不�
 
 委派只有一层：主 Agent 可以并行派工、回答问题和续跑原生会话，被委派的 Agent 不得继续调用其他 Agent。Skill、worker 提示词及运行时入口共同遵循该规则；worker 关闭 Codex `multi_agent` 或 Claude `Agent`/`Task`，保留其余代码工具、项目 MCP 和独立调用凭据。历史父子记录仍保留以便读取与清理。运行状态原子落盘，大段输入输出单独存放；委派会话登记后从主群的历史列表中排除。
 
-委派卡片将整体进度放在顶部，按执行者展示结果、待回答问题和失败原因。单个 Agent 的完成结果默认展开，多个 Agent 的结果分别折叠；不展示 depth、session id 或 request id。
+每次委派以一行状态和调用方提供的 description 展示，进度、任务正文、各执行者结果、待回答问题和失败原因均收在同一折叠面板。群尾委派卡复用至容量用满或出现新消息；主会话新卡也会结束复用。Card Kit 生命周期按共享卡片结算，旧卡上的运行任务继续原地更新；不展示 depth、session id 或 request id。
 
 ## 源码与验证
 

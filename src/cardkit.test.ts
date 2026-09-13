@@ -33,6 +33,21 @@ afterEach(() => {
 })
 
 describe('cardkit card operations', () => {
+  test('checked replacement returns the capacity error and does not revive disposed cards', async () => {
+    const cardId = 'delegation_replace_result'
+    cardkit.recordCardCreated(cardId, 1)
+    globalThis.fetch = (async () => Response.json({ code: 200860, msg: 'card over max size' })) as unknown as typeof fetch
+    const element = { tag: 'markdown', element_id: 'run', content: 'result' }
+    const result = await cardkit.replaceElementResult(cardId, 'run', element)
+    expect(result.landed).toBe(false)
+    expect(result.failure).toMatchObject({ code: 200860, cardId, elementId: 'run' })
+    expect(cardkit.isDeadElement(cardId, 'run')).toBe(true)
+    globalThis.fetch = (async () => Response.json({ code: 0 })) as unknown as typeof fetch
+    expect((await cardkit.replaceElementResult(cardId, 'run', element)).landed).toBe(true)
+    await cardkit.dispose(cardId)
+    expect(await cardkit.replaceElementResult(cardId, 'run', element)).toEqual({ landed: false })
+  })
+
   test('classifies card size and component limits without treating schema errors as capacity', () => {
     expect(cardkit.isCardCapacityFailure(200860, { message: 'ErrMsg: card over max size;' })).toBe(true)
     expect(cardkit.isCardCapacityFailure(300315, {

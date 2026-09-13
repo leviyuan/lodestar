@@ -32,6 +32,7 @@
 - 委派任务按全局 8 个并发槽和 Token Source 上限排队并显示原因；OpenRouter 在同一 daemon 的所有项目、模型间共用 2 个委派名额，这是本地策略而非上游额度。满额来源不得堵住其他来源。取消未确认的进程必须继续保留 handle 与槽位，失败向 Session 传播，不能标成已取消后丢掉控制权。
 - 提问进入 `needs_input`，answer 后恢复；非输入权限请求放行。委派任务不设整轮时长上限，不截断返回正文，结束由后端终态或用户取消决定；follow-up 复用 provider 原生 session。
 - `run --session <session_id>` / `POST /agents/runs` 的 `session_id` 从本群同工作目录的委派历史选择最新一轮，复用原身份及上一轮 effort；每轮新建 run，原生 session 不变。续跑必须等原任务终态和进程退出；同一 provider/session 在开卡、排队及执行期间禁止重叠续跑，不能把恢复失败转为新会话。
+- `run` / `follow-up` 必填单行 `description`（CLI `--description`，最多 60 字）；一条委派一个默认收起的面板，标题仅状态与说明。`agent-cards.ts` 按群尾实际消息复用委派卡，满卡或新消息后开新卡；共享卡的 streaming/dispose 统一结算，单个 run 终态不得关闭同卡其他任务。群内出站消息与委派追加通过 `chat-message-order.ts` 排序；读取群尾失败须报错，不能猜测位置。
 - 每次状态转换原子落盘；大 prompt/输出单独存入私有 artifact，快照不重复内嵌。委派 session id 单独登记，从主会话 `rs`/`fk` 历史排除。
 - 父 run 取消、Session stop/kill/restart 和 daemon shutdown 在首次 await 前关闭新建入口、吊销 capability，并递归回收后代进程。
 - Skill 内容由 `managed-skills.ts` 同源同步至 Codex/Claude standalone 目录和 Claude 本地插件。排除 user settings 的主会话显式加载插件，不能为发现 Skill 混入 user env。

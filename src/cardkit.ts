@@ -516,6 +516,16 @@ export async function replaceElementChecked(
   return !failed && !s.deadElements.has(elementId)
 }
 
+/** Preserve failure classification for callers that rotate only on capacity. */
+export async function replaceElementResult(cardId: string, elementId: string, element: object): Promise<CardWriteResult> {
+  if (isDisposed(cardId)) return { landed: false }
+  const s = state(cardId)
+  if (s.closing) return { landed: false }
+  let failure: CardWriteFailure | undefined
+  await replaceElement(cardId, elementId, element, (_code, detail) => { failure = detail })
+  return { landed: !failure && !s.deadElements.has(elementId), ...(failure ? { failure } : {}) }
+}
+
 export async function addElementChecked(
   cardId: string,
   element: object,

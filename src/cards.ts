@@ -92,7 +92,9 @@ export {
   agentRunCard,
   agentWorkerElement,
   agentRunFooterElement,
-  agentWorkerElementId,
+  agentRunElement,
+  agentRunElementId,
+  agentCardSummary,
   agentWorkerPreviewChars,
   agentRunSummary,
 } from './cards/agents'

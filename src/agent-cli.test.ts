@@ -67,15 +67,15 @@ describe('lodestar-agent CLI args', () => {
 
   test('parses a parallel full-Agent run', () => {
     expect(parsePromptArgs([
-      '--identity', 'a', '--identity', 'b', '--identity', 'a', '--effort', 'max', '--stdin', '--no-wait',
+      '--description', '任务说明', '--identity', 'a', '--identity', 'b', '--identity', 'a', '--effort', 'max', '--stdin', '--no-wait',
     ], true)).toEqual({
-      identityIds: ['a', 'b'], identityId: '', sessionId: '', effort: 'max', prompt: '', noWait: true, readStdin: true, json: false,
+      description: '任务说明', identityIds: ['a', 'b'], identityId: '', sessionId: '', effort: 'max', prompt: '', noWait: true, readStdin: true, json: false,
     })
   })
 
   test('parses a single-session follow-up', () => {
-    expect(parsePromptArgs(['--identity', 'a', 'continue here'], false)).toEqual({
-      identityIds: [], identityId: 'a', sessionId: '', effort: '', prompt: 'continue here', noWait: false, readStdin: false, json: false,
+    expect(parsePromptArgs(['--description', '任务说明', '--identity', 'a', 'continue here'], false)).toEqual({
+      description: '任务说明', identityIds: [], identityId: 'a', sessionId: '', effort: '', prompt: 'continue here', noWait: false, readStdin: false, json: false,
     })
   })
 
@@ -84,8 +84,8 @@ describe('lodestar-agent CLI args', () => {
   })
 
   test('accepts session continuation without a new identity and rejects ambiguous session options', () => {
-    expect(parsePromptArgs(['--session', 'sid', '--prompt', 'next turn', '--json'], true)).toEqual({
-      identityIds: [], identityId: '', sessionId: 'sid', effort: '', prompt: 'next turn', noWait: false, readStdin: false, json: true,
+    expect(parsePromptArgs(['--description', '任务说明', '--session', 'sid', '--prompt', 'next turn', '--json'], true)).toEqual({
+      description: '任务说明', identityIds: [], identityId: '', sessionId: 'sid', effort: '', prompt: 'next turn', noWait: false, readStdin: false, json: true,
     })
     expect(() => parsePromptArgs(['--session', 'sid', '--identity', 'a', '--identity', 'b'], true)).toThrow('at most one')
     expect(() => parsePromptArgs(['--session', 'sid', '--session', 'other'], true)).toThrow('only be specified once')
@@ -119,11 +119,11 @@ describe('lodestar-agent CLI args', () => {
       return { code, stdout, stderr }
     }
     try {
-      const first = await invoke('run', '--identity', 'agent:a', '--prompt', 'first', '--json')
+      const first = await invoke('run', '--description', '任务说明', '--identity', 'agent:a', '--prompt', 'first', '--json')
       expect(first.code, first.stderr).toBe(0)
       const firstRun = JSON.parse(first.stdout)
       expect(firstRun.workers[0].output).toBe('first')
-      const second = await invoke('run', '--session', firstRun.workers[0].session_id, '--prompt', '  第二轮\n', '--json')
+      const second = await invoke('run', '--description', '任务说明', '--session', firstRun.workers[0].session_id, '--prompt', '  第二轮\n', '--json')
       expect(second.code, second.stderr).toBe(0)
       const secondRun = JSON.parse(second.stdout)
       expect(secondRun.run_id).not.toBe(firstRun.run_id)
@@ -131,16 +131,16 @@ describe('lodestar-agent CLI args', () => {
       const status = await invoke('status', secondRun.run_id, '--json')
       expect(status.code, status.stderr).toBe(0)
       expect(JSON.parse(status.stdout)).toEqual(secondRun)
-      const third = await invoke('run', '--session', 'native-sid', '--prompt', 'third')
+      const third = await invoke('run', '--description', '任务说明', '--session', 'native-sid', '--prompt', 'third')
       expect(third.code, third.stderr).toBe(0)
       expect(third.stdout).toContain('Session: native-sid')
-      expect(third.stdout).toContain("lodestar-agent run --session 'native-sid' --identity 'agent:a' --stdin")
+      expect(third.stdout).toContain("lodestar-agent run --session 'native-sid' --identity 'agent:a' --description '<brief next step>' --stdin")
       expect(requests).toEqual([
-        { identity_ids: ['agent:a'], prompt: 'first' },
-        { identity_ids: [], session_id: 'native-sid', prompt: '  第二轮\n' },
-        { identity_ids: [], session_id: 'native-sid', prompt: 'third' },
+        { description: '任务说明', identity_ids: ['agent:a'], prompt: 'first' },
+        { description: '任务说明', identity_ids: [], session_id: 'native-sid', prompt: '  第二轮\n' },
+        { description: '任务说明', identity_ids: [], session_id: 'native-sid', prompt: 'third' },
       ])
-      const failed = await invoke('run', '--session', 'missing', '--prompt', 'next', '--json')
+      const failed = await invoke('run', '--description', '任务说明', '--session', 'missing', '--prompt', 'next', '--json')
       expect(failed.code).toBe(1)
       expect(failed.stderr).toContain('agent session not found')
       expect(requests).toHaveLength(4)

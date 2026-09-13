@@ -1,6 +1,7 @@
 import { localFetch } from './network'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { requireAgentDescription } from './agent-run-types'
 
 interface CliContext {
   baseUrl: string
@@ -12,6 +13,7 @@ interface PromptArgs {
   identityId: string
   sessionId: string
   effort: string
+  description: string
   prompt: string
   noWait: boolean
   readStdin: boolean
@@ -64,6 +66,7 @@ async function runCommand(context: CliContext, argv: string[]): Promise<void> {
   const prompt = await resolvePrompt(parsed)
   const body = {
     identity_ids: parsed.identityIds,
+    description: parsed.description,
     prompt,
     ...(parsed.effort ? { effort: parsed.effort } : {}),
     ...(parsed.sessionId ? { session_id: parsed.sessionId } : {}),
@@ -77,6 +80,7 @@ async function followUpCommand(context: CliContext, argv: string[]): Promise<voi
   const parsed = parsePromptArgs(argv, false)
   const prompt = await resolvePrompt(parsed)
   const body = {
+    description: parsed.description,
     prompt,
     ...(parsed.identityId ? { identity_id: parsed.identityId } : {}),
     ...(parsed.effort ? { effort: parsed.effort } : {}),
@@ -128,7 +132,7 @@ async function answerCommand(context: CliContext, argv: string[]): Promise<void>
 
 export function parsePromptArgs(argv: string[], identitiesRequired: boolean): PromptArgs {
   const out: PromptArgs = {
-    identityIds: [], identityId: '', sessionId: '', effort: '', prompt: '', noWait: false, readStdin: false, json: false,
+    identityIds: [], identityId: '', sessionId: '', effort: '', description: '', prompt: '', noWait: false, readStdin: false, json: false,
   }
   const positional: string[] = []
   for (let i = 0; i < argv.length; i++) {
@@ -140,6 +144,7 @@ export function parsePromptArgs(argv: string[], identitiesRequired: boolean): Pr
         else out.identityId = next()
         break
       case '--effort': out.effort = next(); break
+      case '--description': out.description = next(); break
       case '--session':
         if (!identitiesRequired) throw new Error('--session is only supported by run; follow-up accepts a run_id')
         if (out.sessionId) throw new Error('--session may only be specified once')
@@ -157,6 +162,7 @@ export function parsePromptArgs(argv: string[], identitiesRequired: boolean): Pr
   out.identityIds = [...new Set(out.identityIds)]
   if (out.sessionId && out.identityIds.length > 1) throw new Error('--session accepts at most one --identity')
   if (identitiesRequired && !out.sessionId && out.identityIds.length === 0) throw new Error('run requires at least one --identity')
+  out.description = requireAgentDescription(out.description)
   if (!out.prompt && positional.length) out.prompt = positional.join(' ')
   if (!out.prompt) out.readStdin = true
   return out
@@ -267,6 +273,7 @@ function formatRun(run: any): string {
     `# Lodestar agent ${run.run_id ?? 'MISS'}`,
     '',
     `- Status: ${run.status ?? 'MISS'}`,
+    `- Description: ${run.description ?? 'MISS'}`,
     ...(run.parent_run_id ? [`- Parent: ${run.parent_run_id} (${run.parent_kind ?? 'delegate'})`] : []),
   ]
   if (run.error) lines.push(`- Error: ${run.error}`)
@@ -286,7 +293,7 @@ function formatRun(run: any): string {
     if (worker.session_id && worker.identity_id
       && ['completed', 'failed', 'cancelled'].includes(run.status)) {
       lines.push('', 'Continue with:',
-        `lodestar-agent run --session ${shellQuote(worker.session_id)} --identity ${shellQuote(worker.identity_id)} --stdin`)
+        `lodestar-agent run --session ${shellQuote(worker.session_id)} --identity ${shellQuote(worker.identity_id)} --description '<brief next step>' --stdin`)
     }
   }
   if (run.presentation_errors?.length) {
@@ -315,15 +322,16 @@ function usage(): string {
   return [
     'Usage:',
     '  lodestar-agent identities [--json]',
-    '  lodestar-agent run --identity <id> [--identity <id>...] [--effort <level>] [--json] --stdin',
-    '  lodestar-agent run --session <session_id> [--identity <id>] [--effort <level>] [--json] --stdin',
-    '  lodestar-agent follow-up <run_id> [--identity <id>] [--effort <level>] [--json] --stdin',
+    '  lodestar-agent run --identity <id> [--identity <id>...] --description <summary> [--effort <level>] [--json] --stdin',
+    '  lodestar-agent run --session <session_id> [--identity <id>] --description <summary> [--effort <level>] [--json] --stdin',
+    '  lodestar-agent follow-up <run_id> [--identity <id>] --description <summary> [--effort <level>] [--json] --stdin',
     '  lodestar-agent answer <run_id> [--identity <id>] --request <id> (--answer key=value | --stdin)',
     '  lodestar-agent status <run_id> [--json]',
     '  lodestar-agent cancel <run_id>',
     '',
     'Use --prompt <text> instead of --stdin for inline input. --no-wait returns the started run as JSON.',
     '--session continues a delegated session in the same Lodestar Session and workspace.',
+    '--description is required for every run/follow-up: one short line, at most 60 characters, shown on the collapsed card.',
     'Each turn has a new run_id; workers[].session_id identifies the native conversation.',
   ].join('\n')
 }

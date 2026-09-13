@@ -2,7 +2,8 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import * as cardkit from './cardkit'
-import * as cards from './cards'
+import { AgentCards, type AgentCardsDeps } from './agent-cards'
+import { requireAgentDescription } from './agent-run-types'
 import * as feishu from './feishu'
 import { config } from './config'
 import { getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
@@ -39,7 +40,6 @@ export type AgentPrincipal =
 interface AgentRunRecord {
   snapshot: AgentRunSnapshot
   session: Session | null
-  cardId: string | null
   handles: Map<string, AgentWorkerHandle>
   slotOwners: Map<string, string>
   capabilityByIdentity: Map<string, string>
@@ -58,19 +58,10 @@ interface CreateRunOptions {
   resumeWorker?: AgentWorkerResult
 }
 
-export interface AgentServiceDeps {
+export interface AgentServiceDeps extends AgentCardsDeps {
   getCatalog: typeof getAgentIdentityCatalog
   startWorker: typeof startAgentWorker
-  sendCard(chatId: string, card: object): Promise<string | null>
   sendTextRaw(chatId: string, text: string): Promise<unknown>
-  convertMessageToCard(messageId: string): Promise<string>
-  recordCardCreated(cardId: string, elementCount: number, onFailure?: (code?: number) => void): void
-  replaceElementChecked(cardId: string, elementId: string, element: object): Promise<boolean>
-  patchSummaryThrottled(cardId: string, summary: string): void
-  flush(cardId: string): Promise<void>
-  cancelSummary(cardId: string): void
-  patchSettingsChecked(cardId: string, settings: object): Promise<boolean>
-  dispose(cardId: string): Promise<void>
   writeArtifact(path: string, value: unknown): void
   writeTextArtifact(path: string, value: string): void
   loadArtifacts(): AgentRunSnapshot[]
@@ -80,12 +71,14 @@ const DEFAULT_DEPS: AgentServiceDeps = {
   getCatalog: getAgentIdentityCatalog,
   startWorker: startAgentWorker,
   sendCard: feishu.sendCard,
+  getChatTailMessageId: feishu.getChatTailMessageId,
   sendTextRaw: feishu.sendTextRaw,
   convertMessageToCard: cardkit.convertMessageToCard,
   recordCardCreated: cardkit.recordCardCreated,
-  replaceElementChecked: cardkit.replaceElementChecked,
-  patchSummaryThrottled: cardkit.patchSummaryThrottled,
-  flush: cardkit.flush,
+  getElementCount: cardkit.getElementCount,
+  addElementResult: cardkit.addElementResult,
+  replaceElementResult: cardkit.replaceElementResult,
+  deleteElementChecked: cardkit.deleteElementChecked,
   cancelSummary: cardkit.cancelSummary,
   patchSettingsChecked: cardkit.patchSettingsChecked,
   dispose: cardkit.dispose,
@@ -95,6 +88,7 @@ const DEFAULT_DEPS: AgentServiceDeps = {
 }
 
 export class AgentService {
+  private readonly presentation: AgentCards
   private readonly runs = new Map<string, AgentRunRecord>()
   private readonly capabilities = new Map<string, AgentPrincipal>()
   private activeTurns = 0
@@ -106,6 +100,7 @@ export class AgentService {
   private readonly startingNativeSessions = new Set<string>()
 
   constructor(private readonly deps: AgentServiceDeps = DEFAULT_DEPS) {
+    this.presentation = new AgentCards(deps)
     this.loadDurableRuns()
   }
 
@@ -119,12 +114,13 @@ export class AgentService {
 
   async startRun(principal: AgentPrincipal, request: AgentRunRequest): Promise<AgentRunSnapshot> {
     if (principal.kind !== 'session') throw new Error(NESTED_DELEGATION_ERROR)
+    requireAgentDescription(request.description)
     if (request.sessionId !== undefined) {
       if (!request.sessionId.trim()) throw new Error('agent session_id must be a non-empty string')
       if (request.identityIds.length > 1) throw new Error('agent session continuation accepts at most one identity_id')
       const { run, worker } = this.requireSessionRun(principal, request.sessionId, request.identityIds[0])
       return this.followUp(principal, run.snapshot.runId, {
-        identityId: worker.identityId, prompt: request.prompt, effort: request.effort,
+        identityId: worker.identityId, description: request.description, prompt: request.prompt, effort: request.effort,
       })
     }
     const release = this.reserveCapacity(principal, request.identityIds.length)
@@ -143,6 +139,7 @@ export class AgentService {
     request: AgentFollowUpRequest,
   ): Promise<AgentRunSnapshot> {
     if (principal.kind !== 'session') throw new Error(NESTED_DELEGATION_ERROR)
+    requireAgentDescription(request.description)
     const source = this.requireMutableDescendant(principal, runId)
     if (!isTerminal(source.snapshot.status)) throw new Error('agent follow-up requires a terminal source run')
     const worker = selectWorker(source.snapshot, request.identityId)
@@ -157,6 +154,7 @@ export class AgentService {
       releaseSession = this.reserveNativeSession(worker)
       return await this.createRun(principal.session, {
         identityIds: [worker.identityId],
+        description: request.description,
         prompt: request.prompt,
         effort,
       }, {
@@ -232,6 +230,9 @@ export class AgentService {
     const remainingResults = results.some(result => result.status === 'rejected')
       ? [] : await Promise.allSettled(remaining.map(handle => handle.cancel(reason)))
     throwCancellationFailures([...results, ...remainingResults])
+    for (const chatId of new Set([...this.runs.values()].map(run => run.snapshot.chatId))) {
+      await this.presentation.closeChat(chatId)
+    }
   }
 
   private async createRun(
@@ -272,6 +273,7 @@ export class AgentService {
       chatId: session.chatId,
       workDir: session.workDir,
       prompt: request.prompt,
+      description: requireAgentDescription(request.description),
       ...(options.parentRunId ? { parentRunId: options.parentRunId } : {}),
       ...(options.parentKind ? { parentKind: options.parentKind } : {}),
       depth: 0,
@@ -279,23 +281,9 @@ export class AgentService {
       workers,
       createdAt: new Date().toISOString(),
     }
-    const messageId = await this.deps.sendCard(session.chatId, cards.agentRunCard(snapshot))
-    if (!messageId) throw new Error('agent card creation failed; delegated agents were not started')
-    let cardId: string
-    try {
-      cardId = await this.deps.convertMessageToCard(messageId)
-    } catch (error) {
-      await this.deps.sendTextRaw(session.chatId, `❌ agent 卡片初始化失败，Agent 未启动: ${messageOf(error)}`)
-      throw error
-    }
-    snapshot.cardMessageId = messageId
-    this.deps.recordCardCreated(cardId, workers.length + 2, code => {
-      log(`agent: card write failed run=${runId} code=${code ?? 'MISS'}`)
-    })
     const run: AgentRunRecord = {
       snapshot,
       session,
-      cardId,
       handles: new Map(),
       slotOwners: new Map(),
       capabilityByIdentity: new Map(),
@@ -305,6 +293,20 @@ export class AgentService {
       finalizing: false,
       finalized: false,
       persistedArtifacts: new Set(),
+    }
+    try {
+      await this.presentation.add(snapshot)
+    } catch (error) {
+      this.runs.set(runId, run)
+      if (options.parentRunId) parent?.children.add(runId)
+      const reason = `Agent 卡片初始化失败，Agent 未启动: ${messageOf(error)}`
+      for (const worker of workers) {
+        worker.status = 'failed'
+        worker.error = reason
+      }
+      await this.finalizeRun(run, 'failed', reason)
+      await this.deps.sendTextRaw(session.chatId, `❌ ${reason}`)
+      throw error
     }
     this.runs.set(runId, run)
     if (options.parentRunId) parent?.children.add(runId)
@@ -549,25 +551,7 @@ export class AgentService {
     run.snapshot.finishedAt = new Date().toISOString()
     if (error) run.snapshot.error = error
     try {
-      if (run.cardId) {
-        this.deps.cancelSummary(run.cardId)
-        await this.deps.flush(run.cardId)
-        const footerLanded = await this.deps.replaceElementChecked(
-          run.cardId,
-          cards.ELEMENTS.agentRunFooter,
-          cards.agentRunFooterElement(run.snapshot),
-        )
-        if (!footerLanded) this.recordPresentationError(run, 'agent footer update MISS')
-        const settingsLanded = await this.deps.patchSettingsChecked(run.cardId, {
-          config: {
-            streaming_mode: false,
-            summary: { content: cards.agentRunSummary(run.snapshot) },
-          },
-        })
-        if (!settingsLanded) this.recordPresentationError(run, 'agent terminal settings update MISS')
-        await this.deps.flush(run.cardId)
-        await this.deps.dispose(run.cardId)
-      }
+      await this.presentation.update(run.snapshot, true)
     } catch (presentationError) {
       this.recordPresentationError(run, `agent card finalization failed: ${messageOf(presentationError)}`)
     }
@@ -583,21 +567,14 @@ export class AgentService {
   }
 
   private async updateWorkerCard(run: AgentRunRecord, worker: AgentWorkerResult): Promise<void> {
-    if (!run.cardId || run.finalized) return
+    if (run.finalized) return
+    const previousMessageId = run.snapshot.cardMessageId
     try {
-      const landed = await this.deps.replaceElementChecked(
-        run.cardId,
-        cards.agentWorkerElementId(worker.identityId),
-        cards.agentWorkerElement(worker, cards.agentWorkerPreviewChars(run.snapshot.workers.length), run.snapshot.workers.length === 1),
-      )
-      if (!landed) this.recordPresentationError(run, `agent worker card MISS: ${worker.identityName}`)
-      const progressLanded = await this.deps.replaceElementChecked(
-        run.cardId, cards.ELEMENTS.agentRunFooter, cards.agentRunFooterElement(run.snapshot),
-      )
-      if (!progressLanded) log(`agent: progress update MISS run=${run.snapshot.runId}; later updates will refresh it`)
-      this.deps.patchSummaryThrottled(run.cardId, cards.agentRunSummary(run.snapshot))
+      await this.presentation.update(run.snapshot)
     } catch (error) {
       this.recordPresentationError(run, `agent worker card update failed (${worker.identityName}): ${messageOf(error)}`)
+    } finally {
+      if (run.snapshot.cardMessageId !== previousMessageId) this.persist(run)
     }
   }
 
@@ -809,7 +786,6 @@ export class AgentService {
       const record: AgentRunRecord = {
         snapshot,
         session: null,
-        cardId: null,
         handles: new Map(),
         slotOwners: new Map(),
         capabilityByIdentity: new Map(),
@@ -920,6 +896,7 @@ function isAgentRunSnapshot(value: unknown): value is AgentRunSnapshot {
     && typeof run.chatId === 'string'
     && typeof run.workDir === 'string'
     && typeof run.prompt === 'string'
+    && (run.description === undefined || typeof run.description === 'string')
     && typeof run.depth === 'number'
     && typeof run.status === 'string'
     && Array.isArray(run.workers)

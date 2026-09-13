@@ -62,7 +62,8 @@ function harness(opts: {
   loadArtifacts?: AgentServiceDeps['loadArtifacts']
   sendCard?: AgentServiceDeps['sendCard']
   patchSettingsChecked?: AgentServiceDeps['patchSettingsChecked']
-  replaceElementChecked?: AgentServiceDeps['replaceElementChecked']
+  replaceElementChecked?: (cardId: string, elementId: string, element: object) => Promise<boolean>
+  getChatTailMessageId?: AgentServiceDeps['getChatTailMessageId']
 } = {}) {
   const identities = opts.identities ?? [identity('a', 'Agent A')]
   const catalog: AgentIdentityCatalog = { catalogGeneration: 'g1', identities, sourceFailures: [] }
@@ -73,11 +74,13 @@ function harness(opts: {
     startWorker: opts.startWorker ?? (worker => resolvedHandle(result(`sid-${worker.identity.id}`, `output-${worker.identity.id}`))),
     sendCard: opts.sendCard ?? (async () => 'message-1'),
     sendTextRaw: async () => true,
+    getChatTailMessageId: opts.getChatTailMessageId ?? (async () => null),
+    getElementCount: () => 1,
+    addElementResult: async () => ({ landed: true }),
+    deleteElementChecked: async () => true,
     convertMessageToCard: async () => 'card-1',
     recordCardCreated: () => {},
-    replaceElementChecked: opts.replaceElementChecked ?? (async () => true),
-    patchSummaryThrottled: () => {},
-    flush: async () => {},
+    replaceElementResult: async (cardId, id, element) => ({ landed: await (opts.replaceElementChecked?.(cardId, id, element) ?? true) }),
     cancelSummary: () => {},
     patchSettingsChecked: opts.patchSettingsChecked ?? (async () => true),
     dispose: async () => {},
@@ -112,24 +115,40 @@ async function waitForCondition(check: () => boolean): Promise<void> {
 }
 
 describe('AgentService', () => {
+  test('persists shared card ownership and a new description for each native follow-up', async () => {
+    const sent: object[] = []
+    const { service, root, artifacts } = harness({
+      sendCard: async (_chat, card) => { sent.push(card); return 'message-1' },
+      getChatTailMessageId: async () => 'message-1',
+    })
+    const first = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'first', description: '实现功能' })
+    await waitFor(service, root, first.runId, 'completed')
+    const next = await service.followUp(root, first.runId, { prompt: 'verify', description: '验证功能' })
+    await waitForCondition(() => artifacts.some((value: any) => value.runId === next.runId && value.status === 'completed'))
+    expect(sent).toHaveLength(1)
+    expect(next.cardMessageId).toBe(first.cardMessageId)
+    expect(service.getRun(root, next.runId)).toMatchObject({ description: '验证功能', cardMessageId: 'message-1' })
+    expect(service.getRun(root, first.runId).description).toBe('实现功能')
+  })
+
   test('writes the terminal chat-list summary inside Card Kit config', async () => {
     const settings: object[] = []
     const { service, root } = harness({
       patchSettingsChecked: async (_cardId, value) => { settings.push(value); return true },
     })
-    const started = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'summary test' })
+    const started = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a'], prompt: 'summary test' })
     await waitFor(service, root, started.runId, 'completed')
     expect(settings.at(-1)).toEqual({
       config: {
         streaming_mode: false,
-        summary: { content: '✅ 委派完成 · 1/1' },
+        summary: { content: '✅ 委派完成 · 任务说明' },
       },
     })
   })
 
   test('runs several full Agents concurrently and persists native sessions', async () => {
     const { service, root, artifacts, textArtifacts } = harness({ identities: [identity('a'), identity('codex')] })
-    const started = await service.startRun(root, { identityIds: ['agent:a', 'agent:codex'], prompt: 'implement' })
+    const started = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a', 'agent:codex'], prompt: 'implement' })
     const terminal = await waitFor(service, root, started.runId, 'completed')
     expect(terminal.workers.map(worker => worker.sessionId)).toEqual(['sid-agent:a', 'sid-agent:codex'])
     expect(artifacts.length).toBeGreaterThan(1)
@@ -160,7 +179,7 @@ describe('AgentService', () => {
         }
       },
     })
-    const started = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'ask if needed' })
+    const started = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a'], prompt: 'ask if needed' })
     await waitFor(service, root, started.runId, 'needs_input')
     await service.answer(root, started.runId, { requestId: 'req-1', answers: { q1: 'yes' } })
     const terminal = await waitFor(service, root, started.runId, 'completed')
@@ -175,9 +194,9 @@ describe('AgentService', () => {
         return resolvedHandle(result(opts.resumeSessionId ?? 'sid-first', opts.prompt))
       },
     })
-    const first = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'first' })
+    const first = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a'], prompt: 'first' })
     await waitFor(service, root, first.runId, 'completed')
-    const follow = await service.followUp(root, first.runId, { prompt: 'second' })
+    const follow = await service.followUp(root, first.runId, { description: '任务说明', prompt: 'second' })
     await waitFor(service, root, follow.runId, 'completed')
     expect(calls).toEqual([{ prompt: 'first', resume: undefined }, { prompt: 'second', resume: 'sid-first' }])
   })
@@ -191,10 +210,10 @@ describe('AgentService', () => {
         return resolvedHandle(result(opts.resumeSessionId ?? `sid-${provider}`, `reply: ${opts.prompt}`))
       }
       const { service, root } = harness({ identities: [selected], startWorker })
-      const first = await service.startRun(root, { identityIds: [selected.id], prompt: 'first' })
+      const first = await service.startRun(root, { description: '任务说明', identityIds: [selected.id], prompt: 'first' })
       const firstResult = await waitFor(service, root, first.runId, 'completed')
       const sessionId = firstResult.workers[0]!.sessionId!
-      const second = await service.startRun(root, { identityIds: [], sessionId, prompt: '  second\n', effort: 'low' })
+      const second = await service.startRun(root, { description: '任务说明', identityIds: [], sessionId, prompt: '  second\n', effort: 'low' })
       const secondResult = await waitFor(service, root, second.runId, 'completed')
       expect(secondResult).toMatchObject({ parentRunId: first.runId, parentKind: 'follow_up' })
       expect(secondResult.workers[0]).toMatchObject({ sessionId, output: 'reply:   second\n', effort: 'low' })
@@ -203,7 +222,7 @@ describe('AgentService', () => {
       // Disk enumeration is not chronological. Lineage must win even with equal timestamps.
       const history = [secondResult, firstResult].map(run => ({ ...run, createdAt: '2026-09-01T00:00:00Z' }))
       const reloaded = harness({ identities: [selected], startWorker, loadArtifacts: () => history })
-      const third = await reloaded.service.startRun(reloaded.root, { identityIds: [], sessionId, prompt: 'third' })
+      const third = await reloaded.service.startRun(reloaded.root, { description: '任务说明', identityIds: [], sessionId, prompt: 'third' })
       const terminal = await waitFor(reloaded.service, reloaded.root, third.runId, 'completed')
       expect(terminal).toMatchObject({ parentRunId: second.runId, parentKind: 'follow_up' })
       expect(terminal.workers[0]).toMatchObject({ sessionId, effort: 'low', output: 'reply: third' })
@@ -224,20 +243,20 @@ describe('AgentService', () => {
       sendCard: async () => `card-${++cards}`,
       startWorker: opts => { starts++; return resolvedHandle(result(opts.resumeSessionId ?? `sid-${opts.identity.id}`)) },
     })
-    const first = await service.startRun(root, { identityIds: ['agent:a', 'agent:b'], prompt: 'first' })
+    const first = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a', 'agent:b'], prompt: 'first' })
     await waitFor(service, root, first.runId, 'completed')
     for (const request of [
-      { identityIds: [], sessionId: 'missing', prompt: 'next' },
-      { identityIds: ['agent:b'], sessionId: 'sid-agent:a', prompt: 'next' },
+      { description: '任务说明', identityIds: [], sessionId: 'missing', prompt: 'next' },
+      { description: '任务说明', identityIds: ['agent:b'], sessionId: 'sid-agent:a', prompt: 'next' },
     ]) await expect(service.startRun(root, request)).rejects.toThrow('agent session not found')
     for (const other of [{ chatId: 'other-chat' }, { sessionName: 'other-session' }, { workDir: '/other-repo' }]) {
       const outsider = service.rootPrincipal({ ...session, ...other })
-      await expect(service.startRun(outsider, { identityIds: [], sessionId: 'sid-agent:a', prompt: 'next' }))
+      await expect(service.startRun(outsider, { description: '任务说明', identityIds: [], sessionId: 'sid-agent:a', prompt: 'next' }))
         .rejects.toThrow('agent session not found')
     }
     expect(starts).toBe(2)
     expect(cards).toBe(1)
-    const next = await service.startRun(root, { identityIds: [], sessionId: 'sid-agent:b', prompt: 'second' })
+    const next = await service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid-agent:b', prompt: 'second' })
     const terminal = await waitFor(service, root, next.runId, 'completed')
     expect(terminal.workers).toHaveLength(1)
     expect(terminal.workers[0]).toMatchObject({ identityId: 'agent:b', sessionId: 'sid-agent:b' })
@@ -259,20 +278,20 @@ describe('AgentService', () => {
       startWorker: opts => ++starts === 2 ? control.handle : resolvedHandle(result(opts.resumeSessionId ?? 'sid')),
     })
     try {
-      const first = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'first' })
+      const first = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a'], prompt: 'first' })
       await waitFor(service, root, first.runId, 'completed')
-      const creating = service.startRun(root, { identityIds: [], sessionId: 'sid', prompt: 'second' })
+      const creating = service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'second' })
       await entered
-      await expect(service.followUp(root, first.runId, { prompt: 'duplicate' })).rejects.toThrow('already running or starting')
+      await expect(service.followUp(root, first.runId, { description: '任务说明', prompt: 'duplicate' })).rejects.toThrow('already running or starting')
       expect(cards).toBe(2)
       releaseCard()
       const second = await creating
       await waitFor(service, root, second.runId, 'running')
-      await expect(service.followUp(root, first.runId, { prompt: 'still duplicate' })).rejects.toThrow('already running or starting')
-      await expect(service.startRun(root, { identityIds: [], sessionId: 'sid', prompt: 'too early' })).rejects.toThrow('terminal source run')
+      await expect(service.followUp(root, first.runId, { description: '任务说明', prompt: 'still duplicate' })).rejects.toThrow('already running or starting')
+      await expect(service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'too early' })).rejects.toThrow('terminal source run')
       control.resolve(result('sid'))
       await waitFor(service, root, second.runId, 'completed')
-      const third = await service.startRun(root, { identityIds: [], sessionId: 'sid', prompt: 'third' })
+      const third = await service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'third' })
       await waitFor(service, root, third.runId, 'completed')
       expect(starts).toBe(3)
     } finally { releaseCard(); await service.shutdown('test cleanup') }
@@ -286,22 +305,22 @@ describe('AgentService', () => {
       identities: [selected], sendCard: async () => ++cards === 2 ? null : `message-${cards}`,
       startWorker: opts => { starts++; return resolvedHandle(result(opts.resumeSessionId ?? 'sid')) },
     })
-    const first = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'first' })
+    const first = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a'], prompt: 'first' })
     await waitFor(service, root, first.runId, 'completed')
-    await expect(service.startRun(root, { identityIds: [], sessionId: 'sid', prompt: 'second' })).rejects.toThrow('card creation failed')
+    await expect(service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'second' })).rejects.toThrow('card creation failed')
     for (const field of ['model', 'tokenSourceId', 'provider'] as const) {
       const original = selected[field]
       Object.assign(selected, { [field]: field === 'provider' ? 'codex' : 'changed' })
-      await expect(service.startRun(root, { identityIds: [], sessionId: 'sid', prompt: 'wrong identity' }))
+      await expect(service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'wrong identity' }))
         .rejects.toThrow('identity changed')
       Object.assign(selected, { [field]: original })
     }
     selected.status = 'catalog_failed'
-    await expect(service.startRun(root, { identityIds: [], sessionId: 'sid', prompt: 'unavailable' })).rejects.toThrow('catalog_failed')
+    await expect(service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'unavailable' })).rejects.toThrow('catalog_failed')
     selected.status = 'ready'
     expect(starts).toBe(1)
     expect(cards).toBe(2)
-    const second = await service.startRun(root, { identityIds: [], sessionId: 'sid', prompt: 'second' })
+    const second = await service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'second' })
     await waitFor(service, root, second.runId, 'completed')
     expect(starts).toBe(2)
   })
@@ -320,14 +339,14 @@ describe('AgentService', () => {
       },
     })
     try {
-      const parent = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'parent' })
+      const parent = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a'], prompt: 'parent' })
       for (let i = 0; i < 50 && !capability; i++) await new Promise(resolve => setTimeout(resolve, 1))
       const worker = service.principalForCapability(capability)!
-      await expect(service.startRun(worker, { identityIds: ['agent:a'], prompt: 'nested' }))
+      await expect(service.startRun(worker, { description: '任务说明', identityIds: ['agent:a'], prompt: 'nested' }))
         .rejects.toThrow('cannot delegate again')
-      await expect(service.startRun(worker, { identityIds: [], sessionId: 'sid', prompt: 'nested resume' }))
+      await expect(service.startRun(worker, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'nested resume' }))
         .rejects.toThrow('cannot delegate again')
-      await expect(service.followUp(worker, parent.runId, { prompt: 'nested follow-up' }))
+      await expect(service.followUp(worker, parent.runId, { description: '任务说明', prompt: 'nested follow-up' }))
         .rejects.toThrow('cannot delegate again')
       expect(cardCount).toBe(1)
       expect(starts).toBe(1)
@@ -368,7 +387,7 @@ describe('AgentService', () => {
         return resolvedHandle(result(opts.resumeSessionId!))
       },
     })
-    const follow = await service.followUp(root, source.runId, { prompt: 'continue' })
+    const follow = await service.followUp(root, source.runId, { description: '任务说明', prompt: 'continue' })
     await waitFor(service, root, follow.runId, 'completed')
     expect(resumed).toBe('legacy-session')
     expect(follow.depth).toBe(0)
@@ -386,7 +405,7 @@ describe('AgentService', () => {
       sendCard: async () => { cardEntered(); await released; return 'message-root-race' },
       startWorker: opts => { starts++; return resolvedHandle(result(`sid-${opts.identity.id}`)) },
     })
-    const creating = service.startRun(root, { identityIds: ['agent:a'], prompt: 'racing root' })
+    const creating = service.startRun(root, { description: '任务说明', identityIds: ['agent:a'], prompt: 'racing root' })
     await entered
     await service.cancelSessionRuns('project', 'chat-1', 'session stop')
     releaseCard()
@@ -411,9 +430,9 @@ describe('AgentService', () => {
       },
       startWorker: opts => { starts++; return resolvedHandle(result(`sid-${opts.identity.id}`)) },
     })
-    const source = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'original' })
+    const source = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a'], prompt: 'original' })
     await waitFor(service, root, source.runId, 'completed')
-    const creating = service.followUp(root, source.runId, { prompt: 'continue' })
+    const creating = service.followUp(root, source.runId, { description: '任务说明', prompt: 'continue' })
     await entered
     await service.cancelSessionRuns('project', 'chat-1', 'stop')
     releaseCard()
@@ -437,9 +456,9 @@ describe('AgentService', () => {
       },
     })
     const ids = identities.map(item => item.id)
-    await service.startRun(root, { identityIds: ids, prompt: 'batch one' })
-    await service.startRun(root, { identityIds: ids, prompt: 'batch two' })
-    await expect(service.startRun(root, { identityIds: [ids[0]], prompt: 'overflow' }))
+    await service.startRun(root, { description: '任务说明', identityIds: ids, prompt: 'batch one' })
+    await service.startRun(root, { description: '任务说明', identityIds: ids, prompt: 'batch two' })
+    await expect(service.startRun(root, { description: '任务说明', identityIds: [ids[0]], prompt: 'overflow' }))
       .rejects.toThrow('global Agent worker limit')
     expect(cards).toBe(2)
     await service.shutdown('test cleanup')
@@ -457,7 +476,7 @@ describe('AgentService', () => {
       },
     })
     try {
-      const run = await service.startRun(root, { identityIds: identities.map(item => item.id), prompt: 'parallel work' })
+      const run = await service.startRun(root, { description: '任务说明', identityIds: identities.map(item => item.id), prompt: 'parallel work' })
       for (let i = 0; i < 200 && controls.length < 8; i++) await new Promise(resolve => setTimeout(resolve, 1))
       expect(controls).toHaveLength(8)
       expect(service.getRun(root, run.runId).workers[8]!.status).toBe('queued')
@@ -484,8 +503,8 @@ describe('AgentService', () => {
     })
     const otherRoot = service.rootPrincipal({ ...session, sessionName: 'other-project', chatId: 'chat-2', workDir: '/other' })
     try {
-      await service.startRun(root, { identityIds: router.slice(0, 2).map(item => item.id), prompt: 'first project' })
-      const queued = await service.startRun(otherRoot, {
+      await service.startRun(root, { description: '任务说明', identityIds: router.slice(0, 2).map(item => item.id), prompt: 'first project' })
+      const queued = await service.startRun(otherRoot, { description: '任务说明',
         identityIds: [router[2]!.id, ...others.map(item => item.id)], prompt: 'second project',
       })
       await waitForCondition(() => controls.size === 8)
@@ -520,7 +539,7 @@ describe('AgentService', () => {
     })
     try {
       const runs = []
-      for (const item of identities) runs.push(await service.startRun(root, { identityIds: [item.id], prompt: 'work' }))
+      for (const item of identities) runs.push(await service.startRun(root, { description: '任务说明', identityIds: [item.id], prompt: 'work' }))
       await waitForCondition(() => controls.size === 2)
       expect(service.getRun(root, runs[2]!.runId).status).toBe('queued')
       expect(service.getRun(root, runs[3]!.runId).status).toBe('queued')
@@ -568,17 +587,17 @@ describe('AgentService', () => {
       },
     })
     try {
-      const first = await service.startRun(root, { identityIds: [identities[0]!.id], prompt: 'ask if needed' })
+      const first = await service.startRun(root, { description: '任务说明', identityIds: [identities[0]!.id], prompt: 'ask if needed' })
       await waitFor(service, root, first.runId, 'needs_input')
-      const second = await service.startRun(root, { identityIds: [identities[1]!.id], prompt: 'work' })
-      const third = await service.startRun(root, { identityIds: [identities[2]!.id], prompt: 'wait' })
+      const second = await service.startRun(root, { description: '任务说明', identityIds: [identities[1]!.id], prompt: 'work' })
+      const third = await service.startRun(root, { description: '任务说明', identityIds: [identities[2]!.id], prompt: 'wait' })
       await waitForCondition(() => controls.size === 2)
       expect(service.getRun(root, third.runId).status).toBe('queued')
       await service.answer(root, first.runId, { requestId: 'req-router', answers: { q1: 'yes' } })
       await waitFor(service, root, first.runId, 'completed')
       await waitForCondition(() => controls.size === 3)
 
-      const follow = await service.followUp(root, first.runId, { prompt: 'continue' })
+      const follow = await service.followUp(root, first.runId, { description: '任务说明', prompt: 'continue' })
       expect(service.getRun(root, follow.runId).status).toBe('queued')
       expect(resumedSession).toBeUndefined()
       await service.cancelRun(root, second.runId, 'make room')
@@ -615,9 +634,9 @@ describe('AgentService', () => {
       },
     })
     try {
-      const first = await service.startRun(root, { identityIds: [identities[0]!.id], prompt: 'work' })
-      await service.startRun(root, { identityIds: [identities[1]!.id], prompt: 'work' })
-      const third = await service.startRun(root, { identityIds: [identities[2]!.id], prompt: 'wait' })
+      const first = await service.startRun(root, { description: '任务说明', identityIds: [identities[0]!.id], prompt: 'work' })
+      await service.startRun(root, { description: '任务说明', identityIds: [identities[1]!.id], prompt: 'work' })
+      const third = await service.startRun(root, { description: '任务说明', identityIds: [identities[2]!.id], prompt: 'wait' })
       await waitForCondition(() => controls.size === 2)
       await expect(service.cancelRun(root, first.runId, 'stop')).rejects.toThrow('kill was not confirmed')
       expect(service.getRun(root, third.runId).status).toBe('queued')
@@ -650,7 +669,7 @@ describe('AgentService', () => {
         },
       }),
     })
-    const started = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'work' })
+    const started = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a'], prompt: 'work' })
     await waitFor(service, root, started.runId, 'running')
     await new Promise(resolve => setTimeout(resolve, 1))
     await expect(service.cancelSessionRuns(session.sessionName, session.chatId, 'stop'))
@@ -658,7 +677,7 @@ describe('AgentService', () => {
     expect(service.getRun(root, started.runId).status).toBe('failed')
     expect(service.getRun(root, started.runId).error).toContain('kill was not confirmed')
     expect(alive).toBe(true)
-    await expect(service.followUp(root, started.runId, { prompt: 'resume too early' }))
+    await expect(service.followUp(root, started.runId, { description: '任务说明', prompt: 'resume too early' }))
       .rejects.toThrow('process has not stopped')
     rejectCancel = false
     expect(await service.cancelRun(root, started.runId, 'retry stop')).toBe(true)
@@ -673,7 +692,7 @@ describe('AgentService', () => {
         done: Promise.reject(new AgentWorkerFailure(new Error('upstream failed'), '调查结果仍应保留', 'partial-session')),
       }),
     })
-    const started = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'investigate' })
+    const started = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a'], prompt: 'investigate' })
     const failed = await waitFor(service, root, started.runId, 'failed')
     expect(failed.workers[0]!.output).toBe('调查结果仍应保留')
     expect(failed.workers[0]!.error).toBe('upstream failed')
@@ -688,17 +707,19 @@ describe('AgentService', () => {
       identities,
       startWorker: () => { starts++; return controlledHandle().handle },
       replaceElementChecked: async (_cardId, id, element) => {
-        if (id.startsWith('aw_')) panels.set(id, element)
+        if (id.startsWith('ar_')) panels.set(id, element)
         return true
       },
     })
-    const run = await service.startRun(root, { identityIds: identities.map(item => item.id), prompt: 'tasks' })
+    const run = await service.startRun(root, { description: '任务说明', identityIds: identities.map(item => item.id), prompt: 'tasks' })
     for (let i = 0; i < 100 && starts < 8; i++) await new Promise(resolve => setTimeout(resolve, 1))
     expect(starts).toBe(8)
     await service.cancelRun(root, run.runId, '用户取消')
-    expect(panels.size).toBe(9)
+    expect(panels.size).toBe(1)
     for (const panel of panels.values()) {
       expect(panel.header.title.content).toContain('取消')
+      expect(panel.expanded).toBe(false)
+      for (const item of identities) expect(JSON.stringify(panel)).toContain(item.displayName)
       expect(JSON.stringify(panel)).toContain('停止原因')
       expect(JSON.stringify(panel)).not.toContain('等待执行名额')
     }

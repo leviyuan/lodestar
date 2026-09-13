@@ -48,7 +48,6 @@ export function agentIdentityListCard(opts: AgentIdentityListCardOpts): object {
 }
 
 export function agentRunCard(run: AgentRunSnapshot): object {
-  const previewChars = agentWorkerPreviewChars(run.workers.length)
   return {
     schema: '2.0',
     config: {
@@ -56,26 +55,42 @@ export function agentRunCard(run: AgentRunSnapshot): object {
       streaming_mode: !isTerminal(run.status),
       summary: { content: agentRunSummary(run) },
     },
-    header: {
-      title: { tag: 'plain_text', content: `🧠 ${run.parentKind === 'follow_up' ? '继续委派任务' : '委派任务'} · ${run.workers.length} 位 Agent` },
-      template: 'purple',
-    },
-    body: {
-      elements: [
-        agentRunFooterElement(run),
-        {
-          tag: 'collapsible_panel',
-          header: { title: { tag: 'plain_text', content: `任务说明 · ${shortText(run.prompt, 56)}` } },
-          expanded: false,
-          elements: [{ tag: 'markdown', content: promptPreview(run.prompt) }],
-        },
-        ...run.workers.map(worker => agentWorkerElement(worker, previewChars, run.workers.length === 1)),
-      ],
-    },
+    body: { elements: [agentRunElement(run)] },
   }
 }
 
-export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars = WORKER_MAX_PREVIEW_CHARS, expandResult = false): object {
+/** One visible line per invocation. Everything else stays inside this panel. */
+export function agentRunElement(run: AgentRunSnapshot): object {
+  return {
+    tag: 'collapsible_panel',
+    element_id: agentRunElementId(run.runId),
+    header: { title: { tag: 'plain_text', content: agentRunSummary(run) } },
+    expanded: false,
+    elements: [{
+      tag: 'markdown',
+      content: [
+        `**${escapeMarkdown(run.description ?? '说明 MISS')}**`,
+        agentRunFooterElement(run).content,
+        `**任务说明**\n${promptPreview(run.prompt)}`,
+        ...run.workers.map(worker => agentWorkerElement(worker, agentWorkerPreviewChars(run.workers.length)).content),
+      ].join('\n\n'),
+    }],
+  }
+}
+
+export function agentRunElementId(runId: string): string {
+  return `ar_${createHash('sha256').update(runId).digest('hex').slice(0, 16)}`
+}
+
+export function agentCardSummary(runs: AgentRunSnapshot[]): string {
+  if (runs.length === 1) return agentRunSummary(runs[0]!)
+  const done = runs.filter(run => isTerminal(run.status)).length
+  const failed = runs.filter(run => run.status === 'failed').length
+  const waiting = runs.filter(run => run.status === 'needs_input').length
+  return `🧠 委派任务 · 已结束 ${done}/${runs.length}${failed ? ` · 失败 ${failed}` : ''}${waiting ? ` · 待答 ${waiting}` : ''}`
+}
+
+export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars = WORKER_MAX_PREVIEW_CHARS) {
   const status = workerStatusLabel(worker)
   const body: string[] = [`模型 ${inlineCode(worker.model)} · 推理 ${inlineCode(worker.effort)}`]
   if (worker.durationMs != null) body.push(`用时 ${formatDuration(worker.durationMs / 1000)}`)
@@ -105,15 +120,12 @@ export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars
     }
   }
   return {
-    tag: 'collapsible_panel',
-    element_id: agentWorkerElementId(worker.identityId),
-    header: { title: { tag: 'plain_text', content: `${status} · ${shortText(worker.identityName, 48)}` } },
-    expanded: worker.status === 'failed' || worker.status === 'needs_input' || (expandResult && worker.status === 'completed' && !!worker.output),
-    elements: [{ tag: 'markdown', content: body.join('\n') }],
+    tag: 'markdown',
+    content: [`**${status} · ${escapeMarkdown(worker.identityName)}**`, ...body].join('\n'),
   }
 }
 
-export function agentRunFooterElement(run: AgentRunSnapshot): object {
+export function agentRunFooterElement(run: AgentRunSnapshot) {
   const completed = run.workers.filter(item => item.status === 'completed').length
   const failed = run.workers.filter(item => item.status === 'failed').length
   const waiting = run.workers.filter(item => item.status === 'needs_input').length
@@ -133,13 +145,8 @@ export function agentRunFooterElement(run: AgentRunSnapshot): object {
   ]
   return {
     tag: 'markdown',
-    element_id: ELEMENTS.agentRunFooter,
     content: lines.join('\n'),
   }
-}
-
-export function agentWorkerElementId(identityId: string): string {
-  return `aw_${createHash('sha256').update(identityId).digest('hex').slice(0, 16)}`
 }
 
 export function agentWorkerPreviewChars(workerCount: number): number {
@@ -149,7 +156,7 @@ export function agentWorkerPreviewChars(workerCount: number): number {
 
 export function agentRunSummary(run: AgentRunSnapshot): string {
   const done = run.workers.filter(item => item.status === 'completed').length
-  return `${runStatusLabel(run)} · ${done}/${run.workers.length}`
+  return `${runStatusLabel(run)} · ${shortText(run.description ?? '说明 MISS', 40)}${run.workers.length > 1 ? ` · ${done}/${run.workers.length}` : ''}`
 }
 
 function identityRow(identity: AgentIdentity): object {

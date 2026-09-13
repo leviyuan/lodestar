@@ -1,7 +1,9 @@
 export const MAX_AGENT_PROMPT_CHARS = 800_000
+export const MAX_AGENT_DESCRIPTION_CHARS = 60
 
 export interface AgentRunRequest {
   identityIds: string[]
+  description: string
   prompt: string
   effort?: string
   /** Resume a native session previously delegated by this Lodestar Session. */
@@ -10,6 +12,7 @@ export interface AgentRunRequest {
 
 export interface AgentFollowUpRequest {
   identityId?: string
+  description: string
   prompt: string
   effort?: string
 }
@@ -82,6 +85,8 @@ export interface AgentRunSnapshot {
   prompt: string
   /** Durable prompt body is stored separately from lifecycle metadata. */
   promptArtifact?: string
+  /** Required for new runs; absent only in history written before compact cards. */
+  description?: string
   parentRunId?: string
   parentKind?: 'delegate' | 'follow_up'
   /** Legacy history metadata. New tasks are always main-Agent delegates (0). */
@@ -113,7 +118,7 @@ export function parseAgentRunRequest(raw: unknown): AgentRunRequest {
   if (identityIds.length > 64) throw new Error('agent run supports at most 64 identities')
   const prompt = requiredPrompt(value.prompt, 'agent run requires "prompt"')
   const effort = optionalString(value.effort)
-  return { identityIds, prompt, ...(effort ? { effort } : {}), ...(sessionId ? { sessionId } : {}) }
+  return { identityIds, description: requireAgentDescription(value.description), prompt, ...(effort ? { effort } : {}), ...(sessionId ? { sessionId } : {}) }
 }
 
 export function parseAgentFollowUpRequest(raw: unknown): AgentFollowUpRequest {
@@ -122,10 +127,21 @@ export function parseAgentFollowUpRequest(raw: unknown): AgentFollowUpRequest {
   const identityId = optionalString(value.identity_id ?? value.identityId)
   const effort = optionalString(value.effort)
   return {
+    description: requireAgentDescription(value.description),
     prompt,
     ...(identityId ? { identityId } : {}),
     ...(effort ? { effort } : {}),
   }
+}
+
+export function requireAgentDescription(raw: unknown): string {
+  if (typeof raw !== 'string' || !raw.trim()) throw new Error('agent run requires "description" (CLI: --description)')
+  const description = raw.trim()
+  if (/[\r\n\u2028\u2029]/.test(description)) throw new Error('agent description must be a single line')
+  if ([...description].length > MAX_AGENT_DESCRIPTION_CHARS) {
+    throw new Error(`agent description exceeds ${MAX_AGENT_DESCRIPTION_CHARS} characters`)
+  }
+  return description
 }
 
 export function parseAgentAnswerRequest(raw: unknown): AgentAnswerRequest {

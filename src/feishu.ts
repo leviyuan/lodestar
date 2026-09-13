@@ -1,4 +1,5 @@
 import { networkFetch } from './network'
+import { withChatMessageOrder } from './chat-message-order'
 import { AGENT_PROVIDERS, isAgentProvider, isDshReasoningEffort } from './agent-process'
 /**
  * Feishu (Lark) primitives: Lark client, tenant token cache, chat
@@ -1234,16 +1235,29 @@ function isNormalChatStatus(status: string | null): boolean {
 }
 
 export async function sendText(chatId: string, text: string): Promise<string | null> {
-  return sendViaSdkWithRetry('text', chatId, 'text', JSON.stringify({ text }))
+  return withChatMessageOrder(chatId, () => sendViaSdkWithRetry('text', chatId, 'text', JSON.stringify({ text })))
 }
 
 export async function sendCard(chatId: string, card: object): Promise<string | null> {
-  return sendViaSdkWithRetry(
+  return withChatMessageOrder(chatId, () => sendViaSdkWithRetry(
     'card',
     chatId,
     'interactive',
     JSON.stringify(neutralizeMarkdownImagesInCard(card)),
-  )
+  ))
+}
+
+/** Read the actual chat tail, including messages sent by users/other apps. */
+export async function getChatTailMessageId(chatId: string): Promise<string | null> {
+  const response = await client.im.message.list({ params: {
+    container_id_type: 'chat', container_id: chatId, sort_type: 'ByCreateTimeDesc', page_size: 1,
+  } })
+  if (response.code !== 0) throw new Error(`feishu message.list failed code=${response.code ?? 'MISS'} msg=${response.msg ?? 'MISS'}`)
+  if (!Array.isArray(response.data?.items)) throw new Error('feishu message.list items MISS')
+  if (response.data.items.length === 0) return null
+  const messageId = response.data.items[0]?.message_id
+  if (typeof messageId !== 'string' || !messageId.trim()) throw new Error('feishu message.list message_id MISS')
+  return messageId
 }
 
 export async function updateCard(messageId: string, card: object): Promise<void> {
@@ -1265,6 +1279,10 @@ export async function updateCard(messageId: string, card: object): Promise<void>
  * use this as a general-purpose send; it's the failure-surfacing
  * channel, not a silent fallback. */
 export async function sendTextRaw(chatId: string, text: string): Promise<string | null> {
+  return withChatMessageOrder(chatId, () => sendTextRawOrdered(chatId, text))
+}
+
+async function sendTextRawOrdered(chatId: string, text: string): Promise<string | null> {
   try {
     const token = await getTenantToken()
     const res = await rawFetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id', {
@@ -1467,6 +1485,10 @@ async function uploadFileMultipart(filePath: string): Promise<string | null> {
 }
 
 export async function sendImage(chatId: string, imageKey: string): Promise<string | null> {
+  return withChatMessageOrder(chatId, () => sendImageOrdered(chatId, imageKey))
+}
+
+async function sendImageOrdered(chatId: string, imageKey: string): Promise<string | null> {
   try {
     const res: any = await client.im.message.create({
       params: { receive_id_type: 'chat_id' },
@@ -1481,6 +1503,10 @@ export async function sendImage(chatId: string, imageKey: string): Promise<strin
 }
 
 export async function sendFile(chatId: string, fileKey: string): Promise<string | null> {
+  return withChatMessageOrder(chatId, () => sendFileOrdered(chatId, fileKey))
+}
+
+async function sendFileOrdered(chatId: string, fileKey: string): Promise<string | null> {
   try {
     const res: any = await client.im.message.create({
       params: { receive_id_type: 'chat_id' },
