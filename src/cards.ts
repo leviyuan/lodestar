@@ -1,6 +1,7 @@
 /** Feishu Card Kit schema 2.0 模板的统一导出入口。 */
 
 export { ELEMENTS, sanitizeMarkdownForCardKit } from './cards/elements'
+export { formatDuration } from './cards/duration'
 export {
   type ThreadGoal,
   type TurnPlanStep,

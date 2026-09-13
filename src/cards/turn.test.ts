@@ -453,13 +453,23 @@ describe('main conversation card rendering', () => {
     })
   })
 
-  test('chat-list summary uses a symbol for turn output', () => {
+  test.each([
+    [0, '0s'],
+    [12.34, '12.3s'],
+    [45, '45s'],
+    [60, '1m'],
+    [90, '1.5m'],
+    [3600, '1h'],
+    [10800, '3h'],
+    [11520, '3.2h'],
+    [90000, '25h'],
+  ])('chat-list summary formats %s seconds as %s with turn output', (durationSec, label) => {
     const settings = streamingOffSettings({
-      durationSec: '12.4',
+      durationSec,
       outputTokens: 420,
     }) as any
 
-    expect(settings.config.summary.content).toBe('✅ · ⏱ 12.4s · 📶 420')
+    expect(settings.config.summary.content).toBe(`✅ · ⏱ ${label} · 📶 420`)
   })
 
   test('usage panel shows MISS for missing percentages and no stale badge', () => {
@@ -532,7 +542,7 @@ describe('plan and goal rendering', () => {
       completedAtMs: 1780541433236,
     }, 'context_compact_0') as any
 
-    expect(el.header.title.content).toContain('✅ 🚨 上下文压缩 #1 · 耗时 1m 48s')
+    expect(el.header.title.content).toContain('✅ 🚨 上下文压缩 #1 · 耗时 1.8m')
     expect(el.header.title.content).not.toContain('结束压缩')
     expect(el.elements[0].content).toBe('**来源**: contextCompaction')
   })
@@ -640,7 +650,7 @@ describe('plan and goal rendering', () => {
     expect(body).toContain('**🎯 当前目标** · 进行中')
     expect(body).toContain('完成 Lodestar plan 展示迁移')
     expect(body).toContain('- 用量: 3456 / 12000 tokens')
-    expect(body).toContain('- 用时: 2m 5s')
+    expect(body).toContain('- 用时: 2.1m')
 
     const timelineEl = goalElement({
       objective: '目标更新位置可见',

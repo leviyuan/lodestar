@@ -11,6 +11,7 @@ import type { GlmUsageSnapshot } from '../glm-usage'
 import type { UsageSnapshotUnified, TokenSourceModelCatalogState } from '../token-source'
 import type { AgentProvider } from '../agent-process'
 import { ELEMENTS } from './elements'
+import { formatDuration } from './duration'
 import { fmtResetIn, usageWindowElements } from './usage'
 
 export { fmtResetIn } from './usage'
@@ -982,15 +983,15 @@ function inlineCode(s: string): string {
  * and updates the chat-list preview with `⏱ duration · 📶 NK`
  * (or just the suffix if interrupted before a result event). */
 export function streamingOffSettings(opts: {
-  durationSec?: string
+  durationSec?: number
   outputTokens?: number | null
   suffix?: string
 }): object {
   const parts: string[] = []
   parts.push(opts.suffix ?? '✅')
   // durationSec 缺省的场景:mid-turn rotate 收尾旧卡 (turn 还在跑,没
-  // turn-final elapsed)。直接省掉 ⏱ 段,避免拼出 "⏱ undefineds"。
-  if (opts.durationSec) parts.push(`⏱ ${opts.durationSec}s`)
+  // turn-final elapsed)。此时省掉 ⏱ 段,合法的 0 秒仍显示。
+  if (opts.durationSec != null) parts.push(`⏱ ${formatDuration(opts.durationSec)}`)
   if (opts.outputTokens != null && opts.outputTokens > 0) {
     parts.push(`📶 ${fmtTokens(opts.outputTokens)}`)
   }

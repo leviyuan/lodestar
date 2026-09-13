@@ -42,7 +42,7 @@ export interface LodestarConfig {
     /**
      * 活跃 footer / 后台卡 header 的耗时展示。
      * - `bucket`(默认):粗档位,只在档位边界 push,省飞书配额
-     * - `second`:按秒显示,footer 刷新；长时间运行后降低刷新频率
+     * - `second`:按时长选择单位,每秒刷新；长时间运行后降低刷新频率
      */
     live_elapsed: LiveElapsedMode
   }

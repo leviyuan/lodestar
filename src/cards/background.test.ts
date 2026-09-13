@@ -46,6 +46,9 @@ describe('elapsedBucket', () => {
     expect(elapsedBucket(600_000)).toEqual({ label: '10m+', nextDelayMs: 600_000 })
     expect(elapsedBucket(1_199_999)).toEqual({ label: '10m+', nextDelayMs: 1 })
     expect(elapsedBucket(1_200_000)).toEqual({ label: '20m+', nextDelayMs: 600_000 })
+    expect(elapsedBucket(3_600_000)).toEqual({ label: '1h+', nextDelayMs: 600_000 })
+    expect(elapsedBucket(4_200_000)).toEqual({ label: '1.1h+', nextDelayMs: 600_000 })
+    expect(elapsedBucket(10_800_000)).toEqual({ label: '3h+', nextDelayMs: 600_000 })
   })
 
   test('normalizes non-finite input instead of producing a zero-delay timer loop', () => {
@@ -60,18 +63,23 @@ describe('liveElapsed', () => {
     expect(liveElapsed(45_000)).toEqual(elapsedBucket(45_000))
   })
 
-  test('second mode returns whole-second labels and a 1s tick', () => {
+  test('second mode uses a single duration unit and preserves refresh boundaries', () => {
     expect(liveElapsed(0, 'second')).toEqual({ label: '0s', nextDelayMs: LIVE_ELAPSED_SECOND_FOOTER_TICK_MS })
     expect(liveElapsed(999, 'second')).toEqual({ label: '0s', nextDelayMs: 1000 })
     expect(liveElapsed(1_500, 'second')).toEqual({ label: '1s', nextDelayMs: 1000 })
     expect(liveElapsed(45_000, 'second')).toEqual({ label: '45s', nextDelayMs: 1000 })
-    // 边界:599_999ms 仍按秒,600_000ms(整 10m)切档位。
-    expect(liveElapsed(599_999, 'second')).toEqual({ label: '599s', nextDelayMs: 1000 })
+    expect(liveElapsed(60_000, 'second')).toEqual({ label: '1m', nextDelayMs: 1000 })
+    expect(liveElapsed(90_000, 'second')).toEqual({ label: '1.5m', nextDelayMs: 1000 })
+    // 边界:599_999ms 仍每秒刷新,600_000ms(整 10m)切档位。
+    expect(liveElapsed(599_999, 'second')).toEqual({ label: '10m', nextDelayMs: 1000 })
     // 超 10m:不再按秒,改 5m 颗粒度档位(10m+ / 15m+ / 20m+…),只在 5m 边界 push。
     expect(liveElapsed(600_000, 'second')).toEqual({ label: '10m+', nextDelayMs: 300_000 })
     expect(liveElapsed(899_999, 'second')).toEqual({ label: '10m+', nextDelayMs: 1 })
     expect(liveElapsed(900_000, 'second')).toEqual({ label: '15m+', nextDelayMs: 300_000 })
     expect(liveElapsed(1_200_000, 'second')).toEqual({ label: '20m+', nextDelayMs: 300_000 })
+    expect(liveElapsed(3_600_000, 'second')).toEqual({ label: '1h+', nextDelayMs: 300_000 })
+    expect(liveElapsed(4_200_000, 'second')).toEqual({ label: '1.1h+', nextDelayMs: 300_000 })
+    expect(liveElapsed(10_800_000, 'second')).toEqual({ label: '3h+', nextDelayMs: 300_000 })
   })
 })
 
@@ -393,10 +401,10 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     expect(panel.header.title.content).not.toContain('<1m')
   })
 
-  test('completed:header 写「用时 Ns」(用 usage.duration_ms)', () => {
-    const t = mk({ id: 't1', type: 'shell', description: 'build', status: 'completed', startedAt: 0, usage: { total_tokens: 10, tool_uses: 1, duration_ms: 23000 } })
+  test('completed:header 用单一单位显示长任务耗时(用 usage.duration_ms)', () => {
+    const t = mk({ id: 't1', type: 'shell', description: 'build', status: 'completed', startedAt: 0, usage: { total_tokens: 10, tool_uses: 1, duration_ms: 10_800_000 } })
     const panel = backgroundTaskPanel(t, 999999) as any
-    expect(panel.header.title.content).toContain('用时 23s')
+    expect(panel.header.title.content).toContain('用时 3h')
   })
 
   test('failed:header 写「失败 Ns」', () => {

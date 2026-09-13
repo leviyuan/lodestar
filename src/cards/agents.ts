@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import type { AgentIdentity, AgentSourceFailure } from '../agent-identities'
 import type { AgentRunSnapshot, AgentWorkerResult } from '../agent-run-types'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
+import { formatDuration } from './duration'
 
 const PROMPT_PREVIEW_CHARS = 10_000
 const WORKER_TOTAL_PREVIEW_CHARS = 48_000
@@ -77,7 +78,7 @@ export function agentRunCard(run: AgentRunSnapshot): object {
 export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars = WORKER_MAX_PREVIEW_CHARS, expandResult = false): object {
   const status = workerStatusLabel(worker)
   const body: string[] = [`模型 ${inlineCode(worker.model)} · 推理 ${inlineCode(worker.effort)}`]
-  if (worker.durationMs != null) body.push(`用时 ${durationLabel(worker.durationMs)}`)
+  if (worker.durationMs != null) body.push(`用时 ${formatDuration(worker.durationMs / 1000)}`)
   if (worker.status === 'queued' && worker.queuedReason) body.push('', escapeMarkdown(worker.queuedReason))
   if (worker.pendingInput) {
     body.push('', '**等待主 Agent 回答**')
@@ -127,7 +128,7 @@ export function agentRunFooterElement(run: AgentRunSnapshot): object {
   const lines = [
     `**${runStatusLabel(run)}** · 完成 ${completed}/${run.workers.length}`,
     ...(counts.length ? [counts.join(' · ')] : []),
-    ...(duration != null && Number.isFinite(duration) ? [`⏱ 用时 ${durationLabel(duration)}`] : []),
+    ...(duration != null && Number.isFinite(duration) ? [`⏱ 用时 ${formatDuration(duration / 1000)}`] : []),
     ...(run.error ? [escapeMarkdown(run.error)] : []),
   ]
   return {
@@ -211,15 +212,6 @@ function runStatusLabel(run: AgentRunSnapshot): string {
     case 'running': return run.workers.length > 0 && run.workers.every(worker => isTerminal(worker.status))
       ? '⏳ 正在收尾' : '⏳ 正在执行'
   }
-}
-
-function durationLabel(ms: number): string {
-  if (!Number.isFinite(ms) || ms < 0) return '—'
-  const seconds = Math.floor(ms / 1000)
-  if (seconds < 60) return `${seconds} 秒`
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`
-  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`
 }
 
 function promptPreview(value: string): string {

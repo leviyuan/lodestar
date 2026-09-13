@@ -1,7 +1,7 @@
 export type FooterTimer = {
   setStatus(status: string): void
   stop(): void
-  elapsedSec(): string
+  elapsedSec(): number
 }
 
 export type StatusCardHandle = {

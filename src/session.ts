@@ -224,7 +224,7 @@ function liveElapsedMode(): LiveElapsedMode {
 
 /** footer 状态文案:状态词 + 耗时标签。
  *  bucket 模式:相对档位(<30s / <1m / …),只在边界 push;
- *  second 模式:按秒显示,footer 每 1s push。
+ *  second 模式:按时长选择单位,前 10m 每 1s push,之后按 5m 档位。
  *  见 startFooterTimer / startFooterStatus。*/
 function timedStatus(status: string, startedAt: number): string {
   return `${status} (${liveElapsed(Date.now() - startedAt, liveElapsedMode()).label})`
@@ -1099,7 +1099,7 @@ export class Session {
       void this.replaceFooterContent(cardId, renderContent(timedStatus(status, startedAt)))
     }
     // footer 显示「状态词 + 耗时」(见 timedStatus)。bucket 只在档位边界 push;
-    // second 固定 1s。setStatus 切换状态也立即 push。
+    // second 前 10m 固定 1s,之后按 5m 档位。setStatus 切换状态也立即 push。
     // elapsedSec 仍基于 startedAt,供 closeStatusCard 结束时显示总耗时。
     let timer: ReturnType<typeof setTimeout> | null = null
     const scheduleNext = (): void => {
@@ -1118,8 +1118,8 @@ export class Session {
         stopped = true
         if (timer) clearTimeout(timer)
       },
-      elapsedSec(): string {
-        return ((Date.now() - startedAt) / 1000).toFixed(1)
+      elapsedSec(): number {
+        return (Date.now() - startedAt) / 1000
       },
     }
   }
@@ -1169,7 +1169,7 @@ export class Session {
     if (!handle) return
     handle.timer.stop()
     const elapsed = handle.timer.elapsedSec()
-    const content = cards.statusCardContent(handle.title, `${finalStatus} (${elapsed}s)`)
+    const content = cards.statusCardContent(handle.title, `${finalStatus} (${cards.formatDuration(elapsed)})`)
     await cardkit.flush(handle.cardId)
     const footerLanded = await cardkit.replaceElementChecked(
       handle.cardId,
@@ -5747,7 +5747,7 @@ export class Session {
     if (turn.rotating) await turn.rotating
     await sessionTools.waitForImageDeliveries(turn)
     this.stopFooterStatus(turn)
-    const elapsed = ((Date.now() - turn.startedAt) / 1000).toFixed(1)
+    const elapsed = (Date.now() - turn.startedAt) / 1000
     const cardId = turn.cardId
     const segmentTexts = turn.segmentTexts
     await cardkit.flush(cardId)
@@ -5809,7 +5809,7 @@ export class Session {
     // Footer line 1 keeps the terminal status compact. Usage-derived
     // numbers only render when a fresh SDK result landed for THIS turn;
     // interrupts/boot failures would otherwise show stale prior-turn data.
-    const line1Parts = [`${stateMark} ⏱ ${elapsed}s`]
+    const line1Parts = [`${stateMark} ⏱ ${cards.formatDuration(elapsed)}`]
     if (opts.hasFreshResult) {
       const ctxTokens = snapshot.contextTokens
       const ctxMax = snapshot.contextLimit
@@ -5843,7 +5843,7 @@ export class Session {
       cards.ELEMENTS.footer,
       this.footerElement(footer),
     )
-    // Final chat-list preview: clean finish shows "⏱ Xs · NK tokens";
+    // Final chat-list preview: clean finish shows "⏱ duration · NK tokens";
     // interrupted shows the suffix instead (no usage event landed).
     // cancelSummary kills any in-flight throttled write so a stale
     // in-flight summary update can't clobber this terminal summary.

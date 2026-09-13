@@ -50,10 +50,11 @@ describe('delegated Agent cards', () => {
     }
     const card = agentRunCard(run) as any
     expect(card.body.elements[0].content).toContain('完成 1/1')
-    expect(card.body.elements[0].content).toContain('1 分 5 秒')
+    expect(card.body.elements[0].content).toContain('用时 1.1m')
     expect(card.body.elements[0].content).not.toContain('失败 0')
     const panel = card.body.elements.find((item: any) => item.element_id === agentWorkerElementId(identity.id))
     expect(panel.expanded).toBe(true)
+    expect(panel.elements[0].content).toContain('用时 1.1m')
     expect(JSON.stringify(panel)).toContain('接口检查通过')
 
     run.status = 'failed'

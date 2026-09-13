@@ -10,6 +10,7 @@ import type { CodexUsage } from '../codex-process'
 import type { AgentProvider } from '../agent-process'
 import { contextPercentSummary, contextTokenRatioLabel } from '../context-window'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
+import { formatDuration } from './duration'
 
 export function footerModelLabel(provider: AgentProvider, model?: string | null, effort?: string | null): string {
   const label = model?.replace(/^claude:/i, '').replace(/\[1m\]$/i, '')
@@ -95,17 +96,6 @@ function planHeader(plan: TurnPlanStep[], draftText = ''): string {
   return `📋 计划更新 · ${planStats(plan)}`
 }
 
-function formatGoalTime(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) return 'MISS'
-  if (seconds < 60) return `${Math.round(seconds)}s`
-  const minutes = Math.floor(seconds / 60)
-  const rest = Math.round(seconds % 60)
-  if (minutes < 60) return rest ? `${minutes}m ${rest}s` : `${minutes}m`
-  const hours = Math.floor(minutes / 60)
-  const min = minutes % 60
-  return min ? `${hours}h ${min}m` : `${hours}h`
-}
-
 function numberValue(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null
 }
@@ -114,7 +104,7 @@ function compactionDurationLabel(data: Record<string, unknown>): string {
   const startedAt = numberValue(data.startedAtMs)
   const completedAt = numberValue(data.completedAtMs)
   if (startedAt == null || completedAt == null || completedAt < startedAt) return ''
-  return ` · 耗时 ${formatGoalTime((completedAt - startedAt) / 1000)}`
+  return ` · 耗时 ${formatDuration((completedAt - startedAt) / 1000)}`
 }
 
 function compactTokenLabel(value: unknown): string | null {
@@ -250,7 +240,7 @@ export function goalElement(goal: ThreadGoal, elementId: string): object {
     goal.objective,
     '',
     `- 用量: ${tokensUsed}${tokenBudget} tokens`,
-    `- 用时: ${formatGoalTime(goal.timeUsedSeconds)}`,
+    `- 用时: ${formatDuration(goal.timeUsedSeconds)}`,
   ]
   return {
     tag: 'collapsible_panel',

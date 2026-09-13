@@ -4863,6 +4863,30 @@ describe('Session lifecycle reliability', () => {
     )).toBe(true)
   })
 
+  test('a three-hour turn uses hours in both the final footer and chat-list preview', async () => {
+    const session = new Session('long-turn-duration', 'chat_id') as any
+    const turn = turnState('card_long_turn_duration')
+    turn.startedAt = Date.now() - 10_800_000
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    try {
+      await session.closeTurnCard(undefined, { hasFreshResult: false })
+      const footer = calls.find(call =>
+        call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`
+      )
+      expect(JSON.parse(footer?.body.element ?? '{}').content).toContain('✅ ⏱ 3h')
+      const settings = calls.find(call =>
+        call.method === 'PATCH' && call.path === `/cards/${turn.cardId}/settings`
+      )
+      expect(JSON.parse(settings?.body.settings ?? '{}').config.summary.content).toBe('✅ · ⏱ 3h')
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+      session.dispose()
+    }
+  })
+
   test('keeps CardKit state and sends fallback when the terminal footer transaction misses', async () => {
     const session = new Session('terminal-miss', 'chat_id') as any
     const turn = turnState('card_terminal_miss')

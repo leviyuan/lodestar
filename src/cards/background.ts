@@ -44,6 +44,7 @@ import type {
   BgTaskStatus,
 } from '../claude-agent-process'
 import { sanitizeMarkdownForCardKit } from './elements'
+import { formatDuration } from './duration'
 import { shellCommandDescription } from './shell-command'
 
 export type { BgTaskStatus }
@@ -445,17 +446,6 @@ const TYPE_LABEL: Record<BgTaskType, string> = {
   unknown: '任务',
 }
 
-/** ms → "45s" / "2m13s" / "1h5m"。 */
-function fmtElapsed(ms: number): string {
-  if (!ms || ms < 0) return '0s'
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  if (m < 60) return `${m}m${s % 60}s`
-  const h = Math.floor(m / 60)
-  return `${h}h${m % 60}m`
-}
-
 const FOOTER_BUCKETS = [
   { limit: 30_000, label: '<30s' },
   { limit: 60_000, label: '<1m' },
@@ -466,7 +456,7 @@ const FOOTER_BUCKETS = [
 
 /** 活跃 footer / 后台卡 header 的耗时展示模式。
  *  - `bucket`: 粗档位 (`<30s`/`<1m`/…)，只在档位边界 push（默认，省飞书配额）
- *  - `second`: 按秒显示并每秒 push;超 10m 后改 5m 档位(10m+/15m+/20m+…,见 liveElapsed) */
+ *  - `second`: 按时长选择单位并每秒 push;超 10m 后改 5m 档位(见 liveElapsed) */
 export type LiveElapsedMode = 'bucket' | 'second'
 
 /** second 模式下 footer / 后台卡前 10m 都按 1s tick(对齐旧 FOOTER_STATUS_TICK_MS)。 */
@@ -480,7 +470,7 @@ const SECOND_BUCKET_STEP_MS = 300_000
 
 /** 相对时长档位:<30s / <1m / <3m / <5m / <10m,超过 10m 后每 10 分钟一档(10m+、20m+…)。
  *  返回当前档位标签 + 到下一档位边界的毫秒数。footer / 后台任务 header 用粗粒度档位
- *  代替秒数 —— 档位只在边界变,所以更新只发生在档位边界,不是每秒 tick。*/
+ *  代替秒数;满 1h 后用小时。更新只发生在档位边界,不是每秒 tick。*/
 export function elapsedBucket(elapsedMs: number): { label: string; nextDelayMs: number } {
   const ms = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs) : 0
   for (const b of FOOTER_BUCKETS) {
@@ -489,13 +479,13 @@ export function elapsedBucket(elapsedMs: number): { label: string; nextDelayMs: 
   const step = 600_000
   const idx = Math.floor((ms - 600_000) / step)
   const nextBoundary = 600_000 + (idx + 1) * step
-  return { label: `${(idx + 1) * 10}m+`, nextDelayMs: nextBoundary - ms }
+  return { label: `${formatDuration((idx + 1) * 600, 'down')}+`, nextDelayMs: nextBoundary - ms }
 }
 
 /**
  * Live elapsed for footer / background headers.
  * `bucket` → coarse label + delay to next boundary;
- * `second` → `Ns` label + fixed 1s delay (callers may override for background).
+ * `second` → single-unit label + 1s delay for the first 10m, then 5m buckets.
  */
 export function liveElapsed(
   elapsedMs: number,
@@ -507,10 +497,10 @@ export function liveElapsed(
     if (ms >= SECOND_BUCKET_BASE_MS) {
       const idx = Math.floor((ms - SECOND_BUCKET_BASE_MS) / SECOND_BUCKET_STEP_MS)
       const nextBoundary = SECOND_BUCKET_BASE_MS + (idx + 1) * SECOND_BUCKET_STEP_MS
-      return { label: `${10 + idx * 5}m+`, nextDelayMs: nextBoundary - ms }
+      return { label: `${formatDuration((10 + idx * 5) * 60, 'down')}+`, nextDelayMs: nextBoundary - ms }
     }
     return {
-      label: `${Math.floor(ms / 1000)}s`,
+      label: formatDuration(Math.floor(ms / 1000)),
       nextDelayMs: LIVE_ELAPSED_SECOND_FOOTER_TICK_MS,
     }
   }
@@ -528,7 +518,7 @@ function terminalElapsed(t: BgTaskEntry): number {
 }
 
 /** 标题里的状态+时长标签(折叠时常驻可见)。
- *  活跃态按 liveElapsedMode 显示档位或秒数;终态保留精确耗时。 */
+ *  活跃态按 liveElapsedMode 显示档位或耗时;终态使用实际耗时。 */
 function statusLabel(
   t: BgTaskEntry,
   now: number,
@@ -540,9 +530,9 @@ function statusLabel(
     case 'running': return `🟡 运行中 (${liveLabel(now - t.startedAt)})`
     case 'paused': return `⏸️ 已暂停 (${liveLabel(now - t.startedAt)})`
     case 'pending': return `⚪ 等待中`
-    case 'completed': return `✅ 用时 ${fmtElapsed(terminalElapsed(t))}`
-    case 'failed': return `❌ 失败 ${fmtElapsed(terminalElapsed(t))}`
-    case 'killed': return `💀 已终止 ${fmtElapsed(terminalElapsed(t))}`
+    case 'completed': return `✅ 用时 ${formatDuration(terminalElapsed(t) / 1000)}`
+    case 'failed': return `❌ 失败 ${formatDuration(terminalElapsed(t) / 1000)}`
+    case 'killed': return `💀 已终止 ${formatDuration(terminalElapsed(t) / 1000)}`
   }
 }
 
@@ -577,7 +567,7 @@ function renderDetailBody(t: BgTaskEntry): string {
 
 /** 单任务的整 panel —— 标题写「图标 责任人·描述 — 状态·时长」,展开看详情 body。
  *  session 据此 addElement(新任务)/replaceElement(刷新,整个 panel)。
- *  liveElapsedMode 只影响活跃态 header 时长文案;终态仍用精确 fmtElapsed。 */
+ *  liveElapsedMode 只影响活跃态 header 时长文案;终态仍用实际耗时。 */
 export function backgroundTaskPanel(
   t: BgTaskEntry,
   now: number = Date.now(),
