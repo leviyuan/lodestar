@@ -58,6 +58,8 @@ export const ELEMENTS = {
   modelAgentGroup: (agent: string) => `model_agent_${agent}`,
   /** Basic project tasklist binding panel. */
   tasklistPanel: 'tasklist_panel',
+  /** Independent receipt for one turn's delivered cloud files. */
+  fileDeliveryList: 'file_delivery_list',
   /** Global delegated-agent identity catalog and run status. */
   agentIdentityPanel: 'agent_id_panel',
   agentRunFooter: 'agent_run_footer',

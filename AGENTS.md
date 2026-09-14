@@ -39,7 +39,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - 保留 Claude 的原生 resume/fork、提问、project profile、MCP/Skill、主动压缩和 SDK 后台任务；保留 Codex 的权限、提问、plan/goal、compaction、usage 和 collab 事件。共享接口须表达后端差异。
 - `cardkit.ts` 独占生产卡的队列、sequence、TTL 重开、元素计数和写入失败状态。正文按完整 block 插入静态元素，footer 用 replace；模板和 Session 不直调 Card Kit HTTP。
 - `worktree.ts` 管理 `work/*` 分支和同级 `<project>[name]` 工作区。飞书任务清单只提供绑定与删除，不启动自动规划、执行、审核或合并 worker。
-- 出站文件不超过 30 MB（30 × 1024 × 1024 字节），Agent 交付前检查，发送层同步拦截；超限文件先压缩或分卷。`[[send: /abs/path]]` 发送为独立文件消息，正文保留标记作为回执；卡片模板不读取文件。
+- `[[send: /abs/path]]` 默认走原生聊天附件及其 30 MB 上限；`files on/off` 按群开启/关闭云空间，`files` 查看设置。主 Agent 启动时按群设置动态注入交付标记，只有附件模式附加大小约束；共享 Skill 不写死上限，不让 Agent 查接口或配置。`group-file-delivery.ts` 按 chat_id 持久绑定唯一目录，目录名与实时群名一致，跨轮次和重启复用；关闭保留目录与文件。同名群不能混用目录，失效绑定不得自动重建空目录。云空间卡只列本轮文件，管理按钮打开本群全部历史交付文件的原生飞书目录；开启者和交付发起人获 full_access、群获 view，不转移所有权或开放公网分享。超过 20 MB 分片上传，限额由上游判断，失败不自动切换通道。原附件/图片通道保留，旧聊天附件不删除、不自动迁移。交付方式在本轮输入交给 Agent 时固定，开关改变从下一轮用户任务更新提示词，不重复普通输入或重启进程；记录由 paths.ts 定义，远端文件不自动清理，模板不读取文件。
 - Codex 生图的提示词和图片默认放在同一个折叠面板，提示词包含完成事件补回的内容，不在折叠标题中展开。图片成功嵌入后不再单发；无法嵌入时按用户要求单独发图。关闭或换卡前等待所属图片上传和写入完成。
 - `hi` 展示 Codex 账号可用的重置卡次数，来源为 `account/rateLimits/read` 的 `rateLimitResetCredits.availableCount`；额度窗口在 hi 中逐行展示；这不是飞书换卡计数，也不加入回复 footer。
 - `codex-reset [备注]` 显式使用一次账号重置卡；省略备注只取当前运行账号，账号未知时要求指定。调用原生 `account/rateLimitResetCredit/consume`，同一消息及其网络重试复用幂等标识；按四种原生 outcome 展示结果，之后重新读额度，不能推算卡数或掩盖已扣卡后的刷新/关闭失败。

@@ -2,6 +2,7 @@
 
 export { ELEMENTS, sanitizeMarkdownForCardKit } from './cards/elements'
 export { formatDuration } from './cards/duration'
+export { fileDeliveryCard, fileDeliverySettingsCard, fileSizeLabel } from './cards/files'
 export {
   type ThreadGoal,
   type TurnPlanStep,

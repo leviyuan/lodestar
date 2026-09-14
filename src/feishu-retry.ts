@@ -19,8 +19,8 @@ function isTransient(error: any): boolean {
   if (!error || typeof error !== 'object') return false
   const status = error.response?.status ?? error.status
   const code = error.response?.data?.code ?? error.code
-  // Feishu reports application/group rate limits as 99991400/230020, also on HTTP 400.
-  if (code === 99991400 || code === 230020 || TRANSIENT_HTTP_STATUS.has(status)) return true
+  // Drive explicitly marks 1061045 as retryable; rate limits may also use HTTP 400.
+  if (code === 99991400 || code === 230020 || code === 1061045 || TRANSIENT_HTTP_STATUS.has(status)) return true
   if (typeof status === 'number' && status >= 400) return false
   if (TRANSIENT_NETWORK_CODES.has(code) || error.name === 'TimeoutError') return true
   // Native fetch wraps socket errors in cause; do not retry arbitrary TypeErrors,

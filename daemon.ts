@@ -46,6 +46,7 @@ import { codexLogins } from './src/codex-login'
 import { settleCodexAccountCards } from './src/session-codex-accounts'
 import { handleAgentRequest } from './src/agent-api'
 import { ensureLodestarAgentSkill } from './src/agent-skill'
+import { ensureLodestarFileSkill } from './src/file-delivery-skill'
 import { ensureLodestarAgentCommand } from './src/managed-commands'
 import { config } from './src/config'
 import { log } from './src/log'
@@ -1527,6 +1528,7 @@ async function boot(): Promise<void> {
   // body matches what's actually listening.
   ensureFeishuNotifySkill()
   ensureLodestarAgentSkill()
+  ensureLodestarFileSkill()
 
   // Reserve recovery ahead of both messages and card actions in each chat's
   // FIFO before ingress opens. Feishu REST status cards do not require WS.

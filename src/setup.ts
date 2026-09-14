@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url'
 import { CONFIG_DIR, CONFIG_FILE } from './paths'
 import { writeStateFileAtomic } from './state-store'
 import { agentBin, updateAgentRuntime } from './agent-updates'
+import feishuPermissions from '../docs/feishu-permissions.json'
 
 const C = {
   reset: '\x1b[0m',
@@ -329,8 +330,14 @@ export async function runSetup(): Promise<void> {
   console.log(`  ${C.bold}② 添加机器人能力${C.reset}`)
   console.log(`     左侧菜单 "${C.cyan}添加应用能力${C.reset}" → 找到 "机器人" → 点 "${C.bold}添加${C.reset}" 按钮。`)
   console.log()
-  console.log(`  ${C.bold}③ 申请权限 (左侧 "${C.cyan}权限管理${C.reset}" → "${C.bold}开通权限${C.reset}")${C.reset}`)
-  console.log(`     ${C.yellow}缺一个都会让 daemon 启动后默默丢消息, 一定要全开。${C.reset}`)
+  console.log(`  ${C.bold}③ 申请权限 (左侧 "${C.cyan}权限管理${C.reset}" → "${C.bold}批量导入/导出权限${C.reset}")${C.reset}`)
+  console.log(`     ${C.yellow}选择应用身份权限，复制下方完整 JSON 批量导入，一次开齐账号信息、消息、卡片和云空间能力。${C.reset}`)
+  console.log(JSON.stringify(feishuPermissions, null, 2))
+  console.log(`     ${C.dim}无需用户身份权限或飞书 CLI 登录。权限申请后须完成审批，并在步骤 ⑤ 发布飞书应用版本。${C.reset}`)
+  console.log(`     ${C.dim}清单包含以下用途；也可按名称逐项开通:${C.reset}`)
+  console.log(`     ${C.dim}账号与认证信息 (排障):${C.reset}`)
+  console.log(`       • ${C.bold}verification:verification_information:readonly${C.reset} ${C.dim}# 查看账号主体认证状态${C.reset}`)
+  console.log(`       • ${C.bold}tenant:tenant:readonly${C.reset}             ${C.dim}# 查看租户基本信息${C.reset}`)
   console.log(`     ${C.dim}消息类:${C.reset}`)
   console.log(`       • ${C.bold}im:message:send_as_bot${C.reset}            ${C.dim}# 以机器人身份发消息${C.reset}`)
   console.log(`       • ${C.bold}im:message${C.reset}                        ${C.dim}# 接收/操作消息 (核心)${C.reset}`)
@@ -348,6 +355,11 @@ export async function runSetup(): Promise<void> {
   console.log(`     ${C.dim}卡片类 (Card Kit):${C.reset}`)
   console.log(`       • ${C.bold}cardkit:card:read${C.reset}                 ${C.dim}# 读卡片状态${C.reset}`)
   console.log(`       • ${C.bold}cardkit:card:write${C.reset}                ${C.dim}# 创建/更新卡片 (流式渲染核心)${C.reset}`)
+  console.log(`     ${C.dim}云空间交付 (权限预先开通，功能仍按群开启):${C.reset}`)
+  console.log(`       • ${C.bold}drive:drive${C.reset}                       ${C.dim}# 上传、创建目录、协作者授权、关闭并核对文件链接分享${C.reset}`)
+  console.log(`       • ${C.bold}drive:file:upload${C.reset}                 ${C.dim}# 文件夹改名接口单独要求此权限${C.reset}`)
+  console.log(`     ${C.dim}默认仍直接发聊天附件；在指定群发送 files on 开启云空间，files off 恢复附件。${C.reset}`)
+  console.log(`     ${C.yellow}只取得 tenant_access_token 不代表以上权限已生效；缺少权限时群内命令会明确报错。${C.reset}`)
   console.log()
   console.log(`  ${C.bold}④ 订阅事件 (左侧 "${C.cyan}事件与回调${C.reset}", 拆两个子页:)${C.reset}`)
   console.log(`     ${C.dim}a)${C.reset} ${C.bold}事件配置${C.reset} 页:`)

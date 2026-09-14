@@ -38,6 +38,22 @@ Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`�
 
 长期运行可交给 Linux `systemd --user`、macOS `launchd` 或 Windows 任务计划程序。daemon 重启后会恢复上次活跃的会话。
 
+## 飞书应用权限
+
+创建自建应用并添加机器人能力后，在飞书开放平台的“权限管理 → 批量导入/导出权限”中，导入完整的 [应用身份权限 JSON](feishu-permissions.json)。安装向导会显示同一份清单，账号信息、消息、卡片和文件交付权限可一次开齐。使用应用身份，不需要用户授权登录，也不依赖飞书 CLI。
+
+云空间交付需要同时包含以下权限：
+
+| 应用身份权限 | 用途 |
+| --- | --- |
+| `drive:drive` | 上传与查看文件、创建文件夹、授予协作者权限，以及关闭并核对文件链接分享 |
+| `drive:file:upload` | 文件夹标题更新接口单独要求的权限，用于保持文件夹名与群名一致 |
+| `im:chat` | 读取实际群名和群信息 |
+
+清单还包括原生附件的 `im:resource`、机器人发消息的 `im:message:send_as_bot`、Card Kit 权限，以及排障时读取租户和认证信息的权限。需要审批的权限应完成审批，再创建并发布飞书应用版本。取得应用访问凭据不代表业务权限已生效。
+
+升级已有应用时也应补齐清单并发布应用版本。开通权限不会改变群设置：文件默认直接作为聊天附件发送，只有群内执行 `files on` 才启用云空间，`files off` 恢复附件。文件夹权限与实际文件的分享入口会分别处理，具体行为见[文件与生图](usage.md#文件与生图)。
+
 ## 本机配置
 
 默认配置文件是 `~/.config/lodestar/config.toml`，可通过 `LODESTAR_CONFIG` 指定文件。日志和会话状态位于 `~/.local/share/lodestar/`；Windows 使用相应的应用数据目录。完整路径定义见 [src/paths.ts](../src/paths.ts)。

@@ -1,6 +1,7 @@
 import type { Session } from './session'
 import type { AgentProvider } from './agent-process'
-import { CHANNEL_INSTRUCTIONS, CLAUDE_CHANNEL_INSTRUCTIONS, DSH_CHANNEL_INSTRUCTIONS } from './instructions'
+import { channelInstructions } from './instructions'
+import type { FileDeliveryMode } from './file-delivery-types'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
@@ -24,8 +25,8 @@ export function worktreeSessionDir(s: Session): string {
   return worktree.expectedWorktreePath(projectDir, projectName, slug)
 }
 
-export function spawnDeveloperInstructions(s: Session, provider: AgentProvider = s.currentProvider()): string {
-  const base = provider === 'dsh' ? DSH_CHANNEL_INSTRUCTIONS : provider === 'claude' ? CLAUDE_CHANNEL_INSTRUCTIONS : CHANNEL_INSTRUCTIONS
+export function spawnDeveloperInstructions(s: Session, mode: FileDeliveryMode, provider: AgentProvider = s.currentProvider()): string {
+  const base = channelInstructions(provider, mode)
   const extra = worktreeExtraInstruction(s)
   return extra ? `${base}\n${extra}` : base
 }

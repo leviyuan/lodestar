@@ -103,6 +103,20 @@ test('all message types retry transient SDK failures with the same UUID and reje
   `)
 })
 
+test('Drive explicit retryable errors use the shared bounded retry policy', async () => {
+  await runIsolated(`
+    const { withFeishuRetry, FeishuRequestError } = await import('./src/feishu-retry')
+    let attempts = 0
+    const value = await withFeishuRetry('Drive upload', async () => {
+      if (++attempts < 3) throw new FeishuRequestError('can retry', 400, 1061045)
+      return 'uploaded'
+    })
+    assert.equal(value, 'uploaded')
+    assert.equal(attempts, 3)
+    assert.deepEqual(delays, [1000, 4000])
+  `)
+})
+
 test('uploads retry token failures and rebuild multipart bodies; message retries reuse the uploaded key', async () => {
   await runIsolated(`
     const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs')

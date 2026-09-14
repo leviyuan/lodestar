@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { fileDeliveryAgentContext } from './instructions'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import {
   boundResumes, branchBaseBySession, clearedResumes, deletedReactions, projectProfiles, resetFeishuMock,
@@ -219,6 +220,182 @@ async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<vo
     await new Promise(resolve => setTimeout(resolve, 1))
   }
 }
+
+describe('Session cloud file receipts', () => {
+  test('keeps ordinary file and image messages as the default with no cloud card or upload', () => {
+    const session = new Session('native-files', 'unconfigured-chat') as any
+    const turn = turnState()
+    session.currentTurn = turn
+    session.createFileDeliveryForTurn = () => { throw new Error('cloud delivery must not be used by default') }
+    expect(session.getFileDeliveryMode()).toBe('chat')
+    session.sendOutboundPath('/tmp/report.pdf', 'send marker')
+    session.sendOutboundPath('/tmp/image.png', 'send marker')
+    expect(sentLocalFiles).toEqual([['unconfigured-chat', '/tmp/report.pdf'], ['unconfigured-chat', '/tmp/image.png']])
+    expect(turn.fileDelivery).toBeUndefined()
+    expect(turn.fileDeliveryMode).toBe('chat')
+    expect(sentCards).toHaveLength(0)
+  })
+
+  test('switches only newly admitted batches, so one turn never mixes attachment and cloud delivery', () => {
+    const session = new Session('file-mode-switch', 'chat') as any
+    let mode = 'chat'
+    const cloudPaths: string[] = []
+    session.getFileDeliveryMode = () => mode
+    session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
+    session.currentTurn = turnState()
+    session.sendOutboundPath('/tmp/first.pdf', 'send marker')
+    mode = 'drive'
+    session.sendOutboundPath('/tmp/second.pdf', 'send marker')
+    expect(sentLocalFiles.map(([, path]) => path)).toEqual(['/tmp/first.pdf', '/tmp/second.pdf'])
+    expect(cloudPaths).toEqual([])
+    session.currentTurn = turnState()
+    session.sendOutboundPath('/tmp/third.pdf', 'send marker')
+    expect(cloudPaths).toEqual(['/tmp/third.pdf'])
+  })
+
+  test('updates delivery rules only when the group mode changes, without repeating startup rules', () => {
+    const session = new Session('file-mode-context', 'chat') as any
+    const proc = new FakeAgentProc('codex')
+    let mode = 'drive'
+    session.getFileDeliveryMode = () => mode
+    session.procFileDeliveryModes.set(proc, mode)
+    session.sendClaimedUserText(proc, '生成大文件')
+    mode = 'chat'
+    session.sendClaimedUserText(proc, '继续交付')
+    session.sendClaimedUserText(proc, '生成报告')
+    mode = 'drive'
+    session.sendClaimedUserText(proc, '生成视频')
+    expect(proc.sentTexts).toEqual([
+      '生成大文件',
+      `${fileDeliveryAgentContext('chat')}\n\n继续交付`,
+      '生成报告',
+      `${fileDeliveryAgentContext('drive')}\n\n生成视频`,
+    ])
+    expect(proc.sentTexts[3]).not.toMatch(/30|大小|压缩|分卷/)
+  })
+
+  test('freezes delivery before file generation so changing the group switch cannot invalidate the prepared file', () => {
+    const session = new Session('file-mode-preparation', 'chat') as any
+    const proc = new FakeAgentProc('codex')
+    session.proc = proc
+    let mode = 'drive'
+    session.getFileDeliveryMode = () => mode
+    session.procFileDeliveryModes.set(proc, mode)
+    const cloudPaths: string[] = []
+    session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
+    session.currentTurn = turnState()
+    session.sendClaimedUserText(proc, '生成视频')
+    mode = 'chat'
+    session.sendOutboundPath('/tmp/video.mp4', 'send marker')
+    expect(cloudPaths).toEqual(['/tmp/video.mp4'])
+    expect(sentLocalFiles).toEqual([])
+    session.currentTurn = turnState()
+    session.sendClaimedUserText(proc, '生成报告')
+    session.sendOutboundPath('/tmp/report.pdf', 'send marker')
+    expect(sentLocalFiles).toEqual([['chat', '/tmp/report.pdf']])
+    expect(proc.sentTexts).toEqual(['生成视频', `${fileDeliveryAgentContext('chat')}\n\n生成报告`])
+  })
+
+  test('keeps the injected delivery mode if the backend opens its card after the group switch changed', () => {
+    const session = new Session('file-mode-late-card', 'chat') as any
+    const proc = new FakeAgentProc('codex')
+    session.proc = proc
+    let mode = 'drive'
+    session.getFileDeliveryMode = () => mode
+    session.procFileDeliveryModes.set(proc, mode)
+    const cloudPaths: string[] = []
+    session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
+    session.sendClaimedUserText(proc, '生成视频')
+    mode = 'chat'
+    session.currentTurn = turnState()
+    session.sendOutboundPath('/tmp/late-video.mp4', 'send marker')
+    expect(cloudPaths).toEqual(['/tmp/late-video.mp4'])
+    expect(sentLocalFiles).toEqual([])
+  })
+
+  test('retries a delivery-rule update after the backend rejects its input write', () => {
+    const session = new Session('file-mode-write-error', 'chat') as any
+    const proc = new FakeAgentProc('codex')
+    session.procFileDeliveryModes.set(proc, 'drive')
+    session.getFileDeliveryMode = () => 'chat'
+    const send = proc.sendUserText.bind(proc)
+    proc.sendUserText = () => { throw new Error('input closed') }
+    expect(() => session.sendClaimedUserText(proc, '生成报告')).toThrow('input closed')
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(session.procFileDeliveryModes.get(proc)).toBe('drive')
+    proc.sendUserText = send
+    session.sendClaimedUserText(proc, '生成报告')
+    expect(proc.sentTexts).toEqual([`${fileDeliveryAgentContext('chat')}\n\n生成报告`])
+  })
+
+  test('routes files commands to the current group settings without forwarding them to an Agent', async () => {
+    const session = new Session('file-commands', 'chat') as any
+    const calls: unknown[][] = []
+    session.runFileDeliveryCommand = async (...args: unknown[]) => { calls.push(args) }
+    for (const command of ['files', 'files on', 'FILES OFF']) expect(await session.runCommand(command, 'ou_user')).toBe(true)
+    expect(calls).toEqual([['', 'ou_user'], ['on', 'ou_user'], ['OFF', 'ou_user']])
+  })
+
+  test('keeps one delivery across rotations, deduplicates markers, and waits for final publication', async () => {
+    const session = new Session('files', 'chat_id') as any
+    const turn = turnState('card_file_receipt')
+    turn.fileDeliveryMode = 'drive'
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.currentTurn = turn
+    const admitted: string[] = []
+    let release!: (paths: string[]) => void
+    let finishStarted = false
+    const publication = new Promise<string[]>(resolve => { release = resolve })
+    let factories = 0
+    session.createFileDeliveryForTurn = (captured: any) => {
+      expect(captured.userOpenId).toBe('ou_user')
+      factories++
+      return { add: (path: string) => { admitted.push(path) }, finish: () => { finishStarted = true; return publication } }
+    }
+    session.sendOutboundPath('/tmp/large.mp4', 'send marker')
+    session.sendOutboundPath('/tmp/large.mp4', 'duplicate marker')
+    session.sendOutboundPath('/tmp/report.pdf', 'send marker after rotation')
+    expect(factories).toBe(1)
+    expect(admitted).toEqual(['/tmp/large.mp4', '/tmp/report.pdf'])
+    expect(turn.outboundSentPaths.size).toBe(0)
+    expect(sentLocalFiles).toHaveLength(0)
+    const closed = session.closeTurnCard()
+    await waitUntil(() => finishStarted)
+    expect(cardkit.isDisposed(turn.cardId)).toBe(false)
+    release(['/tmp/large.mp4'])
+    await closed
+    expect(turn.outboundSentPaths.has('/tmp/large.mp4')).toBe(true)
+    expect(turn.outboundSentPaths.has('/tmp/report.pdf')).toBe(false)
+    expect(cardkit.isDisposed(turn.cardId)).toBe(true)
+  })
+
+  test.each(['hard', 'soft'])('%s stop cancels file delivery after the agent finished and its turn was captured', async mode => {
+    const session = new Session('closing-files', 'chat_id') as any
+    const turn = turnState('card_closing_files')
+    turn.fileDeliveryMode = 'drive'
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    let finishStarted = false
+    let cancelled = ''
+    let release!: (paths: string[]) => void
+    const published = new Promise<string[]>(resolve => { release = resolve })
+    session.createFileDeliveryForTurn = () => ({
+      add: () => {},
+      finish: () => { finishStarted = true; return published },
+      cancel: (reason: string) => { cancelled = reason; release([]); return true },
+    })
+    session.sendOutboundPath('/tmp/large.mp4', 'send marker')
+    const close = session.closeTurnCard()
+    await waitUntil(() => finishStarted)
+    expect(session.currentTurn).toBeNull()
+    if (mode === 'hard') await session.stop('取消尚未完成的交付', { announce: false })
+    else await session.runCommand('stop', 'ou_user')
+    await close
+    expect(cancelled).toBe(mode === 'hard' ? '取消尚未完成的交付' : '用户停止了任务')
+    expect(cardkit.isDisposed(turn.cardId)).toBe(true)
+    expect(session.fileDeliveries.size).toBe(0)
+  })
+})
 
 describe('generated image delivery', () => {
   test('card rotation waits for the generated image on the old tool card', async () => {
@@ -2079,7 +2256,7 @@ describe('Session provider switching', () => {
     try {
       await session.startColdUserTurn('hello', 'hello', 'ou_user')
 
-      expect(proc.sentTexts).toEqual(['hello'])
+      expect(proc.sentTexts).toEqual([`${fileDeliveryAgentContext('chat')}\n\nhello`])
       expect(session.currentTurn).not.toBeNull()
       expect(session.status).toBe('working')
     } finally {
@@ -3470,7 +3647,7 @@ describe('Session SDK-initiated bg-task resume turns', () => {
       const userCardId = session.currentTurn.cardId
       await cardkit.flush(userCardId)
 
-      expect(proc.sentTexts).toEqual(['请只讲直接结论'])
+      expect(proc.sentTexts).toEqual([`${fileDeliveryAgentContext('chat')}\n\n请只讲直接结论`])
       expect(sentTexts.some(text => text.includes('后台轮输出'))).toBe(false)
       expect(calls.some(call =>
         call.path === `/cards/${userCardId}/elements` &&
@@ -4194,7 +4371,7 @@ describe('Session lifecycle reliability', () => {
       await message
       expect(spawnCount).toBe(1)
       expect(proc.killCalls).toBe(0)
-      expect(proc.sentTexts).toEqual(['重启期间收到的消息'])
+      expect(proc.sentTexts).toEqual([`${fileDeliveryAgentContext('chat')}\n\n重启期间收到的消息`])
       expect(session.lastSessionId).toBe(ref.sessionId)
     } finally {
       await session.stop('测试收尾', { announce: false })
@@ -5853,7 +6030,7 @@ describe('Session lifecycle reliability', () => {
 
     releaseOpen()
     await message
-    expect(proc.sentTexts).toEqual(['first'])
+    expect(proc.sentTexts).toEqual([`${fileDeliveryAgentContext('chat')}\n\nfirst`])
     expect(await restart).toBe(true)
     expect(proc.killCalls).toBe(1)
     expect(session.proc).toBe(spawned[0])

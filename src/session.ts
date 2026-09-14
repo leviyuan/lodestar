@@ -97,6 +97,10 @@ import * as sessionCompact from './session-compact'
 import * as sessionModel from './session-model'
 import * as sessionAgentIdentities from './session-agent-identities'
 import * as sessionTasklist from './session-tasklist'
+import { createFileDelivery, groupFileDelivery } from './file-delivery-runtime'
+import type { FileDeliveryHandle, FileDeliveryMode } from './file-delivery-types'
+import { runFileDeliveryCommand } from './file-delivery-command'
+import { fileDeliveryAgentContext } from './instructions'
 import * as sessionWorktree from './session-worktree'
 import * as sessionTemp from './session-temp'
 import {
@@ -264,6 +268,8 @@ export class Session {
    * Same source id with rotated credentials/base URL must still replace the
    * idle child after the registry is rebuilt. Weak keys avoid lifecycle leaks. */
   private readonly procSourceRevisions = new WeakMap<AgentProcess, string | null>()
+  /** Delivery rules actually given to each process, including later group changes. */
+  private readonly procFileDeliveryModes = new WeakMap<AgentProcess, FileDeliveryMode>()
   currentTurn: TurnState | null = null
   /** Item-scoped compaction ownership survives a turn-card close so a late
    * completion cannot attach itself to the next turn. Completed receipts keep
@@ -451,6 +457,7 @@ export class Session {
    * transaction finishes. Lifecycle replacement waits this set even after
    * closeTurnCard has synchronously removed the old turn from currentTurn. */
   private turnCloseInflight = new Set<Promise<void>>()
+  private fileDeliveries = new Set<FileDeliveryHandle>()
   private turnCounter = 0
   /** One-shot: user invoked `stop` during the current turn. Set right
    * before `sendInterrupt`; consumed by the next `result` handler so it
@@ -936,6 +943,7 @@ export class Session {
       throw new Error(`token source "${this.selectedTokenSourceId}" 不可用，请重新配置或在 model 面板选择其他账号`)
     }
     const ts = raw?.enabled || codexPool ? raw : undefined
+    const fileDeliveryMode = this.currentTurn?.fileDeliveryMode ?? this.getFileDeliveryMode()
     const created = createAgentProcess({
       provider: this.selectedProvider,
       workDir: this.workDir,
@@ -947,12 +955,13 @@ export class Session {
         ? this.dshEffortForSpawn()
         : this.selectedProvider === 'claude' ? this.claudeEffortForSpawn() : this.effortForSpawn(),
       launch,
-      developerInstructions: this.spawnDeveloperInstructions(),
+      developerInstructions: this.spawnDeveloperInstructions(fileDeliveryMode),
       profile: feishu.projectProfile(this.worktreeProjectName()),
       ...(process.env.LODESTAR_DISABLE_SKILL_SYNC === '1' ? {} : { managedSkillPluginPath: MANAGED_CLAUDE_PLUGIN_DIR }),
       hostEnv,
     })
     this.procSourceRevisions.set(created.process, created.sourceRevision)
+    this.procFileDeliveryModes.set(created.process, fileDeliveryMode)
     return created.process
   }
 
@@ -1716,10 +1725,18 @@ export class Session {
   }
 
   async stop(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
+    this.cancelFileDeliveries(reason)
     await this.runLifecycle('stop', () => this.stopUnlocked(reason, opts))
   }
 
+  cancelFileDeliveries(reason: string): boolean {
+    let cancelled = false
+    for (const delivery of this.fileDeliveries) cancelled = delivery.cancel(reason) || cancelled
+    return cancelled
+  }
+
   private async stopUnlocked(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
+    this.cancelFileDeliveries(reason)
     const announce = opts.announce ?? true
     const report = opts.onStatus
     this.daemonRestoreRequired = false
@@ -1946,6 +1963,7 @@ export class Session {
     this.invalidateTurnOpen()
     this.invalidateBackgroundOpen()
     this.discardOrphanAssistant()
+    for (const delivery of this.fileDeliveries) delivery.cancel('会话正在重启')
     if (this.currentTurn) {
       void this.closeTurnCard('🔁 已中止，正在重启').catch(e => {
         log(`session "${this.sessionName}": restart current main-card close failed: ${messageOf(e)}`)
@@ -2459,8 +2477,8 @@ export class Session {
     return sessionWorktree.worktreeProjectDir(this)
   }
 
-  private spawnDeveloperInstructions(): string {
-    return sessionWorktree.spawnDeveloperInstructions(this)
+  private spawnDeveloperInstructions(mode: FileDeliveryMode = this.getFileDeliveryMode()): string {
+    return sessionWorktree.spawnDeveloperInstructions(this, mode)
   }
 
   delegatedAgentDeveloperInstructions(provider: AgentProvider): string {
@@ -2577,6 +2595,21 @@ export class Session {
    * Returns true if the command was consumed (don't forward to Codex). */
   runCommand(raw: string, userOpenId = '', messageId?: string): Promise<boolean> {
     return sessionCommands.runCommand(this, raw, userOpenId, messageId)
+  }
+
+  getFileDeliveryMode(): FileDeliveryMode { return groupFileDelivery.mode(this.chatId) }
+
+  runFileDeliveryCommand(argument: string, userOpenId: string): Promise<void> {
+    return runFileDeliveryCommand(this.chatId, this.sessionName, userOpenId, argument, {
+      get: chatId => groupFileDelivery.get(chatId),
+      enable: (chatId, managerOpenId) => groupFileDelivery.enable(chatId, managerOpenId),
+      disable: chatId => groupFileDelivery.disable(chatId),
+      sendCard: card => feishu.sendCard(this.chatId, card),
+      reportError: async message => {
+        log(`session "${this.sessionName}": ${message}`)
+        if (!await feishu.sendText(this.chatId, message)) throw new Error(message)
+      },
+    })
   }
 
   /** Build the hi-panel data snapshot for this session.
@@ -2756,11 +2789,19 @@ export class Session {
    * may emit init/turn_started synchronously in tests or immediately on their
    * read loop, so incrementing after sendUserText leaves a boundary race. */
   private sendClaimedUserText(proc: AgentProcess, text: string): void {
+    const turn = this.currentTurn
+    const mode = turn ? (turn.fileDeliveryMode ??= this.getFileDeliveryMode()) : this.getFileDeliveryMode()
+    const previousMode = this.procFileDeliveryModes.get(proc)
+    const context = previousMode === mode ? '' : `${fileDeliveryAgentContext(mode)}\n\n`
+    // Capture before the write: synchronous backend events can open a card or deliver a file.
+    this.procFileDeliveryModes.set(proc, mode)
     this.pendingUserMessageCount++
     try {
-      proc.sendUserText(text, [])
+      proc.sendUserText(context + text, [])
     } catch (error) {
       this.pendingUserMessageCount = Math.max(0, this.pendingUserMessageCount - 1)
+      if (previousMode === undefined) this.procFileDeliveryModes.delete(proc)
+      else this.procFileDeliveryModes.set(proc, previousMode)
       throw error
     }
   }
@@ -4450,6 +4491,11 @@ export class Session {
       cardRotationFailed: false,
       outboundSeenPaths: new Set(),
       outboundSentPaths: new Set(),
+      // Eager user cards get their policy when input is handed to the Agent.
+      // Backend-driven turns keep the policy the process has already received.
+      fileDeliveryMode: trigger === 'user_message' && this.pendingUserMessageCount === 0
+        ? undefined
+        : this.proc ? this.procFileDeliveryModes.get(this.proc) : undefined,
     }
     cardkit.recordCardCreated(cardId, initialElementCount, (code, failure) => {
       this.onCardWriteFailure(turnState, cardId, code, failure)
@@ -5551,9 +5597,38 @@ export class Session {
       log(`session "${this.sessionName}": ignore non-absolute outbound path from ${source}: ${p}`)
       return
     }
-    turn?.outboundSentPaths.add(p)
     log(`session "${this.sessionName}": outbound send from ${source}: ${p}`)
-    void feishu.uploadAndSend(this.chatId, p)
+    try {
+      // Input can reach the backend before its card opens. Reuse its injected
+      // policy even if the group switch changed during that opening window.
+      const mode = turn?.fileDeliveryMode
+        ?? (this.proc ? this.procFileDeliveryModes.get(this.proc) : undefined)
+        ?? this.getFileDeliveryMode()
+      if (turn) turn.fileDeliveryMode = mode
+      if (mode === 'chat') {
+        turn?.outboundSentPaths.add(p)
+        void feishu.uploadAndSend(this.chatId, p)
+        return
+      }
+      if (!turn) throw new Error('当前没有可关联的交付轮次')
+      if (!turn.fileDelivery) {
+        turn.fileDelivery = this.createFileDeliveryForTurn(turn)
+        this.fileDeliveries.add(turn.fileDelivery)
+      }
+      turn.fileDelivery.add(p)
+    } catch (error) {
+      log(`session "${this.sessionName}": file delivery rejected: ${messageOf(error)}`)
+      void feishu.sendText(this.chatId, `❌ 文件交付失败：${messageOf(error)}`)
+    }
+  }
+
+  createFileDeliveryForTurn(turn: TurnState) {
+    return createFileDelivery({
+      chatId: this.chatId,
+      managerOpenId: turn.userOpenId,
+      projectName: this.sessionName,
+      createdAt: turn.startedAt,
+    })
   }
 
   /** Start or switch the turn footer phase. It lives in the stable footer
@@ -5695,6 +5770,7 @@ export class Session {
     // off the table BEFORE their first await.
     const turn = this.currentTurn
     if (!turn) return this.waitForTurnCloses()
+    if (suffix) turn.fileDelivery?.cancel(suffix)
     if (!suffix && turn.cardRotationFailed) this.maybeMidTurnRotate()
     this.currentTurn = null
     this.stopFooterStatus(turn)
@@ -5746,14 +5822,24 @@ export class Session {
     // 重启的 interval,终态 footer 也写在新卡上。
     if (turn.rotating) await turn.rotating
     await sessionTools.waitForImageDeliveries(turn)
+    if (turn.fileDelivery) {
+      try {
+        for (const path of await turn.fileDelivery.finish()) turn.outboundSentPaths.add(path)
+      } catch (error) {
+        log(`session "${this.sessionName}": file delivery close failed: ${messageOf(error)}`)
+        await feishu.sendTextRaw(this.chatId, `❌ 文件交付收尾失败：${messageOf(error)}`)
+      } finally {
+        this.fileDeliveries.delete(turn.fileDelivery)
+      }
+    }
     this.stopFooterStatus(turn)
     const elapsed = (Date.now() - turn.startedAt) / 1000
     const cardId = turn.cardId
     const segmentTexts = turn.segmentTexts
     await cardkit.flush(cardId)
 
-    // [[send: /abs/path]] markers are handled while deltas are received by
-    // processOutboundMarkers(). closeTurnCard only finalizes text display.
+    // Markers are admitted during deltas; their cloud uploads and separate
+    // receipt have settled above. The remaining work finalizes conversation prose.
     // 如果最后一个 assistant 段没有等到 block_stop,这里先把内存缓冲的完整
     // 文本作为静态 markdown 插入卡片。
     const fallbackSegments = new Map<string, string>()

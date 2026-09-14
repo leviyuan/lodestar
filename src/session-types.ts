@@ -3,6 +3,7 @@
 import type { AgentProvider, AgentReasoningEffort } from './agent-process'
 import type { ConversationBranchBase, ConversationLaunch, ConversationRouting } from './conversation'
 import type { TurnAnchor } from './feishu'
+import type { FileDeliveryHandle, FileDeliveryMode } from './file-delivery-types'
 
 export interface TurnState {
   cardId: string
@@ -115,9 +116,8 @@ export interface TurnState {
   assistantSegmentCount: number
   currentAssistantSegmentId: string | null
   currentAssistantText: string
-  // Per-assistant-segment cumulative text — used at turn close to strip
-  // [[send: /path]] markers and replace each segment with a cleaned
-  // version, then post the files as separate Feishu messages.
+  // Per-segment raw text. File markers are admitted during delta handling;
+  // turn close finalizes the prose and publishes the independent file receipt.
   segmentTexts: Map<string, string>
   /** Per-card assistant raw-write tasks. A stream handler registers the task
    * synchronously before returning; turn close drains it before inspecting
@@ -169,8 +169,12 @@ export interface TurnState {
   /** 本 turn 已处理过的出站路径请求。包括合法绝对路径和被拒绝的非绝对路径,
    * 用来避免增量文本反复扫到同一个 [[send: ...]] 时重复上传或刷日志。 */
   outboundSeenPaths: Set<string>
-  /** 已实际排队上传的绝对路径。用于 footer 计数和跨 rotate 去重。 */
+  /** 原生附件沿用排队计数；云空间文件在独立卡成功发送后计入。 */
   outboundSentPaths: Set<string>
+  /** Cloud uploads survive conversation-card rotations and settle before the turn closes. */
+  fileDelivery?: FileDeliveryHandle
+  /** Freeze the transport when its input reaches the Agent, before it prepares files. */
+  fileDeliveryMode?: FileDeliveryMode
 }
 
 export type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'

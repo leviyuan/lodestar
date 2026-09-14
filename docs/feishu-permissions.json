@@ -1,0 +1,24 @@
+{
+  "scopes": {
+    "tenant": [
+      "verification:verification_information:readonly",
+      "tenant:tenant:readonly",
+      "im:message:send_as_bot",
+      "im:message",
+      "im:chat",
+      "im:chat:create",
+      "im:chat:delete",
+      "im:chat.members:read",
+      "im:chat.members:write_only",
+      "im:resource",
+      "im:message.urgent",
+      "im:message.group_msg",
+      "im:message.group_at_msg:readonly",
+      "cardkit:card:read",
+      "cardkit:card:write",
+      "drive:drive",
+      "drive:file:upload"
+    ],
+    "user": []
+  }
+}

@@ -15,7 +15,7 @@ const CONTROL_COMMAND_ALIASES = new Map<string, ControlCommand>([
   ['model', 'model'], ['md', 'model'],
 ])
 
-/** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
+/** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`, `files`)
  * plus their two-letter aliases where applicable.
  * Returns true if the command was consumed (don't forward to Codex).
  * Exact match, case-insensitive, ignores trailing whitespace.
@@ -68,6 +68,11 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
   }
   if (raw.trim().toLowerCase() === 'task') {
     await s.showTasklistPanel()
+    return true
+  }
+  const files = raw.trim().match(/^files(?:[ \t]+([^\r\n]+))?$/i)
+  if (files) {
+    await s.runFileDeliveryCommand((files[1] ?? '').trim(), userOpenId)
     return true
   }
   if (raw.trim().match(/^(?:agents|agent)$/i)) {
@@ -139,7 +144,8 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
       }
       await s.showConsole()
       return true
-    case 'stop':
+    case 'stop': {
+      const cancelledFiles = s.cancelFileDeliveries('用户停止了任务')
       await s.cancelAgentRuns('stop command')
       if (s.proc?.turnRetry?.reason === 'quota') {
         const card = await s.openStatusCard('stop', '🛑 停止额度等待')
@@ -160,6 +166,11 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
       s.clearStaleIdleQueueState('stop')
       s.clearMultiMsgBuffer('stop command')
       if (!s.currentTurn && s.pendingUserMessageCount === 0 && s.pendingMidTurnMsgs.length === 0) {
+        if (cancelledFiles) {
+          await s.closeTurnCard('🛑 已取消未完成的文件上传')
+          await feishu.sendText(s.chatId, '🛑 已取消未完成的文件上传，已上传文件保留')
+          return true
+        }
         const statusCard = await s.openStatusCard('stop', '⚪ 当前没有正在执行的 turn', 'grey')
         if (statusCard) {
           await s.closeStatusCard(statusCard, '⚪ 无正在执行的 turn')
@@ -206,6 +217,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
       // 路径会 early-return,不会重画 footer。
       await s.closeTurnCard('🛑 打断')
       return true
+    }
     case 'kill':
       {
         const wasRunning = s.isRunning()
