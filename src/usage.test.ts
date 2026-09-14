@@ -43,16 +43,19 @@ describe('quota account isolation', () => {
 })
 
 describe('quota transient failures', () => {
-  test('a transient request failure retries the same connection and returns the real quota', async () => {
+  test('a brief outage retries the same connection long enough to read the real quota', async () => {
     let calls = 0
+    const startedAt = performance.now()
     const snapshot = await refreshUsageFromConnection(async method => {
       expect(method).toBe('account/rateLimits/read')
-      if (++calls === 1) throw new Error('failed to fetch codex rate limits: error sending request for url (https://chatgpt.com/backend-api/wham/usage)')
+      calls++
+      if (performance.now() - startedAt < 2000) throw new Error(JSON.stringify({ code: -32603,
+        message: 'failed to fetch codex rate limits: error sending request for url (https://chatgpt.com/backend-api/wham/usage)' }))
       return { rateLimits: { limitId: 'codex', primary: { usedPercent: 19, windowDurationMins: 10080, resetsAt: 1789632148 } } }
     })
-    expect(calls).toBe(2)
+    expect(calls).toBe(3)
     expect(snapshot).toMatchObject({ state: 'ok', weekly: { percent: 19 } })
-  })
+  }, 10_000)
 
   test('persistent network failures remain visible and retain the successful snapshot only for startup', async () => {
     const account = 'cached-startup'
@@ -65,7 +68,7 @@ describe('quota transient failures', () => {
     expect(peekUsage(account)).toBeNull()
     expect(cached).toBe(peekSuccessfulUsage(account))
     invalidateCodexUsage(account)
-  })
+  }, 10_000)
 
   test('an invalid quota response is shown as MISS while the previous successful observation remains cached', async () => {
     const account = 'invalid-refresh'

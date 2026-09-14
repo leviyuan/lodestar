@@ -10,7 +10,7 @@
 - Codex `request_user_input` 和 Claude `AskUserQuestion` 共用问答卡，保留各自回包语义、历史回答和自定义输入入口。
 - `tool.ts` 生成工具摘要，`shell-command.ts` 解析 Bash、PowerShell 及引号包装后的首行 `# desc:`。Claude TaskCreate/Update/List/Get 在 `task-board.ts` 中累积为完整任务板。
 - 生图工具默认收起，完整提示词放在折叠体内，图片以结构化 `img` 子组件展示并允许点击预览。不要把提示词塞进标题，也不要把已嵌入的图片再单独发送。图片上传由 Session helper 处理，模板只接收 image key。
-- `hi` 的额度区用展开式浅蓝面板，与 `codex-accounts` 共用 `usage.ts` 的六格彩色进度条和重置倒计时；各窗口纵向分行，重置卡另起一行只展示 Codex 账号的可用次数，统一额度摘要与 footer 不附带它。活跃项目行尾显示实际 Codex 进程的账号备注；账号未知时省略整个备注，不显示账号 MISS。账号列表每页附完整 Codex 账号命令说明。
+- `hi` 的额度区用展开式浅蓝面板，与 `codex-accounts` 共用 `usage.ts` 的六格彩色进度条和重置倒计时；各窗口纵向分行，重置卡另起一行只展示 Codex 账号的可用次数，统一额度摘要与 footer 不附带它。活跃项目行尾显示实际 Codex 进程的账号备注；账号未知时省略整个备注，不显示账号 MISS。账号列表每页附完整 Codex 账号命令说明，底部「Codex 命令」面板默认折叠。
 - Codex 的 `hi`、footer 和账号额度只显示主额度；保留主额度自身的短时窗口、周窗口，不展示 GPT-5.3-Codex-Spark 等模型的附加额度。
 - `background.ts` 消费 Claude `task_*` 和 Codex collab 事件。子 Agent 细节进入 active/pending 后台状态，终态历史卡停止计时刷新。
 - 临时会话选择卡只携带 `panel_id`、opaque `choice_id`。provider、cwd、source、owner、launch 保存在 Session 短期状态，不能信任回调传入的可执行 id、数组下标或路径。

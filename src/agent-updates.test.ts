@@ -255,9 +255,14 @@ test('concurrent updater calls serialize and do not install the same release twi
   let installed = 0
   const options = { root, metadata: async (name: string) => ({ name, version: '1.0.0' }),
     install: async (directory: string) => { installed++; await Bun.sleep(50); await install(directory) } }
-  const [one, two] = await Promise.all([updateAgentRuntime('codex', options), updateAgentRuntime('codex', options)])
+  const results = await Promise.allSettled(Array.from({ length: 8 }, () => updateAgentRuntime('codex', options)))
+  const states = results.map(result => {
+    if (result.status === 'rejected') throw result.reason
+    return result.value
+  })
   expect(installed).toBe(1)
-  expect(one.directory).toBe(two.directory)
+  expect(new Set(states.map(state => state.directory)).size).toBe(1)
+  expect((await readdir(join(root, 'codex'))).includes('update.lock')).toBe(false)
 })
 
 test('one Agent update failure does not prevent other Agents from getting their latest runtime', async () => {

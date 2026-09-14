@@ -8,6 +8,7 @@ import { join, isAbsolute } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { AGENT_RUNTIMES_DIR } from './paths'
 import { AgentInstallTerminationError, installAgentPackages } from './agent-install'
+import { writeStateFileAtomic } from './state-store'
 export { installAgentPackages } from './agent-install'
 
 export const AGENTS = ['codex', 'claude', 'dsh'] as const
@@ -164,7 +165,14 @@ async function lock(directory: string, signal?: AbortSignal): Promise<() => Prom
     signal?.throwIfAborted()
     try {
       await mkdir(path)
-      await writeFile(join(path, 'pid'), String(process.pid))
+      try {
+        // Other updaters may inspect the directory immediately. Publish a complete PID atomically.
+        await retryAgentFileOperation(async () => writeStateFileAtomic(join(path, 'pid'), String(process.pid)))
+      } catch (error) {
+        try { await retryAgentFileOperation(() => rm(path, { recursive: true })) }
+        catch (cleanup) { throw new AggregateError([error, cleanup], `${errorMessage(error)}; runtime update lock cleanup failed: ${errorMessage(cleanup)}`) }
+        throw error
+      }
       return () => retryAgentFileOperation(() => rm(path, { recursive: true }))
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error

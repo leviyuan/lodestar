@@ -105,7 +105,7 @@ export function consumeCodexResetCredit(
       invalidateCodexUsage(accountId)
       let response: any
       try {
-        response = await requestRateLimitsWithRetry(() => app.request('account/rateLimitResetCredit/consume', { idempotencyKey }))
+        response = await requestRateLimitsWithRetry(() => app.request('account/rateLimitResetCredit/consume', { idempotencyKey }), '重置卡请求')
       } catch (error) {
         throw new Error(`重置卡请求未确认结果：${error instanceof Error ? error.message : String(error)}；请用 codex-accounts 核对额度与重置卡次数`, { cause: error })
       } finally {
@@ -495,15 +495,16 @@ export function invalidateCodexUsage(accountId: string): void {
 }
 
 /** 网络抖动重试同一个额度接口；认证错误和无效响应仍直接报告。 */
-async function requestRateLimitsWithRetry(request: () => Promise<any>): Promise<any> {
-  const delays = [250, 750]
+async function requestRateLimitsWithRetry(request: () => Promise<any>, operation = '额度查询'): Promise<any> {
+  const delays = [1000, 4000]
   for (let attempt = 0; ; attempt++) {
     try { return await withTimeout(request(), API_TIMEOUT_MS) }
     catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const transient = /error sending request|timed? ?out|timeout|ECONNRESET|ETIMEDOUT|EAI_AGAIN|connection (?:reset|closed)|\b(?:429|502|503|504)\b/i.test(message)
-      if (!transient || attempt >= delays.length) throw error
-      log(`usage: rate limit request retry ${attempt + 1}/${delays.length}: ${message}`)
+      if (!transient) throw error
+      if (attempt >= delays.length) throw new Error(`Codex ${operation}失败（已尝试 ${attempt + 1} 次）：${message}`, { cause: error })
+      log(`usage: ${operation} retry ${attempt + 1}/${delays.length} in ${delays[attempt]}ms: ${message}`)
       await new Promise(resolve => setTimeout(resolve, delays[attempt]))
     }
   }

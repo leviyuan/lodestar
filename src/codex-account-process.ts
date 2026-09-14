@@ -107,7 +107,12 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
       if (decision.selected) return { ...decision, selected: decision.selected }
       options.preferCachedUsage = false
       const detail = decision.candidates.map(c => `${c.account.name}：${c.reason ?? c.state}`).join('；')
-      if (decision.retryAt === undefined) throw new Error(`没有可用的 Codex 账号；${detail}`)
+      if (decision.retryAt === undefined) {
+        const missing = decision.candidates.some(c => c.state === 'miss' && !c.duplicateOf)
+        const summary = missing ? 'Codex 账号检查失败，无法自动选账号（MISS）'
+          : decision.candidates.length ? '没有符合条件的 Codex 账号' : '没有配置 Codex 账号'
+        throw new Error(`${summary}${detail ? `；${detail}` : ''}`)
+      }
       const delay = Math.max(1000, Math.min(60_000, decision.retryAt - Date.now()))
       const missing = decision.candidates.filter(c => c.state === 'miss' && !c.duplicateOf).length
       log(`codex account: waiting for quota: ${detail}`)

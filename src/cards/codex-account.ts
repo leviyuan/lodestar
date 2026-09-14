@@ -86,7 +86,7 @@ export function codexAccountPanel(view: CodexAccountCardView): object {
     } else elements.push(md('⚠️ 额度 MISS · 查看详情中的查询错误'))
   }
   if (view.total) elements.push(...accountRows(view))
-  if (view.phase === 'accounts') elements.push({ tag: 'collapsible_panel', expanded: true,
+  if (view.phase === 'accounts') elements.push({ tag: 'collapsible_panel', expanded: false,
     header: { title: { tag: 'plain_text', content: '⌨️ Codex 命令' }, background_color: 'grey-50' },
     border: { color: 'grey-100', corner_radius: '8px' }, padding: '8px', elements: [md([
       '`hi` · 打开控制台；未运行时启动',

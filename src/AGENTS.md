@@ -11,6 +11,7 @@
 - Codex 的 `Selected model is at capacity` 按用户要求持续退避重试（5s 起、60s 封顶），保留当前任务和模型，直到成功或用户停止；等待状态需显示。仅在 `turn/completed` 确认失败或 `turn/start` 明确拒绝后重试，已接受的输入通过原 thread 续跑，不重放原任务；其他错误仍正常结算。
 - Claude 使用 `query()` streaming input。`permissionMode: default` 下普通工具由 `canUseTool` 放行，`AskUserQuestion` 等待回答；保留 `task_*`、`compact_boundary`、resume/fork 和项目配置。
 - daemon 启动不得检查、安装或更新 Agent；`[runtime.agent_auto_update]` 的 `codex`、`claude`、`dsh` 三项默认 false，显式开启的 Agent 各自每 6 小时检查，独立防重叠和取消。旧布尔配置按原值迁移为三项并提示更新配置，禁止与新表混用。手动或定期更新选择 upstream latest，接受新版暂时不兼容并后续适配，不设兼容白名单。`agent-updates.ts` 管理独立版本目录与失败状态；实际 CLI/SDK 必须从选中目录加载，使用中的目录不覆盖、不移动、不删除。`agent-install.ts` 在 Windows 取消安装时终止精确 npm PID 的进程树并等待退出；未确认退出保留临时目录，文件占用只有限重试并报告最终失败。
+- Agent 更新锁内的 PID 必须原子写入，避免并发更新读取到空文件；写入失败清理本次取得的锁，清理失败同时报告。
 - DSH 通过 `dsh-runtime.ts` 启动当前安装的 Node runtime，`dsh-bridge.ts` 与该运行时从同一依赖树加载，只校验 Lodestar 自有通信协议，不硬编码上游版本。它直接调用原生 Agent/持久化/提问服务。恢复点与结果分别经过 flush；只以真实结束原因结算。取消原因须保持不可变，避免 Node fetch 附加 stack 后被原生日志拒绝。
 - DSH 模型能力和 effort 使用原生 LLM 服务解析，目录外模型也调用 `resolveModelInfo/resolveCallConfig`，不另设目录白名单。`dsh-glm` 将账号模型与补录项一起配置给 pi-ai，显式传递用户所选 reasoning_effort，不以安装时目录是否收录作为可用性门槛。同轮请求固定路由，`LODESTAR_DSH_*` 由选定来源注入，不能串用 DeepSeek/GLM 凭据。`DSH_LODESTAR_AGENT_CONTEXT` 由 ShellEnv 仅注入运行时根 Agent，原生子 Agent 不能继承主会话 capability 或继续委派。
 - DSH/SDK 子工具的返回值可能是内容块数组，后台卡须先规范成文本摘要。图片编码按字节判断，不能信任飞书下载文件的 `.png` 后缀。桥接致命错误不得伪装成预期退出。
@@ -23,6 +24,7 @@
 - `codex-quota.ts` 按 Plus/prolite/pro 的 1/5/20 份周额度计算周剩余/距重置小时；Plus 的 5h 满窗是 0.15 份，分数取周速率和短窗速率较小值。所有模式降序选择，同分比较当前可连续使用额度。成功 Plus 响应缺短窗按满窗 0.15/5 计算，标记 `unreportedFull`，不造重置日期；请求失败或已返回窗口畸形仍 MISS。自动 Ultra 排除 Plus，要求周剩余至少 0.5 份；不足是 waiting，不是耗尽，普通模式仍可用。主会话与委派共用 `agent-launch.ts` → `CodexAccountProcess`。
 - 手动指定最高优先：`hi 备注` 通过 Session 生命周期只覆盖这次启动，已有其他账号则重启并 resume；`codex-account` 持久指定、`codex-auto` 清除。手动路径不读额度、不检查套餐、Ultra 门槛或本地模型目录；保留账号存在性、认证文件隔离、原生进程退出与登录写入互斥这些结构约束，真实错误交由 Codex 返回。自动路径仍检查模型与全部实际限额、身份、登录租约。启动及换号优先用 daemon 内上次成功额度缓存，能选出账号就不查询额度，也不等其他账号补缓存；无可用缓存才刷新。网络刷新失败保留这份启动缓存，实时查询和 footer 仍报 MISS；重新登录清空两份缓存。旧缓存不得清除原生耗尽记录，主动查额度和耗尽等待轮询仍读实时接口。运行中耗尽后转自动选择，手动原生默认模型在恢复时必须原样传给新进程，不能变成另一账号的默认模型。
 - 原生 `usageLimitExceeded` 只在主 turn 终态失败或明确 `turn/start` 拒绝后触发换号。`codex-account-process.ts` 保持同一逻辑任务，等待原生落盘与真实退出再替换子进程、resume 同一 thread；已接受任务只续跑，不重放输入。耗尽状态由 `codex-account-scheduler.ts` 原子保存，接口确认窗口恢复后解除；全部耗尽自动等待且可取消。初次等待通过显式 `quotaWaitPromise` 释放 Session actor，不能伪造 init 或占住 stop。网络、认证、普通 HTTP 429 不切号。委派分别记录实际账号；换号保留模型、effort、host capability、权限和工具入口，旧后台任务显式结算，旧进程迟到事件不得关闭新任务。
+- Codex 额度查询遇到已知网络瞬态错误时重试同一接口，最多 3 次，间隔 1s、4s；最终失败保留原始错误并显示实际尝试次数。自动选号区分账号检查失败（MISS）、未配置账号和不符合条件，不能将额度查询失败笼统显示为没有可用账号。
 
 ## 委派 Agent
 

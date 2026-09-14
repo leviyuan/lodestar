@@ -81,11 +81,26 @@ describe('Codex earned reset redemption', () => {
   test('persistent redemption failures stay visible after bounded retries and clear old quota', async () => {
     await refreshUsageFromConnection(async () => limits(99, 1), ACCOUNT)
     const app = new ResetApp(); app.consumeErrors = Array.from({ length: 3 }, () => new Error('HTTP 503'))
-    await expect(consumeCodexResetCredit(ACCOUNT, 'failed-attempt', () => app)).rejects.toThrow('HTTP 503')
+    await expect(consumeCodexResetCredit(ACCOUNT, 'failed-attempt', () => app))
+      .rejects.toThrow('Codex 重置卡请求失败（已尝试 3 次）：HTTP 503')
     expect(app.calls.filter(c => c.method === 'account/rateLimitResetCredit/consume')).toHaveLength(3)
     expect(app.calls.at(-1)?.method).toBe('close')
     expect(peekUsage(ACCOUNT)).toBeNull(); expect(peekSuccessfulUsage(ACCOUNT)).toBeNull()
-  })
+  }, 10_000)
+
+  test('failed quota readback reports the real retry count and preserves the confirmed redemption', async () => {
+    const app = new ResetApp()
+    app.readError = new Error(JSON.stringify({ code: -32603,
+      message: 'failed to fetch codex rate limits: error sending request for url (https://chatgpt.com/backend-api/wham/usage)' }))
+    const result = await consumeCodexResetCredit(ACCOUNT, 'quota-network-failed', () => app)
+    expect(result).toMatchObject({ outcome: 'reset', usage: { state: 'network',
+      reason: `Codex 额度查询失败（已尝试 3 次）：${app.readError.message}` } })
+    expect(app.calls.filter(c => c.method === 'account/rateLimitResetCredit/consume')).toHaveLength(1)
+    expect(app.calls.filter(c => c.method === 'account/rateLimits/read')).toHaveLength(3)
+    expect(app.calls.at(-1)?.method).toBe('close')
+    expect(peekUsage(ACCOUNT)).toEqual(result.usage)
+    expect(peekSuccessfulUsage(ACCOUNT)).toBeNull()
+  }, 10_000)
 
   test('unknown outcomes and authentication errors never become successful redemptions', async () => {
     for (const response of [undefined, {}, { outcome: 'unexpected' }]) {

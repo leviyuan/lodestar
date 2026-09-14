@@ -61,6 +61,29 @@ function harness(choices: Array<CodexAccountDecision | Promise<CodexAccountDecis
 }
 
 describe('Codex account process ownership and recovery', () => {
+  test('failed account checks retain the upstream error instead of reporting no available account', async () => {
+    const reason = 'Codex 额度查询失败（已尝试 3 次）：error sending request for url (https://chatgpt.com/backend-api/wham/usage)'
+    const row: CodexAccountCandidate = { ...candidate('default'), state: 'miss', score: null,
+      usage: { state: 'network', reason }, reason }
+    const h = harness([{ selected: null, candidates: [row] }])
+    const error = `Codex 账号检查失败，无法自动选账号（MISS）；default：${reason}`
+    await expect(h.proc.initializationPromise()).rejects.toThrow(error)
+    expect(h.results).toHaveLength(1)
+    expect(h.results[0]).toMatchObject({ is_error: true, error })
+    expect(h.children).toHaveLength(0)
+    expect(h.order).toEqual([])
+    expect(h.options).toHaveLength(1)
+  })
+  test('missing accounts and excluded accounts remain distinct from failed checks', async () => {
+    const empty = harness([{ selected: null, candidates: [] }])
+    await expect(empty.proc.initializationPromise()).rejects.toThrow('没有配置 Codex 账号')
+    const row: CodexAccountCandidate = { ...candidate('plus'), state: 'excluded', score: null,
+      reason: 'Ultra 自动选择不使用 Plus' }
+    const excluded = harness([{ selected: null, candidates: [row] }])
+    await expect(excluded.proc.initializationPromise()).rejects.toThrow('没有符合条件的 Codex 账号；plus：Ultra 自动选择不使用 Plus')
+    expect(empty.children).toHaveLength(0)
+    expect(excluded.children).toHaveLength(0)
+  })
   test('a manually started account can exhaust before any quota read, then selects an automatic replacement', async () => {
     const manual: CodexAccountCandidate = { ...candidate('a'), usage: null, state: 'manual', score: null }
     const h = harness([{ selected: manual, candidates: [] }, decision('b')])
