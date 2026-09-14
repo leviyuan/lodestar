@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'bun:test'
+import { join } from 'node:path'
 import { AgentService, type AgentServiceDeps } from './agent-service'
 import type { AgentIdentity, AgentIdentityCatalog } from './agent-identities'
 import { AgentWorkerFailure, type AgentWorkerHandle, type AgentWorkerResult } from './agent-runner'
+import type { AgentRunSnapshot } from './agent-run-types'
+import { AGENT_RUNS_DIR } from './paths'
 
 function identity(id: string, name = id): AgentIdentity {
   return {
@@ -56,6 +59,20 @@ function controlledHandle(): {
   }
 }
 
+function completedHistory(count: number, chain = false): AgentRunSnapshot[] {
+  return Array.from({ length: count }, (_, index) => ({
+    runId: `agent_history_${index}`, sessionName: session.sessionName, chatId: session.chatId,
+    workDir: session.workDir, prompt: `original prompt ${index}`, description: `历史任务 ${index}`, depth: 0,
+    ...(chain && index > 0 ? { parentRunId: `agent_history_${index - 1}`, parentKind: 'follow_up' as const } : {}),
+    status: 'completed', createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+    workers: [{
+      identityId: 'agent:a', identityName: 'Agent A', tokenSourceId: 'a', provider: 'claude',
+      model: 'model-a', effort: index === count - 1 ? 'low' : 'max', status: 'completed',
+      output: `original output ${index}`, steps: [], sessionId: chain ? 'sid-history' : `sid-history-${index}`,
+    }],
+  }))
+}
+
 function harness(opts: {
   identities?: AgentIdentity[]
   startWorker?: AgentServiceDeps['startWorker']
@@ -69,6 +86,7 @@ function harness(opts: {
   const catalog: AgentIdentityCatalog = { catalogGeneration: 'g1', identities, sourceFailures: [] }
   const artifacts: unknown[] = []
   const textArtifacts = new Map<string, string>()
+  const artifactReads: string[] = []
   const deps: AgentServiceDeps = {
     getCatalog: () => catalog,
     startWorker: opts.startWorker ?? (worker => resolvedHandle(result(`sid-${worker.identity.id}`, `output-${worker.identity.id}`))),
@@ -86,10 +104,16 @@ function harness(opts: {
     dispose: async () => {},
     writeArtifact: (_path, value) => { artifacts.push(JSON.parse(JSON.stringify(value))) },
     writeTextArtifact: (path, value) => { textArtifacts.set(path, value) },
+    readTextArtifact: (name, label) => {
+      artifactReads.push(name)
+      const text = textArtifacts.get(join(AGENT_RUNS_DIR, name))
+      if (text === undefined) throw new Error(`${label} is unreadable (${name})`)
+      return text
+    },
     loadArtifacts: opts.loadArtifacts ?? (() => []),
   }
   const service = new AgentService(deps)
-  return { service, root: service.rootPrincipal(session), artifacts, textArtifacts }
+  return { service, root: service.rootPrincipal(session), artifacts, textArtifacts, artifactReads }
 }
 
 async function waitFor(
@@ -202,6 +226,30 @@ describe('AgentService', () => {
   })
 
   for (const provider of ['codex', 'claude', 'dsh'] as const) {
+    test(`${provider}: long historical chains do not evict a new task's session index`, async () => {
+      const selected = { ...identity(provider), provider }
+      const history = completedHistory(520, true)
+      const calls: Array<string | undefined> = []
+      const { service, root } = harness({
+        identities: [selected], loadArtifacts: () => history,
+        startWorker: opts => {
+          calls.push(opts.resumeSessionId)
+          return resolvedHandle(result(opts.resumeSessionId ?? `sid-new-${calls.length}`))
+        },
+      })
+      const first = await service.startRun(root, { description: '新任务', identityIds: [selected.id], prompt: 'first' })
+      const terminal = await waitFor(service, root, first.runId, 'completed')
+      const other = await service.startRun(root, { description: '触发历史清理', identityIds: [selected.id], prompt: 'other' })
+      await waitFor(service, root, other.runId, 'completed')
+      const continued = await service.startRun(root, {
+        description: '继续新任务', identityIds: [], sessionId: terminal.workers[0]!.sessionId, prompt: 'continue',
+      })
+      await waitFor(service, root, continued.runId, 'completed')
+      expect(continued.parentRunId).toBe(first.runId)
+      expect(calls).toEqual([undefined, undefined, 'sid-new-1'])
+      expect(service.getRun(root, first.runId).prompt).toBe('first')
+    })
+
     test(`${provider}: continues by session id for three turns including reloaded history`, async () => {
       const selected = { ...identity(provider), provider }
       const calls: Array<{ prompt: string; resume?: string; identity: string; effort: string }> = []
@@ -232,6 +280,78 @@ describe('AgentService', () => {
         { prompt: '  second\n', resume: sessionId, identity: selected.id, effort: 'low' },
         { prompt: 'third', resume: sessionId, identity: selected.id, effort: 'low' },
       ])
+    })
+  }
+
+  test('retains the latest turn and effort when a reloaded chain exceeds the artifact cache limit', async () => {
+    const history = completedHistory(520, true)
+    const { service, root } = harness({ loadArtifacts: () => history })
+    const continued = await service.startRun(root, {
+      description: '继续长会话', identityIds: [], sessionId: 'sid-history', prompt: 'next',
+    })
+    await waitFor(service, root, continued.runId, 'completed')
+    expect(continued.parentRunId).toBe(history.at(-1)!.runId)
+    expect(continued.workers[0]!.effort).toBe('low')
+  })
+
+  test('retains old run lookup, complete results and follow-up beyond the artifact cache limit', async () => {
+    const history = completedHistory(520)
+    const calls: Array<string | undefined> = []
+    const { service, root, artifactReads } = harness({
+      loadArtifacts: () => history,
+      startWorker: opts => {
+        calls.push(opts.resumeSessionId)
+        return resolvedHandle(result(opts.resumeSessionId!))
+      },
+    })
+    const original = service.getRun(root, 'agent_history_0')
+    expect(original.prompt).toBe('original prompt 0')
+    expect(original.workers[0]!.output).toBe('original output 0')
+    expect(artifactReads).toHaveLength(2)
+    expect(service.getRun(root, 'agent_history_519').workers[0]!.output).toBe('original output 519')
+    expect(artifactReads).toHaveLength(2)
+    original.workers[0]!.output = 'caller mutation'
+    expect(service.getRun(root, original.runId).workers[0]!.output).toBe('original output 0')
+    expect(artifactReads).toHaveLength(4)
+    const continued = await service.followUp(root, original.runId, { description: '继续旧任务', prompt: 'next' })
+    await waitFor(service, root, continued.runId, 'completed')
+    expect(calls).toEqual(['sid-history-0'])
+    expect(continued.parentRunId).toBe(original.runId)
+  })
+
+  test('checks access before reading evicted artifacts and surfaces missing text instead of an empty result', async () => {
+    const history = completedHistory(520)
+    const { service, root, textArtifacts, artifactReads } = harness({ loadArtifacts: () => history })
+    for (const other of [{ chatId: 'other-chat' }, { sessionName: 'other-session' }, { workDir: '/other-repo' }]) {
+      const outsider = service.rootPrincipal({ ...session, ...other })
+      expect(() => service.getRun(outsider, 'agent_history_0')).toThrow()
+      await expect(service.startRun(outsider, {
+        description: '越界续接', identityIds: [], sessionId: 'sid-history-0', prompt: 'next',
+      })).rejects.toThrow('agent session not found')
+    }
+    expect(artifactReads).toHaveLength(0)
+    const outputArtifact = history[0]!.workers[0]!.outputArtifact!
+    expect(textArtifacts.delete(join(AGENT_RUNS_DIR, outputArtifact))).toBe(true)
+    expect(() => service.getRun(root, 'agent_history_0')).toThrow('output for agent_history_0 is unreadable')
+    expect(() => service.getRun(root, 'agent_history_0')).toThrow('output for agent_history_0 is unreadable')
+    expect(artifactReads).toHaveLength(4)
+    expect(() => service.getRun(root, 'agent_missing')).toThrow('agent run not found')
+  })
+
+  for (const stop of ['parent', 'session', 'shutdown'] as const) {
+    test(`${stop}: evicting ancestor artifacts preserves cancellation of an active follow-up`, async () => {
+      const history = completedHistory(520, true)
+      const control = controlledHandle()
+      const { service, root } = harness({ loadArtifacts: () => history, startWorker: () => control.handle })
+      const continued = await service.startRun(root, {
+        description: '继续长会话', identityIds: [], sessionId: 'sid-history', prompt: 'next',
+      })
+      await waitFor(service, root, continued.runId, 'running')
+      if (stop === 'parent') await service.cancelRun(root, history[0]!.runId, 'test stop')
+      else if (stop === 'session') await service.cancelSessionRuns(session.sessionName, session.chatId, 'test stop')
+      else await service.shutdown('test stop')
+      expect(service.getRun(root, continued.runId).status).toBe('cancelled')
+      expect(service.getRun(root, history[0]!.runId).workers[0]!.output).toBe('original output 0')
     })
   }
 

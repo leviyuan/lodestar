@@ -28,7 +28,7 @@ const GLOBAL_AGENT_CONCURRENCY = 8
 // Local delegation policy, not an upstream API quota. Shared across all Sessions/models.
 const TOKEN_SOURCE_AGENT_CONCURRENCY = new Map<string, number>([['openrouter', 2]])
 const NESTED_DELEGATION_ERROR = 'Delegated Agents cannot delegate again; ask the main Agent to assign additional work.'
-const MAX_RETAINED_RUNS = 512
+const MAX_CACHED_RUN_ARTIFACTS = 512
 const MAX_WORKER_STEPS = 50
 const MAX_SESSION_ACTIVE_RUNS = 64
 const MAX_GLOBAL_INFLIGHT_WORKERS = 128
@@ -49,6 +49,7 @@ interface AgentRunRecord {
   finalizing: boolean
   finalized: boolean
   persistedArtifacts: Set<string>
+  artifactsUnloaded: boolean
 }
 
 interface CreateRunOptions {
@@ -64,6 +65,7 @@ export interface AgentServiceDeps extends AgentCardsDeps {
   sendTextRaw(chatId: string, text: string): Promise<unknown>
   writeArtifact(path: string, value: unknown): void
   writeTextArtifact(path: string, value: string): void
+  readTextArtifact(name: string, label: string): string
   loadArtifacts(): AgentRunSnapshot[]
 }
 
@@ -84,6 +86,7 @@ const DEFAULT_DEPS: AgentServiceDeps = {
   dispose: cardkit.dispose,
   writeArtifact: writeJsonStateAtomic,
   writeTextArtifact: writeStateFileAtomic,
+  readTextArtifact,
   loadArtifacts: loadAgentRunArtifacts,
 }
 
@@ -193,11 +196,11 @@ export class AgentService {
     this.refreshNonterminalStatus(run)
     this.persist(run)
     await this.updateWorkerCard(run, worker)
-    return cloneSnapshot(run.snapshot)
+    return this.readSnapshot(run)
   }
 
   getRun(principal: AgentPrincipal, runId: string): AgentRunSnapshot {
-    return cloneSnapshot(this.requireAccessibleRun(principal, runId).snapshot)
+    return this.readSnapshot(this.requireAccessibleRun(principal, runId))
   }
 
   async cancelRun(principal: AgentPrincipal, runId: string, reason = 'agent run cancelled'): Promise<boolean> {
@@ -240,7 +243,6 @@ export class AgentService {
     request: AgentRunRequest,
     options: CreateRunOptions,
   ): Promise<AgentRunSnapshot> {
-    this.pruneRuns(options.parentRunId)
     let parent: AgentRunRecord | undefined
     if (options.parentRunId) {
       parent = this.runs.get(options.parentRunId)
@@ -293,6 +295,7 @@ export class AgentService {
       finalizing: false,
       finalized: false,
       persistedArtifacts: new Set(),
+      artifactsUnloaded: false,
     }
     try {
       await this.presentation.add(snapshot)
@@ -322,7 +325,7 @@ export class AgentService {
       this.persist(run)
       await Promise.all(run.snapshot.workers.map(worker => this.updateWorkerCard(run, worker)))
       await this.finalizeRun(run, 'cancelled', reason)
-      return cloneSnapshot(run.snapshot)
+      return this.readSnapshot(run)
     }
     this.persist(run)
     for (const identity of identities) {
@@ -331,7 +334,7 @@ export class AgentService {
         log(`agent: run=${runId} worker=${identity.id} crashed: ${messageOf(error)}`)
       })
     }
-    return cloneSnapshot(snapshot)
+    return this.readSnapshot(run)
   }
 
   private async executeWorker(
@@ -558,6 +561,7 @@ export class AgentService {
     run.finalizing = false
     this.persist(run)
     run.finalized = true
+    this.pruneRunArtifacts()
     if (run.snapshot.presentationErrors?.length) {
       await this.deps.sendTextRaw(
         run.snapshot.chatId,
@@ -607,6 +611,12 @@ export class AgentService {
     assertArtifactName(name)
     this.deps.writeTextArtifact(join(AGENT_RUNS_DIR, name), value)
     run.persistedArtifacts.add(name)
+  }
+
+  private readSnapshot(run: AgentRunRecord): AgentRunSnapshot {
+    const snapshot = cloneSnapshot(run.snapshot)
+    if (run.artifactsUnloaded) hydrateSnapshotArtifacts(snapshot, snapshot.runId, this.deps.readTextArtifact)
+    return snapshot
   }
 
   private requireAccessibleRun(principal: AgentPrincipal, runId: string): AgentRunRecord {
@@ -794,6 +804,7 @@ export class AgentService {
         cancelled: snapshot.status === 'cancelled',
         finalizing: false,
         finalized: true,
+        artifactsUnloaded: false,
         persistedArtifacts: new Set([
           ...(snapshot.promptArtifact ? [snapshot.promptArtifact] : []),
           ...snapshot.workers.flatMap(worker => worker.outputArtifact ? [worker.outputArtifact] : []),
@@ -805,19 +816,21 @@ export class AgentService {
     for (const run of this.runs.values()) {
       if (run.snapshot.parentRunId) this.runs.get(run.snapshot.parentRunId)?.children.add(run.snapshot.runId)
     }
-    this.pruneRuns()
+    this.pruneRunArtifacts()
   }
 
-  private pruneRuns(protectedRunId?: string): void {
-    if (this.runs.size <= MAX_RETAINED_RUNS) return
+  private pruneRunArtifacts(): void {
+    if (this.runs.size <= MAX_CACHED_RUN_ARTIFACTS) return
     const terminal = [...this.runs.values()]
-      .filter(run => run.snapshot.runId !== protectedRunId && isTerminal(run.snapshot.status)
-        && run.handles.size === 0 && run.slotOwners.size === 0 && run.children.size === 0)
+      .filter(run => !run.artifactsUnloaded && run.finalized && !run.finalizing && isTerminal(run.snapshot.status)
+        && run.handles.size === 0 && run.slotOwners.size === 0)
       .sort((a, b) => Date.parse(a.snapshot.finishedAt ?? a.snapshot.createdAt) - Date.parse(b.snapshot.finishedAt ?? b.snapshot.createdAt))
-    for (const run of terminal) {
-      if (this.runs.size <= MAX_RETAINED_RUNS) break
-      this.runs.delete(run.snapshot.runId)
-      if (run.snapshot.parentRunId) this.runs.get(run.snapshot.parentRunId)?.children.delete(run.snapshot.runId)
+    // The run map is the continuation index and cancellation tree, not a cache.
+    // Keep every record and link; only evict text already saved in artifacts.
+    for (const run of terminal.slice(0, Math.max(0, terminal.length - MAX_CACHED_RUN_ARTIFACTS))) {
+      run.snapshot.prompt = ''
+      for (const worker of run.snapshot.workers) worker.output = ''
+      run.artifactsUnloaded = true
     }
   }
 }
@@ -922,10 +935,14 @@ function fullAgentProfile(profile: ReturnType<typeof feishu.projectProfile>): Re
     : { strictMcp: false, loadProjectMcp: true }
 }
 
-function hydrateSnapshotArtifacts(snapshot: AgentRunSnapshot, snapshotPath: string): void {
-  if (snapshot.promptArtifact) snapshot.prompt = readTextArtifact(snapshot.promptArtifact, `prompt for ${snapshotPath}`)
+function hydrateSnapshotArtifacts(
+  snapshot: AgentRunSnapshot,
+  snapshotPath: string,
+  read: AgentServiceDeps['readTextArtifact'] = readTextArtifact,
+): void {
+  if (snapshot.promptArtifact) snapshot.prompt = read(snapshot.promptArtifact, `prompt for ${snapshotPath}`)
   for (const worker of snapshot.workers) {
-    if (worker.outputArtifact) worker.output = readTextArtifact(worker.outputArtifact, `output for ${snapshotPath}`)
+    if (worker.outputArtifact) worker.output = read(worker.outputArtifact, `output for ${snapshotPath}`)
   }
 }
 

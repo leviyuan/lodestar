@@ -36,6 +36,7 @@
 - `run --session <session_id>` / `POST /agents/runs` 的 `session_id` 从本群同工作目录的委派历史选择最新一轮，复用原身份及上一轮 effort；每轮新建 run，原生 session 不变。续跑必须等原任务终态和进程退出；同一 provider/session 在开卡、排队及执行期间禁止重叠续跑，不能把恢复失败转为新会话。
 - `run` / `follow-up` 必填单行 `description`（CLI `--description`，最多 60 字）；一条委派一个默认收起的面板，标题仅状态与说明。`agent-cards.ts` 按群尾实际消息复用委派卡，满卡或新消息后开新卡；共享卡的 streaming/dispose 统一结算，单个 run 终态不得关闭同卡其他任务。群内出站消息与委派追加通过 `chat-message-order.ts` 排序；读取群尾失败须报错，不能猜测位置。
 - 每次状态转换原子落盘；大 prompt/输出单独存入私有 artifact，快照不重复内嵌。委派 session id 单独登记，从主会话 `rs`/`fk` 历史排除。
+- 委派历史索引和父子关系不能按缓存数量删除；仅淘汰已完成、已落盘且进程退出的旧正文缓存。`status` 按原 artifact 读取完整正文，读取失败报错；续接保留原生 session、最新一轮 effort 和群/目录边界。
 - 父 run 取消、Session stop/kill/restart 和 daemon shutdown 在首次 await 前关闭新建入口、吊销 capability，并递归回收后代进程。
 - Skill 内容由 `managed-skills.ts` 同源同步至 Codex/Claude standalone 目录和 Claude 本地插件。排除 user settings 的主会话显式加载插件，不能为发现 Skill 混入 user env。
 - `lodestar-files` Skill 与各后端交付指令共用 `instructions.ts`，`file-delivery-skill.ts` 通过既有受管 Skill 管线同步。`channelInstructions(provider, mode)` 在主 Agent 启动时按群设置生成，只有聊天附件模式在交付标记旁注入 30 MB 约束；云空间提示词和共享 Skill 不提这个数字。Skill 仅在宿主明确提供上限时要求检查大小，不让 Agent 查接口/配置来推断。Agent 只生成/检查本地文件并提交标记，不承担上传、分片、授权或发卡接口；委派 Agent 返回路径给主 Agent。群开关由用户操作，不能让 Agent 为交付读取凭据或修改配置。
