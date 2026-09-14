@@ -1,5 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { fileDeliveryAgentContext } from './instructions'
+import { FileDeliveryBatch } from './file-delivery'
+import type { FileDeliverySnapshot } from './file-delivery-types'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import {
   boundResumes, branchBaseBySession, clearedResumes, deletedReactions, projectProfiles, resetFeishuMock,
@@ -367,6 +369,85 @@ describe('Session cloud file receipts', () => {
     expect(turn.outboundSentPaths.has('/tmp/large.mp4')).toBe(true)
     expect(turn.outboundSentPaths.has('/tmp/report.pdf')).toBe(false)
     expect(cardkit.isDisposed(turn.cardId)).toBe(true)
+  })
+
+  test.each([
+    ['codex', 'success'], ['claude', 'success'], ['dsh', 'success'],
+    ['codex', 'error_during_execution'], ['claude', 'error_during_execution'], ['dsh', 'error_during_execution'],
+  ] as const)('%s keeps an upload running when a result hands queued input to a new card (result=%s)', async (provider, subtype) => {
+    const isError = subtype !== 'success'
+    const session = new Session('file-handoff', 'chat_id') as any
+    const proc = new FakeAgentProc(provider)
+    session.proc = proc
+    session.selectedProvider = provider
+    session.selectedEffort = 'high'
+    session.getFileDeliveryMode = () => 'drive'
+    session.procFileDeliveryModes.set(proc, 'drive')
+    session.wireProc(proc)
+    const turn = turnState(`card_file_handoff_${provider}_${isError}`)
+    turn.provider = provider
+    turn.fileDeliveryMode = 'drive'
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const receipts: FileDeliverySnapshot[] = []
+    const errors: string[] = []
+    let uploadSignal: AbortSignal | undefined
+    let release!: () => void
+    const delivery = new FileDeliveryBatch({
+      chatId: 'chat_id', managerOpenId: 'ou_user', projectName: 'file-handoff', createdAt: turn.startedAt,
+    }, {
+      resolveFolder: async () => ({ token: 'folder', url: 'https://example.feishu.cn/drive/folder/folder' }),
+      uploadFile: async (path, _folder, onUploaded, signal) => {
+        uploadSignal = signal
+        await new Promise<void>((resolve, reject) => {
+          release = resolve
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+        const file = { token: 'video', name: path, bytes: 40 * 1024 * 1024, url: 'https://example.feishu.cn/file/video' }
+        onUploaded(file)
+        return file
+      },
+      sendCard: async snapshot => { receipts.push(structuredClone(snapshot)); return 'om_receipt' },
+      persist: () => {},
+      reportError: async message => { errors.push(message) },
+    })
+    session.createFileDeliveryForTurn = () => delivery
+    session.sendOutboundPath('/tmp/preview.mp4', 'send marker')
+    await waitUntil(() => uploadSignal !== undefined)
+    try {
+      session.pendingMidTurnMsgs = [{
+        text: '继续下一步', wireText: '继续下一步', userOpenId: 'ou_user', msgId: 'om_followup',
+      }]
+      proc.lastResult = { ...proc.lastResult, subtype, is_error: isError }
+      proc.emit('result', { is_error: isError })
+      await waitUntil(() => proc.sentTexts.includes('继续下一步'))
+      const nextTurn = session.currentTurn
+      expect(nextTurn).not.toBeNull()
+      expect(nextTurn).not.toBe(turn)
+      expect(uploadSignal!.aborted).toBe(false)
+      expect(delivery.snapshot.files[0].status).toBe('pending')
+      expect(receipts).toHaveLength(0)
+      expect(cardkit.isDisposed(turn.cardId)).toBe(false)
+      expect(session.fileDeliveries.has(delivery)).toBe(true)
+
+      release()
+      await session.waitForTurnCloses()
+      expect(receipts).toHaveLength(1)
+      expect(receipts[0].files.map(file => file.status)).toEqual(['ready'])
+      expect(receipts[0].error).toBeUndefined()
+      expect(errors).toEqual([])
+      expect(turn.outboundSentPaths.has('/tmp/preview.mp4')).toBe(true)
+      expect(cardkit.isDisposed(turn.cardId)).toBe(true)
+      expect(session.fileDeliveries.size).toBe(0)
+      expect(session.currentTurn).toBe(nextTurn)
+      expect(nextTurn.outboundSentPaths.size).toBe(0)
+      const footer = calls.find(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+      expect(JSON.stringify(footer?.body)).toContain(isError ? '用户已介入' : '📨 转交新卡')
+    } finally {
+      release()
+      await session.waitForTurnCloses()
+      if (session.currentTurn) await session.closeTurnCard()
+    }
   })
 
   test.each(['hard', 'soft'])('%s stop cancels file delivery after the agent finished and its turn was captured', async mode => {

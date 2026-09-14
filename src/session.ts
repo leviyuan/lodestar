@@ -5770,7 +5770,9 @@ export class Session {
     // off the table BEFORE their first await.
     const turn = this.currentTurn
     if (!turn) return this.waitForTurnCloses()
-    if (suffix) turn.fileDelivery?.cancel(suffix)
+    // A terminal label (including a queued-input handoff or Agent error) only
+    // describes the conversation card. Admitted uploads keep their turn owner
+    // and finish below; stop/restart cancel them through the session registry.
     if (!suffix && turn.cardRotationFailed) this.maybeMidTurnRotate()
     this.currentTurn = null
     this.stopFooterStatus(turn)
