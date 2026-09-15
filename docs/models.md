@@ -57,7 +57,7 @@ api_key = "填写 rck_ 个人只读 API key"
 
 模型运行保持 Claude Agent SDK 默认入口，无需设置 `[claude].bin`。ReClaude 来源校验本机设备登录、对应 Claude 凭据、后台进程和 CA，然后只为此来源的 SDK 子进程设置官方本机代理。客户端未运行、登录不匹配、模型目录失败和网关错误均明确报错，不切换到其他账号。安装、登录和后台启动由用户管理，Lodestar 不自动安装或启动 ReClaude。
 
-恢复检测脚本为 `bun scripts/watch-reclaude.ts --project <群项目名> --model opus --interval-seconds 300`。它用极短的真实对话确认恢复，可能消耗拼车额度；首次成功后停止模型请求，经本机通知接口确认群消息发送成功后退出。通知失败每分钟重试，仅重试通知。状态保存在数据目录的 `reclaude-watch/`，已成功或已通知的记录在再次运行时仍有效，不会重复消耗模型额度。`--once` 只执行一轮。常驻时用 `systemd-run --user --unit=cc-<项目>-reclaude-watch -- <Bun绝对路径> <脚本绝对路径> ...` 管理；这不会重启 Lodestar。
+恢复检测脚本为 `bun scripts/watch-reclaude.ts --project <群项目名> --model haiku --interval-seconds 300`。它用极短的真实对话确认恢复，可能消耗拼车额度；首次成功后停止模型请求，经本机通知接口确认群消息发送成功后退出。通知失败每分钟重试，仅重试通知。状态保存在数据目录的 `reclaude-watch/`，已成功或已通知的记录在再次运行时仍有效，不会重复消耗模型额度。`--once` 只执行一轮。常驻时用 `systemd-run --user --unit=cc-<项目>-reclaude-watch -- <Bun绝对路径> <脚本绝对路径> ...` 管理；这不会重启 Lodestar。
 
 ## OpenRouter
 
