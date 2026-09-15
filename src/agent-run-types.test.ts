@@ -19,6 +19,25 @@ describe('delegated-agent request parsing', () => {
     })
   })
 
+  test('accepts work_dir aliases for new runs and continuations without trimming the path', () => {
+    for (const field of ['work_dir', 'workDir']) {
+      const request = { description: '指定目录', prompt: 'work', [field]: 'packages/app with spaces ' }
+      expect(parseAgentRunRequest({ ...request, identity_ids: ['a'] })).toMatchObject({ workDir: 'packages/app with spaces ' })
+      expect(parseAgentRunRequest({ ...request, session_id: 'sid' })).toMatchObject({ workDir: 'packages/app with spaces ' })
+      expect(parseAgentFollowUpRequest(request)).toMatchObject({ workDir: 'packages/app with spaces ' })
+    }
+  })
+
+  test('rejects invalid or conflicting directory options instead of using the default directory', () => {
+    const request = { description: '检查目录', prompt: 'work', identity_ids: ['a'] }
+    for (const work_dir of ['', ' ', null, 7, {}, [], 'invalid\0path']) {
+      expect(() => parseAgentRunRequest({ ...request, work_dir })).toThrow('work_dir')
+      expect(() => parseAgentFollowUpRequest({ ...request, work_dir })).toThrow('work_dir')
+    }
+    expect(() => parseAgentRunRequest({ ...request, work_dir: 'a', workDir: 'b' })).toThrow('conflicting')
+    expect(() => parseAgentFollowUpRequest({ ...request, work_dir: 'a', workDir: 'b' })).toThrow('conflicting')
+  })
+
   test('accepts a native session id with optional identity and preserves the new input', () => {
     expect(parseAgentRunRequest({ description: '任务说明', session_id: ' native-session ', prompt: '  second turn\n' })).toEqual({ description: '任务说明',
       identityIds: [], sessionId: 'native-session', prompt: '  second turn\n',

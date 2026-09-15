@@ -69,13 +69,13 @@ describe('lodestar-agent CLI args', () => {
     expect(parsePromptArgs([
       '--description', '任务说明', '--identity', 'a', '--identity', 'b', '--identity', 'a', '--effort', 'max', '--stdin', '--no-wait',
     ], true)).toEqual({
-      description: '任务说明', identityIds: ['a', 'b'], identityId: '', sessionId: '', effort: 'max', prompt: '', noWait: true, readStdin: true, json: false,
+      description: '任务说明', identityIds: ['a', 'b'], identityId: '', sessionId: '', workDir: '', effort: 'max', prompt: '', noWait: true, readStdin: true, json: false,
     })
   })
 
   test('parses a single-session follow-up', () => {
     expect(parsePromptArgs(['--description', '任务说明', '--identity', 'a', 'continue here'], false)).toEqual({
-      description: '任务说明', identityIds: [], identityId: 'a', sessionId: '', effort: '', prompt: 'continue here', noWait: false, readStdin: false, json: false,
+      description: '任务说明', identityIds: [], identityId: 'a', sessionId: '', workDir: '', effort: '', prompt: 'continue here', noWait: false, readStdin: false, json: false,
     })
   })
 
@@ -85,12 +85,22 @@ describe('lodestar-agent CLI args', () => {
 
   test('accepts session continuation without a new identity and rejects ambiguous session options', () => {
     expect(parsePromptArgs(['--description', '任务说明', '--session', 'sid', '--prompt', 'next turn', '--json'], true)).toEqual({
-      description: '任务说明', identityIds: [], identityId: '', sessionId: 'sid', effort: '', prompt: 'next turn', noWait: false, readStdin: false, json: true,
+      description: '任务说明', identityIds: [], identityId: '', sessionId: 'sid', workDir: '', effort: '', prompt: 'next turn', noWait: false, readStdin: false, json: true,
     })
     expect(() => parsePromptArgs(['--session', 'sid', '--identity', 'a', '--identity', 'b'], true)).toThrow('at most one')
     expect(() => parsePromptArgs(['--session', 'sid', '--session', 'other'], true)).toThrow('only be specified once')
     expect(() => parsePromptArgs(['--session', 'sid'], false)).toThrow('only supported by run')
     expect(() => parsePromptArgs(['--session'], true)).toThrow('requires a value')
+  })
+
+  test('accepts a work directory and rejects missing or repeated directory options', () => {
+    expect(parsePromptArgs(['--identity', 'a', '--description', '指定目录', '--workdir', 'packages/app with spaces ', '--prompt', 'work'], true))
+      .toMatchObject({ workDir: 'packages/app with spaces ' })
+    expect(parsePromptArgs(['--description', '原目录续跑', '--workdir', '/repo/packages/app', '--prompt', 'work'], false))
+      .toMatchObject({ workDir: '/repo/packages/app' })
+    expect(() => parsePromptArgs(['--workdir'], true)).toThrow('--workdir requires a value')
+    expect(() => parsePromptArgs(['--workdir', ' '], true)).toThrow('--workdir requires a value')
+    expect(() => parsePromptArgs(['--workdir', 'a', '--workdir', 'b'], true)).toThrow('only be specified once')
   })
 
   test('round-trips native session ids and content through CLI JSON and prints a continuation command', async () => {
@@ -103,6 +113,7 @@ describe('lodestar-agent CLI args', () => {
         if (body.session_id === 'missing') return Response.json({ error: 'agent session not found' }, { status: 409 })
         current = {
           run_id: `agent_${requests.length}`, status: 'completed',
+          work_dir: body.work_dir ?? current?.work_dir ?? '/repo',
           workers: [{ identity_id: 'agent:a', identity_name: 'Agent A', status: 'completed', session_id: 'native-sid', output: body.prompt }],
         }
         return Response.json(current, { status: 202 })
@@ -119,10 +130,11 @@ describe('lodestar-agent CLI args', () => {
       return { code, stdout, stderr }
     }
     try {
-      const first = await invoke('run', '--description', '任务说明', '--identity', 'agent:a', '--prompt', 'first', '--json')
+      const first = await invoke('run', '--description', '任务说明', '--identity', 'agent:a', '--workdir', 'packages/app', '--prompt', 'first', '--json')
       expect(first.code, first.stderr).toBe(0)
       const firstRun = JSON.parse(first.stdout)
       expect(firstRun.workers[0].output).toBe('first')
+      expect(firstRun.work_dir).toBe('packages/app')
       const second = await invoke('run', '--description', '任务说明', '--session', firstRun.workers[0].session_id, '--prompt', '  第二轮\n', '--json')
       expect(second.code, second.stderr).toBe(0)
       const secondRun = JSON.parse(second.stdout)
@@ -134,9 +146,10 @@ describe('lodestar-agent CLI args', () => {
       const third = await invoke('run', '--description', '任务说明', '--session', 'native-sid', '--prompt', 'third')
       expect(third.code, third.stderr).toBe(0)
       expect(third.stdout).toContain('Session: native-sid')
+      expect(third.stdout).toContain('Work directory: packages/app')
       expect(third.stdout).toContain("lodestar-agent run --session 'native-sid' --identity 'agent:a' --description '<brief next step>' --stdin")
       expect(requests).toEqual([
-        { description: '任务说明', identity_ids: ['agent:a'], prompt: 'first' },
+        { description: '任务说明', identity_ids: ['agent:a'], work_dir: 'packages/app', prompt: 'first' },
         { description: '任务说明', identity_ids: [], session_id: 'native-sid', prompt: '  第二轮\n' },
         { description: '任务说明', identity_ids: [], session_id: 'native-sid', prompt: 'third' },
       ])
@@ -144,6 +157,9 @@ describe('lodestar-agent CLI args', () => {
       expect(failed.code).toBe(1)
       expect(failed.stderr).toContain('agent session not found')
       expect(requests).toHaveLength(4)
+      const follow = await invoke('follow-up', firstRun.run_id, '--description', '指定原目录', '--workdir', 'packages/app', '--prompt', 'follow', '--no-wait')
+      expect(follow.code, follow.stderr).toBe(0)
+      expect(requests.at(-1)).toEqual({ description: '指定原目录', work_dir: 'packages/app', prompt: 'follow' })
     } finally { await server.stop(true) }
   })
 })

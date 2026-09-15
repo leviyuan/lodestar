@@ -92,6 +92,13 @@ Linux/macOS 下，额外账号通过软链接共用默认账号的配置、会�
 
 被调用的 Agent 可以编辑文件、执行命令、使用 MCP 和 Skill；委派只允许一层，被调用的 Agent 不能继续派工。它们与主 Agent 共享工作区，修改会立即可见。需要用户输入时暂停，由主 Agent 回填答案后继续。委派产生的会话不会混入主群的 `rs` 历史列表。
 
+新任务默认使用主 Agent 的工作目录，不受调用命令时 Shell 当前目录影响。可用 `--workdir <路径>` 指定其中已存在的子目录：相对路径以主 Agent 的工作目录为基准，也支持范围内的绝对路径。路径会解析软链接，越界、目录不存在或指向普通文件都会报错。同一个 run 的多个 Agent 使用同一目录；需要不同目录时分别发起任务。
+
+```bash
+# desc: 在项目子目录中委派任务
+lodestar-agent run --identity '<identity-id>' --description '检查应用代码' --workdir 'packages/app' --prompt '检查当前应用的代码并报告结果' --json
+```
+
 每次 `run` 和 `follow-up` 必须填写 `--description`（不超过 60 字的单行说明）。委派任务、原生子 Agent 和后台任务统一收在委派卡里，每项只显示状态和一句说明，展开可看任务类型、正文、结果、错误和最近三步动作。子 Agent 启动即展示，普通前台命令不会额外生成任务项；任务结束后显示实际耗时。
 
 委派卡仍在群对话尾部时，新任务继续追加；容量满或群里出现新消息（包括主 Agent 新开的会话卡）后，下一项另开卡。旧任务继续原地更新，后台任务不再随新消息迁移。共享卡等全部任务结束后才停止更新；后续结果撑满卡片时，对应条目移到新卡。多模型委派的完整结果仍保存在任务记录中。
@@ -110,7 +117,7 @@ lodestar-agent run --session '<session-id>' --description '继续第二步' --pr
 
 第二轮及后续轮次恢复同一个后端原生会话，自动沿用原身份和上一轮的 effort，每轮产生新的 `run_id`。`--identity` 可省略，指定时必须与原身份一致；可用 `--effort` 显式选择本轮档位。多模型首轮会分别返回各 worker 的会话 ID，续跑时一次选择一个会话。也可继续使用 `lodestar-agent follow-up '<run-id>' --description '继续下一步' --prompt '下一步'`；原 run 包含多个 Agent 时需用 `--identity` 指定。
 
-续跑要求原任务已经结束，且属于同一个 Lodestar 群会话和工作目录。持久化的委派历史仍可用时，daemon 重启后也可凭原会话 ID 继续；会话不存在、身份不可用或原生恢复失败会报错。同一个原生会话不能同时执行两轮。`run`、`follow-up`、`status` 支持 `--json`；使用 `--stdin` 可输入多行任务，`--no-wait` 立即返回启动状态，随后通过 `status <run-id>` 查询结果。
+续跑要求原任务已经结束，且属于同一个 Lodestar 群会话和主 Agent 工作目录。`run --session` 和 `follow-up` 自动保留原任务目录；续跑时若填写 `--workdir`，必须仍指向原目录，更换目录需要新建任务。持久化的委派历史仍可用时，daemon 重启后也可凭原会话 ID 继续；会话不存在、身份不可用或原生恢复失败会报错。同一个原生会话不能同时执行两轮。`run`、`follow-up`、`status` 支持 `--json`，返回的 `work_dir` 表示实际工作目录；使用 `--stdin` 可输入多行任务，`--no-wait` 立即返回启动状态，随后通过 `status <run-id>` 查询结果。HTTP API 的 `POST /agents/runs` 和 `POST /agents/runs/<run-id>/follow-up` 同样接受可选的 `work_dir`。
 
 `lodestar-agent` 只能在 Lodestar 管理的 Agent 进程里调用。命令用法见 [Agent Skill](../src/agent-skill.ts)。
 

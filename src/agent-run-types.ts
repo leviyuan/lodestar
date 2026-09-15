@@ -6,6 +6,8 @@ export interface AgentRunRequest {
   description: string
   prompt: string
   effort?: string
+  /** Relative to the main Agent's directory, or an absolute path within it. */
+  workDir?: string
   /** Resume a native session previously delegated by this Lodestar Session. */
   sessionId?: string
 }
@@ -15,6 +17,8 @@ export interface AgentFollowUpRequest {
   description: string
   prompt: string
   effort?: string
+  /** If supplied, must resolve to the original run's working directory. */
+  workDir?: string
 }
 
 export interface AgentAnswerRequest {
@@ -81,6 +85,8 @@ export interface AgentRunSnapshot {
   runId: string
   sessionName: string
   chatId: string
+  /** Main Session's directory; legacy snapshots used workDir for both roles. */
+  sessionWorkDir?: string
   workDir: string
   prompt: string
   /** Durable prompt body is stored separately from lifecycle metadata. */
@@ -118,7 +124,12 @@ export function parseAgentRunRequest(raw: unknown): AgentRunRequest {
   if (identityIds.length > 64) throw new Error('agent run supports at most 64 identities')
   const prompt = requiredPrompt(value.prompt, 'agent run requires "prompt"')
   const effort = optionalString(value.effort)
-  return { identityIds, description: requireAgentDescription(value.description), prompt, ...(effort ? { effort } : {}), ...(sessionId ? { sessionId } : {}) }
+  const workDir = parseWorkDir(value)
+  return {
+    identityIds, description: requireAgentDescription(value.description), prompt,
+    ...(effort ? { effort } : {}), ...(sessionId ? { sessionId } : {}),
+    ...(workDir !== undefined ? { workDir } : {}),
+  }
 }
 
 export function parseAgentFollowUpRequest(raw: unknown): AgentFollowUpRequest {
@@ -126,12 +137,29 @@ export function parseAgentFollowUpRequest(raw: unknown): AgentFollowUpRequest {
   const prompt = requiredPrompt(value.prompt, 'agent follow-up requires "prompt"')
   const identityId = optionalString(value.identity_id ?? value.identityId)
   const effort = optionalString(value.effort)
+  const workDir = parseWorkDir(value)
   return {
     description: requireAgentDescription(value.description),
     prompt,
     ...(identityId ? { identityId } : {}),
     ...(effort ? { effort } : {}),
+    ...(workDir !== undefined ? { workDir } : {}),
   }
+}
+
+export function requireAgentWorkDir(raw: unknown): string {
+  if (typeof raw !== 'string' || !raw.trim() || raw.includes('\0')) {
+    throw new Error('agent work_dir must be a non-empty path without null bytes')
+  }
+  return raw
+}
+
+function parseWorkDir(value: Record<string, unknown>): string | undefined {
+  if (value.work_dir !== undefined && value.workDir !== undefined && value.work_dir !== value.workDir) {
+    throw new Error('conflicting agent work_dir and workDir')
+  }
+  const raw = value.work_dir !== undefined ? value.work_dir : value.workDir
+  return raw === undefined ? undefined : requireAgentWorkDir(raw)
 }
 
 export function requireAgentDescription(raw: unknown): string {

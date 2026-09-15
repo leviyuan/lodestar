@@ -12,6 +12,7 @@ interface PromptArgs {
   identityIds: string[]
   identityId: string
   sessionId: string
+  workDir: string
   effort: string
   description: string
   prompt: string
@@ -70,6 +71,7 @@ async function runCommand(context: CliContext, argv: string[]): Promise<void> {
     prompt,
     ...(parsed.effort ? { effort: parsed.effort } : {}),
     ...(parsed.sessionId ? { session_id: parsed.sessionId } : {}),
+    ...(parsed.workDir ? { work_dir: parsed.workDir } : {}),
   }
   const started = await requestJson(context, 'POST', '/agents/runs', body)
   await presentStartedRun(context, started, parsed.noWait, parsed.json)
@@ -84,6 +86,7 @@ async function followUpCommand(context: CliContext, argv: string[]): Promise<voi
     prompt,
     ...(parsed.identityId ? { identity_id: parsed.identityId } : {}),
     ...(parsed.effort ? { effort: parsed.effort } : {}),
+    ...(parsed.workDir ? { work_dir: parsed.workDir } : {}),
   }
   const started = await requestJson(context, 'POST', `/agents/runs/${encodeURIComponent(runId)}/follow-up`, body)
   await presentStartedRun(context, started, parsed.noWait, parsed.json)
@@ -132,7 +135,7 @@ async function answerCommand(context: CliContext, argv: string[]): Promise<void>
 
 export function parsePromptArgs(argv: string[], identitiesRequired: boolean): PromptArgs {
   const out: PromptArgs = {
-    identityIds: [], identityId: '', sessionId: '', effort: '', description: '', prompt: '', noWait: false, readStdin: false, json: false,
+    identityIds: [], identityId: '', sessionId: '', workDir: '', effort: '', description: '', prompt: '', noWait: false, readStdin: false, json: false,
   }
   const positional: string[] = []
   for (let i = 0; i < argv.length; i++) {
@@ -145,6 +148,9 @@ export function parsePromptArgs(argv: string[], identitiesRequired: boolean): Pr
         break
       case '--effort': out.effort = next(); break
       case '--description': out.description = next(); break
+      case '--workdir':
+        if (out.workDir) throw new Error('--workdir may only be specified once')
+        next(); out.workDir = argv[i]!; break
       case '--session':
         if (!identitiesRequired) throw new Error('--session is only supported by run; follow-up accepts a run_id')
         if (out.sessionId) throw new Error('--session may only be specified once')
@@ -274,6 +280,7 @@ function formatRun(run: any): string {
     '',
     `- Status: ${run.status ?? 'MISS'}`,
     `- Description: ${run.description ?? 'MISS'}`,
+    `- Work directory: ${run.work_dir ?? 'MISS'}`,
     ...(run.parent_run_id ? [`- Parent: ${run.parent_run_id} (${run.parent_kind ?? 'delegate'})`] : []),
   ]
   if (run.error) lines.push(`- Error: ${run.error}`)
@@ -322,15 +329,17 @@ function usage(): string {
   return [
     'Usage:',
     '  lodestar-agent identities [--json]',
-    '  lodestar-agent run --identity <id> [--identity <id>...] --description <summary> [--effort <level>] [--json] --stdin',
-    '  lodestar-agent run --session <session_id> [--identity <id>] --description <summary> [--effort <level>] [--json] --stdin',
-    '  lodestar-agent follow-up <run_id> [--identity <id>] --description <summary> [--effort <level>] [--json] --stdin',
+    '  lodestar-agent run --identity <id> [--identity <id>...] --description <summary> [--workdir <path>] [--effort <level>] [--json] --stdin',
+    '  lodestar-agent run --session <session_id> [--identity <id>] --description <summary> [--workdir <path>] [--effort <level>] [--json] --stdin',
+    '  lodestar-agent follow-up <run_id> [--identity <id>] --description <summary> [--workdir <path>] [--effort <level>] [--json] --stdin',
     '  lodestar-agent answer <run_id> [--identity <id>] --request <id> (--answer key=value | --stdin)',
     '  lodestar-agent status <run_id> [--json]',
     '  lodestar-agent cancel <run_id>',
     '',
     'Use --prompt <text> instead of --stdin for inline input. --no-wait returns the started run as JSON.',
     '--session continues a delegated session in the same Lodestar Session and workspace.',
+    '--workdir defaults to the main Agent working directory; relative paths are resolved from it.',
+    'The directory must exist within the main directory (symlinks are resolved). Continuations keep their original directory.',
     '--description is required for every run/follow-up: one short line, at most 60 characters, shown on the collapsed card.',
     'Each turn has a new run_id; workers[].session_id identifies the native conversation.',
   ].join('\n')

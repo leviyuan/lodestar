@@ -1,4 +1,6 @@
-import { describe, expect, test } from 'bun:test'
+import { afterAll, describe, expect, test } from 'bun:test'
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AgentService, type AgentServiceDeps } from './agent-service'
 import type { AgentIdentity, AgentIdentityCatalog } from './agent-identities'
@@ -18,8 +20,13 @@ function openRouterIdentity(id: string): AgentIdentity {
   return { ...identity(id), tokenSourceId: 'openrouter', tokenSourceDisplay: 'OpenRouter' }
 }
 
+const testDir = realpathSync(mkdtempSync(join(tmpdir(), 'lodestar-agent-service-')))
+mkdirSync(join(testDir, 'repo', 'packages', 'app'), { recursive: true })
+mkdirSync(join(testDir, 'other'))
+afterAll(() => rmSync(testDir, { recursive: true, force: true }))
+
 const session = {
-  sessionName: 'project', chatId: 'chat-1', workDir: '/repo',
+  sessionName: 'project', chatId: 'chat-1', workDir: join(testDir, 'repo'),
   delegatedAgentDeveloperInstructions: () => '',
   worktreeProjectName: () => 'project',
   codexAccountId: () => 'default',
@@ -140,6 +147,148 @@ async function waitForCondition(check: () => boolean): Promise<void> {
 }
 
 describe('AgentService', () => {
+  test('defaults to the main directory and resolves relative, absolute and symlinked subdirectories', async () => {
+    const calls: string[] = []
+    const { service, root, artifacts } = harness({
+      startWorker: opts => { calls.push(opts.workDir); return resolvedHandle(result(`sid-${calls.length}`)) },
+    })
+    const subdir = join(session.workDir, 'packages', 'app')
+    symlinkSync(subdir, join(session.workDir, 'app-alias'), 'dir')
+    const alias = join(testDir, 'repo-alias')
+    symlinkSync(session.workDir, alias, 'dir')
+    const aliasRoot = service.rootPrincipal({ ...session, workDir: alias })
+    for (const principal of [root, aliasRoot]) {
+      for (const workDir of [undefined, '.', principal.session.workDir, 'packages/app', subdir, 'app-alias']) {
+        const expected = workDir === undefined || workDir === '.' || workDir === principal.session.workDir ? principal.session.workDir : subdir
+        const started = await service.startRun(principal, { description: '选择目录', identityIds: ['agent:a'], prompt: 'inspect', workDir })
+        const terminal = await waitFor(service, principal, started.runId, 'completed')
+        expect(terminal).toMatchObject({ workDir: expected, sessionWorkDir: principal.session.workDir })
+        expect(calls.at(-1)).toBe(expected)
+        expect(artifacts.at(-1)).toMatchObject({ workDir: expected, sessionWorkDir: principal.session.workDir })
+      }
+    }
+  })
+
+  test('preserves a legacy native session directory when the main project path is a symlink', async () => {
+    const workDir = join(testDir, 'legacy-root-alias')
+    symlinkSync(session.workDir, workDir, 'dir')
+    const calls: string[] = []
+    const { service } = harness({
+      loadArtifacts: () => completedHistory(1).map(run => ({ ...run, workDir })),
+      startWorker: opts => { calls.push(opts.workDir); return resolvedHandle(result(opts.resumeSessionId!)) },
+    })
+    const root = service.rootPrincipal({ ...session, workDir })
+    const next = await service.startRun(root, { description: '继续旧目录会话', identityIds: [], sessionId: 'sid-history-0', prompt: 'next' })
+    await waitFor(service, root, next.runId, 'completed')
+    expect(calls).toEqual([workDir])
+    expect(next).toMatchObject({ sessionWorkDir: workDir, workDir })
+  })
+
+  test('rejects outside, missing and non-directory paths before creating a card or starting a worker', async () => {
+    let starts = 0
+    let cards = 0
+    const { service, root, artifacts } = harness({
+      sendCard: async () => `card-${++cards}`,
+      startWorker: () => { starts++; return resolvedHandle(result('unexpected')) },
+    })
+    const sibling = join(testDir, 'repo-other')
+    mkdirSync(sibling)
+    writeFileSync(join(session.workDir, 'ordinary-file'), 'data')
+    symlinkSync(sibling, join(session.workDir, 'escape'), 'dir')
+    symlinkSync(join(testDir, 'missing'), join(session.workDir, 'broken-link'), 'dir')
+    for (const workDir of ['..', '../repo-other', sibling, 'escape', join(session.workDir, 'escape')]) {
+      await expect(service.startRun(root, { description: '拒绝越界', identityIds: ['agent:a'], prompt: 'inspect', workDir }))
+        .rejects.toThrow('main Agent working directory')
+    }
+    for (const workDir of ['missing', 'broken-link', 'ordinary-file', '', ' ', 'path\0invalid']) {
+      await expect(service.startRun(root, { description: '拒绝无效目录', identityIds: ['agent:a'], prompt: 'inspect', workDir })).rejects.toThrow()
+    }
+    expect(starts).toBe(0)
+    expect(cards).toBe(0)
+    expect(artifacts).toHaveLength(0)
+  })
+
+  test('keeps subdirectory history within its owning Session and rejects changes to the continuation directory', async () => {
+    const { service, root } = harness()
+    const first = await service.startRun(root, {
+      description: '子目录任务', identityIds: ['agent:a'], prompt: 'first', workDir: 'packages/app',
+    })
+    const terminal = await waitFor(service, root, first.runId, 'completed')
+    for (const workDir of [terminal.workDir, testDir, join(testDir, 'other')]) {
+      const other = service.rootPrincipal({ ...session, workDir })
+      expect(() => service.getRun(other, first.runId)).toThrow('different Session')
+      await expect(service.startRun(other, { description: '越界续接', identityIds: [], sessionId: terminal.workers[0]!.sessionId, prompt: 'next' }))
+        .rejects.toThrow('agent session not found')
+      await expect(service.cancelRun(other, first.runId)).rejects.toThrow('different Session')
+    }
+    for (const workDir of ['.', 'packages']) {
+      await expect(service.followUp(root, first.runId, { description: '更换目录', prompt: 'next', workDir }))
+        .rejects.toThrow('original work_dir')
+      await expect(service.startRun(root, { description: '更换目录', identityIds: [], sessionId: terminal.workers[0]!.sessionId, prompt: 'next', workDir }))
+        .rejects.toThrow('original work_dir')
+    }
+    const next = await service.followUp(root, first.runId, { description: '原目录续跑', prompt: 'next' })
+    await waitFor(service, root, next.runId, 'completed')
+    expect(next.workDir).toBe(terminal.workDir)
+  })
+
+  test('retains status and cancellation access after a worker directory disappears', async () => {
+    const workDir = join(session.workDir, 'removed-worker-dir')
+    mkdirSync(workDir)
+    const control = controlledHandle()
+    let workerStarted = false
+    const { service, root } = harness({ startWorker: opts => {
+      workerStarted = true
+      opts.callbacks?.onSession?.('sid-removed-directory')
+      return control.handle
+    } })
+    try {
+      const started = await service.startRun(root, { description: '目录被删除', identityIds: ['agent:a'], prompt: 'work', workDir })
+      await waitForCondition(() => workerStarted)
+      rmSync(workDir, { recursive: true })
+      expect(service.getRun(root, started.runId).workDir).toBe(workDir)
+      await expect(service.cancelRun(root, started.runId)).resolves.toBe(true)
+      await expect(service.followUp(root, started.runId, { description: '缺失目录续跑', prompt: 'next' })).rejects.toThrow('ENOENT')
+    } finally { await service.shutdown('test cleanup') }
+  })
+
+  test('does not resume a completed task in a replacement directory', async () => {
+    const workDir = join(session.workDir, 'replaced-worker-dir')
+    mkdirSync(workDir)
+    let starts = 0
+    const { service, root } = harness({ startWorker: () => { starts++; return resolvedHandle(result('sid-replaced-directory')) } })
+    const started = await service.startRun(root, { description: '原目录任务', identityIds: ['agent:a'], prompt: 'work', workDir })
+    await waitFor(service, root, started.runId, 'completed')
+    rmSync(workDir, { recursive: true })
+    symlinkSync(join(session.workDir, 'packages', 'app'), workDir, 'dir')
+    await expect(service.startRun(root, { description: '目录已替换', identityIds: [], sessionId: 'sid-replaced-directory', prompt: 'next' }))
+      .rejects.toThrow('work_dir changed')
+    expect(starts).toBe(1)
+  })
+
+  test('rejects a directory replaced with an outside symlink while waiting for a worker slot', async () => {
+    const workDir = join(session.workDir, 'queued-worker-dir')
+    mkdirSync(workDir)
+    const controls = [controlledHandle(), controlledHandle()]
+    let starts = 0
+    const { service, root } = harness({
+      identities: [openRouterIdentity('a')],
+      startWorker: () => controls[starts++]!.handle,
+    })
+    try {
+      for (let i = 0; i < 2; i++) await service.startRun(root, { description: '占用并发槽', identityIds: ['agent:a'], prompt: 'wait' })
+      await waitForCondition(() => starts === 2)
+      const queued = await service.startRun(root, { description: '检查排队目录', identityIds: ['agent:a'], prompt: 'work', workDir })
+      await waitForCondition(() => !!service.getRun(root, queued.runId).workers[0]!.queuedReason)
+      rmSync(workDir, { recursive: true })
+      symlinkSync(join(testDir, 'other'), workDir, 'dir')
+      controls[0]!.resolve(result('sid-release-slot'))
+      const failed = await waitFor(service, root, queued.runId, 'failed')
+      expect(failed.workers[0]!.error).toContain('main Agent working directory')
+      expect(starts).toBe(2)
+    } finally { await service.shutdown('test cleanup') }
+  })
+
   test('persists shared card ownership and a new description for each native follow-up', async () => {
     const sent: object[] = []
     const { service, root, artifacts } = harness({
@@ -228,7 +377,7 @@ describe('AgentService', () => {
         }
       },
     })
-    const started = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a'], prompt: 'ask if needed' })
+    const started = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a'], prompt: 'ask if needed', workDir: 'packages/app' })
     await waitFor(service, root, started.runId, 'needs_input')
     await service.answer(root, started.runId, { requestId: 'req-1', answers: { q1: 'yes' } })
     const terminal = await waitFor(service, root, started.runId, 'completed')
@@ -277,16 +426,18 @@ describe('AgentService', () => {
 
     test(`${provider}: continues by session id for three turns including reloaded history`, async () => {
       const selected = { ...identity(provider), provider }
-      const calls: Array<{ prompt: string; resume?: string; identity: string; effort: string }> = []
+      const workDir = join(session.workDir, `continued-${provider}`)
+      mkdirSync(workDir)
+      const calls: Array<{ prompt: string; resume?: string; identity: string; effort: string; workDir: string }> = []
       const startWorker: AgentServiceDeps['startWorker'] = opts => {
-        calls.push({ prompt: opts.prompt, resume: opts.resumeSessionId, identity: opts.identity.id, effort: opts.effort })
+        calls.push({ prompt: opts.prompt, resume: opts.resumeSessionId, identity: opts.identity.id, effort: opts.effort, workDir: opts.workDir })
         return resolvedHandle(result(opts.resumeSessionId ?? `sid-${provider}`, `reply: ${opts.prompt}`))
       }
       const { service, root } = harness({ identities: [selected], startWorker })
-      const first = await service.startRun(root, { description: '任务说明', identityIds: [selected.id], prompt: 'first' })
+      const first = await service.startRun(root, { description: '任务说明', identityIds: [selected.id], prompt: 'first', workDir: `continued-${provider}` })
       const firstResult = await waitFor(service, root, first.runId, 'completed')
       const sessionId = firstResult.workers[0]!.sessionId!
-      const second = await service.startRun(root, { description: '任务说明', identityIds: [], sessionId, prompt: '  second\n', effort: 'low' })
+      const second = await service.startRun(root, { description: '任务说明', identityIds: [], sessionId, prompt: '  second\n', effort: 'low', workDir })
       const secondResult = await waitFor(service, root, second.runId, 'completed')
       expect(secondResult).toMatchObject({ parentRunId: first.runId, parentKind: 'follow_up' })
       expect(secondResult.workers[0]).toMatchObject({ sessionId, output: 'reply:   second\n', effort: 'low' })
@@ -297,13 +448,13 @@ describe('AgentService', () => {
       const reloaded = harness({ identities: [selected], startWorker, loadArtifacts: () => history })
       const third = await reloaded.service.startRun(reloaded.root, { description: '任务说明', identityIds: [], sessionId, prompt: 'third' })
       const terminal = await waitFor(reloaded.service, reloaded.root, third.runId, 'completed')
-      expect(terminal).toMatchObject({ parentRunId: second.runId, parentKind: 'follow_up' })
+      expect(terminal).toMatchObject({ parentRunId: second.runId, parentKind: 'follow_up', workDir, sessionWorkDir: session.workDir })
       expect(terminal.workers[0]).toMatchObject({ sessionId, effort: 'low', output: 'reply: third' })
       expect(new Set([first.runId, second.runId, third.runId]).size).toBe(3)
       expect(calls).toEqual([
-        { prompt: 'first', resume: undefined, identity: selected.id, effort: 'max' },
-        { prompt: '  second\n', resume: sessionId, identity: selected.id, effort: 'low' },
-        { prompt: 'third', resume: sessionId, identity: selected.id, effort: 'low' },
+        { prompt: 'first', resume: undefined, identity: selected.id, effort: 'max', workDir },
+        { prompt: '  second\n', resume: sessionId, identity: selected.id, effort: 'low', workDir },
+        { prompt: 'third', resume: sessionId, identity: selected.id, effort: 'low', workDir },
       ])
     })
   }
@@ -506,7 +657,7 @@ describe('AgentService', () => {
 
   test('marks interrupted durable runs failed on daemon restart', () => {
     const active = {
-      runId: 'agent_old', sessionName: 'project', chatId: 'chat-1', workDir: '/repo', prompt: 'old', depth: 0,
+      runId: 'agent_old', sessionName: 'project', chatId: 'chat-1', workDir: session.workDir, prompt: 'old', depth: 0,
       status: 'running' as const, createdAt: new Date().toISOString(), workers: [{
         identityId: 'agent:a', identityName: 'A', tokenSourceId: 'a', provider: 'claude' as const,
         model: 'm', effort: 'max', status: 'running' as const, output: '', steps: [],
@@ -518,7 +669,7 @@ describe('AgentService', () => {
 
   test('the main Agent can continue a legacy nested run as a new single-level task', async () => {
     const source = {
-      runId: 'agent_legacy', sessionName: 'project', chatId: 'chat-1', workDir: '/repo', prompt: 'old task', depth: 2,
+      runId: 'agent_legacy', sessionName: 'project', chatId: 'chat-1', workDir: session.workDir, prompt: 'old task', depth: 2,
       status: 'completed' as const, createdAt: '2026-09-05T00:00:00Z', workers: [{
         identityId: 'agent:a', identityName: 'A', tokenSourceId: 'a', provider: 'claude' as const,
         model: 'model-a', effort: 'max', status: 'completed' as const, output: 'old result', steps: [], sessionId: 'legacy-session',
@@ -646,7 +797,7 @@ describe('AgentService', () => {
         return control.handle
       },
     })
-    const otherRoot = service.rootPrincipal({ ...session, sessionName: 'other-project', chatId: 'chat-2', workDir: '/other' })
+    const otherRoot = service.rootPrincipal({ ...session, sessionName: 'other-project', chatId: 'chat-2', workDir: join(testDir, 'other') })
     try {
       await service.startRun(root, { description: '任务说明', identityIds: router.slice(0, 2).map(item => item.id), prompt: 'first project' })
       const queued = await service.startRun(otherRoot, { description: '任务说明',

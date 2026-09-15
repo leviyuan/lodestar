@@ -131,6 +131,7 @@ function serializeRun(run: AgentRunSnapshot): object {
   return {
     run_id: run.runId,
     session_name: run.sessionName,
+    work_dir: run.workDir,
     prompt: run.prompt,
     description: run.description,
     parent_run_id: run.parentRunId,

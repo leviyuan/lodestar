@@ -1,9 +1,9 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { AgentCards, type AgentCardsDeps } from './agent-cards'
 import { agentCardsDeps } from './agent-cards-runtime'
-import { requireAgentDescription } from './agent-run-types'
+import { requireAgentDescription, requireAgentWorkDir } from './agent-run-types'
 import * as feishu from './feishu'
 import { config } from './config'
 import { getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
@@ -114,6 +114,7 @@ export class AgentService {
       const { run, worker } = this.requireSessionRun(principal, request.sessionId, request.identityIds[0])
       return this.followUp(principal, run.snapshot.runId, {
         identityId: worker.identityId, description: request.description, prompt: request.prompt, effort: request.effort,
+        workDir: request.workDir,
       })
     }
     const release = this.reserveCapacity(principal, request.identityIds.length)
@@ -140,6 +141,13 @@ export class AgentService {
       throw new Error('Agent process has not stopped; cannot start follow-up yet')
     }
     if (!worker.sessionId) throw new Error(`${worker.identityName} has no resumable native session id`)
+    const workDir = resolveAgentWorkDir(principal.session.workDir, source.snapshot.workDir)
+    if (source.snapshot.sessionWorkDir !== undefined && workDir !== source.snapshot.workDir) {
+      throw new Error('agent work_dir changed since the original run')
+    }
+    if (request.workDir !== undefined && resolveAgentWorkDir(principal.session.workDir, request.workDir) !== workDir) {
+      throw new Error('agent session continuation must use its original work_dir')
+    }
     const effort = request.effort ?? worker.effort
     const release = this.reserveCapacity(principal, 1)
     let releaseSession: (() => void) | undefined
@@ -150,6 +158,7 @@ export class AgentService {
         description: request.description,
         prompt: request.prompt,
         effort,
+        workDir,
       }, {
         parentRunId: source.snapshot.runId,
         parentKind: 'follow_up',
@@ -233,6 +242,7 @@ export class AgentService {
     request: AgentRunRequest,
     options: CreateRunOptions,
   ): Promise<AgentRunSnapshot> {
+    const workDir = resolveAgentWorkDir(session.workDir, request.workDir)
     let parent: AgentRunRecord | undefined
     if (options.parentRunId) {
       parent = this.runs.get(options.parentRunId)
@@ -263,7 +273,8 @@ export class AgentService {
       codexAccountId,
       sessionName: session.sessionName,
       chatId: session.chatId,
-      workDir: session.workDir,
+      sessionWorkDir: session.workDir,
+      workDir,
       prompt: request.prompt,
       description: requireAgentDescription(request.description),
       ...(options.parentRunId ? { parentRunId: options.parentRunId } : {}),
@@ -362,6 +373,11 @@ export class AgentService {
       this.persist(run)
       await this.updateWorkerCard(run, worker)
       if (run.cancelled) return
+      this.assertSameSession(run, run.session!)
+      // Queued tasks may wait while directories are removed or replaced by symlinks.
+      if (resolveAgentWorkDir(run.session!.workDir, run.snapshot.workDir) !== run.snapshot.workDir) {
+        throw new Error('agent work_dir changed before the worker could start')
+      }
       const handle = this.deps.startWorker({
         identity,
         codexAccountId: run.snapshot.codexAccountId,
@@ -623,7 +639,7 @@ export class AgentService {
     run: AgentRunRecord; worker: AgentWorkerResult
   } {
     const matches = [...this.runs.values()].flatMap(run => {
-      if (!this.canAccess(principal, run) || run.snapshot.workDir !== principal.session.workDir) return []
+      if (!this.canAccess(principal, run) || runSessionWorkDir(run.snapshot) !== principal.session.workDir) return []
       return run.snapshot.workers
         .filter(worker => worker.sessionId === sessionId && (!identityId || worker.identityId === identityId))
         .map(worker => ({ run, worker }))
@@ -678,7 +694,7 @@ export class AgentService {
     if (
       run.snapshot.sessionName !== session.sessionName
       || run.snapshot.chatId !== session.chatId
-      || run.snapshot.workDir !== session.workDir
+      || runSessionWorkDir(run.snapshot) !== session.workDir
     ) throw new Error('agent run belongs to a different Session')
   }
 
@@ -827,6 +843,23 @@ export class AgentService {
   }
 }
 
+function resolveAgentWorkDir(sessionWorkDir: string, requestedWorkDir?: string): string {
+  const root = realpathSync(sessionWorkDir)
+  const workDir = realpathSync(resolve(sessionWorkDir, requestedWorkDir === undefined ? '.' : requireAgentWorkDir(requestedWorkDir)))
+  const fromRoot = relative(root, workDir)
+  if (fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
+    throw new Error('agent work_dir must be the main Agent working directory or one of its subdirectories')
+  }
+  if (!statSync(workDir).isDirectory()) throw new Error(`agent work_dir is not a directory: ${workDir}`)
+  // Native session storage may be keyed by the original (possibly symlinked) project path.
+  return fromRoot === '' ? sessionWorkDir : workDir
+}
+
+function runSessionWorkDir(snapshot: AgentRunSnapshot): string {
+  // Before selectable worker directories, workDir was always the main Session's directory.
+  return snapshot.sessionWorkDir ?? snapshot.workDir
+}
+
 function workerSnapshot(
   identity: AgentIdentity,
   effort: AgentReasoningEffort,
@@ -900,6 +933,7 @@ function isAgentRunSnapshot(value: unknown): value is AgentRunSnapshot {
     && typeof run.sessionName === 'string'
     && typeof run.chatId === 'string'
     && typeof run.workDir === 'string'
+    && (run.sessionWorkDir === undefined || typeof run.sessionWorkDir === 'string')
     && typeof run.prompt === 'string'
     && (run.description === undefined || typeof run.description === 'string')
     && typeof run.depth === 'number'

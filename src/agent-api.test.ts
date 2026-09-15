@@ -16,7 +16,7 @@ async function serve(onStart?: (request: any) => void) {
     async startRun(_principal: any, request: any) {
       onStart?.(request)
       current = {
-        runId: 'agent_1', sessionName: 'project', chatId: 'chat', workDir: '/repo', description: request.description, prompt: request.prompt,
+        runId: 'agent_1', sessionName: 'project', chatId: 'chat', workDir: request.workDir ?? '/repo', description: request.description, prompt: request.prompt,
         depth: 0, status: 'running', createdAt: new Date().toISOString(), workers: [{
           identityId: 'agent:a', status: 'running', sessionId: request.sessionId, output: request.prompt, steps: [],
         }],
@@ -48,6 +48,28 @@ describe('delegated Agent HTTP API', () => {
     const base = await serve()
     expect((await fetch(`${base}/agents/identities`)).status).toBe(401)
     expect((await fetch(`${base}/agents/identities`, { headers: { authorization: 'Bearer wrong' } })).status).toBe(403)
+  })
+
+  test('passes work_dir to the service and reports the selected directory in run and status responses', async () => {
+    const requests: any[] = []
+    const base = await serve(request => requests.push(request))
+    const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' }
+    const response = await fetch(`${base}/agents/runs`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ description: '指定目录', identity_ids: ['agent:a'], prompt: 'work', work_dir: '/repo/packages/app' }),
+    })
+    expect(response.status).toBe(202)
+    expect(await response.json()).toMatchObject({ run_id: 'agent_1', work_dir: '/repo/packages/app' })
+    expect(requests[0]).toMatchObject({ workDir: '/repo/packages/app' })
+    const status = await fetch(`${base}/agents/runs/agent_1`, { headers })
+    expect(await status.json()).toMatchObject({ work_dir: '/repo/packages/app' })
+    const invalid = await fetch(`${base}/agents/runs`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ description: '目录非法', identity_ids: ['agent:a'], prompt: 'work', work_dir: '' }),
+    })
+    expect(invalid.status).toBe(409)
+    expect(await invalid.json()).toMatchObject({ error: expect.stringContaining('work_dir') })
+    expect(requests).toHaveLength(1)
   })
 
   test('skill discovery lazily refreshes subscriptions after 30 minutes without changing the model catalog', async () => {
