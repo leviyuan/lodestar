@@ -109,7 +109,7 @@ export async function onProviderSelect(
   const sourceId = sourceIdRaw.trim()
   const ts = s.tokenSource(sourceId)
   if (!ts) return { ok: false, message: `未知账号: ${sourceId}` }
-  if (!ts.enabled) return { ok: false, message: `${ts.display} 未配置,请先点「启用」` }
+  if (!ts.enabled) return { ok: false, message: ts.modelCatalogState?.error ?? `${ts.display} 未配置,请先点「启用」` }
   const panelId = panelIdRaw.trim()
   if (!s.modelPanels.has(panelId)) return { ok: false, message: '模型面板已失效，请重新发送 model' }
   if (ts.modelCatalogState?.status === 'failed') {

@@ -1834,6 +1834,72 @@ describe('Session provider switching', () => {
     expect(session.isRunning()).toBe(false)
   })
 
+  test.each(['stopped', 'idle', 'working'])('disabled Claude subscription rejects new input while %s without stopping the process', async state => {
+    const session = new Session('subscription-off', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'existing-conversation', 'claude-sub')
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'claude-sub'
+    session.selectedModel = 'sonnet'
+    session.selectedEffort = 'high'
+    session.proc = state === 'stopped' ? null : proc
+    session.currentTurn = state === 'working' ? turnState('running-subscription') : null
+    session.status = state
+    const turn = session.currentTurn
+    session.tokenSource = () => ({ id: 'claude-sub', kind: 'claude-subscription', enabled: false,
+      modelCatalogState: { status: 'disabled', error: 'Claude Code 订阅已禁用；发送 claude-sub on 启用' } })
+    try {
+      await session.onUserMessage('new task', [], 'ou_user', 'om_new')
+      expect(sentTexts.at(-1)).toContain('claude-sub on')
+      expect(sentTexts.at(-1)).toContain('消息未送给 Agent')
+      expect(proc.sentTexts).toEqual([])
+      expect(proc.killCalls).toBe(0)
+      expect(session.currentTurn).toBe(turn)
+      expect(session.pendingMidTurnMsgs).toEqual([])
+      expect(session.status).toBe(state)
+    } finally { session.currentTurn = null; session.dispose() }
+  })
+
+  test.each([false, true])('Claude subscription rechecks the switch after opening an input card (queued=%s)', async queued => {
+    const session = new Session('subscription-race', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'existing-conversation', 'claude-sub')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'claude-sub'
+    session.selectedModel = 'sonnet'
+    session.selectedEffort = 'high'
+    session.initCount = 1
+    const source = { id: 'claude-sub', kind: 'claude-subscription', agent: 'claude', enabled: true,
+      modelCatalogState: { status: 'ready', error: 'Claude Code 订阅已禁用；发送 claude-sub on 启用' } }
+    session.tokenSource = () => source
+    const statuses: string[] = []
+    session.openTurnCard = async () => {
+      source.enabled = false
+      const turn = turnState('switch-during-card-open')
+      session.currentTurn = turn
+      session.pendingTurnInputs = []
+      return turn
+    }
+    session.closeTurnCard = async (status: string) => { statuses.push(status); session.currentTurn = null }
+    try {
+      if (queued) {
+        session.pendingMidTurnMsgs = [{ text: 'queued task', wireText: 'queued task', userOpenId: '', msgId: '' }]
+        await session.drainMidTurnAndOpen()
+      } else await session.onUserMessage('new task')
+      expect(proc.sentTexts).toEqual([])
+      expect(proc.killCalls).toBe(0)
+      expect(statuses.join('\n')).toContain('消息未送给 Agent')
+      expect(session.pendingUserMessageCount).toBe(0)
+      expect(session.pendingMidTurnMsgs).toEqual([])
+      expect(session.currentTurn).toBeNull()
+      expect(session.status).toBe('idle')
+      source.enabled = true
+      expect(await session.sendClaimedUserText(proc, 'enabled again')).toBe(true)
+      expect(proc.sentTexts).toHaveLength(1)
+      expect(proc.sentTexts[0]).toContain('enabled again')
+      expect(proc.killCalls).toBe(0)
+    } finally { session.dispose() }
+  })
+
   test('MD waits for the source refresh instead of sending a zero-model snapshot', async () => {
     const previous = listTokenSources()
     resetTokenSourceRegistry()

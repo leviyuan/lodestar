@@ -41,6 +41,20 @@ function loadFreshConfig(extraToml = ''): FreshConfigResult {
   }
 }
 
+describe('Claude subscription switch', () => {
+  test.each([true, false])('parses enabled = %s', enabled => {
+    const result = loadFreshConfig(`[token_source.claude-sub]\nenabled = ${enabled}`)
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout).token_sources['claude-sub'].enabled).toBe(enabled)
+  })
+
+  test('rejects an invalid enabled value', () => {
+    const result = loadFreshConfig('[token_source.claude-sub]\nenabled = "off"')
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('[token_source.claude-sub].enabled 必须为 true 或 false')
+  })
+})
+
 describe('runtime live_elapsed', () => {
   test('defaults to bucket when omitted', () => {
     const result = loadFreshConfig()

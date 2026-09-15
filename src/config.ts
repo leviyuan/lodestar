@@ -90,6 +90,8 @@ export interface ClaudeModelConfig {
  *  usage       — 额度查询策略 'codex-rate-limit' | 'glm-coding-plan' | 'none' */
 export interface TokenSourceConfig {
   agent?: string
+  /** Claude Code 订阅的 Lodestar 开关；省略时保持自动识别本机登录。 */
+  enabled?: boolean
   display?: string
   auth?: string
   base_url?: string
@@ -302,7 +304,10 @@ export function loadConfig(): LodestarConfig {
       for (const [rawKey, value] of Object.entries(section)) {
         if (typeof value !== 'string') continue
         const field = rawKey.trim()
-        if (field === 'default') {
+        if (field === 'enabled') {
+          if (value !== 'true' && value !== 'false') throw new Error(`[${sectionName}].enabled 必须为 true 或 false`)
+          cfg.enabled = value === 'true'
+        } else if (field === 'default') {
           cfg.default = value === 'true'
         } else if (
           field === 'agent' || field === 'display' || field === 'auth' ||

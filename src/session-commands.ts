@@ -41,6 +41,12 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
     await runCodexAccountCommand(s, accountCommand[1].toLowerCase(), (accountCommand[2] ?? '').trim(), userOpenId, messageId)
     return true
   }
+  const subscription = raw.trim().match(/^claude-sub(?:[ \t]+([^\r\n]+))?$/i)
+  if (subscription) {
+    const { runClaudeSubscriptionCommand } = await import('./token-source-setup')
+    await runClaudeSubscriptionCommand(s, (subscription[1] ?? '').trim().toLowerCase())
+    return true
+  }
   const wt = raw.trim().match(/^(?:wt|worktree)(?:\s+(.+))?$/i)
   if (wt) {
     await s.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId)

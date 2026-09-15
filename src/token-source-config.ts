@@ -17,6 +17,7 @@ function cfgToToml(id: string, cfg: TokenSourceConfig): string {
   const lines = [`[token_source.${id}]`]
   const push = (k: string, v?: string) => { if (v !== undefined) lines.push(`${k} = "${esc(v)}"`) }
   push('agent', cfg.agent)
+  if (cfg.enabled !== undefined) lines.push(`enabled = ${cfg.enabled}`)
   push('display', cfg.display)
   push('auth', cfg.auth)
   push('base_url', cfg.base_url)

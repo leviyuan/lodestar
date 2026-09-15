@@ -2716,10 +2716,27 @@ export class Session {
     this.proc.sendInterrupt()
   }
 
+  private disabledSubscriptionMessage(sourceId = this.selectedTokenSourceId): string | null {
+    const source = this.tokenSource(sourceId)
+    return source?.kind === 'claude-subscription' && !source.enabled
+      ? source.modelCatalogState?.error ?? 'Claude Code 订阅未启用，请发送 claude-sub 查看状态'
+      : null
+  }
+
   /** Register the SDK-input claim before the write. AgentProcess implementations
    * may emit init/turn_started synchronously in tests or immediately on their
    * read loop, so incrementing after sendUserText leaves a boundary race. */
-  private sendClaimedUserText(proc: AgentProcess, text: string): void {
+  private async sendClaimedUserText(proc: AgentProcess, text: string): Promise<boolean> {
+    // 其他群可能在开卡期间关闭全局开关；真正送入进程前再检查一次。
+    const blocked = this.disabledSubscriptionMessage(proc.tokenSourceId)
+    if (blocked) {
+      const message = `❌ ${blocked}。消息未送给 Agent，请启用后重发或通过 md 切换来源。`
+      this.pendingTurnInputs = []
+      if (this.currentTurn) await this.closeTurnCard(message)
+      else await feishu.sendText(this.chatId, message)
+      this.status = 'idle'
+      return false
+    }
     const turn = this.currentTurn
     const mode = turn ? (turn.fileDeliveryMode ??= this.getFileDeliveryMode()) : this.getFileDeliveryMode()
     const previousMode = this.procFileDeliveryModes.get(proc)
@@ -2735,6 +2752,7 @@ export class Session {
       else this.procFileDeliveryModes.set(proc, previousMode)
       throw error
     }
+    return true
   }
 
   private async startColdUserTurn(text: string, wireText: string, userOpenId: string): Promise<void> {
@@ -2780,7 +2798,7 @@ export class Session {
         return
       }
       this.startThinkingFooter(turn)
-      this.sendClaimedUserText(proc, wireText)
+      if (!await this.sendClaimedUserText(proc, wireText)) return
       this.status = 'working'
     } finally {
       this.releaseTurnOpen(openOwner)
@@ -2802,6 +2820,11 @@ export class Session {
   }
 
   private async onUserMessageUnlocked(text: string, files: string[], userOpenId: string, msgId: string): Promise<void> {
+    const subscriptionDisabled = this.disabledSubscriptionMessage()
+    if (subscriptionDisabled) {
+      await feishu.sendText(this.chatId, `❌ ${subscriptionDisabled}。消息未送给 Agent，请启用后重发或通过 md 切换来源。`)
+      return
+    }
     const blocked = this.blockedProcessMessage()
     if (blocked) {
       await feishu.sendText(this.chatId, `❌ ${blocked}。请重试 stop/restart，或等待旧进程退出。`)
@@ -2927,7 +2950,7 @@ export class Session {
           await this.closeTurnCard(`⚠️ ${this.backendLabel(proc.provider)} 已退出`)
           return
         }
-        this.sendClaimedUserText(proc, wireText)
+        if (!await this.sendClaimedUserText(proc, wireText)) return
         this.status = 'working'
       } finally {
         this.releaseTurnOpen(openOwner)
@@ -2955,7 +2978,7 @@ export class Session {
       return
     }
     this.pendingTurnInputs.push(text)
-    this.sendClaimedUserText(this.proc!, wireText)
+    if (!await this.sendClaimedUserText(this.proc!, wireText)) return
     if (wasBusy && msgId) {
       // Bootstrap race / sibling-opening race: until a card is open,
       // the OneSecond ⏳ is the only ack the user gets. The init handler
@@ -4059,7 +4082,7 @@ export class Session {
         return
       }
       try {
-        this.sendClaimedUserText(proc, merged)
+        if (!await this.sendClaimedUserText(proc, merged)) return
       } catch (e) {
         log(`session "${this.sessionName}": mid-turn sendUserText failed after card open: ${e}`)
         await this.closeTurnCard(`❌ ${this.backendLabel(proc.provider)} 接收消息失败`)

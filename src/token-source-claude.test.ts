@@ -76,6 +76,69 @@ test('Claude subscription coexists with other accounts and refreshes authoritati
   `)
 })
 
+test('disabled Claude subscription skips native queries and discovery until explicitly enabled', () => {
+  isolated(`
+    import assert from 'node:assert/strict'
+    import { mock } from 'bun:test'
+    let modelQueries = 0
+    let usageQueries = 0
+    const nativeModels = await import('./src/token-source-models')
+    const nativeUsage = await import('./src/claude-usage')
+    mock.module('./src/token-source-models', () => ({ ...nativeModels,
+      fetchNativeClaudeModels: async () => {
+        modelQueries++
+        return [{ model: 'sonnet', display: 'Sonnet', efforts: ['high'], defaultEffort: 'high' }]
+      },
+    }))
+    mock.module('./src/claude-usage', () => ({ ...nativeUsage,
+      fetchClaudeSubscriptionUsage: async () => { usageQueries++; return { state: 'ok', windows: [] } },
+    }))
+    const { config } = await import('./src/config')
+    const registry = await import('./src/token-source')
+    const { buildTokenSourcesFromConfig } = await import('./src/token-source-builtins')
+    const { buildAgentSkillIdentityCatalog } = await import('./src/agent-identities')
+    const { createAgentProcess } = await import('./src/agent-launch')
+    config.token_sources['claude-sub'] = { enabled: false, custom_models: 'manual-model' }
+    for (let rebuild = 0; rebuild < 2; rebuild++) {
+      buildTokenSourcesFromConfig()
+      const source = registry.getTokenSource('claude-sub')
+      assert.equal(source.enabled, false)
+      await source.refreshModels()
+      await source.refreshModels()
+      assert.equal(source.modelCatalogState.status, 'disabled')
+      assert.match(source.modelCatalogState.error, /claude-sub on/)
+      assert.deepEqual(source.models, [])
+      assert.deepEqual(source.modelSelection.availableModels, [])
+      assert.notEqual((await source.readUsage()).state, 'ok')
+      const catalog = await buildAgentSkillIdentityCatalog([source])
+      assert.deepEqual(catalog.identities, [])
+      assert.equal(catalog.sourceFailures[0].status, 'disabled')
+      assert.throws(() => createAgentProcess({ provider: 'claude', workDir: '/tmp', tokenSourceId: source.id,
+        model: 'sonnet', effort: 'high' }), /token source disabled/)
+    }
+    assert.equal(modelQueries, 0)
+    assert.equal(usageQueries, 0)
+    config.token_sources['claude-sub'].enabled = true
+    buildTokenSourcesFromConfig()
+    const enabled = registry.getTokenSource('claude-sub')
+    await enabled.refreshModels()
+    assert.equal(enabled.enabled, true)
+    assert.equal(enabled.modelCatalogState.status, 'ready')
+    assert.equal((await buildAgentSkillIdentityCatalog([enabled])).identities.length, 2)
+    assert.equal(modelQueries, 1)
+    assert.equal(usageQueries, 1)
+    config.token_sources.reclaude = { auth: 'reclaude-login' }
+    buildTokenSourcesFromConfig()
+    const blocked = registry.getTokenSource('claude-sub')
+    await blocked.refreshModels()
+    await blocked.readUsage()
+    assert.equal(blocked.enabled, false)
+    assert.match(blocked.modelCatalogState.error, /ReClaude/)
+    assert.equal(modelQueries, 1)
+    assert.equal(usageQueries, 1)
+  `)
+})
+
 test('Claude subscription quota uses authenticated native control, closes queries and surfaces failures', () => {
   isolated(`
     import assert from 'node:assert/strict'

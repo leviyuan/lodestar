@@ -31,13 +31,16 @@ registerTokenSourceFactory({
   build(cfg): TokenSource {
     const settings = subscriptionSettings()
     const configuredModel = cfg.model?.trim()
+    const disabledReason = 'Claude Code 订阅已在 Lodestar 中禁用；发送 claude-sub on 启用'
     let usageRequest: Promise<UsageSnapshotUnified> | undefined
     const source: TokenSource = {
       id: 'claude-sub', kind: 'claude-subscription', agent: 'claude',
       display: cfg.display?.trim() || 'Claude Code 订阅',
       // 登录态可能位于系统钥匙串；原生 accountInfo 是权威来源，不扫描或复制凭据。
-      enabled: true, models: [], defaultModel: configuredModel ?? '',
-      modelCatalogState: { status: 'idle', updatedAt: Date.now() },
+      enabled: cfg.enabled !== false, models: [], defaultModel: configuredModel ?? '',
+      modelCatalogState: cfg.enabled === false
+        ? { status: 'disabled', updatedAt: Date.now(), error: disabledReason }
+        : { status: 'idle', updatedAt: Date.now() },
       settingSources: ['user', 'project', 'local'],
       claudeSettings: settings,
       validateClaudeAccount: validateClaudeSubscriptionAccount,
@@ -46,6 +49,12 @@ registerTokenSourceFactory({
       },
       resolveSpawnModel(model) { return model },
       async refreshModels() {
+        if (cfg.enabled === false) {
+          source.enabled = false
+          source.models = []
+          source.modelCatalogState = { status: 'disabled', updatedAt: Date.now(), error: disabledReason }
+          return
+        }
         source.enabled = true
         source.models = []
         source.modelCatalogState = { status: 'loading', updatedAt: null }
@@ -78,6 +87,8 @@ registerTokenSourceFactory({
         }
       },
       readUsage() {
+        if (!source.enabled) return Promise.resolve({ state: 'not_applicable' as const, windows: [],
+          reason: source.modelCatalogState?.error ?? disabledReason })
         // 并发的 hi/收尾共用本次查询；完成后下一次调用重新读取原生接口。
         usageRequest ??= fetchClaudeSubscriptionUsage({
           settingSources: ['user'], settings, transformEnv: source.spawnEnv,

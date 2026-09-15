@@ -81,6 +81,20 @@ test('does not rebuild or refresh when reading the configuration fails', () => {
   `)
 })
 
+test('persists the Claude subscription switch across later model edits and preserves other sources', () => {
+  runConfigUpdate(`
+    releaseRefresh()
+    await addTokenSource('claude-sub', { enabled: false, model: 'sonnet', hidden_models: 'opus' })
+    await addTokenSource('claude-sub', { effort: 'high' })
+    assert.deepEqual(config.token_sources['claude-sub'], { enabled: false, model: 'sonnet', hidden_models: 'opus', effort: 'high' })
+    assert.ok(readFileSync(configFile, 'utf8').includes('enabled = false'))
+    await addTokenSource('claude-sub', { enabled: true })
+    assert.deepEqual(config.token_sources['claude-sub'], { enabled: true, model: 'sonnet', hidden_models: 'opus', effort: 'high' })
+    assert.equal(config.token_sources.glm.auth_token, 'old-token')
+    assert.equal(config.token_sources.glm.slots, 'opus=GLM-5.3[1m],sonnet=GLM-5.3[1m]')
+  `)
+})
+
 test('persists an OpenRouter account and reloads its catalog settings', () => {
   runConfigUpdate(`
     releaseRefresh()

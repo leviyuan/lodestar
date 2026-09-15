@@ -16,6 +16,9 @@
 | `clear` | `cl` | 关闭当前进程并开始新会话；已停止时提示先启动 |
 | `compact` | `cm` | 压缩当前会话的上下文 |
 | `agents` | `agent` | 查看可调用的 Agent 身份及可用状态 |
+| `claude-sub` | — | 查看 Claude Code 订阅在 Lodestar 中的开关和可用状态 |
+| `claude-sub on` | — | 启用 Claude Code 订阅来源，所有群共用 |
+| `claude-sub off` | — | 禁用 Claude Code 订阅来源，保留本机登录态，所有群共用 |
 | `codex-login [备注]` | — | 用设备码登录 Codex；省略备注为设备默认账号，带备注为独立保存的额外账号 |
 | `codex-login-cancel [备注]` | — | 取消本人在本群发起的 Codex 登录；只有一个等待任务时可省略备注 |
 | `codex-accounts [页码]` | — | 卡片列出账号额度、调度分数、顺序与当前/优先账号标记 |
