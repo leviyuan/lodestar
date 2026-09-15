@@ -13,7 +13,7 @@
 - `hi` 的额度区用展开式浅蓝面板，与 `codex-accounts` 共用 `usage.ts` 的六格彩色进度条和重置倒计时；各窗口纵向分行，重置卡另起一行只展示 Codex 账号的可用次数，统一额度摘要与 footer 不附带它。活跃项目行尾显示实际 Codex 进程的账号备注；账号未知时省略整个备注，不显示账号 MISS。账号列表每页附完整 Codex 账号命令说明，底部「Codex 命令」面板默认折叠。
 - Codex 的 `hi`、footer 和账号额度只显示主额度；保留主额度自身的短时窗口、周窗口，不展示 GPT-5.3-Codex-Spark 等模型的附加额度。
 - Claude 订阅 footer 同时保留 5 小时与周额度，周额度按该条回复的模型选择专属窗口或总窗口；已返回的专属窗口缺数据时显示 MISS。hi 仍列出全部额度窗口。
-- `background.ts` 消费 Claude `task_*` 和 Codex collab 事件。子 Agent 细节进入 active/pending 后台状态，终态历史卡停止计时刷新。
+- `background.ts` 累积 Claude `task_*`、Codex collab 和 DSH 子 Agent 事件；子 Agent 直接展示，普通前台命令留在 pending。任务行与委派共用 `agent-cards.ts`：默认折叠，标题仅状态与最多 40 字说明，类型、完整说明、结果、错误和最近三步动作放在详情；完成后显示实际耗时，运行中不放需要定时刷新的计时。禁止恢复独立后台卡和游标迁移。
 - 临时会话选择卡只携带 `panel_id`、opaque `choice_id`。provider、cwd、source、owner、launch 保存在 Session 短期状态，不能信任回调传入的可执行 id、数组下标或路径。
 - 公式段使用固定 id 的单个顶层 `column_set`，按源码顺序替换内部 markdown/image。小图可用 `crop_center` 和精确 `size`；宽图用 `fit_horizontal`，不传 `size`，由容器缩放。
 - Card action 立即换卡返回 `{ card: { type: 'raw', data: card } }`。异步更新先返回 toast ACK，再调用 `feishu.updateCard()`；不用 callback-token 的 `/interactive/v1/card/update`，该端点会让 schema 2.0 卡片空白。`notify_callback` 在 Session 存在性检查前分流。
@@ -21,6 +21,6 @@
 ## 验证
 
 - 模板、问答、工具和 IDs：`bun test src/cards/turn.test.ts src/cards/elements.test.ts src/cards/shell-command.test.ts`。
-- 后台任务：`bun test src/cards/task-board.test.ts src/cards/background.test.ts src/session.test.ts`。
+- 统一委派面板与后台任务：`bun test src/agent-cards.test.ts src/cards/agents.test.ts src/cards/task-board.test.ts src/cards/background.test.ts src/session.test.ts`。
 - 公式事务：`bun test src/math-render.test.ts src/cardkit.test.ts src/session.test.ts src/cards/elements.test.ts`。
 - Card action：`bun test src/card-action.test.ts src/card-action-runtime.test.ts src/notify-callbacks.test.ts`。真实交互需要明确授权的目标群。

@@ -81,7 +81,7 @@ Agent 运行依赖由 `src/agent-updates.ts` 独立安装，daemon 启动时不�
 
 - `session/open` 完成原生 create/resume/fork 并 flush 后才公布恢复点。`rs` 通过原生持久化服务列出同工作目录会话；`fk/bk` 使用 `turn/end` 的事件序号作为 checkpoint，原生日志验证并加载分叉历史。
 - 实时文本来自 `agent/assistant-stream`，工具和计划来自会话事件。进入 idle 后等待持久化完成，再用真实 `turn/end` 原因结算；认证失败、token 耗尽及驱动异常均向调用方报告。
-- 子工具返回的内容块数组先转换为后台卡摘要；不能按字符串直接处理。致命桥接错误会把未结束的子任务标记失败，并将进程退出作为异常向用户报告。
+- 子工具返回的内容块数组先转换为委派面板内的步骤摘要；不能按字符串直接处理。致命桥接错误会把未结束的子任务标记失败，并将进程退出作为异常向用户报告。
 - 提问通过 `user-questions/request` 停驻，复用飞书问答卡；回答按原始 question id 返回。主动和自动压缩使用 DSH compaction 服务与事件。
 - 模型与 effort 更新在下一轮应用，同一轮的工具续跑保持当前路由。`off` 是 DSH 原生推理选项。
 - `dsh-glm` 接入 Coding Plan 的 `/api/coding/paas/v4/models` 与 `/chat/completions`。显式配置优先，否则复用已有 GLM 账号；凭据变化参与 `spawnRevision`。`dsh-runtime` 通过私有 composition patch 启用原生 `llm-pi-ai` 的 `zai-coding-cn` / `zai` 路由并关闭 DeepSeek 适配器，patch 仅记录环境变量名，不写明文 Key。
@@ -102,7 +102,9 @@ Agent 运行依赖由 `src/agent-updates.ts` 独立安装，daemon 启动时不�
 
 委派只有一层：主 Agent 可以并行派工、回答问题和续跑原生会话，被委派的 Agent 不得继续调用其他 Agent。Skill、worker 提示词及运行时入口共同遵循该规则；worker 关闭 Codex `multi_agent` 或 Claude `Agent`/`Task`，保留其余代码工具、项目 MCP 和独立调用凭据。历史父子记录仍保留以便读取与清理。运行状态原子落盘，大段输入输出单独存放；委派会话登记后从主群的历史列表中排除。
 
-每次委派以一行状态和调用方提供的 description 展示，进度、任务正文、各执行者结果、待回答问题和失败原因均收在同一折叠面板。群尾委派卡复用至容量用满或出现新消息；主会话新卡也会结束复用。Card Kit 生命周期按共享卡片结算，旧卡上的运行任务继续原地更新；不展示 depth、session id 或 request id。
+委派、原生子 Agent 和后台任务由同一个 `AgentCards` 实例展示。每项仅显示状态和一句说明，类型、进度、任务正文、结果、待回答问题及失败原因放在折叠体内，动作只展示最近三步。原生子 Agent 启动即展示，普通前台命令仍在观察池中；启动工具和 SDK task id 关联后只保留一项。
+
+群尾委派卡复用至容量用满或出现新消息；原任务继续在原卡更新，后台任务不再迁移。Card Kit 生命周期由共享卡片统一结算，停止主进程只结算其所属任务，不关闭仍有委派执行的共享卡；不展示 depth、session id 或 request id。
 
 ## 源码与验证
 

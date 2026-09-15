@@ -4,6 +4,7 @@ import { agentRunElementId } from './cards/agents'
 import type { AgentRunSnapshot } from './agent-run-types'
 import type { CardWriteResult } from './cardkit'
 import { withChatMessageOrder } from './chat-message-order'
+import type { BgTaskEntry } from './cards/background'
 
 function run(id: string, chatId = 'chat'): AgentRunSnapshot {
   return {
@@ -19,6 +20,10 @@ function terminal(value: AgentRunSnapshot): void {
   value.status = 'completed'
   value.workers[0]!.status = 'completed'
   value.workers[0]!.output = `结果 ${value.runId}`
+}
+
+function background(id: string, type: BgTaskEntry['type'] = 'shell'): BgTaskEntry {
+  return { id, type, description: `检查 ${id}`, status: 'running', startedAt: Date.now(), steps: [] }
 }
 
 function failure(code: number, message = 'card over max size'): CardWriteResult {
@@ -70,6 +75,156 @@ function harness() {
 }
 
 describe('shared delegation card lifecycle', () => {
+  test('delegated runs, native children and background jobs share one collapsed card', async () => {
+    const h = harness()
+    const delegated = run('delegated')
+    const child = background('native-child', 'subagent')
+    const shell = background('build')
+    await Promise.all([
+      h.cards.add(delegated),
+      h.cards.syncBackground('chat', 'session', [child, shell]),
+    ])
+    expect(h.sent).toHaveLength(1)
+    const rows = [...h.elements.get('message-1')!.values()]
+    expect(rows).toHaveLength(3)
+    expect(rows.every(row => row.tag === 'collapsible_panel' && row.expanded === false)).toBe(true)
+    expect(h.settings.get('message-1').config.summary.content).toBe('🧠 委派任务 · 已结束 0/3')
+    const completedChild = { ...child, status: 'completed' as const, summary: '子任务已完成', endTime: Date.now() }
+    await h.cards.syncBackground('chat', 'session', [completedChild, shell])
+    terminal(delegated)
+    await h.cards.update(delegated, true)
+    expect(h.settings.get('message-1').config.streaming_mode).toBe(true)
+    expect(h.settings.get('message-1').config.summary.content).toContain('2/3')
+    const failedShell = { ...shell, status: 'failed' as const, error: '构建失败', endTime: Date.now() }
+    await h.cards.syncBackground('chat', 'session', [completedChild, failedShell])
+    expect(h.settings.get('message-1').config.streaming_mode).toBe(false)
+    expect(h.settings.get('message-1').config.summary.content).toContain('失败 1')
+    expect(JSON.stringify([...h.elements.get('message-1')!.values()])).toContain('构建失败')
+  })
+
+  test('late SDK task ids keep one row; native follow-ups retain the previous result', async () => {
+    const h = harness()
+    const child = { ...background('tool-id', 'subagent'), toolUseId: 'tool-id' }
+    await h.cards.syncBackground('chat', 'session', [child])
+    const bound = { ...child, id: 'sdk-task-id' }
+    await h.cards.syncBackground('chat', 'session', [bound])
+    expect(h.elements.get('message-1')!.size).toBe(1)
+    const completed = { ...bound, status: 'completed' as const, summary: '上一轮结果' }
+    await h.cards.syncBackground('chat', 'session', [completed])
+    await h.cards.syncBackground('chat', 'session', [{ ...bound, startedAt: Date.now() + 1000 }])
+    expect(h.sent).toHaveLength(1)
+    expect(h.elements.get('message-1')!.size).toBe(2)
+    expect(JSON.stringify([...h.elements.get('message-1')!.values()])).toContain('上一轮结果')
+    expect(h.settings.get('message-1').config.streaming_mode).toBe(true)
+  })
+
+  test('process owners and delegated run ids cannot collide with native task ids', async () => {
+    const h = harness()
+    await h.cards.add(run('same-id'))
+    await h.cards.syncBackground('chat', 'process-a', [background('same-id')])
+    await h.cards.syncBackground('chat', 'process-b', [background('same-id')])
+    expect(h.sent).toHaveLength(1)
+    expect(h.elements.get('message-1')!.size).toBe(3)
+    expect([...h.elements.get('message-1')!.keys()].every(id => /^[A-Za-z][A-Za-z0-9_]{0,19}$/.test(id))).toBe(true)
+  })
+
+  test('unchanged snapshots do not write; new messages leave existing native tasks in place', async () => {
+    const h = harness()
+    const child = background('child', 'subagent')
+    const shell = background('shell')
+    await h.cards.syncBackground('chat', 'session', [child, shell])
+    const replace = h.deps.replaceElementResult
+    h.deps.replaceElementResult = async () => { throw new Error('unexpected unchanged write') }
+    await h.cards.syncBackground('chat', 'session', [child, shell])
+    h.deps.replaceElementResult = replace
+    h.tails.set('chat', 'new-user-message')
+    await h.cards.add(run('later-delegation'))
+    const completed = [child, shell].map(task => ({ ...task, status: 'completed' as const }))
+    await h.cards.syncBackground('chat', 'session', completed)
+    expect(h.sent).toHaveLength(2)
+    expect(h.disposed.has('message-1')).toBe(true)
+    expect(h.disposed.has('message-2')).toBe(false)
+    await h.cards.syncBackground('chat', 'session', completed)
+    expect(h.sent).toHaveLength(2)
+  })
+
+  test('a rejected settings update retries its existing native row without duplication', async () => {
+    const h = harness()
+    await h.cards.add(run('delegated'))
+    const child = background('child', 'subagent')
+    const patch = h.deps.patchSettingsChecked
+    h.deps.patchSettingsChecked = async () => false
+    await expect(h.cards.syncBackground('chat', 'session', [child])).rejects.toThrow('settings update MISS')
+    h.deps.patchSettingsChecked = patch
+    await h.cards.syncBackground('chat', 'session', [child])
+    expect(h.sent).toHaveLength(1)
+    expect(h.elements.get('message-1')!.size).toBe(2)
+  })
+
+  test('native follow-up preserves a result whose terminal settings failed', async () => {
+    const h = harness()
+    const child = background('child', 'subagent')
+    await h.cards.syncBackground('chat', 'session', [child])
+    const patch = h.deps.patchSettingsChecked
+    h.deps.patchSettingsChecked = async () => false
+    await expect(h.cards.syncBackground('chat', 'session', [{ ...child, status: 'completed', summary: '已完成的结果' }]))
+      .rejects.toThrow('settings update MISS')
+    h.deps.patchSettingsChecked = patch
+    await h.cards.syncBackground('chat', 'session', [{ ...child, description: '继续检查', startedAt: child.startedAt + 1000 }])
+    expect(h.elements.get('message-1')!.size).toBe(2)
+    expect(h.settings.get('message-1').config.streaming_mode).toBe(true)
+    expect(JSON.stringify([...h.elements.get('message-1')!.values()])).toContain('已完成的结果')
+  })
+
+  test('native terminal corrections and byte-capacity rotation preserve other delegated work', async () => {
+    const h = harness()
+    const delegated = run('delegated')
+    const child = background('child', 'subagent')
+    await h.cards.add(delegated)
+    await h.cards.syncBackground('chat', 'session', [child])
+    const complete = { ...child, status: 'completed' as const, summary: '结果' }
+    await h.cards.syncBackground('chat', 'session', [complete])
+    const replace = h.deps.replaceElementResult
+    h.deps.replaceElementResult = async (id, key, element) => id === 'message-1' && key.startsWith('bg_')
+      ? failure(200860) : replace(id, key, element)
+    await h.cards.syncBackground('chat', 'session', [{ ...complete, status: 'failed', error: '原生终态纠正' }])
+    expect(h.sent).toHaveLength(2)
+    expect(h.elements.get('message-1')!.size).toBe(1)
+    expect(h.settings.get('message-1').config.streaming_mode).toBe(true)
+    expect(JSON.stringify([...h.elements.get('message-2')!.values()])).toContain('原生终态纠正')
+    terminal(delegated)
+    await h.cards.update(delegated, true)
+    expect(h.disposed.has('message-1')).toBe(true)
+  })
+
+  test('late tool ownership preserves the stable task row', async () => {
+    const h = harness()
+    const child = { ...background('sdk-id', 'subagent'), displayId: 'sdk-id' }
+    await h.cards.syncBackground('chat', 'session', [child])
+    await h.cards.syncBackground('chat', 'session', [{ ...child, toolUseId: 'late-tool' }])
+    expect(h.sent).toHaveLength(1)
+    expect(h.elements.get('message-1')!.size).toBe(1)
+  })
+
+  test('capacity rotation can correct an entirely completed shared card before disposing it', async () => {
+    const h = harness()
+    const first = { ...background('first'), status: 'completed' as const }
+    const second = { ...background('second'), status: 'completed' as const }
+    await h.cards.syncBackground('chat', 'session', [first, second])
+    const replace = h.deps.replaceElementResult
+    h.deps.replaceElementResult = async (id, key, element) => id === 'message-1'
+      ? failure(200860) : replace(id, key, element)
+    const remove = h.deps.deleteElementChecked
+    h.deps.deleteElementChecked = async (id, key) => {
+      expect(h.disposed.has(id)).toBe(false)
+      return remove(id, key)
+    }
+    await h.cards.syncBackground('chat', 'session', [{ ...first, status: 'failed', error: '原生失败结果' }, second])
+    expect(h.sent).toHaveLength(2)
+    expect(h.disposed.has('message-1')).toBe(true)
+    expect(h.settings.get('message-2').config.streaming_mode).toBe(false)
+  })
+
   test('concurrent calls append unique rows and only the last task closes streaming', async () => {
     const h = harness()
     const a = run('a'), b = run('b')

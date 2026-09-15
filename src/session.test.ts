@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, te
 import {
   boundResumes, branchBaseBySession, clearedResumes, deletedReactions, projectProfiles, resetFeishuMock,
   modelSelections, sentCards, sentRawTexts, sentTexts, updatedCards, urgentPushes,
-  setResumeWriteError, setTurnAnchorWriteError, setUpdateCardHandler,
+  setResumeWriteError, setTurnAnchorWriteError,
   turnAnchorsBySession, resumeRefs, pendingConversationLaunchBySession,
   sentImages, uploadedImages, sentLocalFiles, setImageUploadHandler,
 } from './feishu-test-mock'
@@ -3678,7 +3678,7 @@ describe('Session SDK-initiated bg-task resume turns', () => {
     expect(session.status).toBe('idle')
   })
 
-  test('用户消息撞上 bg-resume 开卡时排队等待,不抢 owner、不重复迁移、不把后台正文塞进用户卡', async () => {
+  test('用户消息撞上 bg-resume 开卡时排队等待,不抢 owner、不重复开卡、不把后台正文塞进用户卡', async () => {
     const session = new Session('probe', 'chat_id') as any
     const proc = new FakeAgentProc('claude', 'claude-session-1')
     session.proc = proc
@@ -3687,30 +3687,20 @@ describe('Session SDK-initiated bg-task resume turns', () => {
     session.wireProc(proc)
     proc.emit('init', { session_id: 'claude-session-1' })
 
-    session.backgroundTasks = [{
-      id: 'still-running',
-      type: 'shell',
-      description: 'long review',
-      status: 'running',
-      startedAt: Date.now(),
-      steps: [],
-    }]
-    session.backgroundCard = { messageId: 'om_bg_old', cardId: 'card_bg_old' }
-
-    let releaseMigration: () => void = () => {}
-    const migrationGate = new Promise<void>(resolve => { releaseMigration = resolve })
-    let migrateCalls = 0
-    session.migrateBackgroundCard = async function () {
-      migrateCalls++
-      await migrationGate
-      this.backgroundCard = null
-      this.backgroundTasks = []
-    }
+    let releaseOpen!: () => void
+    const gate = new Promise<void>(resolve => { releaseOpen = resolve })
+    const originalConvert = cardkit.convertMessageToCard
+    let openCalls = 0
+    const convert = spyOn(cardkit, 'convertMessageToCard').mockImplementation(async (messageId: string) => {
+      openCalls++
+      if (openCalls === 1) await gate
+      return originalConvert(messageId)
+    })
 
     try {
       session.bgResumePending = true
       proc.emit('init', { session_id: 'claude-session-1' })
-      await waitFor(() => migrateCalls === 1 && session.openingTurn)
+      await waitFor(() => openCalls === 1 && session.openingTurn)
 
       proc.emit('assistant_text', { text: '上一轮后台结果', parentToolUseId: null })
       proc.emit('assistant_block_stop', { index: 'assistant_bg', parentToolUseId: null })
@@ -3720,10 +3710,10 @@ describe('Session SDK-initiated bg-task resume turns', () => {
       emitClaudeResult(proc)
       await new Promise(resolve => setTimeout(resolve, 10))
       // result handler 只能等待既有 bg-resume owner；不能 beginTurnOpen 覆盖它，
-      // 更不能让两条 openTurnCard 协程同时迁移同一张后台卡。
-      expect(migrateCalls).toBe(1)
+      // 更不能让两条 openTurnCard 协程同时创建主卡。
+      expect(openCalls).toBe(1)
 
-      releaseMigration()
+      releaseOpen()
       await waitFor(() => session.currentTurn?.trigger === 'user_message' && !session.openingTurn)
       const userCardId = session.currentTurn.cardId
       await cardkit.flush(userCardId)
@@ -3740,11 +3730,9 @@ describe('Session SDK-initiated bg-task resume turns', () => {
         String(call.body?.elements ?? '').includes('上一轮后台结果')
       )).toBe(true)
     } finally {
-      releaseMigration()
+      releaseOpen()
       if (session.currentTurn) await session.closeTurnCard('测试收尾')
-      session.backgroundCard = null
-      session.backgroundTasks = []
-      session.pendingBgTasks = []
+      convert.mockRestore()
     }
   })
 
@@ -3800,11 +3788,14 @@ describe('Session claude subagent tool calls stay off the main card', () => {
       expect(t1.steps[0].brief).toContain('→ file body')
       // 主卡 toolByUseId 不含子 agent 工具 —— 没走 addTool/completeTool
       expect(session.currentTurn.toolByUseId.has('sub_read_1')).toBe(false)
-      // 主线程 Task 本身照常上主卡
-      expect(session.currentTurn.toolByUseId.has('task_main_1')).toBe(true)
+      // 启动工具也归入委派面板，SDK task id 回填后仍然只有一项。
+      expect(session.currentTurn.toolByUseId.has('task_main_1')).toBe(false)
+      expect(session.backgroundTasks).toHaveLength(1)
       await cardkit.flush('card_subagent_iso')
     } finally {
       session.stopFooterStatus(session.currentTurn)
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
       await cardkit.dispose('card_subagent_iso')
     }
   })
@@ -3827,6 +3818,8 @@ describe('Session claude subagent tool calls stay off the main card', () => {
       expect(proc.isAlive()).toBe(true)
     } finally {
       session.stopFooterStatus(session.currentTurn)
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
       await cardkit.dispose('card_dsh_child_blocks')
     }
   })
@@ -4022,254 +4015,158 @@ describe('Session usage cache cross-backend isolation', () => {
   })
 })
 
-describe('Session resetBackgroundTasks on kill/restart', () => {
-  // 复现:SDK 子进程一死就不再发 task_settled,活跃 entry 永远卡 running,
-  // backgroundRefreshTick(setInterval,不归 SDK 管)还在每 tick 把「🟡 运行中
-  // Ns」时长往上推 —— 卡片永不沉降,伪造「还在跑」。kill(stop)/restart 必须
-  // 主动结算。回归:2026-07-06。
+describe('Session background tasks in shared delegation cards', () => {
   function makeRunningTask(id: string): any {
     return { id, type: 'shell', description: `bg ${id}`, status: 'running', startedAt: Date.now() - 5000, steps: [] }
   }
 
-  test('stop() kills proc AND clears running background tasks (public kill path)', async () => {
-    // 用户真实触发路径:kill 命令 → session.stop()。修复前 stop 只杀进程,
-    // 不碰 backgroundTasks,running entry 留在内存 + refresh tick 继续伪造时长。
+  test('stop drains visible tasks as killed and drops ordinary foreground commands', async () => {
     const session = new Session('probe', 'chat_id') as any
     const proc = new FakeAgentProc('claude', 'claude-session-1')
     session.proc = proc
     session.backgroundTasks = [makeRunningTask('t1'), makeRunningTask('t2')]
-    session.pendingBgTasks = [makeRunningTask('p1')]
-    session.backgroundCard = null // 无活卡 → 走纯内存清理分支(避开 feishu.updateCard)
-    session.openingBackground = true
+    session.pendingBgTasks = [makeRunningTask('foreground')]
+    await session.refreshBackgroundCardFull()
+    session.scheduleBackgroundRefresh()
 
     await session.stop('已终止', { announce: false })
 
-    expect(proc.killCalls).toBe(1) // 进程被杀
-    expect(session.backgroundTasks).toEqual([]) // running entry 不再残留
-    expect(session.pendingBgTasks).toEqual([])
-    expect(session.openingBackground).toBe(false)
-  })
-
-  test('live card: flips running tasks to killed terminal BEFORE settling (so the tombstone shows 💀 已终止)', async () => {
-    // 有活卡路径:先翻 killed,再 settleBackgroundCard 用终态 entry 渲染墓碑
-    // (用户看到「💀 已终止 Ns」而非「🟡 运行中」)。settle 内部 feishu.updateCard
-    // 在测试 mock 里不存在,stub 掉以聚焦本次修复边界(settle 老逻辑另有覆盖)。
-    const session = new Session('probe', 'chat_id') as any
-    const completedTask = { id: 't0', type: 'subagent', description: 'done', status: 'completed', startedAt: 0, endTime: 1000, steps: [] }
-    session.backgroundTasks = [makeRunningTask('t1'), completedTask]
-    session.backgroundCard = { messageId: 'om_bg', cardId: 'card_bg' }
-    let settleCalls = 0
-    let statusesAtSettle = ''
-    session.settleBackgroundCard = async function () {
-      settleCalls++
-      statusesAtSettle = JSON.stringify(this.backgroundTasks.map((t: any) => t.status))
-    }
-
-    await session.resetBackgroundTasks()
-
-    expect(settleCalls).toBe(1) // 有卡 → 沉降被调
-    // 活跃 entry 在 settle 之前已翻 killed(供墓碑渲染);已终态的保持原状。
-    expect(statusesAtSettle).toBe('["killed","completed"]')
-    expect(session.pendingBgTasks).toEqual([])
-  })
-
-  test('no live card: clears tasks + pending pool + refresh timer + detail set', async () => {
-    const session = new Session('probe', 'chat_id') as any
-    session.backgroundTasks = [makeRunningTask('t1')]
-    session.pendingBgTasks = [makeRunningTask('p1')]
-    session.backgroundCard = null
-    const liveTimer = setTimeout(() => {}, 100000)
-    session.backgroundRefreshTimer = liveTimer
-    session.backgroundDetailAdded = new Set(['t1'])
-    session.openingBackground = true
-
-    await session.resetBackgroundTasks()
-
+    expect(proc.killCalls).toBe(1)
     expect(session.backgroundTasks).toEqual([])
     expect(session.pendingBgTasks).toEqual([])
-    expect(session.backgroundRefreshTimer).toBeNull() // timer 引用已清
-    expect(session.backgroundDetailAdded.size).toBe(0)
-    expect(session.openingBackground).toBe(false)
+    expect(session.backgroundSync).toBeNull()
+    expect(session.backgroundRefreshTimer).toBeNull()
+    expect(sentCards).toHaveLength(1)
+    const writes = calls.filter(call => call.method === 'PUT').map(call => String(call.body.element)).join('\n')
+    expect(writes).toContain('已终止')
+    expect(writes).not.toContain('foreground')
+    expect(updatedCards).toHaveLength(0)
+    const settings = calls.filter(call => call.path.endsWith('/settings')).at(-1)!
+    expect(JSON.parse(settings.body.settings).config.streaming_mode).toBe(false)
+    await session.agentCards.closeChat('chat_id')
   })
 
-  test('an old background open cannot revive after reset or clear a newer opening owner', async () => {
-    const session = new Session('background-open-generation', 'chat_id') as any
-    session.backgroundTasks = [makeRunningTask('old')]
+  test('a main message leaves running work in its original panel', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.backgroundTasks = [makeRunningTask('running')]
+    await session.refreshBackgroundCardFull()
+    await feishu.sendCard('chat_id', { schema: '2.0', body: { elements: [] } })
+    session.backgroundTasks = [{ ...session.backgroundTasks[0], summary: '检查中' }]
+    await session.refreshBackgroundCardFull()
+    expect(sentCards).toHaveLength(2)
+    expect(updatedCards).toHaveLength(0)
+    expect(calls.some(call => call.method === 'PUT' && String(call.body.element).includes('检查中'))).toBe(true)
+    await session.resetBackgroundTasks()
+    await session.agentCards.closeChat('chat_id')
+  })
 
-    let releaseOldConvert: () => void = () => {}
-    const oldConvertGate = new Promise<void>(resolve => { releaseOldConvert = resolve })
-    let releaseNewConvert: () => void = () => {}
-    const newConvertGate = new Promise<void>(resolve => { releaseNewConvert = resolve })
-    let convertCount = 0
+  test('stop waits for an admitted open, settles it, and namespaces a later process', async () => {
+    const session = new Session('background-open-generation', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('same-id')]
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
     const baseFetch = globalThis.fetch
+    let converting = false
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = new URL(String(input))
-      if (url.pathname.endsWith('/cards/id_convert')) {
-        const n = ++convertCount
-        if (n === 1) await oldConvertGate
-        if (n === 2) await newConvertGate
-        return new Response(JSON.stringify({ code: 0, data: { card_id: n === 1 ? 'card_bg_old' : 'card_bg_new' } }), {
-          headers: { 'Content-Type': 'application/json' },
-        })
+      if (new URL(String(input)).pathname.endsWith('/cards/id_convert')) {
+        converting = true
+        await gate
       }
       return baseFetch(input, init)
     }) as typeof fetch
-
     try {
-      session.onBackgroundTaskChanged()
-      await waitUntil(() => convertCount === 1)
-
-      await session.resetBackgroundTasks()
-      expect(session.backgroundCard).toBeNull()
-      expect(session.openingBackground).toBe(false)
-
-      session.backgroundTasks = [makeRunningTask('new')]
-      session.onBackgroundTaskChanged()
-      await waitUntil(() => convertCount === 2)
-
-      releaseOldConvert()
-      await waitUntil(() => calls.some(call =>
-        call.method === 'PATCH' && call.path === '/cards/card_bg_old/settings'
-      ))
-      expect(session.backgroundCard).toBeNull()
-      expect(session.openingBackground).toBe(true)
-
-      releaseNewConvert()
-      await waitUntil(() => session.backgroundCard?.cardId === 'card_bg_new' && !session.openingBackground)
-      expect(session.backgroundTasks.map((task: any) => task.id)).toEqual(['new'])
+      const opening = session.refreshBackgroundCardFull()
+      await waitUntil(() => converting)
+      let resetDone = false
+      const resetting = session.resetBackgroundTasks().then(() => { resetDone = true })
+      await Promise.resolve()
+      expect(resetDone).toBe(false)
+      release()
+      await Promise.all([opening, resetting])
+      expect(session.backgroundTasks).toEqual([])
+      session.backgroundTasks = [makeRunningTask('same-id')]
+      await session.refreshBackgroundCardFull()
+      expect(sentCards).toHaveLength(1)
+      const appended = calls.filter(call => call.method === 'POST' && call.path.endsWith('/elements'))
+      expect(appended).toHaveLength(1)
+      const initialId = (sentCards[0] as any).body.elements[0].element_id
+      expect(JSON.parse(appended[0]!.body.elements)[0].element_id).not.toBe(initialId)
     } finally {
-      releaseOldConvert()
-      releaseNewConvert()
-      session.stopBackgroundRefreshTick()
-      if (session.backgroundRefreshTimer) clearTimeout(session.backgroundRefreshTimer)
-      session.backgroundRefreshTimer = null
-      const cardId = session.backgroundCard?.cardId
-      session.backgroundCard = null
-      session.backgroundTasks = []
-      if (cardId) await cardkit.dispose(cardId)
+      release()
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
       globalThis.fetch = baseFetch
     }
   })
 
-  test('background migration is single-flight and rejects refresh writes against the transitioning element tree', async () => {
-    const session = new Session('background-migration-owner', 'chat_id') as any
-    const running = makeRunningTask('running')
-    const completed = {
-      id: 'completed',
-      type: 'subagent',
-      description: 'done',
-      status: 'completed',
-      startedAt: Date.now() - 1000,
-      endTime: Date.now(),
-      steps: [],
-    }
-    session.backgroundTasks = [running, completed]
-    session.backgroundCard = { messageId: 'om_bg_migrate', cardId: 'card_bg_migrate' }
-    session.backgroundDetailAdded = new Set(['running', 'completed'])
-    cardkit.recordCardCreated('card_bg_migrate', 2)
-
-    let releaseUpdate: () => void = () => {}
-    const updateGate = new Promise<void>(resolve => { releaseUpdate = resolve })
-    setUpdateCardHandler(async () => { await updateGate })
-
+  test('a failed terminal update remains visible and can be retried without duplicate rows', async () => {
+    const session = new Session('background-update-failure', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('running')]
+    await session.refreshBackgroundCardFull()
+    const patch = spyOn(session.agentCards.deps, 'patchSettingsChecked').mockResolvedValue(false)
     try {
-      const first = session.migrateBackgroundCard()
-      await waitUntil(() => updatedCards.length === 1)
-      const second = session.migrateBackgroundCard()
+      await expect(session.resetBackgroundTasks()).rejects.toThrow('settings update MISS')
+      expect(session.backgroundTasks[0].status).toBe('killed')
+    } finally { patch.mockRestore() }
+    await session.resetBackgroundTasks()
+    expect(session.backgroundTasks).toEqual([])
+    expect(sentCards).toHaveLength(1)
+    await session.agentCards.closeChat('chat_id')
+  })
 
-      expect(second).toBe(first)
-      session.refreshBackgroundCardFull()
-      session.onBackgroundTaskChanged()
-      await new Promise(resolve => setTimeout(resolve, 5))
-      expect(calls.some(call =>
-        call.method === 'PUT' &&
-        call.path.startsWith('/cards/card_bg_migrate/elements/bg_')
-      )).toBe(false)
-
-      releaseUpdate()
-      await Promise.all([first, second])
-      expect(updatedCards).toHaveLength(1)
-      expect(session.backgroundCard).toBeNull()
-      expect(session.backgroundTasks.map((task: any) => task.id)).toEqual(['running'])
+  test('a failed launch is visible in the delegation panel without a main tool panel', async () => {
+    const session = new Session('native-launch-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_failed_child')
+    cardkit.recordCardCreated('card_failed_child', 1)
+    try {
+      proc.emit('tool_use', { id: 'agent-tool', name: 'Agent', input: { description: '检查接口' }, parentToolUseId: null })
+      proc.emit('tool_result', { tool_use_id: 'agent-tool', content: '无法启动子 Agent', is_error: true, parentToolUseId: null })
+      await session.backgroundSync
+      expect(session.currentTurn.toolByUseId.size).toBe(0)
+      expect(session.backgroundTasks).toHaveLength(1)
+      expect(session.backgroundTasks[0].status).toBe('failed')
+      const rendered = calls.filter(call => call.method === 'PUT').map(call => String(call.body.element)).join('\n')
+      expect(rendered).toContain('委派失败')
+      expect(rendered).toContain('无法启动子 Agent')
     } finally {
-      releaseUpdate()
-      setUpdateCardHandler(null)
-      session.backgroundCard = null
-      session.backgroundTasks = []
-      session.pendingBgTasks = []
-      await cardkit.dispose('card_bg_migrate')
+      session.stopFooterStatus(session.currentTurn)
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+      await cardkit.dispose('card_failed_child')
     }
   })
 
-  test('a failed migration is retried by terminal settle instead of poisoning stop cleanup', async () => {
-    const session = new Session('background-migration-failure', 'chat_id') as any
-    session.backgroundTasks = [makeRunningTask('running')]
-    session.backgroundCard = { messageId: 'om_bg_failure', cardId: 'card_bg_failure' }
-    session.backgroundDetailAdded = new Set(['running'])
-    cardkit.recordCardCreated('card_bg_failure', 1)
-
-    let updateCalls = 0
-    let releaseFirstUpdate: () => void = () => {}
-    const firstUpdateGate = new Promise<void>(resolve => { releaseFirstUpdate = resolve })
-    setUpdateCardHandler(async () => {
-      updateCalls++
-      if (updateCalls === 1) {
-        await firstUpdateGate
-        throw new Error('forced migration update failure')
-      }
-    })
-
+  test('a successful async launch receipt leaves the child running until its native result', async () => {
+    const session = new Session('native-background-receipt', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_async_child')
+    cardkit.recordCardCreated('card_async_child', 1)
     try {
-      const migrationOutcome = session.migrateBackgroundCard().catch((error: Error) => error)
-      await waitUntil(() => updateCalls === 1)
-
-      const reset = session.resetBackgroundTasks()
-      releaseFirstUpdate()
-      await expect(reset).resolves.toBeUndefined()
-      expect(await migrationOutcome).toBeInstanceOf(Error)
-      expect(updateCalls).toBe(2)
-      expect(session.backgroundCard).toBeNull()
-      expect(session.backgroundTasks).toEqual([])
-      expect(JSON.stringify(updatedCards.at(-1)?.[1])).toContain('已终止')
+      proc.emit('tool_use', { id: 'agent-tool', name: 'Agent', input: { description: '检查接口', run_in_background: true }, parentToolUseId: null })
+      expect(session.currentTurn.footerStatusLabel).toBe('Working...')
+      proc.emit('tool_result', { tool_use_id: 'agent-tool', content: 'Agent launched', is_error: false, parentToolUseId: null })
+      expect(session.currentTurn.footerStatusLabel).toBe('Thinking...')
+      expect(session.backgroundTasks[0].status).toBe('running')
+      proc.emit('bg_task_started', { task_id: 'native-id', tool_use_id: 'agent-tool', description: '检查接口', task_type: 'local_agent' })
+      proc.emit('bg_task_settled', { task_id: 'native-id', status: 'completed', summary: '接口正常' })
+      await session.backgroundSync
+      expect(session.backgroundTasks).toHaveLength(1)
+      expect(session.backgroundTasks[0].status).toBe('completed')
+      expect(session.currentTurn.toolByUseId.size).toBe(0)
+      expect(sentCards).toHaveLength(1)
+      expect(calls.filter(call => call.method === 'POST' && call.path.endsWith('/elements'))).toHaveLength(0)
     } finally {
-      releaseFirstUpdate()
-      setUpdateCardHandler(null)
-      session.migratingBackgroundCard = null
-      session.backgroundCard = null
-      session.backgroundTasks = []
-      await cardkit.dispose('card_bg_failure')
-    }
-  })
-
-  test('stop during a post-snapshot migration cannot leave killed task state behind', async () => {
-    const session = new Session('background-migration-stop-race', 'chat_id') as any
-    session.backgroundTasks = [makeRunningTask('running')]
-    session.backgroundCard = { messageId: 'om_bg_stop_race', cardId: 'card_bg_stop_race' }
-    session.backgroundDetailAdded = new Set(['running'])
-    cardkit.recordCardCreated('card_bg_stop_race', 1)
-
-    let releaseUpdate: () => void = () => {}
-    const updateGate = new Promise<void>(resolve => { releaseUpdate = resolve })
-    setUpdateCardHandler(async () => { await updateGate })
-
-    try {
-      const migration = session.migrateBackgroundCard()
-      await waitUntil(() => updatedCards.length === 1)
-      const reset = session.resetBackgroundTasks()
-      await new Promise(resolve => setTimeout(resolve, 5))
-
-      releaseUpdate()
-      await Promise.all([migration, reset])
-
-      expect(session.backgroundCard).toBeNull()
-      expect(session.backgroundTasks).toEqual([])
-      expect(session.pendingBgTasks).toEqual([])
-    } finally {
-      releaseUpdate()
-      setUpdateCardHandler(null)
-      session.backgroundCard = null
-      session.backgroundTasks = []
-      await cardkit.dispose('card_bg_stop_race')
+      session.stopFooterStatus(session.currentTurn)
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+      await cardkit.dispose('card_async_child')
     }
   })
 })
@@ -4391,7 +4288,7 @@ describe('Session codex plan live panel (plan_live)', () => {
   })
 })
 
-describe('Session live_elapsed second mode', () => {  test('second live_elapsed mode uses 1s footer and 1s background ticks', async () => {
+describe('Session live_elapsed second mode', () => {  test('second live_elapsed mode updates the main footer without background clock timers', async () => {
     // 显式钉死 second 模式，隔离本机配置差异。
     const cfg = config as any
     const previousRuntime = cfg.runtime
@@ -4412,14 +4309,6 @@ describe('Session live_elapsed second mode', () => {  test('second live_elapsed 
       expect(delays).toHaveLength(1)
       expect(delays[0]).toBe(1000)
       session.stopFooterStatus(turn)
-
-      session.backgroundCard = { messageId: 'msg_second', cardId: 'card_second' }
-      session.backgroundTasks = [{
-        id: 'bg', type: 'shell', description: 'bg', status: 'running',
-        startedAt: Date.now() - 300_001, steps: [],
-      }]
-      session.startBackgroundRefreshTick()
-      expect(delays.at(-1)).toBe(1000)
 
       // startFooterStatus 先 Date.now() 记 startedAt,再 Date.now() 算 elapsed。
       // 第一次返回 base,后续返回 base+45s → 文案 Writing... (45s)。
@@ -4442,7 +4331,6 @@ describe('Session live_elapsed second mode', () => {  test('second live_elapsed 
       expect(footerWrites.at(-1)).toContain('Writing... (45s)')
     } finally {
       session.stopFooterStatus(turn)
-      session.stopBackgroundRefreshTick()
       timeoutSpy.mockRestore()
       if (previousRuntime === undefined) delete cfg.runtime
       else cfg.runtime = previousRuntime

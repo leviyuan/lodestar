@@ -53,6 +53,8 @@ import {
 import { config } from './config'
 import { createAgentProcess } from './agent-launch'
 import { agentApiUrl } from './agent-runtime'
+import { createAgentCards } from './agent-cards-runtime'
+import type { AgentCards } from './agent-cards'
 import { getTokenSource, getTokenSourceForAccount, listEnabledTokenSourcesByAgent, waitForTokenSourceModelRefresh, tokenSourceProcessRevision, tokenSourceRuntimeModel, type TokenSource } from './token-source'
 import { codexAccounts, DEFAULT_CODEX_ACCOUNT, processCodexAccount } from './codex-accounts'
 import { codexAccountCard } from './cards/codex-account'
@@ -200,13 +202,6 @@ interface TurnOpenOwner {
   resolveDone: () => void
 }
 
-interface BackgroundOpenOwner {
-  token: number
-  proc: AgentProcess | null
-  procEpoch: number
-  generation: number
-}
-
 interface TurnCloseSnapshot {
   turn: TurnState
   proc: AgentProcess | null
@@ -286,46 +281,16 @@ export class Session {
   private contextCompactionOwnerSequence = 0
   private lastManualContextCompactionCompletedAt = 0
   private lastManualContextCompactionWasAnonymous = false
-  /** 已确认后台的任务(workflow/monitor 白名单,或收到 is_backgrounded:true 提升)。
-   *  驱动后台游标卡渲染。以 task_id 为 key,跨 turn 累积 —— 后台任务生命周期
-   *  不受 turn 边界约束。 */
+  /** Native children are visible immediately; foreground shell tasks stay pending. */
   backgroundTasks: cards.BgTaskEntry[] = []
-  /** 观察池:task_started 进来但还没后台化的前台 task(Bash 命令/前台子 agent)。
-   *  不渲染;等 task_updated.is_backgrounded=true 提升到 backgroundTasks,或
-   *  task_settled 时丢弃。治「随便跑个命令就冒一项后台任务」的关键。 */
   pendingBgTasks: cards.BgTaskEntry[] = []
-  /** 后台游标卡句柄。null = 当前无活卡(从未建/已沉降/已固化)。活卡期间
-   *  streaming 开,replaceElement body 刷新任务行。卡吸附在对话末尾,被新消息
-   *  超越时沉降(updateCard),只在全部终态时固化留在原地。 */
-  backgroundCard: { messageId: string; cardId: string } | null = null
-  private settlingBackgroundCard = false
-  /** Single-flight transition that rewrites/disposes the live background card
-   * before a new main card. While non-null, no refresh/settle mutation may be
-   * queued against the old element tree. */
-  private migratingBackgroundCard: Promise<void> | null = null
-  /** task_progress 风暴的刷新节流 timer。 */
+  private readonly agentCards: AgentCards
+  private backgroundOwner = randomBytes(16).toString('hex')
   private backgroundRefreshTimer: ReturnType<typeof setTimeout> | null = null
-  /** 后台卡自适应 tick:bucket 取活跃任务最近档位边界,second 固定 2s。
-   *  setTimeout 刷新一次 header 时长标签,治无 task_progress 的 shell 任务
-   *  时长冻结。活卡期间常驻,沉降/迁移时清。见 startBackgroundRefreshTick。 */
-  private backgroundRefreshTick: ReturnType<typeof setTimeout> | null = null
-  /** openBackgroundCard 进行中标记 —— 防止并发 bg_task 事件在 await sendCard
-   *  期间重复开卡(sendCard 未返回前 backgroundCard 仍 null,第二个事件会再开一张)。 */
-  private openingBackground = false
-  private openingBackgroundOwner: BackgroundOpenOwner | null = null
-  private backgroundOpenSequence = 0
-  private backgroundGeneration = 0
-  /** 已 addElement 到活卡的 task panel 的 task_id 集合。新任务 diff 出来才
-   *  addElement(避免重复 add);已有任务 replaceElement 整个 panel。 */
-  private backgroundDetailAdded = new Set<string>()
-  /** Panels whose checked add is currently queued. Prevents a second refresh
-   * from enqueueing a duplicate before the first wire result is known. */
-  private backgroundDetailAdding = new Set<string>()
-  /** 最近一次主线程 Task tool_use 的 id —— SDK 若在 task_started 里没填 tool_use_id,
-   *  用它兜底关联子 agent 消息的 parent_tool_use_id 到对应 task。 */
+  private backgroundSync: Promise<void> | null = null
+  private backgroundWriteError: string | null = null
   private lastMainTaskToolUseId: string | null = null
-  /** onUserMessage 沉降旧卡后置位;主卡落地后据此重建后台卡(游标重回末尾)。 */
-  private pendingRebuildBackgroundCard = false
+  private nativeAgentTools = new Map<string, { confirmed: boolean; input: any }>()
   /** turn 收尾后有后台任务结算 → SDK 会自发开一轮恢复轮(task_notification
    *  合并结果),该轮 init 没有伴随用户消息。置位后,下一个无用户批次的 init
    *  据此开 bg_task_resume 卡承接输出;任何 turn 开卡即消费(结算通知会被
@@ -515,6 +480,7 @@ export class Session {
     public readonly chatId: string,
     public opts: SessionOpts = {},
   ) {
+    this.agentCards = opts.agentCards ?? createAgentCards()
     Session.all.add(this)
     const selection = feishu.getSessionModelSelection(sessionName)
     this.selectedProvider = selection?.provider ?? 'claude'
@@ -1277,41 +1243,8 @@ export class Session {
     return this.proc === proc && this.procEpoch === epoch && proc.isAlive()
   }
 
-  private beginBackgroundOpen(): BackgroundOpenOwner | null {
-    if (this.backgroundCard || this.openingBackgroundOwner) return null
-    const owner: BackgroundOpenOwner = {
-      token: ++this.backgroundOpenSequence,
-      proc: this.proc,
-      procEpoch: this.procEpoch,
-      generation: this.backgroundGeneration,
-    }
-    this.openingBackgroundOwner = owner
-    this.openingBackground = true
-    return owner
-  }
-
-  private ownsBackgroundOpen(owner: BackgroundOpenOwner): boolean {
-    return this.openingBackgroundOwner === owner
-      && this.backgroundGeneration === owner.generation
-      && this.proc === owner.proc
-      && this.procEpoch === owner.procEpoch
-  }
-
-  private releaseBackgroundOpen(owner: BackgroundOpenOwner): void {
-    if (this.openingBackgroundOwner !== owner) return
-    this.openingBackgroundOwner = null
-    this.openingBackground = false
-  }
-
-  private invalidateBackgroundOpen(): void {
-    this.backgroundGeneration++
-    this.openingBackgroundOwner = null
-    this.openingBackground = false
-  }
-
   private attachProc(proc: AgentProcess): void {
     this.invalidateTurnOpen()
-    this.invalidateBackgroundOpen()
     this.stoppingProc = null
     this.blockedProc = null
     this.blockedProcReason = null
@@ -1323,7 +1256,6 @@ export class Session {
   private detachProc(proc: AgentProcess): boolean {
     if (this.proc !== proc) return false
     this.invalidateTurnOpen()
-    this.invalidateBackgroundOpen()
     this.proc = null
     this.agentCapability = null
     if (this.stoppingProc === proc) this.stoppingProc = null
@@ -1765,7 +1697,6 @@ export class Session {
     // `systemctl restart` revived the killed session on boot).
     log(`session "${this.sessionName}": stop (${reason})`)
     this.invalidateTurnOpen()
-    this.invalidateBackgroundOpen()
     if (this.currentTurn) {
       void this.closeTurnCard(`🛑 ${reason}`).catch(e => {
         log(`session "${this.sessionName}": stop current main-card close failed: ${messageOf(e)}`)
@@ -1952,9 +1883,9 @@ export class Session {
       || this.pendingUserMessageCount > 0
       || this.pendingMidTurnMsgs.length > 0
       || this.pendingTurnInputs.length > 0
-      || this.backgroundTasks.length > 0
+      || cards.hasActiveBgTask(this.backgroundTasks)
       || this.pendingBgTasks.length > 0
-      || this.openingBackground,
+      || this.backgroundSync,
     )
     // 主动重启:孤儿缓冲随轮作废,不兜底推送。必须在 kill 之前丢弃 ——
     // 否则 kill 触发的 exit 处理器会抢先把缓冲当作"进程崩溃残留"兜底推出去,
@@ -1962,7 +1893,6 @@ export class Session {
     // stale-proc 早退,不再重复兜底(与 stop() 同一模式)。
     this.bgResumePending = false
     this.invalidateTurnOpen()
-    this.invalidateBackgroundOpen()
     this.discardOrphanAssistant()
     for (const delivery of this.fileDeliveries) delivery.cancel('会话正在重启')
     if (this.currentTurn) {
@@ -3236,11 +3166,7 @@ export class Session {
     }
   }
 
-  // ── 后台游标卡(子 agent / 后台 bash / MCP / workflow 的后台执行) ──────
-  // 由 claude-agent-process 的 bg_task_* 事件驱动。卡吸附在对话末尾,被新
-  // 消息超越时沉降为历史快照(updateCard),只在全部终态时固化留在原地。
-  // 阶段①:建卡 + 节流刷新 + 全终态沉降。游标迁移(onUserMessage 沉降+重建)
-  // 是阶段②(待 pendingRebuildBackgroundCard 接入)。
+  // ── 原生子 Agent / 后台任务 → 共享委派面板 ───────────────────────
 
   /** 当前双池快照 —— 喂给纯函数累积器的入参。 */
   private bgStore(): cards.BgStore {
@@ -3270,281 +3196,74 @@ export class Session {
       || this.pendingBgTasks.some(t => t.toolUseId === parentToolUseId)
   }
 
-  private onBackgroundTaskChanged(): void {
-    // task_* events remain accumulated in backgroundTasks while the old card is
-    // transitioning, but must not mutate that card. openTurnCard rebuilds the
-    // remaining snapshot behind the new main card once migration completes.
-    if (this.migratingBackgroundCard) {
-      this.pendingRebuildBackgroundCard = true
-      return
-    }
-    const hasActive = cards.hasActiveBgTask(this.backgroundTasks)
-    // 全部终态 → 活卡沉降成历史快照,关 streaming,清句柄
-    if (!hasActive) {
-      if (this.backgroundCard) {
-        void this.settleBackgroundCard().catch(e => {
-          log(`session "${this.sessionName}": background settle failed: ${messageOf(e)}`)
-        })
-      }
-      return
-    }
-    // 有活跃任务但无卡(且没在开卡中) → 建活卡。openingBackground 挡住并发事件
-    // 在 await sendCard 期间重复开卡(backgroundCard 此时仍 null)。
-    if (!this.backgroundCard && !this.openingBackground) {
-      void this.openBackgroundCard()
-        .catch(e => { log(`session "${this.sessionName}": background open failed: ${messageOf(e)}`) })
-      return
-    }
-    // 有卡有活跃 → 节流刷新 body
-    this.scheduleBackgroundRefresh()
+  hasPendingAgentTool(): boolean {
+    return this.nativeAgentTools.size > 0
   }
 
-  private async openBackgroundCard(): Promise<void> {
-    const owner = this.beginBackgroundOpen()
-    if (!owner) return
-    const tasksAtOpen = this.backgroundTasks.slice()
-    try {
-      const card = cards.backgroundLiveCard(tasksAtOpen, Date.now(), liveElapsedMode())
-      const messageId = await feishu.sendCard(this.chatId, card)
-      if (!messageId) {
-        if (this.ownsBackgroundOpen(owner)) {
-          log(`session "${this.sessionName}": background card send failed`)
-        }
-        return
-      }
-      let cardId: string
-      try {
-        cardId = await cardkit.convertMessageToCard(messageId)
-      } catch (e) {
-        log(`session "${this.sessionName}": background card id_convert failed: ${e}`)
-        return
-      }
-      // 初始 body = 每任务一个 panel(无概要区)。
-      cardkit.recordCardCreated(cardId, tasksAtOpen.length)
-      if (!this.ownsBackgroundOpen(owner)) {
-        await this.terminalizeSupersededCard(cardId, '⚠️ 后台任务世代已切换，本卡已作废', false)
-        return
-      }
-      this.backgroundCard = { messageId, cardId }
-      this.backgroundDetailAdded = new Set(tasksAtOpen.map(t => t.id))
-      this.backgroundDetailAdding.clear()
-      log(`session "${this.sessionName}": background card opened cardId=${cardId.slice(0, 12)} tasks=${tasksAtOpen.length}`)
-      // 开卡 await 窗口内任务可能已全部终态(短命 agent:start/settle 同批到达,
-      // settle 那刻 backgroundCard 还是 null 空转了)—— 落地后复查,直接沉降,
-      // 否则活卡带着终态快照永不 settle,后台 tick 还在推「运行中」计时。
-      if (!cards.hasActiveBgTask(this.backgroundTasks)) {
-        void this.settleBackgroundCard().catch(e => {
-          log(`session "${this.sessionName}": background settle-after-open failed: ${messageOf(e)}`)
-        })
-        return
-      }
-      this.startBackgroundRefreshTick()
+  private onBackgroundTaskChanged(immediate = false): void {
+    if (!this.backgroundTasks.length) return
+    // Start and terminal states are published immediately; tool/progress bursts
+    // coalesce within 1.5s. Titles have no ticking clock, so idle jobs need no timer.
+    if (immediate) {
+      if (this.backgroundRefreshTimer) clearTimeout(this.backgroundRefreshTimer)
+      this.backgroundRefreshTimer = null
+      void this.refreshBackgroundCardFull().catch(error => this.reportBackgroundWriteFailure(error))
+    } else {
       this.scheduleBackgroundRefresh()
-    } finally {
-      this.releaseBackgroundOpen(owner)
     }
   }
 
-  /** 后台卡 tick:running 任务 header 时长标签。
-   *  bucket:取所有活跃任务最近档位边界再刷新(省配额);
-   *  second:前 10m 每 1s、超 10m 每 5m 边界(同 footer;2026-08-01 起后台卡不再 2s)。
-   *  事件驱动的 scheduleBackgroundRefresh 仍负责详情 diff;本 tick 只补无 progress
-   *  事件时的时长变化。*/
-  private startBackgroundRefreshTick(): void {
-    if (this.backgroundRefreshTick) return
-    const schedule = (): void => {
-      if (this.migratingBackgroundCard || !this.backgroundCard || !cards.hasActiveBgTask(this.backgroundTasks)) return
-      const mode = liveElapsedMode()
-      const now = Date.now()
-      let minDelay = Infinity
-      for (const t of this.backgroundTasks) {
-        if (cards.isBgTerminal(t)) continue
-        const delay = liveElapsed(now - t.startedAt, mode).nextDelayMs
-        if (delay < minDelay) minDelay = delay
-      }
-      if (!isFinite(minDelay)) return
-      this.backgroundRefreshTick = setTimeout(() => {
-        this.refreshBackgroundCardFull()
-        schedule()
-      }, Math.max(1, Math.ceil(minDelay)))
-    }
-    schedule()
-  }
-
-  private stopBackgroundRefreshTick(): void {
-    if (this.backgroundRefreshTick) {
-      clearTimeout(this.backgroundRefreshTick)
-      this.backgroundRefreshTick = null
-    }
-  }
-
-  /** 节流刷新:合并 1.5s 窗口内的 task_progress 风暴,避免打爆 cardkit。
-   *  事件触发的刷新走 full(summary + detail diff);5s tick 只刷 summary。 */
   private scheduleBackgroundRefresh(): void {
-    if (!this.backgroundCard || this.settlingBackgroundCard || this.migratingBackgroundCard) return
     if (this.backgroundRefreshTimer) return
     this.backgroundRefreshTimer = setTimeout(() => {
       this.backgroundRefreshTimer = null
-      this.refreshBackgroundCardFull()
+      void this.refreshBackgroundCardFull().catch(error => this.reportBackgroundWriteFailure(error))
     }, 1500)
   }
 
-  /** 全量刷新:增量同步每任务的 panel。新任务 addElement panel;已有任务
-   *  replaceElement 整个 panel(header 状态/时长 + body 一起)。 */
-  private refreshBackgroundCardFull(): void {
-    if (this.migratingBackgroundCard) return
-    const handle = this.backgroundCard
-    if (!handle) return
-    const now = Date.now()
-    const mode = liveElapsedMode()
-    for (const t of this.backgroundTasks) {
-      if (!this.backgroundDetailAdded.has(t.id)) {
-        if (this.backgroundDetailAdding.has(t.id)) continue
-        this.backgroundDetailAdding.add(t.id)
-        void cardkit.addElementChecked(handle.cardId, cards.backgroundTaskPanel(t, now, mode))
-          .then(landed => {
-            if (landed) this.backgroundDetailAdded.add(t.id)
-            else log(`session "${this.sessionName}": background panel add MISS task=${t.id}`)
-          })
-          .finally(() => { this.backgroundDetailAdding.delete(t.id) })
-      } else {
-        void cardkit.replaceElement(handle.cardId, cards.BG_ELEMENTS.panel(t.id), cards.backgroundTaskPanel(t, now, mode))
-      }
-    }
-    // 同步聊天列表预览(config.summary) —— 建卡后任务增减 / 结算都要反映到预览,
-    // 否则 summary 永远停在首任务到达时的"1 进行中"。patchSummaryThrottled 自带节流。
-    cardkit.patchSummaryThrottled(handle.cardId, cards.backgroundLiveSummary(this.backgroundTasks))
-  }
-
-  /** kill / restart 时强制结算后台任务状态。SDK 子进程一死就不再发 task_settled,
-   *  活跃 entry 会永远卡 running,且 backgroundRefreshTick(setInterval 不归 SDK 管)
-   *  还在每 tick 把「🟡 运行中 Ns」时长往上推 —— 卡片永不沉降,伪造「还在跑」。
-   *  这里把活跃 entry 翻成 killed 终态,有活卡则沉降成历史墓碑(settleBackgroundCard
-   *  内部关 tick/timer + 渲染墓碑 + 清空数组),无卡只清内存。语义同 clearMultiMsgBuffer
-   *  / releaseAllReactions —— 属于「轮作废」清理,此前漏了这一层。 */
-  private async resetBackgroundTasks(): Promise<void> {
-    this.invalidateBackgroundOpen()
-    if (this.backgroundTasks.some(t => !cards.isBgTerminal(t))) {
-      const now = Date.now()
-      this.backgroundTasks = this.backgroundTasks.map(t =>
-        cards.isBgTerminal(t) ? t : { ...t, status: 'killed', endTime: t.endTime ?? now }
-      )
-    }
-    this.pendingBgTasks = []
-    if (this.backgroundCard) {
-      await this.settleBackgroundCard()
-    }
-    this.stopBackgroundRefreshTick()
-    if (this.backgroundRefreshTimer) {
-      clearTimeout(this.backgroundRefreshTimer)
-      this.backgroundRefreshTimer = null
-    }
-    this.backgroundTasks = []
-    this.backgroundDetailAdded.clear()
-    this.backgroundDetailAdding.clear()
-  }
-
-  /** 全部后台任务终态:活卡 updateCard 成历史快照(只终态墓碑),关 streaming,
-   *  dispose,清句柄。卡留在原地不再跟随。 */
-  private async settleBackgroundCard(): Promise<void> {
-    if (this.migratingBackgroundCard) {
-      try {
-        await this.migratingBackgroundCard
-      } catch (error) {
-        // stop/restart still owns the authoritative terminal cleanup. A failed
-        // migration must not poison that lifecycle; retry below against the
-        // retained handle and surface any final settle failure normally.
-        log(`session "${this.sessionName}": background migration failed before settle; retry terminal snapshot: ${messageOf(error)}`)
-      }
-    }
-    const handle = this.backgroundCard
-    if (!handle || this.settlingBackgroundCard) return
-    this.settlingBackgroundCard = true
-    // 历史快照用进入沉降那一刻的终态代:await 窗口内若有 followup 翻活,
-    // 可变 backgroundTasks 里的 entry 会变回 running,backgroundHistoryCard
-    // 会把它滤掉 —— 旧卡被定稿成「0 已结束」。快照定格后再进 await。
+  private refreshBackgroundCardFull(): Promise<void> {
+    const owner = this.backgroundOwner
     const snapshot = [...this.backgroundTasks]
-    if (this.backgroundRefreshTimer) {
-      clearTimeout(this.backgroundRefreshTimer)
-      this.backgroundRefreshTimer = null
-    }
-    this.stopBackgroundRefreshTick()
-    try {
-      await cardkit.flush(handle.cardId)
-      await feishu.updateCard(handle.messageId, cards.backgroundHistoryCard(snapshot))
-      cardkit.cancelSummary(handle.cardId)
-      const closed = await cardkit.patchSettingsChecked(handle.cardId, cards.streamingOffSettings({ suffix: '🧭 后台任务已结束' }))
-      if (!closed) throw new Error('background history streaming-off rejected')
-      await cardkit.dispose(handle.cardId)
-      if (this.backgroundCard === handle) this.backgroundCard = null
-      // 终态 entry 已固化在历史卡,从跟踪移除。沉降 await 窗口内若有 followup 翻活
-      // (running 重新入池)或新 spawn 进来,它们的 entry 是非终态 —— 保留,由
-      // onBackgroundTaskChanged 重新开活卡;一刀清空会吃掉复活任务的状态。
-      // pending 观察池不动:前台 task 可能仍在跑,它们结算时自己从 pending 丢。
-      this.backgroundTasks = this.backgroundTasks.filter(t => !cards.isBgTerminal(t))
-      this.backgroundDetailAdded.clear()
-      this.backgroundDetailAdding.clear()
-      log(`session "${this.sessionName}": background card settled cardId=${handle.cardId.slice(0, 12)} remaining=${this.backgroundTasks.length}`)
-    } finally {
-      this.settlingBackgroundCard = false
-      if (this.backgroundCard === handle && cards.hasActiveBgTask(this.backgroundTasks)) {
-        this.startBackgroundRefreshTick()
-        this.scheduleBackgroundRefresh()
-      }
-    }
-    if (this.backgroundTasks.length > 0) this.onBackgroundTaskChanged()
-  }
-
-  /** 游标迁移:发新主卡前调用。旧后台卡沉降 —— 有终态任务则成历史墓碑
-   *  (backgroundHistoryCard),全活跃无终态则留固定标识(backgroundMigratedMarker)。
-   *  终态任务从 backgroundTasks 移除(已固化在旧卡),活跃任务保留待新卡重建。 */
-  private migrateBackgroundCard(): Promise<void> {
-    if (this.migratingBackgroundCard) return this.migratingBackgroundCard
-    const handle = this.backgroundCard
-    if (!handle) return Promise.resolve()
-    const operation = this.performBackgroundCardMigration(handle)
+    const operation = this.agentCards.syncBackground(this.chatId, owner, snapshot)
     let guarded!: Promise<void>
-    guarded = operation.finally(() => {
-      if (this.migratingBackgroundCard === guarded) this.migratingBackgroundCard = null
+    guarded = operation.then(() => { this.backgroundWriteError = null }).finally(() => {
+      if (this.backgroundSync === guarded) this.backgroundSync = null
     })
-    this.migratingBackgroundCard = guarded
+    this.backgroundSync = guarded
     return guarded
   }
 
-  private async performBackgroundCardMigration(handle: { messageId: string; cardId: string }): Promise<void> {
-    if (this.backgroundCard !== handle) return
-    if (this.backgroundRefreshTimer) {
-      clearTimeout(this.backgroundRefreshTimer)
-      this.backgroundRefreshTimer = null
+  private async reportBackgroundWriteFailure(error: unknown): Promise<void> {
+    const detail = messageOf(error)
+    log(`session "${this.sessionName}": delegation panel update failed: ${detail}`)
+    if (this.backgroundWriteError === detail) return
+    this.backgroundWriteError = detail
+    await feishu.sendTextRaw(this.chatId, `⚠️ 委派面板更新失败：${detail}`)
+  }
+
+  /** Drain admitted writes and settle only this process's rows. The shared card
+   * stays streaming while other delegated work is still running. */
+  private async resetBackgroundTasks(): Promise<void> {
+    if (this.backgroundRefreshTimer) clearTimeout(this.backgroundRefreshTimer)
+    this.backgroundRefreshTimer = null
+    const now = Date.now()
+    this.backgroundTasks = this.backgroundTasks.map(task => cards.isBgTerminal(task)
+      ? task : { ...task, status: 'killed', endTime: task.endTime ?? now })
+    this.pendingBgTasks = []
+    // A previous write may have failed, but terminal cleanup still attempts its
+    // own authoritative snapshot and propagates any final failure to stop().
+    if (this.backgroundSync) {
+      try { await this.backgroundSync }
+      catch (error) { log(`session "${this.sessionName}": retrying terminal delegation update after: ${messageOf(error)}`) }
     }
-    this.stopBackgroundRefreshTick()
-    await cardkit.flush(handle.cardId)
-    if (this.backgroundCard !== handle) return
-    // Snapshot after queued panel writes drain. task_* events that arrive after
-    // this point stay in the live store and are rebuilt on the next card; only
-    // terminal entries actually painted into this history snapshot are removed.
-    const snapshot = [...this.backgroundTasks]
-    const terminalIds = new Set(snapshot.filter(cards.isBgTerminal).map(task => task.id))
-    const terminalCount = terminalIds.size
-    if (terminalCount > 0) {
-      // 有终态:旧卡成历史快照(backgroundHistoryCard 内部只渲染终态)。
-      await feishu.updateCard(handle.messageId, cards.backgroundHistoryCard(snapshot))
-    } else {
-      // 全活跃无终态:留固定标识。
-      await feishu.updateCard(handle.messageId, cards.backgroundMigratedMarker())
-    }
-    cardkit.cancelSummary(handle.cardId)
-    const closed = await cardkit.patchSettingsChecked(handle.cardId, cards.streamingOffSettings({ suffix: '🧭 已迁移至新卡' }))
-    if (!closed) throw new Error('background migration streaming-off rejected')
-    await cardkit.dispose(handle.cardId)
-    if (this.backgroundCard === handle) this.backgroundCard = null
-    // 终态任务已固化在旧卡历史,从活跃跟踪移除;活跃任务保留(新卡重建时显示)。
-    this.backgroundTasks = this.backgroundTasks.filter(t =>
-      !terminalIds.has(t.id) || !cards.isBgTerminal(t)
-    )
-    this.backgroundDetailAdded.clear()
-    this.backgroundDetailAdding.clear()
-    log(`session "${this.sessionName}": background card migrated cardId=${handle.cardId.slice(0, 12)} terminal=${terminalCount} active=${this.backgroundTasks.length}`)
+    await this.refreshBackgroundCardFull()
+    if (this.backgroundRefreshTimer) clearTimeout(this.backgroundRefreshTimer)
+    this.backgroundRefreshTimer = null
+    this.agentCards.releaseBackground(this.backgroundOwner)
+    this.backgroundOwner = randomBytes(16).toString('hex')
+    this.backgroundTasks = []
+    this.nativeAgentTools.clear()
+    this.lastMainTaskToolUseId = null
   }
 
   /** Claude SDK Cron prompts are injected outside Lodestar's sendUserText
@@ -3627,8 +3346,7 @@ export class Session {
     // attachProc() and passes the already-incremented generation.
     if (wiredEpoch === undefined) {
       this.invalidateTurnOpen()
-      this.invalidateBackgroundOpen()
-    }
+      }
     const epoch = wiredEpoch ?? ++this.procEpoch
     if (wiredEpoch === undefined && this.proc !== p) this.proc = p
     const isCurrent = (): boolean => this.proc === p && this.procEpoch === epoch
@@ -3891,7 +3609,7 @@ export class Session {
     })
     on('assistant_text', ({ text, parentToolUseId }: { text: string; parentToolUseId: string | null }) => {
       // SDK/CLI 若转发子 Agent assistant 正文，会在 parentToolUseId 上标归属；
-      // 其工具已进后台卡，正文同样不得泄漏进主对话卡。后台任务的可见进度/
+      // 其工具已进委派面板，正文同样不得泄漏进主对话卡。后台任务的可见进度/
       // 终稿由 task_progress/task_notification 权威事件承载。
       if (parentToolUseId) return
       this.appendAssistant(text)
@@ -3908,7 +3626,7 @@ export class Session {
     })
     on('tool_use', ({ id, name, input, parentToolUseId }: { id: string; name: string; input: any; parentToolUseId: string | null }) => {
       // 子 agent 内的工具调用(parentToolUseId 非空)不上主卡 —— 只累积进对应后台
-      // task 的 steps[](后台卡展开可见)。与 codex 侧 isSubagentThread 分流同构:
+      // task 的 steps[](委派面板展开可见)。与 codex 侧 isSubagentThread 分流同构:
       // 主卡只承载主 agent,子 agent 过程不把主卡面板数刷爆。parentToolUseId 无
       // 归属 task(如 canUseTool 合成的 AskUserQuestion)不在此列,仍走主卡。
       if (parentToolUseId && this.bgTaskOwns(parentToolUseId)) {
@@ -3919,12 +3637,36 @@ export class Session {
         this.onBackgroundTaskChanged()
         return
       }
+      if (!parentToolUseId && (name === 'Task' || name === 'Agent'
+        || p.provider === 'dsh' && (name === 'subagent' || name === 'subagent_fork'))) {
+        const turn = this.currentTurn
+        if (turn) {
+          this.startWorkingFooter(turn)
+          this.finalizeCurrentAssistantSegment()
+          turn.openBatchI = null
+          turn.taskCreateI = null
+          turn.taskUpdateI = null
+        }
+        this.onMainThreadAdvance()
+        this.nativeAgentTools.set(id, { confirmed: false, input })
+        // Codex exposes each child separately through collab lifecycle events.
+        // Claude's native tool is itself the initial task until task_started
+        // supplies its SDK id. Both paths keep launch details off the main card.
+        if (p.provider === 'claude') {
+          this.lastMainTaskToolUseId = id
+          this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), {
+            task_id: id, tool_use_id: id, task_type: 'subagent',
+            description: input?.description || input?.name || '子 Agent',
+            prompt: input?.prompt, subagent_type: input?.subagent_type,
+          }))
+          this.onBackgroundTaskChanged(true)
+        }
+        return
+      }
       sessionTools.addTool(this, id, name, input)
       // 主线程发起新 tool_use = 主 agent 没在等 pending 里的 task → 它们是后台,提升入卡。
       // 前台 task 的 settled 先于主线程下一个 tool_use 到达,pending 已空,不会误提。
       if (!parentToolUseId) this.onMainThreadAdvance()
-      // 主线程 Task tool_use(触发子 agent):记 id 供 task_started 缺 tool_use_id 时兜底关联
-      if (!parentToolUseId && (name === 'Task' || name === 'Agent')) this.lastMainTaskToolUseId = id
     })
     on('tool_result', ({ tool_use_id, content, is_error, parentToolUseId, input }: any) => {
       // 子 agent 内的工具结果同 tool_use:只回填后台 task steps,不上主卡面板。
@@ -3934,6 +3676,32 @@ export class Session {
           parentToolUseId, tool_use_id, content, is_error,
         ))
         this.onBackgroundTaskChanged()
+        return
+      }
+      const nativeTool = !parentToolUseId && this.nativeAgentTools.get(tool_use_id)
+      if (nativeTool) {
+        this.nativeAgentTools.delete(tool_use_id)
+        if (this.lastMainTaskToolUseId === tool_use_id) this.lastMainTaskToolUseId = null
+        // A background launch receipt is not the child's result. Only an
+        // unbound synchronous invocation or a failed launch settles here.
+        if (is_error || p.provider === 'claude' && !nativeTool.confirmed && nativeTool.input?.run_in_background !== true) {
+          const output = typeof content === 'string' ? content : Array.isArray(content)
+            ? content.map((block: any) => typeof block?.text === 'string' ? block.text : JSON.stringify(block)).join('\n')
+            : JSON.stringify(content) ?? 'MISS'
+          let task = this.backgroundTasks.find(entry => entry.toolUseId === tool_use_id)
+          if (!task) {
+            this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), {
+              task_id: tool_use_id, tool_use_id, task_type: 'subagent',
+              description: nativeTool.input?.description || '子 Agent', prompt: nativeTool.input?.prompt,
+            }))
+            task = this.backgroundTasks.find(entry => entry.toolUseId === tool_use_id)!
+          }
+          this.applyBgStore(cards.applyBgTaskSettled(this.bgStore(), {
+            task_id: task.id, status: is_error ? 'failed' : 'completed', summary: output,
+          }))
+          this.onBackgroundTaskChanged(true)
+        }
+        sessionTools.startThinkingIfNoToolsRunning(this)
         return
       }
       sessionTools.completeTool(this, tool_use_id, content, is_error, input)
@@ -4024,10 +3792,12 @@ export class Session {
     on('bg_task_started', (e: BgTaskStartedEvent) => {
       // SDK 若没填 tool_use_id,用最近的主线程 Task tool_use id 兜底 —— 子 agent 消息
       //  的 parent_tool_use_id 等于它,据此才能把 steps 关联到 task。
-      const toolUseId = e.tool_use_id ?? this.lastMainTaskToolUseId ?? undefined
+      const toolUseId = e.tool_use_id ?? (p.provider === 'claude' ? this.lastMainTaskToolUseId : null) ?? undefined
+      const nativeTool = toolUseId ? this.nativeAgentTools.get(toolUseId) : undefined
+      if (nativeTool) nativeTool.confirmed = true
       log(`session "${this.sessionName}": bg_task_started task=${e.task_id} type=${e.task_type ?? '-'} subagent=${e.subagent_type ?? '-'} toolUseId=${toolUseId?.slice(0, 8) ?? '-'} desc=${(e.description ?? '').slice(0, 40)}`)
       this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), { ...e, tool_use_id: toolUseId }))
-      this.onBackgroundTaskChanged()
+      this.onBackgroundTaskChanged(true)
     })
     on('bg_task_progress', (e: BgTaskProgressEvent) => {
       this.applyBgStore(cards.applyBgTaskProgress(this.bgStore(), e))
@@ -4035,12 +3805,12 @@ export class Session {
     })
     on('bg_task_updated', (e: BgTaskUpdatedEvent) => {
       this.applyBgStore(cards.applyBgTaskUpdated(this.bgStore(), e))
-      this.onBackgroundTaskChanged()
+      this.onBackgroundTaskChanged(!!e.patch.status || e.patch.is_backgrounded === true)
     })
     on('bg_task_settled', (e: BgTaskSettledEvent) => {
       log(`session "${this.sessionName}": bg_task_settled task=${e.task_id} status=${e.status}`)
       this.applyBgStore(cards.applyBgTaskSettled(this.bgStore(), e))
-      this.onBackgroundTaskChanged()
+      this.onBackgroundTaskChanged(true)
       // turn 已收尾后才结算的任务:Claude SDK 会自发开一轮恢复轮合并结果,
       // 标记给下一个无用户批次的 init 开卡。Codex 的 collab 子 agent 结果由
       // 主 turn 内的 wait 收编,app-server 不会自发开轮 —— 不置位。
@@ -4049,7 +3819,7 @@ export class Session {
       }
     })
     on('subagent_step', (e: { thread_id: string; item_id: string; tool: string; phase: 'started' | 'completed'; brief: string }) => {
-      // Codex 子 agent 的过程步骤 → 后台卡 steps(主卡不承载,见 codex-process
+      // Codex 子 agent 的过程步骤 → 委派面板 steps(主卡不承载,见 codex-process
       // isSubagentThread 过滤)。未知 thread(先于 started 到达的极早期)丢弃。
       this.applyBgStore(cards.applySubagentStep(this.bgStore(), e.thread_id, e.item_id, e.tool, e.phase, e.brief))
       this.onBackgroundTaskChanged()
@@ -4342,19 +4112,6 @@ export class Session {
     await feishu.sendTextRaw(this.chatId, `⚠️ 已作废卡片未能正常关闭 (${detail})。`)
   }
 
-  /** A successful background migration sets a rebuild receipt that is normally
-   * consumed after the new main card lands. If that main card cannot be sent or
-   * converted, rebuild immediately so active/late-terminal tasks do not remain
-   * cardless until some unrelated future event. */
-  private rebuildBackgroundAfterTurnOpenFailure(): void {
-    if (!this.pendingRebuildBackgroundCard) return
-    this.pendingRebuildBackgroundCard = false
-    if (this.backgroundTasks.length === 0) return
-    void this.openBackgroundCard().catch(error => {
-      log(`session "${this.sessionName}": background rebuild after turn-open failure failed: ${messageOf(error)}`)
-    })
-  }
-
   private async openTurnCard(
     owner: TurnOpenOwner,
     userOpenId: string,
@@ -4365,19 +4122,6 @@ export class Session {
     // 任何 turn 开卡都消费掉 pending 的恢复轮标记 —— 若用户消息抢在恢复轮
     // init 前开了卡,SDK 会把结算通知并入该轮,标记留着只会误伤后续空 init。
     this.bgResumePending = false
-    // ── 后台游标卡迁移 ── 发新主卡前,先把旧后台卡沉降(终态墓碑/固定标识),
-    // 主卡落地后(currentTurn 赋值处)重建后台卡重回末尾。迁移失败不阻塞主卡。
-    if (this.backgroundCard && cards.hasActiveBgTask(this.backgroundTasks)) {
-      try {
-        await this.migrateBackgroundCard()
-        this.pendingRebuildBackgroundCard = true
-      } catch (e) {
-        log(`session "${this.sessionName}": background migrate failed (non-blocking): ${e}`)
-        this.startBackgroundRefreshTick()
-        this.scheduleBackgroundRefresh()
-      }
-    }
-    if (!this.ownsTurnOpen(owner)) return null
     const turn = ++this.turnCounter
     // Snapshot+clear pendingTurnInputs synchronously here so concurrent
     // pushes between snapshot and the await don't sneak into THIS turn's
@@ -4418,7 +4162,6 @@ export class Session {
           `❌ 创建对话卡片失败 (Feishu SDK 重试 3 次后仍连不上)。你这条消息尚未送给 ${this.backendLabel()},请稍后重发。`,
         )
       }
-      this.rebuildBackgroundAfterTurnOpenFailure()
       // currentTurn left null as the failure signal. Caller decides
       // whether to sendInterrupt: onUserMessage's eager-open path
       // hasn't fed SDK yet so doesn't need to; the init handler has
@@ -4435,7 +4178,6 @@ export class Session {
           `❌ 对话卡片初始化失败。你这条消息尚未送给 ${this.backendLabel()},请稍后重发。`,
         )
       }
-      if (this.ownsTurnOpen(owner)) this.rebuildBackgroundAfterTurnOpenFailure()
       return null
     }
     // Tell cardkit how many elements the initial body already has so
@@ -4514,15 +4256,6 @@ export class Session {
     if (orphan) {
       this.appendAssistant(orphan)
       this.finalizeCurrentAssistantSegment()
-    }
-    // 主卡落地 → 若刚迁移过旧后台卡且仍有活跃任务,重建后台卡重回末尾。
-    if (this.pendingRebuildBackgroundCard) {
-      this.pendingRebuildBackgroundCard = false
-      if (this.backgroundTasks.length > 0) {
-        void this.openBackgroundCard().catch(e => {
-          log(`session "${this.sessionName}": background rebuild failed: ${messageOf(e)}`)
-        })
-      }
     }
     return turnState
   }

@@ -83,11 +83,17 @@ export function agentRunElementId(runId: string): string {
 }
 
 export function agentCardSummary(runs: AgentRunSnapshot[]): string {
-  if (runs.length === 1) return agentRunSummary(runs[0]!)
-  const done = runs.filter(run => isTerminal(run.status)).length
-  const failed = runs.filter(run => run.status === 'failed').length
-  const waiting = runs.filter(run => run.status === 'needs_input').length
-  return `🧠 委派任务 · 已结束 ${done}/${runs.length}${failed ? ` · 失败 ${failed}` : ''}${waiting ? ` · 待答 ${waiting}` : ''}`
+  return delegationCardSummary(runs.map(run => ({
+    summary: agentRunSummary(run), status: run.status, terminal: isTerminal(run.status),
+  })))
+}
+
+export function delegationCardSummary(tasks: Array<{ summary: string; status: string; terminal: boolean }>): string {
+  if (tasks.length === 1) return tasks[0]!.summary
+  const done = tasks.filter(task => task.terminal).length
+  const failed = tasks.filter(task => task.status === 'failed').length
+  const waiting = tasks.filter(task => task.status === 'needs_input' || task.status === 'paused').length
+  return `🧠 委派任务 · 已结束 ${done}/${tasks.length}${failed ? ` · 失败 ${failed}` : ''}${waiting ? ` · 待处理 ${waiting}` : ''}`
 }
 
 export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars = WORKER_MAX_PREVIEW_CHARS) {

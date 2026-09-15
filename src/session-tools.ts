@@ -335,9 +335,9 @@ function completeTaskTool(s: Session, meta: { i: number; name: string }, taskNam
   startThinkingIfNoToolsRunning(s)
 }
 
-function startThinkingIfNoToolsRunning(s: Session): void {
+export function startThinkingIfNoToolsRunning(s: Session): void {
   const turn = s.currentTurn
-  if (!turn) return
+  if (!turn || s.hasPendingAgentTool()) return
   for (const tool of turn.toolByUseId.values()) {
     if (tool.output == null) return
   }

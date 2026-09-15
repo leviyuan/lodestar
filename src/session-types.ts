@@ -180,6 +180,8 @@ export interface TurnState {
 export type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
 
 export interface SessionOpts {
+  /** Shared with AgentService so native children and background jobs use the same cards. */
+  agentCards?: import('./agent-cards').AgentCards
   /** Daemon hook: persist its current alive-session snapshot whenever this
    * session starts, stops, exits, or changes process lifecycle. Scripts
    * that construct Session directly can omit it. */

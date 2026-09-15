@@ -255,6 +255,7 @@ const tempSessionRuntime = createTempSessionRuntime<Session>({
   registry: sessions,
   createSession: (sessionName, chatId) => {
     const session = new Session(sessionName, chatId, {
+      agentCards: agentService.presentation,
       onLifecycleChange: writeCurrentAliveMarker,
       onCreateTempSession: createTempSession,
       onDisbandTempSession: disbandTempSession,

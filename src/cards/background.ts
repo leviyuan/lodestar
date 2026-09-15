@@ -1,39 +1,6 @@
-/**
- * 后台任务 / 子 agent 的状态累积 + 游标卡渲染。
- *
- * 与 cards/task-board.ts 的区别:task-board 是 TaskCreate/Update/List 工具
- * (用户任务板)的累积,渲染成 turn 卡内的常驻元素(element_id task_board_live);
- * 本模块是 SDK task_* 消息族(子 agent / 后台 bash / MCP / workflow 的后台
- * 执行)的累积,渲染成一张独立的「后台游标卡」——吸附在对话末尾,被新消息
- * 超越时沉降为历史快照(updateCard),只在全部终态时固化留在原地。
- *
- * 卡片结构(每任务合一个 panel —— 标题写状态+时长,展开看详情):
- *   ┌ config.summary: "🧭 后台任务 · N 进行中·M 已结束"   ← 聊天列表预览
- *   │ [bg_<id> collapsible_panel]                          ← 每任务一个 panel
- *   │   header: "🟢 Explore · 搜索 — 🟡 运行中 47s"        ← 状态+时长 标题
- *   │   └ [bg_body_<id>] 耗时/用量/任务/执行过程(steps)
- *   │ ...
- *
- * 状态机由 session 驱动(事件来自 claude-agent-process.handleSystemMessage):
- *   task_started      → applyBgTaskStarted  (workflow/monitor 白名单直入 active;
- *                                            其余前台 task 进 pending 观察池)
- *   task_progress     → applyBgTaskProgress (刷 usage / last_tool / summary)
- *   task_updated      → applyBgTaskUpdated  (is_backgrounded:true 时 pending→active
- *                                            提升;其余 patch 原地改)
- *   主线程推进         → promotePendingOnAdvance (主 agent 继续发起 tool_use / 说新段 =
- *                            没在等 pending task → 全部提升入 active。run_in_background
- *                            的 Bash 靠它入卡 —— SDK 不给它发 is_backgrounded)
- *   task_notification → applyBgTaskSettled  (active 结算成墓碑;pending 前台 task 直接丢)
- * 子 agent 逐步工具调用(tool_use/tool_result 带 parent_tool_use_id)归属到对应
- * task,累积成 steps[](trim 到最近 ~1000 字)。
- *
- * 前台/后台区分靠控制流事实:主线程(tool_use / assistant)在某 task 未结算前继续
- * 推进了,该 task 就是后台(没在阻塞主线程);阻塞等待的就是前台。SDK 的
- * is_backgrounded 信号只覆盖显式后台化(Ctrl+B / background_tasks / background:
- * 子 agent),run_in_background 的 Bash 不发 —— 故 task_started 先落 pending 观察
- * 池,由「主线程推进」或「is_backgrounded:true」任一提升入 active 建卡。前台 task
- * 的 settled 先于主线程下一个动作到达,pending 已空,推进判定不会误提。workflow/
- * monitor 是天生后台执行模型,白名单直入 active。
+/** Native task state and compact rows for the shared delegation card.
+ * Children are visible on start; ordinary foreground commands stay in pending
+ * until the backend marks them backgrounded or the main thread advances.
  */
 
 import type {
@@ -55,6 +22,8 @@ export type BgTaskType = 'subagent' | 'shell' | 'monitor' | 'workflow' | 'unknow
 /** 一条后台任务的累积视图,session 以 task_id 为 key 维护一份数组。 */
 export interface BgTaskEntry {
   id: string
+  /** Stable presentation identity, retained when the SDK supplies its task/tool ids. */
+  displayId?: string
   toolUseId?: string
   type: BgTaskType
   description: string
@@ -87,8 +56,8 @@ export interface BgTaskStep {
 
 /** 后台任务累积库 —— 双池结构,session 以此为单一可变状态。
  *  - active:已确认后台(workflow/monitor 白名单,或收到 is_backgrounded:true 提升),
- *    驱动游标卡渲染。
- *  - pending:观察池。task_started 进来但还没后台化的前台 task(Bash 命令/前台子 agent),
+ *    驱动共享委派卡的任务行。
+ *  - pending:观察池。尚未确认后台化的普通命令,
  *    不渲染;等 task_updated.is_backgrounded=true 提升到 active,或 task_settled 时丢弃。 */
 export interface BgStore {
   active: BgTaskEntry[]
@@ -100,8 +69,8 @@ export function emptyBgStore(): BgStore {
   return { active: [], pending: [] }
 }
 
-/** 后台卡内部 element_id:每任务一个 panel(bg_<hash>),其 body 是 bg_body_<hash>。
- *  刷新任务时 replaceElement 整个 panel(header 状态/时长 + body 一起)。
+/** 委派卡后台任务行 element_id:每任务一个 panel(bg_<hash>),其 body 是 bg_body_<hash>。
+ *  刷新任务时 replaceElement 整个 panel。
  *  飞书 element_id 规则(300315 报错原文):字母开头、只能字母数字下划线、
  *  ≤20 字符。Claude 的 task id(bw0ez19dm)天然满足;Codex 的 agentThreadId 是
  *  36 字符带 '-' 的 UUID —— 直接拼既含非法字符又超长,sanitize 连字符后仍 39+
@@ -127,7 +96,7 @@ export const BG_ELEMENTS = {
 function normalizeType(taskType?: string, subagentType?: string): BgTaskType {
   // SDK 实测 task_type 带 local_ 前缀:local_agent / local_bash / local_workflow。
   const t = taskType ?? ''
-  if (t === 'subagent' || t === 'local_agent') return 'subagent'
+  if (t === 'agent' || t === 'subagent' || t === 'local_agent') return 'subagent'
   if (t === 'shell' || t === 'local_bash' || t === 'local_shell') return 'shell'
   if (t === 'monitor' || t === 'local_monitor') return 'monitor'
   if (t === 'workflow' || t === 'local_workflow') return 'workflow'
@@ -136,8 +105,7 @@ function normalizeType(taskType?: string, subagentType?: string): BgTaskType {
 }
 
 /** 天生后台的 task_type:workflow / monitor 在 SDK 里是 fire-and-forget 后台执行
- *  模型,task_started 即可入 active;subagent / shell / unknown 默认前台,先进
- *  pending 观察池,等 is_backgrounded:true 才提升。 */
+ *  模型。子 Agent 无论前台还是后台都展示；普通命令先进入 pending 观察池。 */
 function isInherentlyBackground(type: BgTaskType): boolean {
   return type === 'workflow' || type === 'monitor'
 }
@@ -147,7 +115,7 @@ export function isBgTerminal(t: BgTaskEntry): boolean {
   return t.status === 'completed' || t.status === 'failed' || t.status === 'killed'
 }
 
-/** 是否还有活跃任务(决定游标卡要不要继续跟随 / 重建)。 */
+/** 是否还有活跃任务。 */
 export function hasActiveBgTask(tasks: BgTaskEntry[]): boolean {
   return tasks.some(t => !isBgTerminal(t))
 }
@@ -160,27 +128,41 @@ export function applyBgTaskStarted(
   now: number = Date.now(),
 ): BgStore {
   const type = normalizeType(e.task_type, e.subagent_type)
-  const inActive = store.active.some(t => t.id === e.task_id)
-  const inPending = store.pending.some(t => t.id === e.task_id)
-  // 已知 task:补全字段,留在原池(不跨池迁移;提升只由 applyBgTaskUpdated 做)。
+  // A native Agent/Task tool can precede the SDK's task id. Its tool_use_id
+  // keeps that same panel and accumulated steps when the real id arrives.
+  const matches = (t: BgTaskEntry): boolean => t.id === e.task_id
+    || !!e.tool_use_id && t.toolUseId === e.tool_use_id
+  const inActive = store.active.some(matches)
+  const inPending = store.pending.some(matches)
+  // 已知 task 补全字段；新确认的子 Agent 直接展示。
   if (inActive || inPending) {
     const patchField = (t: BgTaskEntry): BgTaskEntry => ({
       ...t,
-      type,
+      ...(isBgTerminal(t) ? {
+        status: 'running' as const, startedAt: now, endTime: undefined,
+        summary: undefined, error: undefined, usage: undefined, steps: [],
+      } : {}),
+      id: e.task_id,
+      type: type === 'unknown' ? t.type : type,
       toolUseId: e.tool_use_id ?? t.toolUseId,
       description: e.description || t.description,
       subagentType: e.subagent_type ?? t.subagentType,
       workflowName: e.workflow_name ?? t.workflowName,
       prompt: e.prompt ?? t.prompt,
     })
+    if (inPending && type === 'subagent') return {
+      active: [...store.active, ...store.pending.filter(matches).map(patchField)],
+      pending: store.pending.filter(t => !matches(t)),
+    }
     return {
-      active: inActive ? store.active.map(t => t.id === e.task_id ? patchField(t) : t) : store.active,
-      pending: inPending ? store.pending.map(t => t.id === e.task_id ? patchField(t) : t) : store.pending,
+      active: inActive ? store.active.map(t => matches(t) ? patchField(t) : t) : store.active,
+      pending: inPending ? store.pending.map(t => matches(t) ? patchField(t) : t) : store.pending,
     }
   }
-  // 新 task:workflow/monitor 白名单天生后台 → 直入 active;其余前台 → pending 观察池。
+  // 子 Agent、workflow、monitor 直接展示；普通前台命令先观察。
   const entry: BgTaskEntry = {
     id: e.task_id,
+    displayId: e.tool_use_id ?? e.task_id,
     toolUseId: e.tool_use_id,
     type,
     description: e.description,
@@ -192,7 +174,7 @@ export function applyBgTaskStarted(
     steps: [],
     ...(isInherentlyBackground(type) ? { isBackgrounded: true } : {}),
   }
-  return isInherentlyBackground(type)
+  return type === 'subagent' || isInherentlyBackground(type)
     ? { active: [...store.active, entry], pending: store.pending }
     : { active: store.active, pending: [...store.pending, entry] }
 }
@@ -280,7 +262,7 @@ export function applyBgTaskSettled(
     : e.status === 'failed' ? 'failed'
     : 'killed'
   // 前台 task 结算,从未后台化 —— 不进卡,直接从观察池丢。这是治「随便跑个命令就
-  // 冒一项」的关键:前台 Bash/子 agent 从 pending 沉掉,不进 active 不渲染。
+  // 冒一项」的关键:前台命令从 pending 移除,不进 active 不渲染。
   if (store.pending.some(t => t.id === e.task_id)) {
     return { active: store.active, pending: store.pending.filter(t => t.id !== e.task_id) }
   }
@@ -343,8 +325,7 @@ function briefResult(content: unknown, isError: boolean): string {
 
 /** tool_use 到达:parent_tool_use_id 匹配的 task 追加一步(无结果)。主线程工具
  *  (parentToolUseId 为 null/undefined)或无归属 task 跳过 —— 返回原 store 引用。
- *  同时在 active 和 pending 累积:前台子 agent 跑时 steps 暂存 pending,
- *  is_backgrounded 提升后 entry 自带 steps 带到 active。 */
+ *  两池同时按归属累积；子 Agent 在 active，观察池中的任务提升时保留 steps。 */
 export function applyBgToolUse(
   store: BgStore,
   parentToolUseId: string | null | undefined,
@@ -430,17 +411,9 @@ export function applyBgToolResult(
 
 // ── 渲染 ─────────────────────────────────────────────────────────────
 
-const TYPE_ICON: Record<BgTaskType, string> = {
-  subagent: '🟢',
-  shell: '⚙️',
-  monitor: '📡',
-  workflow: '🔁',
-  unknown: '🔹',
-}
-
 const TYPE_LABEL: Record<BgTaskType, string> = {
-  subagent: '子agent',
-  shell: 'shell',
+  subagent: '子 Agent',
+  shell: '后台命令',
   monitor: '监控',
   workflow: '工作流',
   unknown: '任务',
@@ -454,12 +427,12 @@ const FOOTER_BUCKETS = [
   { limit: 600_000, label: '<10m' },
 ]
 
-/** 活跃 footer / 后台卡 header 的耗时展示模式。
+/** 活跃 footer / 后台任务详情 的耗时展示模式。
  *  - `bucket`: 粗档位 (`<30s`/`<1m`/…)，只在档位边界 push（默认，省飞书配额）
  *  - `second`: 按时长选择单位并每秒 push;超 10m 后改 5m 档位(见 liveElapsed) */
 export type LiveElapsedMode = 'bucket' | 'second'
 
-/** second 模式下 footer / 后台卡前 10m 都按 1s tick(对齐旧 FOOTER_STATUS_TICK_MS)。 */
+/** second 模式下 footer 前 10m 按 1s tick(对齐旧 FOOTER_STATUS_TICK_MS)。 */
 export const LIVE_ELAPSED_SECOND_FOOTER_TICK_MS = 1000
 
 /** second 模式超 10m 后切粗档位,治「等用户答 AskUserQuestion 时 footer 无限按秒计到
@@ -469,7 +442,7 @@ const SECOND_BUCKET_BASE_MS = 600_000
 const SECOND_BUCKET_STEP_MS = 300_000
 
 /** 相对时长档位:<30s / <1m / <3m / <5m / <10m,超过 10m 后每 10 分钟一档(10m+、20m+…)。
- *  返回当前档位标签 + 到下一档位边界的毫秒数。footer / 后台任务 header 用粗粒度档位
+ *  返回当前档位标签 + 到下一档位边界的毫秒数。footer / 后台任务详情 用粗粒度档位
  *  代替秒数;满 1h 后用小时。更新只发生在档位边界,不是每秒 tick。*/
 export function elapsedBucket(elapsedMs: number): { label: string; nextDelayMs: number } {
   const ms = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs) : 0
@@ -483,7 +456,7 @@ export function elapsedBucket(elapsedMs: number): { label: string; nextDelayMs: 
 }
 
 /**
- * Live elapsed for footer / background headers.
+ * Live elapsed for main conversation footers.
  * `bucket` → coarse label + delay to next boundary;
  * `second` → single-unit label + 1s delay for the first 10m, then 5m buckets.
  */
@@ -517,124 +490,45 @@ function terminalElapsed(t: BgTaskEntry): number {
   return 0
 }
 
-/** 标题里的状态+时长标签(折叠时常驻可见)。
- *  活跃态按 liveElapsedMode 显示档位或耗时;终态使用实际耗时。 */
-function statusLabel(
-  t: BgTaskEntry,
-  now: number,
-  liveElapsedMode: LiveElapsedMode = 'bucket',
-): string {
-  const liveLabel = (elapsedMs: number): string =>
-    liveElapsed(elapsedMs, liveElapsedMode).label
-  switch (t.status) {
-    case 'running': return `🟡 运行中 (${liveLabel(now - t.startedAt)})`
-    case 'paused': return `⏸️ 已暂停 (${liveLabel(now - t.startedAt)})`
-    case 'pending': return `⚪ 等待中`
-    case 'completed': return `✅ 用时 ${formatDuration(terminalElapsed(t) / 1000)}`
-    case 'failed': return `❌ 失败 ${formatDuration(terminalElapsed(t) / 1000)}`
-    case 'killed': return `💀 已终止 ${formatDuration(terminalElapsed(t) / 1000)}`
-  }
-}
-
-/** header 摘要:N 进行中(· M 已结束)。聊天列表预览(config.summary)用。 */
-export function summarizeBackground(tasks: BgTaskEntry[]): string {
-  const active = tasks.filter(t => !isBgTerminal(t)).length
-  const terminal = tasks.length - active
-  if (active > 0) return `${active} 进行中${terminal ? ` · ${terminal} 已结束` : ''}`
-  return terminal ? `${terminal} 已结束` : '空'
-}
-
-/** 聊天列表预览全文(🧭 前缀 + 计数)。活卡建卡(sendCard)与增量刷新(patchSummary)
- *  共用此函数 —— 否则建卡后 summary 永远停在首任务到达时的"1 进行中",后续任务
- *  增减 / 结算都不再反映到预览。 */
-export function backgroundLiveSummary(tasks: BgTaskEntry[]): string {
-  return `🧭 后台任务 · ${summarizeBackground(tasks)}`
-}
-
-/** 详情 body —— 精简:仅 error(异常一行) + steps(执行过程,每步一行)。
- *  用量/摘要/prompt 等元信息不入 body(header 状态行已够,后面占行越少越好)。 */
 function renderDetailBody(t: BgTaskEntry): string {
-  const lines: string[] = []
+  const lines: string[] = [
+    `**${TYPE_LABEL[t.type]}**${ownerOf(t) !== TYPE_LABEL[t.type] ? ` · ${ownerOf(t)}` : ''}${isBgTerminal(t) ? ` · 用时 ${formatDuration(terminalElapsed(t) / 1000)}` : ''}`,
+    t.description || '说明 MISS',
+  ]
   if (t.error) lines.push(`⚠ ${t.error}`)
   // 终态摘要(子 agent 最终答复 / Claude task summary)置顶:墓碑展开第一眼
   // 是结果,不是过程。有界预览,steps 仍然完整跟在后面。
-  if (isBgTerminal(t) && t.summary) lines.push(`📝 ${t.summary.slice(0, 400)}`, '')
-  for (let i = 0; i < t.steps.length; i++) {
-    lines.push(`${i + 1}. ${t.steps[i].brief}`)
+  if (t.summary) lines.push('', `**${isBgTerminal(t) ? '结果' : '进度'}**`, preview(t.summary, 8000))
+  if (t.prompt) lines.push('', '**任务说明**', preview(t.prompt, 2000))
+  if (t.steps.length) {
+    lines.push('', '**最近动作**')
+    for (const step of t.steps.slice(-3)) lines.push(`- ${step.brief}`)
+  } else if (t.lastToolName) {
+    lines.push('', `最近动作：${t.lastToolName}`)
   }
-  return sanitizeMarkdownForCardKit(lines.length > 0 ? lines.join('\n') : '_(暂无执行记录)_')
+  return sanitizeMarkdownForCardKit(lines.join('\n'))
 }
 
-/** 单任务的整 panel —— 标题写「图标 责任人·描述 — 状态·时长」,展开看详情 body。
- *  session 据此 addElement(新任务)/replaceElement(刷新,整个 panel)。
- *  liveElapsedMode 只影响活跃态 header 时长文案;终态仍用实际耗时。 */
-export function backgroundTaskPanel(
-  t: BgTaskEntry,
-  now: number = Date.now(),
-  liveElapsedMode: LiveElapsedMode = 'bucket',
-): object {
+function preview(text: string, limit: number): string {
+  return text.length <= limit ? text : `${text.slice(0, limit)}\n_这里只显示预览。_`
+}
+
+export function backgroundTaskSummary(t: BgTaskEntry): string {
+  const status = {
+    running: '⏳ 正在执行', pending: '⏳ 等待执行', paused: '⏸️ 已暂停',
+    completed: '✅ 委派完成', failed: '❌ 委派失败', killed: '🛑 委派已终止',
+  }[t.status]
+  const description = t.description.replace(/\s+/g, ' ').trim() || '说明 MISS'
+  return `${status} · ${description.length <= 40 ? description : `${description.slice(0, 39)}…`}`
+}
+
+/** 与委派 run 一致：一行状态与说明，类型、耗时、结果和最近动作折叠在内。 */
+export function backgroundTaskPanel(t: BgTaskEntry): object {
   return {
     tag: 'collapsible_panel',
     element_id: BG_ELEMENTS.panel(t.id),
-    header: { title: { tag: 'plain_text', content: `${TYPE_ICON[t.type]} ${ownerOf(t)} · ${t.description || '(无描述)'} — ${statusLabel(t, now, liveElapsedMode)}` } },
+    header: { title: { tag: 'plain_text', content: backgroundTaskSummary(t) } },
     expanded: false,
     elements: [{ tag: 'markdown', element_id: BG_ELEMENTS.body(t.id), content: renderDetailBody(t) }],
-  }
-}
-
-/** 活卡整张 JSON —— 首个后台任务到来时 sendCard 用。streaming 开。
- *  初始 body = 每任务一个 panel。 */
-export function backgroundLiveCard(
-  tasks: BgTaskEntry[],
-  now: number = Date.now(),
-  liveElapsedMode: LiveElapsedMode = 'bucket',
-): object {
-  return {
-    schema: '2.0',
-    config: {
-      streaming_mode: true,
-      summary: { content: backgroundLiveSummary(tasks) },
-    },
-    body: {
-      elements: tasks.map(t => backgroundTaskPanel(t, now, liveElapsedMode)),
-    },
-  }
-}
-
-/** 历史沉降卡 —— 用户发新消息且仍有活跃任务时,把旧卡 updateCard 成这个。
- *  只渲染终态任务,streaming 关。留在原地不再跟随。 */
-export function backgroundHistoryCard(
-  tasks: BgTaskEntry[],
-  now: number = Date.now(),
-  liveElapsedMode: LiveElapsedMode = 'bucket',
-): object {
-  const terminal = tasks.filter(isBgTerminal)
-  return {
-    schema: '2.0',
-    config: {
-      streaming_mode: false,
-      summary: { content: `🧭 后台任务(历史) · ${terminal.length} 已结束` },
-    },
-    body: {
-      elements: terminal.map(t => backgroundTaskPanel(t, now, liveElapsedMode)),
-    },
-  }
-}
-
-/** 固定标识卡 —— 旧卡撤销时若全部仍在跑(无终态),updateCard 成这个占位。 */
-export function backgroundMigratedMarker(): object {
-  return {
-    schema: '2.0',
-    config: {
-      streaming_mode: false,
-      summary: { content: '↪ 后台任务进行中' },
-    },
-    body: {
-      elements: [{
-        tag: 'markdown',
-        element_id: 'bg_marker',
-        content: '↪ 本轮后台任务仍在进行，进度已迁至最新卡片',
-      }],
-    },
   }
 }

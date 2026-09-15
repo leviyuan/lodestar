@@ -1,6 +1,7 @@
 import * as cards from './cards'
 import { isCardCapacityFailure, type CardWriteResult } from './cardkit'
 import type { AgentRunSnapshot } from './agent-run-types'
+import type { BgTaskEntry } from './cards/background'
 import { withChatMessageOrder } from './chat-message-order'
 
 // Each row has one panel and one Markdown body. Leave room below the
@@ -25,28 +26,95 @@ interface CardGroup {
   cardId: string
   messageId: string
   chatId: string
-  runs: Map<string, AgentRunSnapshot>
+  rows: Map<string, TaskRow>
   settled: Set<string>
   sealed: boolean
   settingsJson?: string
 }
 
-/** A run owns a row; a group owns Card Kit streaming and disposal. */
+interface TaskRow {
+  key: string
+  chatId: string
+  elementId: string
+  element: object
+  summary: string
+  status: string
+  terminal: boolean
+  attach?: (messageId: string) => void
+}
+
+/** All delegated work shares placement, capacity and streaming ownership. */
 export class AgentCards {
   private readonly tails = new Map<string, CardGroup>()
-  private readonly byRun = new Map<string, CardGroup>()
+  private readonly byTask = new Map<string, CardGroup>()
+  private readonly background = new Map<string, Map<string, { task: BgTaskEntry; version: number; pendingSettings?: boolean }>>()
 
   constructor(private readonly deps: AgentCardsDeps) {}
 
   add(run: AgentRunSnapshot): Promise<void> {
-    return withChatMessageOrder(run.chatId, async () => {
-      const group = this.tails.get(run.chatId)
+    return this.addRow(runRow(run))
+  }
+
+  update(run: AgentRunSnapshot, terminal = false): Promise<void> {
+    return this.updateRow(runRow(run), terminal)
+  }
+
+  /** Snapshots are immutable. Unchanged entries do not produce Card Kit writes.
+   * Native follow-ups get a fresh row; late terminal corrections update the old row. */
+  syncBackground(chatId: string, owner: string, tasks: BgTaskEntry[]): Promise<void> {
+    return withChatMessageOrder(chatId, async () => {
+      let entries = this.background.get(owner)
+      if (!entries) this.background.set(owner, entries = new Map())
+      const errors: unknown[] = []
+      for (const task of tasks) {
+        const id = task.displayId ?? task.toolUseId ?? task.id
+        const previous = entries.get(id)
+        if (previous?.task === task && !previous.pendingSettings) continue
+        const restarted = previous && cards.isBgTerminal(previous.task) && !cards.isBgTerminal(task)
+        const version = (previous?.version ?? 0) + (restarted ? 1 : 0)
+        const key = `background:${owner}:${id}:${version}`
+        const row: TaskRow = {
+          key, chatId, elementId: cards.BG_ELEMENTS.panel(key),
+          element: cards.backgroundTaskPanel({ ...task, id: key }),
+          summary: cards.backgroundTaskSummary(task), status: task.status, terminal: cards.isBgTerminal(task),
+        }
+        try {
+          if (!previous || restarted) await this.addRow(row)
+          else await this.updateRow(row, row.terminal, true)
+          entries.set(id, { task, version })
+        } catch (error) {
+          // The row may have landed even when settings failed. Preserve that
+          // terminal boundary so a native follow-up gets its own row, while
+          // keeping the failed settings eligible for retry.
+          if (this.byTask.get(key)?.rows.get(key) === row) {
+            entries.set(id, { task, version, pendingSettings: true })
+          }
+          errors.push(error)
+        }
+      }
+      if (errors.length) throw new AggregateError(errors, errors.map(String).join('; '))
+    })
+  }
+
+  releaseBackground(owner: string): void {
+    this.background.delete(owner)
+  }
+
+  private addRow(row: TaskRow): Promise<void> {
+    return withChatMessageOrder(row.chatId, async () => {
+      // A successful append followed by a settings failure still owns its row.
+      const existing = this.byTask.get(row.key)
+      if (existing) {
+        await this.updateRow(row, row.terminal, true)
+        return
+      }
+      const group = this.tails.get(row.chatId)
       if (group) {
-        const atTail = await this.deps.getChatTailMessageId(run.chatId) === group.messageId
+        const atTail = await this.deps.getChatTailMessageId(row.chatId) === group.messageId
         if (atTail && this.deps.getElementCount(group.cardId) < CARD_ROW_SOFT_LIMIT) {
-          const result = await this.deps.addElementResult(group.cardId, cards.agentRunElement(run))
+          const result = await this.deps.addElementResult(group.cardId, row.element)
           if (result.landed) {
-            this.attach(group, run)
+            this.attach(group, row)
             // Appending to a completed card reopens the group for this run.
             await this.settings(group)
             return
@@ -55,44 +123,46 @@ export class AgentCards {
         }
         await this.seal(group)
       }
-      await this.create(run)
+      await this.create(row)
     })
   }
 
-  update(run: AgentRunSnapshot, terminal = false): Promise<void> {
-    return withChatMessageOrder(run.chatId, async () => {
-      let group = this.byRun.get(run.runId)
+  private updateRow(row: TaskRow, terminal = false, allowTerminalCorrection = false): Promise<void> {
+    return withChatMessageOrder(row.chatId, async () => {
+      let group = this.byTask.get(row.key)
       if (!group) return // Durable history / a disposed, settled card.
-      if (group.settled.has(run.runId)) {
+      if (group.settled.has(row.key) && !allowTerminalCorrection) {
         // A progress callback admitted before finalization must not reopen a
         // completed card; failed terminal settings may still be retried.
         if (terminal) await this.settings(group)
         return
       }
       const errors: string[] = []
-      const result = await this.deps.replaceElementResult(group.cardId, cards.agentRunElementId(run.runId), cards.agentRunElement(run))
+      const result = await this.deps.replaceElementResult(group.cardId, row.elementId, row.element)
       if (!result.landed) {
-        if (!isCapacity(result) || group.runs.size === 1) throw writeError('agent task row update', result)
+        if (!isCapacity(result) || group.rows.size === 1) throw writeError('agent task row update', result)
         // A later result can exhaust the shared card's byte capacity. Move only
         // this row, keeping every other running task attached to its own card.
         const old = group
-        await this.seal(old)
-        const tail = this.tails.get(run.chatId)
+        await this.seal(old, true)
+        const tail = this.tails.get(row.chatId)
         if (tail) await this.seal(tail)
-        group = await this.create(run)
+        group = await this.create(row)
         // Ownership transfers as soon as the new row exists. Even a failed
         // deletion must not leave a ghost task holding the old card open.
-        old.runs.delete(run.runId)
-        old.settled.delete(run.runId)
+        old.rows.delete(row.key)
+        old.settled.delete(row.key)
         try {
-          if (!await this.deps.deleteElementChecked(old.cardId, cards.agentRunElementId(run.runId))) {
+          if (!await this.deps.deleteElementChecked(old.cardId, row.elementId)) {
             throw new Error('agent moved task row deletion MISS; the previous card may still show its earlier state')
           }
         } catch (error) { errors.push(String(error)) }
         try { await this.settings(old) }
         catch (error) { errors.push(String(error)) }
       }
-      if (terminal) group.settled.add(run.runId)
+      group.rows.set(row.key, row)
+      if (terminal) group.settled.add(row.key)
+      else group.settled.delete(row.key)
       try { await this.settings(group) }
       catch (error) { errors.push(String(error)) }
       if (errors.length) throw new Error(errors.join('; '))
@@ -106,38 +176,43 @@ export class AgentCards {
     })
   }
 
-  private attach(group: CardGroup, run: AgentRunSnapshot): void {
-    group.runs.set(run.runId, run)
-    this.byRun.set(run.runId, group)
-    run.cardMessageId = group.messageId
+  private attach(group: CardGroup, row: TaskRow): void {
+    group.rows.set(row.key, row)
+    this.byTask.set(row.key, group)
+    if (row.terminal) group.settled.add(row.key)
+    row.attach?.(group.messageId)
   }
 
-  private async create(run: AgentRunSnapshot): Promise<CardGroup> {
-    const messageId = await this.deps.sendCard(run.chatId, cards.agentRunCard(run))
+  private async create(row: TaskRow): Promise<CardGroup> {
+    const messageId = await this.deps.sendCard(row.chatId, {
+      schema: '2.0',
+      config: { update_multi: true, streaming_mode: !row.terminal, summary: { content: row.summary } },
+      body: { elements: [row.element] },
+    })
     if (!messageId) throw new Error('agent card creation failed')
     const cardId = await this.deps.convertMessageToCard(messageId)
     this.deps.recordCardCreated(cardId, 1)
     const group: CardGroup = {
-      cardId, messageId, chatId: run.chatId, runs: new Map(), settled: new Set(), sealed: false,
+      cardId, messageId, chatId: row.chatId, rows: new Map(), settled: new Set(), sealed: false,
     }
-    this.attach(group, run)
-    this.tails.set(run.chatId, group)
+    this.attach(group, row)
+    this.tails.set(row.chatId, group)
     return group
   }
 
-  private async seal(group: CardGroup): Promise<void> {
+  private async seal(group: CardGroup, movingRow = false): Promise<void> {
     group.sealed = true
     if (this.tails.get(group.chatId) === group) this.tails.delete(group.chatId)
-    await this.settings(group)
+    await this.settings(group, !movingRow)
   }
 
-  private async settings(group: CardGroup): Promise<void> {
+  private async settings(group: CardGroup, allowDisposal = true): Promise<void> {
     this.deps.cancelSummary(group.cardId)
-    const complete = group.settled.size === group.runs.size
+    const complete = group.settled.size === group.rows.size
     const settings = {
       config: {
         streaming_mode: !complete,
-        summary: { content: cards.agentCardSummary([...group.runs.values()]) },
+        summary: { content: cards.delegationCardSummary([...group.rows.values()]) },
       },
     }
     const settingsJson = JSON.stringify(settings)
@@ -145,12 +220,21 @@ export class AgentCards {
       if (!await this.deps.patchSettingsChecked(group.cardId, settings)) throw new Error('agent card settings update MISS')
       group.settingsJson = settingsJson
     }
-    if (complete && group.sealed) {
+    if (complete && group.sealed && allowDisposal) {
       await this.deps.dispose(group.cardId)
-      for (const runId of group.runs.keys()) {
-        if (this.byRun.get(runId) === group) this.byRun.delete(runId)
+      for (const key of group.rows.keys()) {
+        if (this.byTask.get(key) === group) this.byTask.delete(key)
       }
     }
+  }
+}
+
+function runRow(run: AgentRunSnapshot): TaskRow {
+  return {
+    key: `run:${run.runId}`, chatId: run.chatId, elementId: cards.agentRunElementId(run.runId),
+    element: cards.agentRunElement(run), summary: cards.agentRunSummary(run), status: run.status,
+    terminal: run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled',
+    attach: messageId => { run.cardMessageId = messageId },
   }
 }
 

@@ -10,12 +10,7 @@ import {
   applyBgToolResult,
   isBgTerminal,
   hasActiveBgTask,
-  summarizeBackground,
-  backgroundLiveSummary,
   backgroundTaskPanel,
-  backgroundLiveCard,
-  backgroundHistoryCard,
-  backgroundMigratedMarker,
   emptyBgStore,
   BG_ELEMENTS,
   elapsedBucket,
@@ -107,15 +102,43 @@ describe('applyBgTaskStarted — 白名单直入 active / 前台落 pending', ()
     expect(s.pending[0].isBackgrounded).toBeUndefined()
   })
 
-  test('前台子 agent 进 pending', () => {
+  test('前台子 Agent 直接展示', () => {
     const s = applyBgTaskStarted(emptyBgStore(), { task_id: 'a1', description: '搜索', subagent_type: 'Explore' })
-    expect(s.active).toHaveLength(0)
-    expect(s.pending[0]).toMatchObject({ id: 'a1', type: 'subagent', subagentType: 'Explore' })
+    expect(s.pending).toHaveLength(0)
+    expect(s.active[0]).toMatchObject({ id: 'a1', type: 'subagent', subagentType: 'Explore' })
+  })
+
+  test('DSH agent 类型直接显示为子 Agent', () => {
+    const s = applyBgTaskStarted(emptyBgStore(), { task_id: 'dsh', task_type: 'agent', description: '检查' })
+    expect(s.pending).toHaveLength(0)
+    expect(s.active[0].type).toBe('subagent')
+  })
+
+  test('SDK 后补子 Agent 类型时立即从观察池展示', () => {
+    const unknown = applyBgTaskStarted(emptyBgStore(), { task_id: 'child', description: '检查' })
+    expect(unknown.pending).toHaveLength(1)
+    const known = applyBgTaskStarted(unknown, { task_id: 'child', description: '检查', subagent_type: 'Explore' })
+    expect(known.pending).toHaveLength(0)
+    expect(known.active[0].type).toBe('subagent')
+  })
+
+  test('SDK task id 回填沿用启动工具的状态与步骤，续跑重新计时', () => {
+    let s = applyBgTaskStarted(emptyBgStore(), { task_id: 'tool', tool_use_id: 'tool', task_type: 'subagent', description: '检查' }, 100)
+    s = applyBgToolUse(s, 'tool', 'read', 'Read', { file_path: '/repo/a.ts' })
+    s = applyBgTaskStarted(s, { task_id: 'sdk-task', tool_use_id: 'tool', description: '检查代码' }, 200)
+    expect(s.active).toHaveLength(1)
+    expect(s.active[0]).toMatchObject({ id: 'sdk-task', type: 'subagent', startedAt: 100 })
+    expect(s.active[0].steps).toHaveLength(1)
+    s = applyBgTaskSettled(s, { task_id: 'sdk-task', status: 'completed', summary: '已完成' }, 300)
+    s = applyBgTaskStarted(s, { task_id: 'sdk-task', tool_use_id: 'tool', task_type: 'subagent', description: '续跑' }, 400)
+    expect(s.active[0]).toMatchObject({ startedAt: 400, status: 'running', steps: [] })
+    expect(s.active[0].endTime).toBeUndefined()
+    expect(s.active[0].summary).toBeUndefined()
   })
 
   test('local_ 前缀归一化:local_bash→shell / local_agent→subagent / local_workflow→workflow', () => {
     expect(applyBgTaskStarted(emptyBgStore(), { task_id: 'b', task_type: 'local_bash', description: 'x' }).pending[0].type).toBe('shell')
-    expect(applyBgTaskStarted(emptyBgStore(), { task_id: 'a', task_type: 'local_agent', description: 'x' }).pending[0].type).toBe('subagent')
+    expect(applyBgTaskStarted(emptyBgStore(), { task_id: 'a', task_type: 'local_agent', description: 'x' }).active[0].type).toBe('subagent')
     expect(applyBgTaskStarted(emptyBgStore(), { task_id: 'w', task_type: 'local_workflow', description: 'x' }).active[0].type).toBe('workflow')
   })
 
@@ -305,14 +328,13 @@ describe('applyBgToolUse / applyBgToolResult — 双池 steps 累积', () => {
     expect(s.active[0].steps[s.active[0].steps.length - 1].brief).toContain('number/49')
   })
 
-  test('端到端:前台子 agent 攒 steps → 后台化提升 → steps 随 entry 到 active', () => {
+  test('子 Agent 前后台切换保留同一项及工具步骤', () => {
     let s = emptyBgStore()
     s = applyBgTaskStarted(s, { task_id: 'a1', task_type: 'local_agent', description: '搜索', subagent_type: 'Explore', tool_use_id: 'p' })
     s = applyBgToolUse(s, 'p', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })
     s = applyBgToolResult(s, 'p', 'tu_1', '命中', false)
-    // 提升前:active 空,pending 攒了 steps
-    expect(s.active).toHaveLength(0)
-    expect(s.pending[0].steps).toHaveLength(1)
+    expect(s.active).toHaveLength(1)
+    expect(s.active[0].steps).toHaveLength(1)
     // 后台化 → 提升,steps 带到 active
     s = applyBgTaskUpdated(s, { task_id: 'a1', patch: { is_backgrounded: true } })
     expect(s.active).toHaveLength(1)
@@ -364,118 +386,72 @@ describe('isBgTerminal / hasActiveBgTask', () => {
   })
 })
 
-describe('summarizeBackground', () => {
-  test('混合计数', () => {
-    expect(summarizeBackground([mk({ id: 'a', status: 'running' }), mk({ id: 'b', status: 'completed' })])).toBe('1 进行中 · 1 已结束')
-    expect(summarizeBackground([mk({ id: 'a', status: 'running' })])).toBe('1 进行中')
-    expect(summarizeBackground([mk({ id: 'a', status: 'completed' }), mk({ id: 'b', status: 'failed' })])).toBe('2 已结束')
-    expect(summarizeBackground([])).toBe('空')
+describe('任务面板：标题简洁，详情折叠', () => {
+  test('长说明保持单行，展开保留错误、结果及最近三步', () => {
+    const panel = backgroundTaskPanel(mk({
+      id: 'long', status: 'failed', description: '很长的说明\n'.repeat(30), error: '读取失败', summary: '部分结果',
+      steps: [1, 2, 3, 4].map(i => ({ toolUseId: String(i), tool: 'Read', brief: `检查步骤 ${i}` })),
+    })) as any
+    expect(panel.expanded).toBe(false)
+    expect(panel.header.title.content).not.toContain('\n')
+    expect(panel.header.title.content.length).toBeLessThan(60)
+    const body = panel.elements[0].content
+    expect(body).toContain('读取失败')
+    expect(body).toContain('部分结果')
+    expect(body).not.toContain('检查步骤 1')
+    expect(body).toContain('检查步骤 4')
   })
-})
-
-describe('backgroundLiveSummary — 聊天列表预览全文(建卡与刷新共用)', () => {
-  test('带 🧭 前缀 + 实时计数', () => {
-    expect(backgroundLiveSummary([mk({ id: 'a', status: 'running' })])).toBe('🧭 后台任务 · 1 进行中')
-    expect(backgroundLiveSummary([mk({ id: 'a', status: 'running' }), mk({ id: 'b', status: 'running' }), mk({ id: 'c', status: 'completed' })])).toBe('🧭 后台任务 · 2 进行中 · 1 已结束')
-    expect(backgroundLiveSummary([])).toBe('🧭 后台任务 · 空')
-  })
-})
-
-describe('任务 panel —— 标题状态+时长,展开详情', () => {
-  test('running:header 写「责任人·描述 — 运行中 <档位>」,时长随 now', () => {
+  test('标题只展示状态与短说明，类型放入详情', () => {
     const t = mk({ id: 't1', type: 'subagent', description: '搜索认证', status: 'running', startedAt: 0, subagentType: 'Explore' })
-    const panel = backgroundTaskPanel(t, 45000) as any
+    const panel = backgroundTaskPanel(t) as any
     expect(panel.tag).toBe('collapsible_panel')
     expect(panel.expanded).toBe(false)
     expect(panel.element_id).toBe(BG_ELEMENTS.panel('t1'))
-    expect(panel.header.title.content).toContain('Explore')
-    expect(panel.header.title.content).toContain('搜索认证')
-    expect(panel.header.title.content).toContain('运行中')
-    expect(panel.header.title.content).toContain('<1m')  // cc13607:45s 落 <1m 档
+    expect(panel.header.title.content).toBe('⏳ 正在执行 · 搜索认证')
+    expect(panel.elements[0].content).toContain('Explore')
+    expect(panel.elements[0].content).not.toContain('<1m')
   })
 
-  test('running + second 模式:header 写精确秒数', () => {
+  test('运行中详情不展示静止的计时数字', () => {
     const t = mk({ id: 't1', type: 'subagent', description: '搜索认证', status: 'running', startedAt: 0, subagentType: 'Explore' })
-    const panel = backgroundTaskPanel(t, 45000, 'second') as any
-    expect(panel.header.title.content).toContain('(45s)')
+    const panel = backgroundTaskPanel(t) as any
+    expect(panel.elements[0].content).not.toContain('45s')
     expect(panel.header.title.content).not.toContain('<1m')
   })
 
-  test('completed:header 用单一单位显示长任务耗时(用 usage.duration_ms)', () => {
+  test('完成任务在详情显示实际耗时', () => {
     const t = mk({ id: 't1', type: 'shell', description: 'build', status: 'completed', startedAt: 0, usage: { total_tokens: 10, tool_uses: 1, duration_ms: 10_800_000 } })
-    const panel = backgroundTaskPanel(t, 999999) as any
-    expect(panel.header.title.content).toContain('用时 3h')
+    const panel = backgroundTaskPanel(t) as any
+    expect(panel.elements[0].content).toContain('用时 3h')
   })
 
-  test('failed:header 写「失败 Ns」', () => {
+  test('失败状态在标题可见，详情保留耗时', () => {
     const t = mk({ id: 't1', status: 'failed', startedAt: 0, usage: { total_tokens: 1, tool_uses: 1, duration_ms: 12000 } })
-    const panel = backgroundTaskPanel(t, 999999) as any
+    const panel = backgroundTaskPanel(t) as any
     expect(panel.header.title.content).toContain('失败')
-    expect(panel.header.title.content).toContain('12s')
+    expect(panel.elements[0].content).toContain('12s')
   })
 
-  test('body 精简:不含用量/摘要,无 steps 时占位', () => {
+  test('运行中摘要可见，不堆砌用量元数据', () => {
     const t = mk({ id: 't1', type: 'subagent', description: 'd', status: 'running', subagentType: 'Explore', usage: { total_tokens: 1200, tool_uses: 8, duration_ms: 1000 }, summary: '命中 3 处' })
-    const panel = backgroundTaskPanel(t, 1000) as any
+    const panel = backgroundTaskPanel(t) as any
     const body = panel.elements[0]
     expect(body.element_id).toBe(BG_ELEMENTS.body('t1'))
     expect(body.content).not.toContain('1.2K tok')
-    expect(body.content).not.toContain('命中 3 处')
-    expect(body.content).toContain('暂无执行记录')
+    expect(body.content).toContain('命中 3 处')
+    expect(body.content).toContain('进度')
   })
 
-  test('body 含 steps(精简,无 prompt/标题)', () => {
+  test('详情包含任务说明和最近动作', () => {
     let s: BgStore = { active: [mk({ id: 't1', type: 'subagent', toolUseId: 'p', description: '搜索', status: 'running', subagentType: 'Explore', prompt: '找 auth 代码' })], pending: [] }
     s = applyBgToolUse(s, 'p', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })
     s = applyBgToolResult(s, 'p', 'tu_1', '命中 3 处', false)
-    const panel = backgroundTaskPanel(s.active[0], 1000) as any
+    const panel = backgroundTaskPanel(s.active[0]) as any
     const body = panel.elements[0]
     expect(body.content).toContain('Grep')
     expect(body.content).toContain('命中 3 处')
     expect(body.content).not.toContain('执行过程')
-    expect(body.content).not.toContain('找 auth 代码')
-  })
-})
-
-describe('整卡三态', () => {
-  test('backgroundLiveCard:每任务一个 panel,streaming 开', () => {
-    const tasks = [
-      mk({ id: 't1', type: 'subagent', description: 'a', status: 'running', subagentType: 'Explore' }),
-      mk({ id: 't2', type: 'shell', description: 'build', status: 'completed', usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1000 } }),
-    ]
-    const card = backgroundLiveCard(tasks, 1000) as any
-    expect(card.schema).toBe('2.0')
-    expect(card.config.streaming_mode).toBe(true)
-    expect(card.config.summary.content).toBe('🧭 后台任务 · 1 进行中 · 1 已结束')
-    const els = card.body.elements
-    expect(els[0].tag).toBe('collapsible_panel')
-    expect(els[0].element_id).toBe(BG_ELEMENTS.panel('t1'))
-    expect(els[1].element_id).toBe(BG_ELEMENTS.panel('t2'))
-  })
-
-  test('backgroundHistoryCard:streaming 关 + 只渲染终态任务 panel', () => {
-    const tasks = [
-      mk({ id: 't1', description: '活跃', status: 'running' }),
-      mk({ id: 't2', description: '完成的', status: 'completed', usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1000 } }),
-    ]
-    const card = backgroundHistoryCard(tasks, 1000) as any
-    expect(card.config.streaming_mode).toBe(false)
-    const els = card.body.elements
-    expect(els).toHaveLength(1)
-    expect(els[0].tag).toBe('collapsible_panel')
-    expect(els[0].element_id).toBe(BG_ELEMENTS.panel('t2'))
-    expect(els[0].header.title.content).toContain('完成的')
-  })
-
-  test('backgroundMigratedMarker:固定标识', () => {
-    const card = backgroundMigratedMarker() as any
-    expect(card.config.streaming_mode).toBe(false)
-    expect(card.body.elements[0].content).toContain('迁至最新卡片')
-  })
-
-  test('BG_ELEMENTS id 生成', () => {
-    expect(BG_ELEMENTS.panel('t1')).toBe(BG_ELEMENTS.panel('t1'))
-    expect(BG_ELEMENTS.body('t1')).toBe(BG_ELEMENTS.body('t1'))
+    expect(body.content).toContain('找 auth 代码')
   })
 })
 
@@ -502,7 +478,8 @@ describe('promotePendingOnAdvance — 主线程推进判后台', () => {
     expect(r.active).toHaveLength(2)
     expect(r.pending).toHaveLength(0)
     expect(r.active.map(t => t.id).sort()).toEqual(['b1', 'b2'])
-    expect(r.active.every(t => t.isBackgrounded === true)).toBe(true)
+    expect(r.active.find(t => t.id === 'b1')?.isBackgrounded).toBe(true)
+    expect(r.active.find(t => t.id === 'b2')?.type).toBe('subagent')
   })
 
   test('前台 task 先结算被从 pending 丢,推进时不会被提', () => {

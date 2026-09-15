@@ -1,8 +1,8 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import * as cardkit from './cardkit'
 import { AgentCards, type AgentCardsDeps } from './agent-cards'
+import { agentCardsDeps } from './agent-cards-runtime'
 import { requireAgentDescription } from './agent-run-types'
 import * as feishu from './feishu'
 import { config } from './config'
@@ -70,20 +70,10 @@ export interface AgentServiceDeps extends AgentCardsDeps {
 }
 
 const DEFAULT_DEPS: AgentServiceDeps = {
+  ...agentCardsDeps,
   getCatalog: getAgentIdentityCatalog,
   startWorker: startAgentWorker,
-  sendCard: feishu.sendCard,
-  getChatTailMessageId: feishu.getChatTailMessageId,
   sendTextRaw: feishu.sendTextRaw,
-  convertMessageToCard: cardkit.convertMessageToCard,
-  recordCardCreated: cardkit.recordCardCreated,
-  getElementCount: cardkit.getElementCount,
-  addElementResult: cardkit.addElementResult,
-  replaceElementResult: cardkit.replaceElementResult,
-  deleteElementChecked: cardkit.deleteElementChecked,
-  cancelSummary: cardkit.cancelSummary,
-  patchSettingsChecked: cardkit.patchSettingsChecked,
-  dispose: cardkit.dispose,
   writeArtifact: writeJsonStateAtomic,
   writeTextArtifact: writeStateFileAtomic,
   readTextArtifact,
@@ -91,7 +81,7 @@ const DEFAULT_DEPS: AgentServiceDeps = {
 }
 
 export class AgentService {
-  private readonly presentation: AgentCards
+  readonly presentation: AgentCards
   private readonly runs = new Map<string, AgentRunRecord>()
   private readonly capabilities = new Map<string, AgentPrincipal>()
   private activeTurns = 0

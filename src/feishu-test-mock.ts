@@ -15,6 +15,7 @@ import type { TurnAnchor } from './feishu'
 import type { ConversationBranchBase, PendingConversationLaunch } from './conversation'
 
 export const sentCards: object[] = []
+export const chatTailMessages = new Map<string, string>()
 export const sentTexts: string[] = []
 export const sentRawTexts: string[] = []
 export const sentImages: Array<[string, string]> = []
@@ -60,6 +61,7 @@ export function resetFeishuMock(): void {
     arr.length = 0
   }
   projectProfiles.clear()
+  chatTailMessages.clear()
   modelSelections.clear()
   resumeRefs.clear()
   turnAnchorsBySession.clear()
@@ -87,16 +89,21 @@ mock.module('./feishu', () => ({
   sendImage: async (chatId: string, key: string) => { sentImages.push([chatId, key]); return `om_image_${sentImages.length}` },
   uploadAndSend: async (chatId: string, path: string) => { sentLocalFiles.push([chatId, path]); return true },
   preferredChatForSession: new Map(),
-  sendCard: async (_chatId: string, card: object) => {
+  getChatTailMessageId: async (chatId: string) => chatTailMessages.get(chatId) ?? null,
+  sendCard: async (chatId: string, card: object) => {
     sentCards.push(card)
-    return `om_status_${sentCards.length}`
+    const id = `om_status_${sentCards.length}`
+    chatTailMessages.set(chatId, id)
+    return id
   },
-  sendText: async (_chatId: string, text: string) => {
+  sendText: async (chatId: string, text: string) => {
     sentTexts.push(text)
+    chatTailMessages.set(chatId, 'om_text')
     return 'om_text'
   },
-  sendTextRaw: async (_chatId: string, text: string) => {
+  sendTextRaw: async (chatId: string, text: string) => {
     sentRawTexts.push(text)
+    chatTailMessages.set(chatId, 'om_raw')
     return 'om_raw'
   },
   updateCard: async (messageId: string, card: object) => {
