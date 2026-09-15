@@ -95,6 +95,8 @@ export interface TokenSourceConfig {
   base_url?: string
   auth_token?: string
   api_key?: string
+  /** ReClaude 个人只读 API 查询的拼车组织，避免网站切换组织后额度串号。 */
+  org_id?: string
   bin?: string
   model?: string
   effort?: string
@@ -304,7 +306,7 @@ export function loadConfig(): LodestarConfig {
           cfg.default = value === 'true'
         } else if (
           field === 'agent' || field === 'display' || field === 'auth' ||
-          field === 'base_url' || field === 'auth_token' || field === 'api_key' ||
+          field === 'base_url' || field === 'auth_token' || field === 'api_key' || field === 'org_id' ||
           field === 'bin' || field === 'model' || field === 'effort' ||
           field === 'models' || field === 'hidden_models' || field === 'custom_models' || field === 'slots' || field === 'usage'
         ) {

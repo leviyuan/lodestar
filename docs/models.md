@@ -35,6 +35,28 @@
 
 订阅进程保留本机和项目的 Claude 设置，并在进程内清除其他来源的 API key、模型映射和中转路由。发送任务前会再次核对实际账号是否为第一方订阅。Claude native 继续保留为使用本机完整配置的来源。
 
+## ReClaude 拼车
+
+在运行 Lodestar 的本机按 [ReClaude 官方说明](https://docs.reclaude.ai/cli/install)安装客户端，执行 `reclaude login` 完成浏览器设备授权并选择拼车组织，再运行 `reclaude daemon --detach` 启动官方后台。Linux 后台由用户 systemd 管理。
+
+**客户端会接管本机 Claude 登录**，并在账号变化时终止其管理的 Claude 进程。Lodestar 启用 ReClaude 后停用重复的「Claude Code 订阅」入口。退出 ReClaude 并恢复原生登录按官方客户端的 `reclaude logout` 流程操作。
+
+在群内发送 `reclaude-setup <拼车组织 ID> [个人只读 API key]`，然后通过 `md` → Claude Code → **ReClaude** 选择模型。也可以在配置文件中添加：
+
+```toml
+[token_source.reclaude]
+agent = "claude"
+auth = "reclaude-login"
+org_id = "填写拼车组织 ID"
+api_key = "填写 rck_ 个人只读 API key"
+# model = "opus"   # 可选；模型和 effort 来自 SDK 原生目录
+# effort = "max"
+```
+
+个人 `rck_` key 仅查询指定组织的拼车 5 小时额度，不用于模型认证。组织 ID 可从个人 API 的 `GET /api/v1/orgs` 查询。未填写只读 key 不影响已登录客户端的模型调用，额度显示 `MISS`。接口里的美元金额是该窗口的用量口径，不是账户余额；重置时间未返回时保留未知，不推算周额度。
+
+模型运行保持 Claude Agent SDK 默认入口，无需设置 `[claude].bin`。ReClaude 来源校验本机设备登录、对应 Claude 凭据、后台进程和 CA，然后只为此来源的 SDK 子进程设置官方本机代理。客户端未运行、登录不匹配、模型目录失败和网关错误均明确报错，不切换到其他账号。安装、登录和后台启动由用户管理，Lodestar 不自动安装或启动 ReClaude。
+
 ## OpenRouter
 
 OpenRouter 通过 Claude Agent SDK 运行。在群内发送 `openrouter-setup <api_key>`，再通过 `model` 面板选择模型和 effort；自建兼容端点用 `openrouter-setup <base_url> <api_key>`。也可在配置文件中添加：

@@ -21,6 +21,8 @@ api_key="test-key"
 [token_source.openrouter]
 api_key="test-key"
 models="vendor/upstream"
+[token_source.reclaude]
+auth="reclaude-login"
 [token_source.deepseek-harness]
 api_key="test-key"
 [token_source.dsh-glm]
@@ -48,7 +50,8 @@ api_key="test-key"
     const { config } = await import(${modulePath('config.ts')})
     const registry = await import(${modulePath('token-source.ts')})
     const { withModelVisibility } = await import(${modulePath('token-source-visibility.ts')})
-    for (const name of ['codex', 'glm', 'native', 'claude', 'deepseek', 'openrouter', 'dsh', 'dsh-glm']) {
+    mock.module(${modulePath('reclaude-runtime.ts')}, () => ({ readReclaudeRuntime: () => ({ proxyUrl: 'http://127.0.0.1:34567', caFile: '/test/ca.pem' }) }))
+    for (const name of ['codex', 'glm', 'native', 'claude', 'reclaude', 'deepseek', 'openrouter', 'dsh', 'dsh-glm']) {
       await import(${JSON.stringify(join(import.meta.dir, 'token-source-'))} + name + '.ts')
     }
     const rebuild = () => {
@@ -64,7 +67,7 @@ api_key="test-key"
     mock.module(${modulePath('token-source-builtins.ts')}, () => ({ buildTokenSourcesFromConfig: rebuild }))
     const { registerCustomTokenSourceModel, removeCustomTokenSourceModel, editTokenSourceModels } = await import(${modulePath('token-source-config.ts')})
     rebuild(); await registry.refreshAllTokenSourceModels()
-    const sources = ['codex-sub', 'glm', 'claude-native', 'claude-sub', 'deepseek', 'openrouter', 'deepseek-harness', 'dsh-glm']
+    const sources = ['codex-sub', 'glm', 'claude-native', 'claude-sub', 'reclaude', 'deepseek', 'openrouter', 'deepseek-harness', 'dsh-glm']
     for (const id of sources) {
       const before = registry.getTokenSource(id).models.map(m => m.model)
       const custom = id === 'openrouter' ? 'vendor/custom-test' : 'custom-test'

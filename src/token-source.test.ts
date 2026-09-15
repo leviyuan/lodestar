@@ -90,6 +90,14 @@ describe('token source model refresh', () => {
 })
 
 describe('token source spawn revision', () => {
+  test('ReClaude read-only quota credentials and organization do not replace model processes', () => {
+    expect(tokenSourceSpawnRevision('reclaude', {
+      auth: 'reclaude-login', api_key: 'rck_one', org_id: '1',
+    }, null)).toBe(tokenSourceSpawnRevision('reclaude', {
+      auth: 'reclaude-login', api_key: 'rck_two', org_id: '2',
+    }, null))
+  })
+
   test('changes for routing credentials but not catalog-only fields', () => {
     const base = tokenSourceSpawnRevision('glm-coding-plan', {
       base_url: 'https://example.test/anthropic', auth_token: 'one', models: 'A', display: 'Account A',
