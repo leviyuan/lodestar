@@ -181,3 +181,10 @@ mock.module('./feishu', () => ({
   ensureChatForSession: async (chatName: string) => ({ chatId: `oc_${chatName}`, created: true, joined: true }),
   disbandChatForSession: async () => ({ chatId: null, disbanded: true }),
 }))
+
+// 随机顺序可能先加载 AgentService，令默认卡片依赖保存真实函数的副本。
+// mock.module 只更新模块导出；同步替换这两份已捕获的引用，避免测试访问飞书。
+const { agentCardsDeps } = await import('./agent-cards-runtime')
+const mockedFeishu = await import('./feishu')
+agentCardsDeps.sendCard = mockedFeishu.sendCard
+agentCardsDeps.getChatTailMessageId = mockedFeishu.getChatTailMessageId
