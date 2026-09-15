@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Session } from './session'
 import type { AgentService, AgentPrincipal } from './agent-service'
-import { getAgentIdentityCatalog } from './agent-identities'
+import { getAgentSkillIdentityCatalog, type AgentIdentityCatalog } from './agent-identities'
 import {
   parseAgentAnswerRequest,
   parseAgentFollowUpRequest,
@@ -37,7 +37,7 @@ export async function handleAgentRequest(
 
   if (req.method === 'GET' && url.pathname === '/agents/identities') {
     await pendingTokenSourceModelRefresh()
-    return send(200, serializeCatalog(getAgentIdentityCatalog(principal.session.codexAccountId())))
+    return send(200, serializeCatalog(await getAgentSkillIdentityCatalog(principal.session.codexAccountId())))
   }
   if (req.method === 'POST' && url.pathname === '/agents/runs') {
     try {
@@ -101,7 +101,7 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   catch { throw new Error('bad json') }
 }
 
-function serializeCatalog(catalog: ReturnType<typeof getAgentIdentityCatalog>): object {
+function serializeCatalog(catalog: AgentIdentityCatalog): object {
   return {
     catalog_generation: catalog.catalogGeneration,
     identities: catalog.identities.map(identity => ({

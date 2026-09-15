@@ -50,10 +50,12 @@ api_key = "填写自己的 OpenRouter API key"
 # slots = "haiku=moonshotai/kimi-k3" # 可选：辅助任务模型，须获账号目录确认且使用相同的 effort 参数模式
 ```
 
-内置默认列表包含以下 **10 项**，定义见[默认模型配置](../src/openrouter-defaults.ts)。这是项目提供的初始列表，默认不含 Claude，可在面板中自行调整。
+内置默认列表包含以下 **12 项**，定义见[默认模型配置](../src/openrouter-defaults.ts)。这是项目提供的初始列表，可在面板中自行调整；其中 Claude 模型通过 OpenRouter 使用，与本机 Claude Code 订阅独立。
 
 | 厂商 | 模型 ID | 默认档位 |
 | --- | --- | --- |
+| Anthropic | `anthropic/claude-fable-5.1` | max |
+| Anthropic | `anthropic/claude-opus-5` | max |
 | Moonshot | `moonshotai/kimi-k3` | max |
 | Tencent | `tencent/hy4-preview` | high |
 | Google | `google/gemini-3.8-flash` | high |
@@ -65,7 +67,7 @@ api_key = "填写自己的 OpenRouter API key"
 | 字节跳动 | `bytedance-seed/seed-2-1-turbo` | 模型默认 |
 | 美团 | `meituan/longcat-2.0` | 模型默认 |
 
-在 `md` → Claude Code → OpenRouter 中，点「显示模型」进入账号目录，再点「显」加入列表，点「隐」移出面板列表。可见性自动保存，不改当前运行模型；全部隐藏后也能继续显示或补录。未配置 `models` 时才使用上述十项；`models = ""` 表示没有已显示的接口模型，刷新或重启不会补回默认项。内置列表更新不会覆盖用户维护的列表。
+在 `md` → Claude Code → OpenRouter 中，点「显示模型」进入账号目录，再点「显」加入列表，点「隐」移出面板列表。可见性自动保存，不改当前运行模型；全部隐藏后也能继续显示或补录。未配置 `models` 时才使用上述十二项；`models = ""` 表示没有已显示的接口模型，刷新或重启不会补回默认项。内置列表更新不会覆盖用户维护的列表。
 
 候选目录来自 `/api/v1/models/user`，按账号供应商和隐私设置筛选，仅纳入支持文本和工具调用的交互模型；OpenAI、GLM、DeepSeek 及无法保证厂商范围的自动路由不会出现在添加候选中。目录刷新失败显示 `MISS`。显式配置但已下线的模型保留为可删除的 `MISS` 项。
 

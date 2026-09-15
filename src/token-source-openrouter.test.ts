@@ -153,7 +153,7 @@ describe('OpenRouter authoritative model catalog', () => {
     expect(source.models[0].model).toBe('anthropic/test-model[1m]')
   })
 
-  test('keeps eight ranked labs plus ByteDance and Meituan without Claude in the defaults', async () => {
+  test('includes Fable and Opus alongside the ranked labs, ByteDance and Meituan in the defaults', async () => {
     respond = () => json({ data: OPENROUTER_DEFAULT_MODELS.map(entry => model(entry.model, {
       reasoning: entry.effort === 'default' ? { mandatory: false }
         : { supported_efforts: [entry.effort, 'low'], default_effort: 'low' },
@@ -162,10 +162,16 @@ describe('OpenRouter authoritative model catalog', () => {
     await source.refreshModels()
     expect(source.models.map(entry => entry.model)).toEqual(OPENROUTER_DEFAULT_MODELS.map(entry => entry.model))
     expect(source.models.map(entry => entry.defaultEffort)).toEqual(OPENROUTER_DEFAULT_MODELS.map(entry => entry.effort))
-    expect(OPENROUTER_DEFAULT_MODELS.filter(entry => entry.rank).map(entry => entry.rank)).toEqual([3, 4, 7, 8, 9, 10, 11, 12])
-    expect(OPENROUTER_DEFAULT_MODELS.filter(entry => !entry.rank).map(entry => entry.lab)).toEqual(['ByteDance', 'Meituan'])
-    expect(new Set(OPENROUTER_DEFAULT_MODELS.map(entry => entry.lab)).size).toBe(10)
-    expect(source.models.some(entry => /anthropic|claude/i.test(entry.model))).toBe(false)
+    expect(OPENROUTER_DEFAULT_MODELS.filter(entry => entry.rank).map(entry => entry.rank)).toEqual([1, 3, 4, 7, 8, 9, 10, 11, 12])
+    expect(OPENROUTER_DEFAULT_MODELS.filter(entry => !entry.rank).map(entry => entry.lab)).toEqual(['Anthropic', 'ByteDance', 'Meituan'])
+    expect(source.models).toHaveLength(12)
+    expect(new Set(OPENROUTER_DEFAULT_MODELS.map(entry => entry.lab)).size).toBe(11)
+    expect(source.models.filter(entry => entry.model.startsWith('anthropic/')).map(entry => ({
+      model: entry.model, defaultEffort: entry.defaultEffort,
+    }))).toEqual([
+      { model: 'anthropic/claude-fable-5.1', defaultEffort: 'max' },
+      { model: 'anthropic/claude-opus-5', defaultEffort: 'max' },
+    ])
     expect(source.models.every(entry => !openRouterModelExcluded(entry.model))).toBe(true)
   })
 

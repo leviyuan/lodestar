@@ -1,6 +1,5 @@
-/** 用户指定：Arena Agent Labs 前 12 家，各取榜单代表模型，排除 OpenAI/Z.ai/DeepSeek；
- * 2026-09-11 补充字节和美团；蚂蚁、阶跃不列为默认。
- * 2026-09-15 Claude 改用本机 Claude Code 订阅，默认列表移除 Anthropic。
+/** 用户指定：Arena Agent Labs 前 12 家的代表模型，补充 Claude Opus、字节和美团；
+ * 排除 OpenAI/Z.ai/DeepSeek，蚂蚁、阶跃不列为默认；Claude 与本机订阅独立可选。
  * 榜单快照 2026-09-08：https://arena.ai/leaderboard/agent?rankBy=labs
  * 顺序固定为该次榜单顺序；后续增删持久化在 token_source.openrouter.models。
  */
@@ -9,6 +8,8 @@ import type { ClaudeReasoningEffort } from './agent-process'
 export const OPENROUTER_DEFAULT_MODELS: ReadonlyArray<{
   rank?: number; lab: string; model: string; effort: ClaudeReasoningEffort
 }> = [
+  { rank: 1, lab: 'Anthropic', model: 'anthropic/claude-fable-5.1', effort: 'max' },
+  { lab: 'Anthropic', model: 'anthropic/claude-opus-5', effort: 'max' },
   { rank: 3, lab: 'Moonshot', model: 'moonshotai/kimi-k3', effort: 'max' },
   { rank: 4, lab: 'Tencent', model: 'tencent/hy4-preview', effort: 'high' },
   { rank: 7, lab: 'Google', model: 'google/gemini-3.8-flash', effort: 'high' },

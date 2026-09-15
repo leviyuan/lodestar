@@ -1,6 +1,8 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { createServer, type Server } from 'node:http'
 import { handleAgentRequest } from './agent-api'
+import { buildAgentIdentityCatalog } from './agent-identities'
+import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, type TokenSource, type UsageSnapshotUnified } from './token-source'
 
 let server: Server | null = null
 afterEach(() => { server?.close(); server = null })
@@ -46,6 +48,58 @@ describe('delegated Agent HTTP API', () => {
     const base = await serve()
     expect((await fetch(`${base}/agents/identities`)).status).toBe(401)
     expect((await fetch(`${base}/agents/identities`, { headers: { authorization: 'Bearer wrong' } })).status).toBe(403)
+  })
+
+  test('skill discovery lazily refreshes subscriptions after 30 minutes without changing the model catalog', async () => {
+    const previousSources = listTokenSources()
+    let checks = 0
+    let usage: UsageSnapshotUnified = { state: 'network', windows: [], reason: 'Claude 原生额度接口未返回 rate_limits 数据' }
+    const subscription: TokenSource = {
+      id: 'claude-sub', kind: 'claude-subscription', agent: 'claude', display: 'Claude Code 订阅', enabled: true,
+      models: [{ model: 'sonnet', display: 'Sonnet', efforts: ['high'], defaultEffort: 'high' }],
+      defaultModel: 'sonnet', modelCatalogState: { status: 'ready', updatedAt: 1 },
+      refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
+      readUsage: async () => { checks++; return usage },
+    }
+    resetTokenSourceRegistry()
+    registerTokenSource(subscription)
+    const start = Date.now()
+    const time = spyOn(Date, 'now').mockReturnValue(start)
+    try {
+      const before = buildAgentIdentityCatalog([subscription])
+      const base = await serve()
+      const headers = { authorization: 'Bearer secret' }
+      const failed = await fetch(`${base}/agents/identities`, { headers })
+      expect(failed.status).toBe(200)
+      const failedCatalog = await failed.json() as any
+      expect(failedCatalog.identities).toEqual([])
+      expect(failedCatalog.source_failures).toEqual([{
+        token_source_id: 'claude-sub', display: 'Claude Code 订阅', status: 'failed', reason: usage.reason,
+      }])
+      expect(buildAgentIdentityCatalog([subscription])).toEqual(before)
+
+      usage = { state: 'ok', windows: [{ kind: 'fiveHour', label: '5h 窗口', percent: 0, resetsAt: null }] }
+      time.mockReturnValue(start + 30 * 60 * 1000 - 1)
+      const cached = await fetch(`${base}/agents/identities`, { headers })
+      expect(cached.status).toBe(200)
+      expect(await cached.json()).toEqual(failedCatalog)
+      expect(checks).toBe(1)
+
+      time.mockReturnValue(start + 30 * 60 * 1000)
+      const recovered = await fetch(`${base}/agents/identities`, { headers })
+      expect(recovered.status).toBe(200)
+      const readyCatalog = await recovered.json() as any
+      expect(readyCatalog.identities).toMatchObject([{
+        token_source_id: 'claude-sub', model: 'sonnet', default_effort: 'high', status: 'ready',
+      }])
+      expect(readyCatalog.source_failures).toEqual([])
+      expect(readyCatalog.catalog_generation).not.toBe(failedCatalog.catalog_generation)
+      expect(checks).toBe(2)
+    } finally {
+      time.mockRestore()
+      resetTokenSourceRegistry()
+      for (const source of previousSources) registerTokenSource(source)
+    }
   })
 
   test('creates, reads, follows up, answers, and cancels Agent runs', async () => {
