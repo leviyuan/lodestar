@@ -81,6 +81,7 @@ function harness(opts: {
   patchSettingsChecked?: AgentServiceDeps['patchSettingsChecked']
   replaceElementChecked?: (cardId: string, elementId: string, element: object) => Promise<boolean>
   getChatTailMessageId?: AgentServiceDeps['getChatTailMessageId']
+  sendTextRaw?: AgentServiceDeps['sendTextRaw']
 } = {}) {
   const identities = opts.identities ?? [identity('a', 'Agent A')]
   const catalog: AgentIdentityCatalog = { catalogGeneration: 'g1', identities, sourceFailures: [] }
@@ -91,7 +92,7 @@ function harness(opts: {
     getCatalog: () => catalog,
     startWorker: opts.startWorker ?? (worker => resolvedHandle(result(`sid-${worker.identity.id}`, `output-${worker.identity.id}`))),
     sendCard: opts.sendCard ?? (async () => 'message-1'),
-    sendTextRaw: async () => true,
+    sendTextRaw: opts.sendTextRaw ?? (async () => true),
     getChatTailMessageId: opts.getChatTailMessageId ?? (async () => null),
     getElementCount: () => 1,
     addElementResult: async () => ({ landed: true }),
@@ -153,6 +154,30 @@ describe('AgentService', () => {
     expect(next.cardMessageId).toBe(first.cardMessageId)
     expect(service.getRun(root, next.runId)).toMatchObject({ description: '验证功能', cardMessageId: 'message-1' })
     expect(service.getRun(root, first.runId).description).toBe('实现功能')
+  })
+
+  test('a card finalization failure keeps the worker result and sends the concrete error to the chat', async () => {
+    const notices: string[] = []
+    const { service, root, artifacts } = harness({
+      patchSettingsChecked: async (cardId, settings, onFailure) => {
+        if ((settings as any).config.streaming_mode !== false) return true
+        onFailure?.({ cardId, operation: 'patchSettings', code: 300317, logId: 'terminal-request-id', message: 'sequence number compare failed' })
+        return false
+      },
+      sendTextRaw: async (_chatId, text) => { notices.push(text); return true },
+    })
+    const started = await service.startRun(root, { description: '保存检查结果', identityIds: ['agent:a'], prompt: 'inspect' })
+    await waitForCondition(() => notices.length === 1)
+    const saved = service.getRun(root, started.runId)
+    expect(saved.status).toBe('completed')
+    expect(saved.workers[0]!.output).toBe('output-agent:a')
+    expect(saved.presentationErrors).toHaveLength(1)
+    expect(notices[0]).toContain('保存检查结果')
+    expect(notices[0]).toContain('sequence number compare failed')
+    expect(notices[0]).toContain('code=300317')
+    expect(notices[0]).toContain('log_id=terminal-request-id')
+    expect(notices[0]).toContain(started.runId)
+    expect((artifacts.at(-1) as AgentRunSnapshot).presentationErrors).toEqual(saved.presentationErrors)
   })
 
   test('writes the terminal chat-list summary inside Card Kit config', async () => {

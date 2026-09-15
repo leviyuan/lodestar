@@ -669,7 +669,11 @@ export function patchSettings(cardId: string, settings: object): Promise<void> {
 /** Checked settings mutation for terminal/static-card transactions. Unlike
  * the legacy fire-and-forget wrapper, callers can distinguish a landed PATCH
  * from a timeout/rejection and must not dispose bookkeeping on false. */
-export async function patchSettingsChecked(cardId: string, settings: object): Promise<boolean> {
+export async function patchSettingsChecked(
+  cardId: string,
+  settings: object,
+  onFailure?: (failure: CardWriteFailure) => void,
+): Promise<boolean> {
   if (isDisposed(cardId)) return false
   const s = state(cardId)
   if (s.closing) return false
@@ -687,7 +691,7 @@ export async function patchSettingsChecked(cardId: string, settings: object): Pr
       })
       landed = true
     },
-    () => { failed = true },
+    failure => { failed = true; onFailure?.(failure) },
     true,
   ))
   await s.queue

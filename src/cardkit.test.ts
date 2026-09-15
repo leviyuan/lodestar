@@ -33,6 +33,19 @@ afterEach(() => {
 })
 
 describe('cardkit card operations', () => {
+  test('settings failures preserve the upstream error for the caller', async () => {
+    const cardId = 'settings_error_details'
+    cardkit.recordCardCreated(cardId, 1)
+    globalThis.fetch = (async () => Response.json({ code: 300317, msg: 'sequence number compare failed' },
+      { headers: { 'x-tt-logid': 'settings-error-request-id' } })) as unknown as typeof fetch
+    const failures: import('./cardkit').CardWriteFailure[] = []
+    expect(await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } }, failure => { failures.push(failure) })).toBe(false)
+    expect(failures).toHaveLength(1)
+    expect(failures[0]).toMatchObject({ cardId, operation: 'patchSettings', code: 300317, httpStatus: 200, logId: 'settings-error-request-id' })
+    expect(failures[0]!.message).toContain('sequence number compare failed')
+    await cardkit.dispose(cardId)
+  })
+
   test('checked replacement returns the capacity error and does not revive disposed cards', async () => {
     const cardId = 'delegation_replace_result'
     cardkit.recordCardCreated(cardId, 1)

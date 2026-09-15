@@ -553,9 +553,11 @@ export class AgentService {
     run.finalized = true
     this.pruneRunArtifacts()
     if (run.snapshot.presentationErrors?.length) {
+      const details = run.snapshot.presentationErrors.map((detail, index) => `${index + 1}. ${detail}`).join('\n')
+      const preview = details.length > 3000 ? `${details.slice(0, 3000)}\n…完整错误已保存在任务记录中。` : details
       await this.deps.sendTextRaw(
         run.snapshot.chatId,
-        `⚠️ agent ${run.snapshot.runId} 结果已保存，但卡片有 ${run.snapshot.presentationErrors.length} 个呈现错误。`,
+        `⚠️ 委派卡片出现更新错误 · ${run.snapshot.description ?? run.snapshot.runId}\n结果已保存，卡片更新期间出现 ${run.snapshot.presentationErrors.length} 个错误：\n${preview}\n任务：${run.snapshot.runId}`,
       ).catch(error => log(`agent: warning delivery failed run=${run.snapshot.runId}: ${messageOf(error)}`))
     }
   }

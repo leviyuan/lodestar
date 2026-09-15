@@ -75,6 +75,19 @@ function harness() {
 }
 
 describe('shared delegation card lifecycle', () => {
+  test('settings rejections keep their code and request id in the presentation error', async () => {
+    const h = harness()
+    const a = run('settings-details')
+    await h.cards.add(a)
+    h.deps.patchSettingsChecked = async (cardId, _settings, onFailure) => {
+      onFailure?.({ cardId, operation: 'patchSettings', code: 300317, logId: 'settings-request-id', message: 'sequence number compare failed' })
+      return false
+    }
+    terminal(a)
+    await expect(h.cards.update(a, true)).rejects.toThrow('sequence number compare failed (code=300317, log_id=settings-request-id)')
+    expect(h.disposed.size).toBe(0)
+  })
+
   test('delegated runs, native children and background jobs share one collapsed card', async () => {
     const h = harness()
     const delegated = run('delegated')

@@ -1,5 +1,5 @@
 import * as cards from './cards'
-import { isCardCapacityFailure, type CardWriteResult } from './cardkit'
+import { isCardCapacityFailure, type CardWriteFailure, type CardWriteResult } from './cardkit'
 import type { AgentRunSnapshot } from './agent-run-types'
 import type { BgTaskEntry } from './cards/background'
 import { withChatMessageOrder } from './chat-message-order'
@@ -18,7 +18,7 @@ export interface AgentCardsDeps {
   replaceElementResult(cardId: string, elementId: string, element: object): Promise<CardWriteResult>
   deleteElementChecked(cardId: string, elementId: string): Promise<boolean>
   cancelSummary(cardId: string): void
-  patchSettingsChecked(cardId: string, settings: object): Promise<boolean>
+  patchSettingsChecked(cardId: string, settings: object, onFailure?: (failure: CardWriteFailure) => void): Promise<boolean>
   dispose(cardId: string): Promise<void>
 }
 
@@ -137,6 +137,9 @@ export class AgentCards {
         if (terminal) await this.settings(group)
         return
       }
+      // 完成后的正文更新可能由 Card Kit 自动重开 streaming。旧的设置缓存
+      // 此时不能证明远端仍已关闭，即便补充结果没有改变标题和摘要。
+      if (group.settled.size === group.rows.size) group.settingsJson = undefined
       const errors: string[] = []
       const result = await this.deps.replaceElementResult(group.cardId, row.elementId, row.element)
       if (!result.landed) {
@@ -217,7 +220,10 @@ export class AgentCards {
     }
     const settingsJson = JSON.stringify(settings)
     if (settingsJson !== group.settingsJson) {
-      if (!await this.deps.patchSettingsChecked(group.cardId, settings)) throw new Error('agent card settings update MISS')
+      let failure: CardWriteFailure | undefined
+      if (!await this.deps.patchSettingsChecked(group.cardId, settings, detail => { failure = detail })) {
+        throw writeError('agent card settings update', { landed: false, failure })
+      }
       group.settingsJson = settingsJson
     }
     if (complete && group.sealed && allowDisposal) {
@@ -243,5 +249,5 @@ function isCapacity(result: CardWriteResult): boolean {
 }
 
 function writeError(action: string, result: CardWriteResult): Error {
-  return new Error(`${action} MISS${result.failure ? `: ${result.failure.message} (code=${result.failure.code ?? 'MISS'})` : ''}`)
+  return new Error(`${action} MISS${result.failure ? `: ${result.failure.message} (code=${result.failure.code ?? 'MISS'}${result.failure.logId ? `, log_id=${result.failure.logId}` : ''})` : ''}`)
 }
