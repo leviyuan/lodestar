@@ -71,6 +71,7 @@ import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { readSysInfo } from './sysinfo'
 import { readUsage, refreshUsageFromConnection, observeRateLimitsNotification, peekUsage, type UsageSnapshot } from './usage'
 import { readGlmUsage, type GlmUsageSnapshot } from './glm-usage'
+import { claudeWeeklyUsageWindow } from './claude-usage'
 import {
   contextLimitFromAppServer,
   contextTokensFromUsage,
@@ -5692,12 +5693,18 @@ export class Session {
     selectedTokenSourceId: string | null,
     ts: TokenSource | undefined,
     cachedCodexUsage: UsageSnapshot | null,
+    model: string | null,
   ): Promise<string> {
     if (selectedTokenSourceId && (!ts || !ts.enabled || ts.agent !== provider)) return '  |  额度 MISS'
     if (ts?.agent === provider && ts.enabled && (provider === 'claude' || provider === 'dsh')) {
       const snap = await ts.readUsage()
       if (snap.state === 'ok' && snap.kind !== 'balance') {
         const fiveHour = snap.windows.find(w => w.kind === 'fiveHour')
+        if (ts.kind === 'claude-subscription') {
+          const weekly = claudeWeeklyUsageWindow(snap, model)
+          const missing = { percent: null, resetsAt: null }
+          return this.fmtDualWindowSuffix(fiveHour ?? missing, weekly ?? missing)
+        }
         const weekly = snap.windows.find(w => w.kind === 'weekly')
         if (fiveHour || weekly) return this.fmtDualWindowSuffix(fiveHour ?? null, weekly ?? null)
       }
@@ -5923,6 +5930,7 @@ export class Session {
             snapshot.tokenSourceId,
             snapshot.tokenSource,
             snapshot.codexUsage,
+            turn.model,
           ))
       : ''
     const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1

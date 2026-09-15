@@ -2,8 +2,9 @@
 import type { AccountInfo, Settings } from '@anthropic-ai/claude-agent-sdk'
 import { isClaudeReasoningEffort } from './agent-process'
 import { log } from './log'
-import { ANTHROPIC_ENV_KEYS, registerTokenSourceFactory, scrubAnthropicEnv, type TokenSource } from './token-source'
+import { ANTHROPIC_ENV_KEYS, registerTokenSourceFactory, scrubAnthropicEnv, type TokenSource, type UsageSnapshotUnified } from './token-source'
 import { fetchNativeClaudeModels } from './token-source-models'
+import { fetchClaudeSubscriptionUsage } from './claude-usage'
 import { modelList } from './token-source-visibility'
 
 /** 覆盖 settings.env，防止 user/project/local settings 重新注入其他账号的路由。 */
@@ -30,6 +31,7 @@ registerTokenSourceFactory({
   build(cfg): TokenSource {
     const settings = subscriptionSettings()
     const configuredModel = cfg.model?.trim()
+    let usageRequest: Promise<UsageSnapshotUnified> | undefined
     const source: TokenSource = {
       id: 'claude-sub', kind: 'claude-subscription', agent: 'claude',
       display: cfg.display?.trim() || 'Claude Code 订阅',
@@ -75,7 +77,14 @@ registerTokenSourceFactory({
           source.modelCatalogState = { status: source.enabled ? 'failed' : 'disabled', updatedAt: Date.now(), error: reason }
         }
       },
-      async readUsage() { return { state: 'not_applicable', windows: [] } },
+      readUsage() {
+        // 并发的 hi/收尾共用本次查询；完成后下一次调用重新读取原生接口。
+        usageRequest ??= fetchClaudeSubscriptionUsage({
+          settingSources: ['user'], settings, transformEnv: source.spawnEnv,
+          validateAccount: source.validateClaudeAccount, tokenSourceId: source.id,
+        }).finally(() => { usageRequest = undefined })
+        return usageRequest
+      },
     }
     return source
   },

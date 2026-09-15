@@ -229,7 +229,7 @@ describe('Claude configured executable ([claude] bin)', () => {
     }
   })
 
-  test('listModels/setModelSettings 在 sendInitialize 失败后抛清晰错误', async () => {
+  test('原生目录、额度和设置查询保留初始化失败的原始错误', async () => {
     // sendInitialize 因配错 bin 走 catch → this.query 保持 undefined。
     // 旧实现此时调 listModels/setModelSettings 会抛模糊的
     // "Cannot read properties of undefined (reading 'supportedModels')";
@@ -241,6 +241,7 @@ describe('Claude configured executable ([claude] bin)', () => {
       proc.sendInitialize() // 走 catch,this.query 仍 undefined
 
       await expect(proc.listModels()).rejects.toThrow('[claude].bin not found: /nope/reclaude')
+      await expect(proc.readSubscriptionUsage()).rejects.toThrow('[claude].bin not found: /nope/reclaude')
       await expect(proc.setModelSettings('opus', 'high')).rejects.toThrow('[claude].bin not found: /nope/reclaude')
     } finally {
       if (previousBin === undefined) delete (config.claude as any).bin

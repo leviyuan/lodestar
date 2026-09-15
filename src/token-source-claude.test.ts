@@ -12,6 +12,12 @@ test('Claude subscription coexists with other accounts and refreshes authoritati
     import assert from 'node:assert/strict'
     import { mock } from 'bun:test'
     const nativeModels = await import('./src/token-source-models')
+    const nativeUsage = await import('./src/claude-usage')
+    mock.module('./src/claude-usage', () => ({ ...nativeUsage,
+      fetchClaudeSubscriptionUsage: async () => ({ state: 'ok', windows: [
+        { kind: 'fiveHour', label: '5h 窗口', percent: 10, resetsAt: null },
+      ] }),
+    }))
     let account = { subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
     let failure = null
     let models = [{ model: 'sonnet', display: 'Sonnet', efforts: ['high', 'low'], defaultEffort: 'high' }]
@@ -37,7 +43,7 @@ test('Claude subscription coexists with other accounts and refreshes authoritati
     assert.equal(source.defaultModel, 'sonnet')
     assert.deepEqual(source.models[0].efforts, ['high', 'low'])
     assert.equal(source.models[0].defaultEffort, 'high')
-    assert.equal((await source.readUsage()).state, 'not_applicable')
+    assert.equal((await source.readUsage()).state, 'ok')
 
     account = {}
     await source.refreshModels()
@@ -67,6 +73,111 @@ test('Claude subscription coexists with other accounts and refreshes authoritati
     config.token_sources = {}
     buildTokenSourcesFromConfig()
     assert.equal(registry.getTokenSource('claude-native').enabled, true)
+  `)
+})
+
+test('Claude subscription quota uses authenticated native control, closes queries and surfaces failures', () => {
+  isolated(`
+    import assert from 'node:assert/strict'
+    import { mock } from 'bun:test'
+    const updates = await import('./src/agent-updates')
+    const queries = []
+    let account = { subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
+    let data = { subscription_type: 'max', rate_limits_available: true, rate_limits: {
+      five_hour: { utilization: 12.5, resets_at: null },
+      seven_day: { utilization: 20, resets_at: null },
+    } }
+    let readFailure = null
+    let closeFailure = false
+    let methodAvailable = true
+    mock.module('./src/agent-updates', () => ({ ...updates,
+      agentPackagePath: () => '/unused-test-sdk',
+      loadClaudeSdk: async () => ({ query: ({ prompt, options }) => {
+        let finish
+        const closed = new Promise(resolve => { finish = resolve })
+        const record = { options, delivered: [], authRequested: false, requests: [], closed: false }
+        queries.push(record)
+        record.inputDone = (async () => { for await (const input of prompt) record.delivered.push(input) })()
+        return {
+          async *[Symbol.asyncIterator]() { await closed },
+          accountInfo: async () => { record.authRequested = true; return account },
+          usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: methodAvailable ? async opts => {
+            assert.equal(record.authRequested, true)
+            record.requests.push(opts)
+            if (readFailure) throw readFailure
+            return structuredClone(data)
+          } : undefined,
+          close: () => { record.closed = true; finish(); if (closeFailure) throw new Error('close failed') },
+        }
+      } }),
+    }))
+    const { tokenSourceFactories } = await import('./src/token-source')
+    await import('./src/token-source-claude')
+    const { config } = await import('./src/config')
+    config.claude.env = { ANTHROPIC_API_KEY: 'wrong-key', ANTHROPIC_BASE_URL: 'https://wrong.test' }
+    const source = tokenSourceFactories().find(f => f.kind === 'claude-subscription').build({})
+    const [first, concurrent] = await Promise.all([source.readUsage(), source.readUsage()])
+    assert.equal(first, concurrent)
+    assert.equal(queries.length, 1)
+    assert.equal(first.state, 'ok')
+    assert.equal(first.windows[0].percent, 12.5)
+    assert.deepEqual(queries[0].requests, [{ skipBehaviors: true }])
+    assert.equal(queries[0].options.env.ANTHROPIC_API_KEY, '')
+    assert.equal(queries[0].options.env.ANTHROPIC_BASE_URL, 'https://api.anthropic.com')
+    assert.equal(queries[0].options.settings.forceLoginMethod, 'claudeai')
+    assert.deepEqual(queries[0].options.settingSources, ['user'])
+    assert.equal(queries[0].closed, true)
+    await queries[0].inputDone
+    assert.deepEqual(queries[0].delivered, [])
+
+    readFailure = new Error('quota transport failed')
+    const failed = await source.readUsage()
+    assert.equal(failed.state, 'network')
+    assert.match(failed.reason, /quota transport failed/)
+    assert.deepEqual(failed.windows, [])
+    assert.equal(queries.at(-1).closed, true)
+
+    closeFailure = true
+    const bothFailed = await source.readUsage()
+    assert.match(bothFailed.reason, /quota transport failed.*close failed/)
+    readFailure = null
+    const closeFailed = await source.readUsage()
+    assert.equal(closeFailed.state, 'network')
+    assert.match(closeFailed.reason, /close failed/)
+    closeFailure = false
+
+    methodAvailable = false
+    const unsupported = await source.readUsage()
+    assert.equal(unsupported.state, 'network')
+    assert.match(unsupported.reason, /不支持原生订阅额度查询/)
+    assert.equal(queries.at(-1).closed, true)
+    methodAvailable = true
+
+    account = {}
+    const loggedOut = await source.readUsage()
+    assert.equal(loggedOut.state, 'no_credentials')
+    assert.match(loggedOut.reason, /claude auth login/)
+    assert.deepEqual(queries.at(-1).requests, [])
+    account = { subscriptionType: 'Claude Max', apiProvider: 'vertex' }
+    const wrongProvider = await source.readUsage()
+    assert.match(wrongProvider.reason, /不是第一方订阅/)
+    assert.deepEqual(queries.at(-1).requests, [])
+
+    account = { subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
+    data.rate_limits = null
+    const missing = await source.readUsage()
+    assert.equal(missing.state, 'network')
+    assert.match(missing.reason, /未返回 rate_limits/)
+    data.rate_limits = { five_hour: { utilization: 0, resets_at: null } }
+    const recovered = await source.readUsage()
+    assert.equal(recovered.state, 'ok')
+    assert.equal(recovered.windows[0].percent, 0)
+    assert.equal(recovered.windows[1].percent, null)
+    for (const record of queries) {
+      await record.inputDone
+      assert.equal(record.closed, true)
+      assert.deepEqual(record.delivered, [])
+    }
   `)
 })
 

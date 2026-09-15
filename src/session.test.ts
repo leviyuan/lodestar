@@ -3941,6 +3941,85 @@ describe('Session usage cache cross-backend isolation', () => {
     expect(session.fmtDualWindowSuffix({ percent: 7, resetsAt: new Date(Date.now() - 1000) }, weekly)).toBe('  |  7%·[6.9d·17%]')
     expect(session.fmtDualWindowSuffix(null, null)).toBe('  |  额度 MISS')
   })
+
+  test('Claude 的 hi 展示全部窗口，footer 按当前模型选择周额度并保留 5h', async () => {
+    const { claudeUsageSnapshot } = await import('./claude-usage')
+    const session = new Session('claude-quota', 'chat_id') as any
+    let snapshot = claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
+      five_hour: { utilization: 7, resets_at: new Date(Date.now() + 4.1 * 3600_000).toISOString() },
+      seven_day: { utilization: 17, resets_at: new Date(Date.now() + 6.9 * 86400_000).toISOString() },
+      model_scoped: [{ display_name: 'Fable', utilization: 42, resets_at: null }],
+    } })
+    const source = { id: 'claude-sub', kind: 'claude-subscription', agent: 'claude', enabled: true, readUsage: async () => snapshot }
+    session.selectedTokenSourceId = source.id
+    session.currentTokenSource = () => source
+    session.buildConsoleOpts = async () => ({ sessionName: 'claude-quota', status: 'idle', provider: 'claude' })
+    const replaceSpy = spyOn(cardkit, 'replaceElementChecked').mockResolvedValue(true)
+    try {
+      await session.patchConsoleUsage('quota-card')
+      const panel = replaceSpy.mock.calls.at(-1)?.[2] as any
+      expect(panel.element_id).toBe('console_usage')
+      expect(panel.elements.filter((e: any) => e.tag === 'markdown' && e.content.startsWith('**'))
+        .map((e: any) => e.content.split('\n')[0])).toEqual(['**5h 窗口 · 7%**', '**周额度 · 17%**', '**Fable 周额度 · 42%**'])
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'opus')).toBe('  |  4.1h·7%·[6.9d·17%]')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'default')).toBe('  |  4.1h·7%·[6.9d·17%]')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'claude-fable-5-1[1m]')).toBe('  |  4.1h·7%·[42%]')
+      snapshot.windows.find(window => window.kind === 'modelWeekly:Fable')!.percent = null
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'fable')).toBe('  |  4.1h·7%·[MISS]')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, null)).toBe('  |  4.1h·7%·[MISS]')
+      snapshot = { state: 'network', windows: [], reason: 'query failed' }
+      await session.patchConsoleUsage('quota-card')
+      expect((replaceSpy.mock.calls.at(-1)?.[2] as any).content).toBe('**📊 额度** MISS')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null)).toBe('  |  额度 MISS')
+      expect(await session.footerUsageSuffix('codex', null, source.id, source, null)).toBe('  |  额度 MISS')
+      expect(await session.footerUsageSuffix('claude', null, 'other-source', undefined, null)).toBe('  |  额度 MISS')
+    } finally { replaceSpy.mockRestore() }
+  })
+
+  test('Claude 收尾查询等待期间切换模型，不改变旧回复的专属周额度', async () => {
+    const { claudeUsageSnapshot } = await import('./claude-usage')
+    const snapshot = claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
+      five_hour: { utilization: 7, resets_at: null },
+      seven_day: { utilization: 17, resets_at: null },
+      model_scoped: [{ display_name: 'Fable', utilization: 42, resets_at: null }],
+    } })
+    const session = new Session('claude-quota-snapshot', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'quota-session', 'claude-sub')
+    proc.lastModel = 'claude:fable'
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'claude-sub'
+    session.selectedModel = 'fable'
+    const turn = { ...turnState('card_quota_snapshot'), provider: 'claude', model: 'fable', effort: 'high', userOpenId: '' }
+    session.currentTurn = turn
+    session.lastTurnUsage = { input_tokens: 100, output_tokens: 10, total_tokens: 110 }
+    let signalStarted!: () => void
+    const started = new Promise<void>(resolve => { signalStarted = resolve })
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const source = { id: 'claude-sub', kind: 'claude-subscription', agent: 'claude', enabled: true,
+      readUsage: async () => { signalStarted(); await gate; return snapshot } }
+    session.currentTokenSource = () => source
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const closing = session.closeTurnCard(undefined, { hasFreshResult: true })
+    try {
+      await started
+      session.selectedModel = 'sonnet'
+      proc.lastModel = 'claude:sonnet'
+      release()
+      await closing
+      const footer = calls.find(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+      const content = JSON.parse(footer?.body.element ?? '{}').content as string
+      expect(content).toContain('claude · fable/high')
+      expect(content).toContain('7%·[42%]')
+      expect(content).not.toContain('17%')
+    } finally {
+      release()
+      await closing
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
 })
 
 describe('Session resetBackgroundTasks on kill/restart', () => {

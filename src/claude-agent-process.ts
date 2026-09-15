@@ -9,6 +9,7 @@ import {
   type McpServerConfig,
   type ModelInfo,
   type Query,
+  type SDKControlGetUsageResponse,
   type SDKMessage,
   type SDKUserMessage,
   type SettingSource,
@@ -856,6 +857,19 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (!this.query) throw new Error('claude-agent-process: SDK query not initialized (sendInitialize failed or not called)')
     const models = await this.query.supportedModels()
     return models.map(mapModelInfo)
+  }
+
+  /** 原生 /usage 控制查询；不发送对话，也不扫描本机历史用量。 */
+  async readSubscriptionUsage(): Promise<SDKControlGetUsageResponse> {
+    if (!this.started) this.sendInitialize()
+    await this.queryStart
+    if (this.initializationError) throw this.initializationError
+    if (!this.query || !this.alive) throw new Error('Claude 订阅额度查询连接未就绪或已退出')
+    const readUsage = this.query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET
+    if (typeof readUsage !== 'function') {
+      throw new Error('当前 Claude SDK 不支持原生订阅额度查询，需更新 Agent 或适配其接口')
+    }
+    return readUsage.call(this.query, { skipBehaviors: true })
   }
 
   async setModelSettings(model: string, effort: AgentReasoningEffort): Promise<void> {
