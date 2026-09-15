@@ -24,6 +24,8 @@ export async function onTokenSourceEnable(s: Session, sourceId: string): Promise
     const sent = await feishu.sendCard(s.chatId, codexAccountCard({ phase: 'current', title: '添加账号',
       message: '通过设备码完成浏览器授权', hint: '默认：codex-login · 额外：codex-login 备注' }))
     if (!sent) throw new Error('Codex 登录引导卡片发送失败')
+  } else if (ts.kind === 'claude-subscription') {
+    await feishu.sendText(s.chatId, '请在运行 Lodestar 的本机执行 `claude auth login` 登录 Claude 订阅，完成后发送 `md` 刷新。')
   } else if (ts.kind === 'claude-native') {
     // native 凭本机 Claude 配置自动启用/禁用,无独立「启用」操作(它就是默认通路)。
     await feishu.sendText(s.chatId, `${ts.display} 直接使用本机 Claude Code 配置,无需单独启用。`)

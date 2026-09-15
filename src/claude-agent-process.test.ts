@@ -233,15 +233,15 @@ describe('Claude configured executable ([claude] bin)', () => {
     // sendInitialize 因配错 bin 走 catch → this.query 保持 undefined。
     // 旧实现此时调 listModels/setModelSettings 会抛模糊的
     // "Cannot read properties of undefined (reading 'supportedModels')";
-    // 守卫后改成可定位的清晰错误(2026-07-04 review follow-up)。
+    // 保留初始化的原始路径错误，不能用泛化的 SDK 错误掩盖原因。
     const previousBin = config.claude.bin
     ;(config.claude as any).bin = '/nope/reclaude'
     try {
       const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' })
       proc.sendInitialize() // 走 catch,this.query 仍 undefined
 
-      await expect(proc.listModels()).rejects.toThrow('SDK query not initialized')
-      await expect(proc.setModelSettings('opus', 'high')).rejects.toThrow('SDK query not initialized')
+      await expect(proc.listModels()).rejects.toThrow('[claude].bin not found: /nope/reclaude')
+      await expect(proc.setModelSettings('opus', 'high')).rejects.toThrow('[claude].bin not found: /nope/reclaude')
     } finally {
       if (previousBin === undefined) delete (config.claude as any).bin
       else config.claude.bin = previousBin

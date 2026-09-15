@@ -5,6 +5,7 @@
 
 import type { AgentProvider, AgentReasoningEffort } from './agent-process'
 import type { TokenSourceConfig } from './config'
+import type { AccountInfo, Settings } from '@anthropic-ai/claude-agent-sdk'
 import { log } from './log'
 
 export type TokenSourceAgent = AgentProvider
@@ -65,7 +66,7 @@ export interface UsageSnapshotUnified {
 // ── env helper(各 source 共享:scrub 残留凭据防 A 账号夹带 B 的 key) ─────
 type Env = Record<string, string | undefined>
 
-const ANTHROPIC_ENV_KEYS = [
+export const ANTHROPIC_ENV_KEYS = [
   'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_DEFAULT_FABLE_MODEL', 'ANTHROPIC_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL',
@@ -127,6 +128,10 @@ export interface TokenSource {
    *  注入 env 的 source(glm/deepseek)不设 → DEFAULT(['project','local'],spawnEnv 权威);
    *  透传型 source(native)设 ['user','project','local'] → 读本机 Claude Code 配置。 */
   settingSources?: readonly string[]
+  /** Claude 来源的进程级设置覆盖；不修改本机 settings 文件。 */
+  claudeSettings?: Settings
+  /** 在 Claude SDK 接收用户输入前确认实际认证来源。 */
+  validateClaudeAccount?(account: AccountInfo): void
   readUsage(): Promise<UsageSnapshotUnified>
 }
 

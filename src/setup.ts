@@ -249,9 +249,8 @@ export async function runSetup(): Promise<void> {
   console.log('默认后端是 Claude Code; Codex 是可选第二后端, 群里发 model 一键切换。')
   console.log('每个群对应一个项目目录, agent 在那里跑、能读写文件。')
   console.log()
-  console.log(`${C.yellow}⚠ Claude 官方限制:${C.reset}`)
-  console.log(`  ${C.bold}Claude 订阅 (Pro/Max OAuth 登录) 不支持本项目${C.reset},`)
-  console.log(`  必须走 API 方式 —— 推荐 GLM Coding Plan, 或自备 Anthropic API key。`)
+  console.log('支持本机已登录的 Claude Code 订阅，也可配置 GLM Coding Plan 或 Anthropic API key。')
+  console.log('Claude Code 订阅与第三方来源可在 model 面板中分别选择。')
   console.log()
   console.log('本向导依次做 4 件事:')
   console.log(`  ${C.dim}1) 确保 Claude Code CLI 已装好${C.reset}`)
@@ -267,14 +266,14 @@ export async function runSetup(): Promise<void> {
   console.log(`${C.green}✓ Claude Code / SDK 已更新${C.reset}: ${C.dim}${agentBin('claude', 'claude')}${C.reset}`)
   console.log()
   console.log(`${C.dim}下一步可选配 GLM Coding Plan 自动写入路由; 不配则用本机 Claude Code 现有配置。${C.reset}`)
-  console.log(`${C.dim}记住: 别用 \`claude\` 走订阅 OAuth 登录 —— 订阅不支持本项目, 要用 API key。${C.reset}`)
+  console.log(`${C.dim}使用 Claude 订阅时，在本机运行 \`claude auth login\`；完成后在 model 面板选择 Claude Code 订阅。${C.reset}`)
 
   // ── Step 2/4 ──────────────────────────────────────────────────
   step(2, 4, 'GLM Coding Plan (推荐, 可选)')
   console.log('GLM Coding Plan 给 Claude Code 接 GLM 系列模型 (支持 1M token 上下文, 中文友好)。')
   console.log('订阅后在智谱开放平台拿一个 API key, 粘到下面 —— 向导自动写进 ~/.claude/settings.json。')
   console.log(`  ${C.dim}拿 key: https://open.bigmodel.cn → 控制台 → API Keys${C.reset}`)
-  console.log(`  ${C.dim}不给也行: 以本机 Claude Code 现有配置启动 (确保是 API key 方式, 非订阅)。${C.reset}`)
+  console.log(`  ${C.dim}直接回车跳过，可使用本机 Claude Code 订阅或其他已有配置。${C.reset}`)
   console.log()
 
   const glmKey = await ask('GLM API key (直接回车跳过)', {})

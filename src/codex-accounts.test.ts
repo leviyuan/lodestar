@@ -178,7 +178,8 @@ describe('Codex native and named accounts', () => {
     const env = accounts.env(named.id, { CODEX_HOME: '/foreign', CODEX_ACCESS_TOKEN: 'foreign-token',
       OPENAI_API_KEY: 'foreign-key', OPENAI_IDENTITY_TOKEN_FILE: '/foreign-token', PATH: '/bin' })
     expect(env.CODEX_HOME).toBe(accounts.home(named.id))
-    expect(env.CODEX_SQLITE_HOME).toBe(process.env.CODEX_SQLITE_HOME || accounts.defaultHome)
+    // 调用方没有在 base 中传入数据库目录，不能读取测试宿主的全局环境。
+    expect(env.CODEX_SQLITE_HOME).toBe(accounts.defaultHome)
     expect(env.PATH).toBe('/bin')
     expect(env.CODEX_ACCESS_TOKEN).toBeUndefined()
     expect(env.OPENAI_API_KEY).toBeUndefined()

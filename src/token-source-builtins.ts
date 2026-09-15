@@ -15,6 +15,7 @@ import { withModelVisibility } from './token-source-visibility'
 import './token-source-codex'
 import './token-source-glm'
 import './token-source-native'
+import './token-source-claude'
 import './token-source-deepseek'
 import './token-source-openrouter'
 import './token-source-dsh'
@@ -35,10 +36,11 @@ export function buildTokenSourcesFromConfig(): number {
     source.spawnRevision = tokenSourceSpawnRevision(def.kind, cfg, detected)
     return source
   })
-  // 有其他已启用的 Claude 侧来源时，native 让位。
+  // native 的旧激活规则只看第三方来源；新增订阅探测不能改变本机配置通路。
   const native = sources.find(s => s.kind === 'claude-native')
   if (native) {
-    const hasClaudeSource = sources.some(s => s.agent === 'claude' && s.enabled && s.kind !== 'claude-native')
+    const hasClaudeSource = sources.some(s => s.agent === 'claude' && s.enabled
+      && s.kind !== 'claude-native' && s.kind !== 'claude-subscription')
     native.enabled = !hasClaudeSource
     native.modelCatalogState = {
       status: native.enabled ? 'idle' : 'disabled',

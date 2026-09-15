@@ -1,6 +1,6 @@
 /**
  * 沿用本机 Claude 环境和 user settings 的账号来源。
- * 有其他已启用的 Claude 侧来源时禁用；模型目录来自 SDK，额度不适用。
+ * 有已启用的第三方 Claude 侧来源时禁用；模型目录来自 SDK，额度不适用。
  */
 
 import { type TokenSourceConfig } from './config'

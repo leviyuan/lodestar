@@ -4,6 +4,7 @@ import { spawn as crossSpawn } from 'cross-spawn'
 import { delimiter, join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import {
+  type AccountInfo,
   type EffortLevel,
   type McpServerConfig,
   type ModelInfo,
@@ -11,6 +12,7 @@ import {
   type SDKMessage,
   type SDKUserMessage,
   type SettingSource,
+  type Settings,
   type SpawnOptions as ClaudeSdkSpawnOptions,
   type SpawnedProcess,
   type PermissionResult,
@@ -109,6 +111,8 @@ export interface ClaudeSpawnOpts extends Omit<SpawnOpts, 'effort'> {
    *  注入 env 的 token source(glm/deepseek)不传 → DEFAULT(['project','local'],不读 user settings env,spawnEnv 权威);
    *  透传型 source(native)传 ['user','project','local'] → 读本机 Claude Code 配置(settings.json env / .credentials)。 */
   settingSources?: readonly string[]
+  settings?: Settings
+  validateAccount?: (account: AccountInfo) => void
   /** 该进程 spawn 时绑定的 token source id;stopIdleMismatchedProcess 据此判跨 source 重启。 */
   tokenSourceId?: string | null
   /** Daemon-owned local plugin containing shared Skills. Loaded only when the
@@ -605,6 +609,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   private resolveExit!: () => void
   private started = false
   private queryStart?: Promise<void>
+  private initializationError: Error | null = null
   private pendingPermissions = new Map<string, PendingControl>()
   private requestCounter = 0
   private cumulativeUsageFromResults: CodexUsage | null = null
@@ -641,9 +646,17 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (this.started) return
     this.started = true
     this.queryStart = this.initializeQuery().catch(error => {
-      this.emit('error', error instanceof Error ? error : new Error(String(error)))
-      this.finishExit(1, null)
+      this.initializationError = error instanceof Error ? error : new Error(String(error))
+      this.emit('error', this.initializationError)
+      // 已启动的 query 由 readLoop 确认退出；清理失败时不能伪造进程已退出。
+      if (!this.query) this.finishExit(1, null)
     })
+  }
+
+  private async *validatedInput(): AsyncIterableIterator<SDKUserMessage> {
+    await this.queryStart
+    if (this.initializationError || !this.alive) return
+    yield* this.input
   }
 
   private async initializeQuery(): Promise<void> {
@@ -675,7 +688,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       if (this.opts.effort === 'default') env.CLAUDE_CODE_EFFORT_LEVEL = 'unset'
       log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} cwd=${this.opts.workDir} executable=${executable.description}`)
       this.query = query({
-        prompt: this.input,
+        prompt: this.opts.validateAccount ? this.validatedInput() : this.input,
         options: {
           cwd: this.opts.workDir,
           abortController: this.abortController,
@@ -695,6 +708,7 @@ export class ClaudeAgentProcess extends EventEmitter {
           permissionMode: CLAUDE_PERMISSION_MODE,
           env,
           settingSources: [...settingSources] as SettingSource[],
+          ...(this.opts.settings ? { settings: this.opts.settings } : {}),
           ...managedSkillOptions,
           tools: toolsOption,
           ...(this.opts.allowDelegation === false ? { disallowedTools: ['Agent', 'Task'] } : {}),
@@ -718,11 +732,21 @@ export class ClaudeAgentProcess extends EventEmitter {
       })
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e))
+      this.initializationError = err
       this.emit('error', err)
       this.finishExit(1, null)
       return
     }
     void this.readLoop(this.query)
+    if (this.opts.validateAccount) {
+      try {
+        this.opts.validateAccount(await this.query.accountInfo())
+      } catch (error) {
+        this.initializationError = error instanceof Error ? error : new Error(String(error))
+        this.emit('error', this.initializationError)
+        await this.kill()
+      }
+    }
   }
 
   sendUserText(text: string, files: string[] = []): void {
@@ -828,6 +852,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   async listModels(): Promise<CodexModel[]> {
     if (!this.started) this.sendInitialize()
     await this.queryStart
+    if (this.initializationError) throw this.initializationError
     if (!this.query) throw new Error('claude-agent-process: SDK query not initialized (sendInitialize failed or not called)')
     const models = await this.query.supportedModels()
     return models.map(mapModelInfo)
@@ -841,6 +866,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
     if (!this.started) this.sendInitialize()
     await this.queryStart
+    if (this.initializationError) throw this.initializationError
     if (!this.query) throw new Error('claude-agent-process: SDK query not initialized (sendInitialize failed or not called)')
     if (claudeModel) await this.query.setModel(claudeModel)
     await this.query.applyFlagSettings({ effortLevel: effort === 'default' ? null : effort, ultracode: null })

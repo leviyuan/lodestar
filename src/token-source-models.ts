@@ -12,6 +12,7 @@ import type { TokenSourceModel } from './token-source'
 import type { AgentReasoningEffort } from './agent-process'
 import { homedir } from 'node:os'
 import { log } from './log'
+import type { ClaudeSpawnOpts } from './claude-agent-process'
 
 const TIMEOUT_MS = 10_000
 
@@ -32,10 +33,11 @@ function codexEffort(e: unknown): AgentReasoningEffort | null {
 export const CLAUDE_EFFORTS: AgentReasoningEffort[] = ['max', 'xhigh', 'high', 'medium', 'low']
 
 /** SDK 控制接口不发送用户输入；目录读取后关闭这个独立查询进程。 */
-export async function fetchNativeClaudeModels(): Promise<TokenSourceModel[]> {
+export async function fetchNativeClaudeModels(options: Pick<ClaudeSpawnOpts,
+  'settingSources' | 'settings' | 'transformEnv' | 'validateAccount' | 'tokenSourceId'> = {}): Promise<TokenSourceModel[]> {
   const { ClaudeAgentProcess } = await import('./claude-agent-process')
   const proc = new ClaudeAgentProcess({ workDir: homedir(), effort: 'high',
-    settingSources: ['user'], allowDelegation: false, profile: { loadProjectMcp: false } })
+    settingSources: ['user'], allowDelegation: false, profile: { loadProjectMcp: false }, ...options })
   proc.on('error', error => log(`Claude model catalog MISS: ${error.message}`))
   try {
     const catalog = await withTimeout(proc.listModels())

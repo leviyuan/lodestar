@@ -48,7 +48,7 @@ api_key="test-key"
     const { config } = await import(${modulePath('config.ts')})
     const registry = await import(${modulePath('token-source.ts')})
     const { withModelVisibility } = await import(${modulePath('token-source-visibility.ts')})
-    for (const name of ['codex', 'glm', 'native', 'deepseek', 'openrouter', 'dsh', 'dsh-glm']) {
+    for (const name of ['codex', 'glm', 'native', 'claude', 'deepseek', 'openrouter', 'dsh', 'dsh-glm']) {
       await import(${JSON.stringify(join(import.meta.dir, 'token-source-'))} + name + '.ts')
     }
     const rebuild = () => {
@@ -64,7 +64,7 @@ api_key="test-key"
     mock.module(${modulePath('token-source-builtins.ts')}, () => ({ buildTokenSourcesFromConfig: rebuild }))
     const { registerCustomTokenSourceModel, removeCustomTokenSourceModel, editTokenSourceModels } = await import(${modulePath('token-source-config.ts')})
     rebuild(); await registry.refreshAllTokenSourceModels()
-    const sources = ['codex-sub', 'glm', 'claude-native', 'deepseek', 'openrouter', 'deepseek-harness', 'dsh-glm']
+    const sources = ['codex-sub', 'glm', 'claude-native', 'claude-sub', 'deepseek', 'openrouter', 'deepseek-harness', 'dsh-glm']
     for (const id of sources) {
       const before = registry.getTokenSource(id).models.map(m => m.model)
       const custom = id === 'openrouter' ? 'vendor/custom-test' : 'custom-test'

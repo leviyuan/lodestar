@@ -109,6 +109,8 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
         ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
         ...(opts.profile ? { profile: opts.profile } : {}),
         ...(source ? { settingSources: source.settingSources ?? ['project', 'local'] } : {}),
+        ...(source?.claudeSettings ? { settings: source.claudeSettings } : {}),
+        ...(source?.validateClaudeAccount ? { validateAccount: source.validateClaudeAccount } : {}),
         ...(opts.managedSkillPluginPath ? { managedSkillPluginPath: opts.managedSkillPluginPath } : {}),
         tokenSourceId: source?.id ?? null,
         transformEnv,

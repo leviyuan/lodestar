@@ -25,6 +25,14 @@
 
 回复底部显示 `agent · 模型名/effort`，其中 Agent 为 `claude`、`codex` 或 `dsh`。窗口额度如 `4.1h·7%·[6.9d·17%]`，分别表示重置倒计时与已用百分比，方括号内为周窗口；余额显示 `余额 $12.34` 或 `余额 ¥12.34`。读取失败显示 `MISS`，Codex 的短暂网络失败会有限重试。
 
+## Claude Code 订阅
+
+在运行 Lodestar 的本机通过 `claude auth login` 登录 Claude 订阅后，发送 `md` → Claude Code → **Claude Code 订阅**。来源 id 为 `claude-sub`，可与 GLM、DeepSeek、OpenRouter 同时使用；无需复制登录凭据或填写 API key。
+
+账号和模型目录通过 Claude Code 原生 SDK 查询，模型与 effort 随目录更新；未登录会显示启用引导，查询失败显示 `MISS`。可选配置节为 `[token_source.claude-sub]`，支持 `display`、`model`、`effort`、`hidden_models` 和 `custom_models`。当前未接入订阅额度查询。
+
+订阅进程保留本机和项目的 Claude 设置，并在进程内清除其他来源的 API key、模型映射和中转路由。发送任务前会再次核对实际账号是否为第一方订阅。Claude native 继续保留为使用本机完整配置的来源。
+
 ## OpenRouter
 
 OpenRouter 通过 Claude Agent SDK 运行。在群内发送 `openrouter-setup <api_key>`，再通过 `model` 面板选择模型和 effort；自建兼容端点用 `openrouter-setup <base_url> <api_key>`。也可在配置文件中添加：
@@ -34,17 +42,16 @@ OpenRouter 通过 Claude Agent SDK 运行。在群内发送 `openrouter-setup <a
 agent = "claude"
 api_key = "填写自己的 OpenRouter API key"
 # base_url = "https://openrouter.ai/api" # SDK 自动追加 /v1/messages
-# model = "anthropic/claude-fable-5.1"   # 可选：默认运行模型，须获账号目录确认
+# model = "moonshotai/kimi-k3"   # 可选：默认运行模型，须获账号目录确认
 # effort = "max"                       # 可选：仅覆盖默认运行模型的档位
-# models = "anthropic/claude-fable-5.1,moonshotai/kimi-k3" # 可选：自定义可选列表
-# slots = "haiku=anthropic/claude-fable-5.1" # 可选：辅助任务模型，须获账号目录确认且使用相同的 effort 参数模式
+# models = "moonshotai/kimi-k3,google/gemini-3.8-flash" # 可选：自定义可选列表
+# slots = "haiku=moonshotai/kimi-k3" # 可选：辅助任务模型，须获账号目录确认且使用相同的 effort 参数模式
 ```
 
-内置默认列表包含以下 **11 项**，定义见[默认模型配置](../src/openrouter-defaults.ts)。这是项目提供的初始列表，可在面板中自行调整。
+内置默认列表包含以下 **10 项**，定义见[默认模型配置](../src/openrouter-defaults.ts)。这是项目提供的初始列表，默认不含 Claude，可在面板中自行调整。
 
 | 厂商 | 模型 ID | 默认档位 |
 | --- | --- | --- |
-| Anthropic | `anthropic/claude-fable-5.1` | max |
 | Moonshot | `moonshotai/kimi-k3` | max |
 | Tencent | `tencent/hy4-preview` | high |
 | Google | `google/gemini-3.8-flash` | high |
@@ -56,7 +63,7 @@ api_key = "填写自己的 OpenRouter API key"
 | 字节跳动 | `bytedance-seed/seed-2-1-turbo` | 模型默认 |
 | 美团 | `meituan/longcat-2.0` | 模型默认 |
 
-在 `md` → Claude Code → OpenRouter 中，点「显示模型」进入账号目录，再点「显」加入列表，点「隐」移出面板列表。可见性自动保存，不改当前运行模型；全部隐藏后也能继续显示或补录。未配置 `models` 时才使用上述十一项；`models = ""` 表示没有已显示的接口模型，刷新或重启不会补回默认项。内置列表更新不会覆盖用户维护的列表。
+在 `md` → Claude Code → OpenRouter 中，点「显示模型」进入账号目录，再点「显」加入列表，点「隐」移出面板列表。可见性自动保存，不改当前运行模型；全部隐藏后也能继续显示或补录。未配置 `models` 时才使用上述十项；`models = ""` 表示没有已显示的接口模型，刷新或重启不会补回默认项。内置列表更新不会覆盖用户维护的列表。
 
 候选目录来自 `/api/v1/models/user`，按账号供应商和隐私设置筛选，仅纳入支持文本和工具调用的交互模型；OpenAI、GLM、DeepSeek 及无法保证厂商范围的自动路由不会出现在添加候选中。目录刷新失败显示 `MISS`。显式配置但已下线的模型保留为可删除的 `MISS` 项。
 

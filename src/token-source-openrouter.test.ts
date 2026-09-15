@@ -153,7 +153,7 @@ describe('OpenRouter authoritative model catalog', () => {
     expect(source.models[0].model).toBe('anthropic/test-model[1m]')
   })
 
-  test('keeps the nine ranked labs plus ByteDance and Meituan and uses the declared effort behavior', async () => {
+  test('keeps eight ranked labs plus ByteDance and Meituan without Claude in the defaults', async () => {
     respond = () => json({ data: OPENROUTER_DEFAULT_MODELS.map(entry => model(entry.model, {
       reasoning: entry.effort === 'default' ? { mandatory: false }
         : { supported_efforts: [entry.effort, 'low'], default_effort: 'low' },
@@ -162,9 +162,10 @@ describe('OpenRouter authoritative model catalog', () => {
     await source.refreshModels()
     expect(source.models.map(entry => entry.model)).toEqual(OPENROUTER_DEFAULT_MODELS.map(entry => entry.model))
     expect(source.models.map(entry => entry.defaultEffort)).toEqual(OPENROUTER_DEFAULT_MODELS.map(entry => entry.effort))
-    expect(OPENROUTER_DEFAULT_MODELS.filter(entry => entry.rank).map(entry => entry.rank)).toEqual([1, 3, 4, 7, 8, 9, 10, 11, 12])
+    expect(OPENROUTER_DEFAULT_MODELS.filter(entry => entry.rank).map(entry => entry.rank)).toEqual([3, 4, 7, 8, 9, 10, 11, 12])
     expect(OPENROUTER_DEFAULT_MODELS.filter(entry => !entry.rank).map(entry => entry.lab)).toEqual(['ByteDance', 'Meituan'])
-    expect(new Set(OPENROUTER_DEFAULT_MODELS.map(entry => entry.lab)).size).toBe(11)
+    expect(new Set(OPENROUTER_DEFAULT_MODELS.map(entry => entry.lab)).size).toBe(10)
+    expect(source.models.some(entry => /anthropic|claude/i.test(entry.model))).toBe(false)
     expect(source.models.every(entry => !openRouterModelExcluded(entry.model))).toBe(true)
   })
 
