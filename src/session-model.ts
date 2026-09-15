@@ -480,11 +480,12 @@ export async function onModelEffortSelect(
   const sourceChanged = !!choice.sourceId && s.currentTokenSource()?.id !== choice.sourceId
   const environmentChanged = !s.processSourceMatches(source, model) || !!source?.modelEnvironmentRevision
     && source.modelEnvironmentRevision(s.currentModelLabel() ?? '') !== source.modelEnvironmentRevision(model)
+  const processNeedsStop = s.modelSelectionNeedsProcessStop(provider, choice.sourceId ?? s.selectedTokenSourceId, model)
   const selectionUnchanged = s.currentProvider() === provider &&
     !sourceChanged &&
     s.currentModelLabel() === model &&
     s.currentEffortLabel() === effort
-  if (selectionUnchanged) {
+  if (selectionUnchanged && !processNeedsStop && !environmentChanged) {
     s.modelPanels.delete(panelId)
     return {
       ok: true,
@@ -511,7 +512,7 @@ export async function onModelEffortSelect(
   const modelChanged = s.currentModelLabel() !== model
   const profileChanged = modelChanged || sourceChanged
   const procBusy = !!(s.currentTurn || s.openingTurn || s.pendingUserMessageCount > 0 || s.pendingMidTurnMsgs.length > 0)
-  if (environmentChanged && s.proc?.isAlive() && procBusy) {
+  if ((environmentChanged || processNeedsStop) && s.proc?.isAlive() && procBusy) {
     return { ok: false, message: '新模型需要更新进程配置，请等当前任务结束后再选择' }
   }
   if (
@@ -534,7 +535,7 @@ export async function onModelEffortSelect(
     // 跨 source(GLM↔DeepSeek↔native,即使同 provider)env 变了 → 跳过热切换,交给
     // applyModelSelection→stopIdleMismatchedProcess 杀进程重启换 env。热切换只改 model
     // 不重注入 env,跨 source 会打到上一个 source 的 base_url(silent divergence)。
-    if (s.proc?.isAlive() && s.proc.provider === provider && !sourceChanged && !environmentChanged) {
+    if (s.proc?.isAlive() && s.proc.provider === provider && !sourceChanged && !environmentChanged && !processNeedsStop) {
       const processModel = choice.sourceId
         ? s.tokenSource(choice.sourceId)?.resolveSpawnModel(model) ?? model
         : model
@@ -560,7 +561,6 @@ export async function onModelEffortSelect(
   } catch (e) {
     const message = `模型切换失败: ${messageOf(e)}`
     log(`session "${s.sessionName}": set model settings failed: ${messageOf(e)}`)
-    await feishu.sendText(s.chatId, `❌ ${message}`)
     return { ok: false, message }
   }
 }

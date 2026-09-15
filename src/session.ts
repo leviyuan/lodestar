@@ -950,28 +950,43 @@ export class Session {
     tokenSourceId?: string,
   ): Promise<void> {
     const previousProvider = this.selectedProvider
-    if (previousProvider !== provider) {
-      // Checked first: a failed state write must not leave the in-memory
-      // provider changed while a durable Claude fork marker survives.
-      feishu.replaceTurnAnchors(this.sessionName, [], null, null)
-      this.pendingConversationMaterialization = null
+    const nextSourceId = tokenSourceId ?? this.selectedTokenSourceId
+    const ts = getTokenSource(nextSourceId)
+    const nextModel = ts ? model || null : provider === 'codex' ? null : model
+    const nextEffort = ts
+      ? effort ?? tokenSourceRuntimeModel(ts, model || ts.defaultModel)?.defaultEffort ?? null
+      : provider === 'codex' ? null : effort
+
+    // Keep both routing and its durable selection unchanged until the old
+    // process has actually stopped. A failed close must remain retryable.
+    await this.stopIdleMismatchedProcessUnlocked(provider, nextSourceId, nextModel)
+    const previousConversation = previousProvider !== provider ? {
+      anchors: feishu.getTurnAnchors(this.sessionName).slice(),
+      base: feishu.getSessionBranchBase(this.sessionName),
+      pending: feishu.getPendingConversationLaunch(this.sessionName),
+    } : null
+    if (previousConversation) feishu.replaceTurnAnchors(this.sessionName, [], null, null)
+    try {
+      feishu.bindSessionModelChecked(this.sessionName, provider, nextModel, nextEffort, nextSourceId)
+    } catch (error) {
+      if (previousConversation) {
+        try {
+          feishu.replaceTurnAnchors(this.sessionName, previousConversation.anchors,
+            previousConversation.base, previousConversation.pending)
+        } catch (restoreError) {
+          throw new AggregateError([error, restoreError],
+            `model selection write failed: ${messageOf(error)}; conversation state restore failed: ${messageOf(restoreError)}`)
+        }
+      }
+      throw error
     }
+    if (previousConversation) this.pendingConversationMaterialization = null
     this.selectedProvider = provider
-    // 有 token source 时:用 source.id;model/effort 走 ts.defaultModel(真实模型,非 SDK alias)
-    this.selectedTokenSourceId = tokenSourceId ?? this.selectedTokenSourceId
-    const ts = getTokenSource(this.selectedTokenSourceId)
-    if (ts) {
-      // model = 用户面板选的具体 slug(gpt-5.6-sol / GLM-5.2[1m]);空 → fallback ts.defaultModel
-      this.selectedModel = model || null
-      this.selectedEffort = effort ?? tokenSourceRuntimeModel(ts, model || ts.defaultModel)?.defaultEffort ?? null
-    } else {
-      this.selectedModel = provider === 'codex' ? null : model
-      this.selectedEffort = provider === 'codex' ? null : effort
-    }
+    this.selectedTokenSourceId = nextSourceId
+    this.selectedModel = nextModel
+    this.selectedEffort = nextEffort
     this.lastSessionRef = feishu.getSessionResumeRef(this.sessionName, provider)
     this.lastSessionId = this.lastSessionRef?.sessionId ?? null
-    feishu.bindSessionModel(this.sessionName, provider, this.selectedModel, this.selectedEffort, this.selectedTokenSourceId)
-    await this.stopIdleMismatchedProcessUnlocked()
   }
 
   async stopIdleMismatchedProcess(): Promise<void> {
@@ -985,21 +1000,32 @@ export class Session {
       || this.procSourceRevisions.get(this.proc) === tokenSourceProcessRevision(source, model)
   }
 
-  private async stopIdleMismatchedProcessUnlocked(): Promise<void> {
-    if (!this.proc?.isAlive()) return
+  modelSelectionNeedsProcessStop(
+    provider = this.selectedProvider,
+    tokenSourceId = this.selectedTokenSourceId,
+    model = this.selectedModel,
+  ): boolean {
+    const proc = this.proc
+    return !!proc?.isAlive() && (
+      this.blockedProc === proc
+      || proc.provider !== provider
+      || proc.tokenSourceId !== tokenSourceId
+      || !this.processSourceMatches(this.tokenSource(tokenSourceId), model)
+    )
+  }
+
+  private async stopIdleMismatchedProcessUnlocked(
+    provider = this.selectedProvider,
+    tokenSourceId = this.selectedTokenSourceId,
+    model = this.selectedModel,
+  ): Promise<void> {
     // provider 或 token source 任一变化 = 进程 env 不再匹配 → idle 时杀掉,下轮重 spawn 换 env。
     // 同 provider 跨 source(GLM↔DeepSeek↔native)env(base_url/凭据)不同也必须重启,
     // 否则热切换只改 model 不换 env → 模型名打到上一个 source 的 base_url(silent divergence)。
-    const source = this.currentTokenSource()
-    const revisionMatches = this.processSourceMatches(source, this.selectedModel)
-    if (
-      this.proc.provider === this.selectedProvider
-      && this.proc.tokenSourceId === this.selectedTokenSourceId
-      && revisionMatches
-    ) return
+    if (!this.proc || !this.modelSelectionNeedsProcessStop(provider, tokenSourceId, model)) return
     if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return
     const proc = this.proc
-    log(`session "${this.sessionName}": stop idle ${proc.provider} process after switching to ${this.selectedProvider}`)
+    log(`session "${this.sessionName}": stop idle ${proc.provider} process before switching to ${provider}`)
     this.beginProcStop(proc)
     this.initCount = 0
     // 进程换掉:恢复轮标记 / 孤儿缓冲随旧进程作废,否则会泄漏到新进程的
@@ -1012,13 +1038,15 @@ export class Session {
     this.status = 'stopped'
     let resumableStateError = await this.settleProcResumableState(proc)
     let killError: unknown = null
-    try { await proc.kill(1000) }
+    // Use the backend's shutdown deadline: Claude SDK alone allows about 2 s
+    // for graceful cleanup, so the former 1 s override reported false failures.
+    try { await proc.kill() }
     catch (e) { killError = e }
     resumableStateError = await this.settleProcResumableState(proc)
     const confirmed = this.finishProcStop(proc, killError)
     this.opts.onLifecycleChange?.()
     const failures = [
-      ...(!confirmed ? [killError ?? new Error(this.blockedProcReason ?? 'process stop unconfirmed')] : []),
+      ...(killError ? [killError] : !confirmed ? [new Error(this.blockedProcReason ?? 'process stop unconfirmed')] : []),
       ...(resumableStateError ? [new Error(resumableStateError)] : []),
     ]
     if (failures.length === 1) throw failures[0]
@@ -1046,13 +1074,13 @@ export class Session {
     this.status = 'stopped'
     let resumableStateError = await this.settleProcResumableState(proc)
     let killError: unknown = null
-    try { await proc.kill(1000) }
+    try { await proc.kill() }
     catch (e) { killError = e }
     resumableStateError = await this.settleProcResumableState(proc)
     const confirmed = this.finishProcStop(proc, killError)
     this.opts.onLifecycleChange?.()
     const failures = [
-      ...(!confirmed ? [killError ?? new Error(this.blockedProcReason ?? 'process stop unconfirmed')] : []),
+      ...(killError ? [killError] : !confirmed ? [new Error(this.blockedProcReason ?? 'process stop unconfirmed')] : []),
       ...(resumableStateError ? [new Error(resumableStateError)] : []),
     ]
     if (failures.length === 1) throw failures[0]

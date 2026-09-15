@@ -14,6 +14,7 @@ import {
 const { Session } = await import('./session')
 const sessionTools = await import('./session-tools')
 const { CodexRpcResponseError } = await import('./codex-process')
+const { ClaudeAgentProcess } = await import('./claude-agent-process')
 const cardkit = await import('./cardkit')
 const feishu = await import('./feishu')
 const mathRender = await import('./math-render')
@@ -2190,6 +2191,199 @@ describe('Session provider switching', () => {
     expect(proc.setModelSettingsCalls).toEqual([])
     expect(proc.killCalls).toBe(1)
     expect(session.proc).not.toBe(proc)   // 旧进程已杀;下轮 start 用 deepseek 的 base_url 重 spawn
+  })
+
+  test('model switching waits through Claude SDK cleanup before committing the new selection', async () => {
+    const session = new Session('model-sdk-cleanup', 'chat_id') as any
+    const previous = { provider: 'claude' as const, tokenSourceId: 'glm', model: 'GLM-5.2', effort: 'max' }
+    Object.assign(session, { selectedProvider: previous.provider, selectedTokenSourceId: previous.tokenSourceId,
+      selectedModel: previous.model, selectedEffort: previous.effort })
+    const proc = new ClaudeAgentProcess({ workDir: session.workDir, effort: 'max', tokenSourceId: 'glm' }) as any
+    proc.sessionId = 'claude-before-switch'
+    proc.started = true
+    let signalClose!: () => void
+    const closing = new Promise<void>(resolve => { signalClose = resolve })
+    proc.query = {
+      close: signalClose,
+      async *[Symbol.asyncIterator]() {
+        await closing
+        // SDK cleanup can spend about 2 s waiting for stdin EOF to finish.
+        await new Promise(resolve => setTimeout(resolve, 1200))
+      },
+    }
+    const readLoop = proc.readLoop(proc.query)
+    session.proc = proc
+    session.wireProc(proc)
+    session.modelPanels.set('switch', { models: [{ provider: 'claude', sourceId: 'deepseek',
+      model: 'deepseek-v4-pro', displayName: 'DeepSeek', efforts: [{ effort: 'high' }] }] })
+    const save = spyOn(feishu, 'bindSessionModelChecked')
+    try {
+      const switching = session.onModelEffortSelect('deepseek-v4-pro', 'high', 'switch', '', 'claude')
+      await closing
+      const duringClose = session.conversationRouting()
+      const writesDuringClose = save.mock.calls.length
+      const result = await switching
+
+      expect(duringClose).toMatchObject(previous)
+      expect(writesDuringClose).toBe(0)
+      expect(result.ok).toBe(true)
+      expect(proc.isAlive()).toBe(false)
+      expect(session.proc).toBeNull()
+      expect(save).toHaveBeenCalledWith(session.sessionName, 'claude', 'deepseek-v4-pro', 'high', 'deepseek')
+      expect(resumeRefs.get(`${session.sessionName}:claude`)?.sessionId).toBe('claude-before-switch')
+    } finally {
+      await readLoop
+      save.mockRestore()
+      session.dispose()
+    }
+  })
+
+  test.each([
+    { provider: 'codex' as const, sourceId: 'codex-sub', model: 'gpt-6-astra', effort: 'max' as const },
+    { provider: 'claude' as const, sourceId: 'deepseek', model: 'deepseek-v4-pro', effort: 'high' as const },
+  ])('failed switch to $sourceId keeps the old selection and retries without duplicate error messages', async target => {
+    const source = getTokenSource(target.sourceId)!
+    const sourceBefore = { enabled: source.enabled, models: source.models, modelCatalogState: source.modelCatalogState }
+    source.enabled = true
+    source.models = [{ model: target.model, display: target.model, efforts: [target.effort], defaultEffort: target.effort }]
+    source.modelCatalogState = { status: 'ready', updatedAt: 1 }
+    const session = new Session(`model-failed-${target.sourceId}`, 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-before-switch', 'glm')
+    session.proc = proc
+    session.selectedProvider = 'claude'; session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'; session.selectedEffort = 'max'
+    session.modelPanels.set('switch', { models: [{ ...target, displayName: target.model,
+      efforts: [{ effort: target.effort }] }] })
+    const save = spyOn(feishu, 'bindSessionModelChecked')
+    let attempts = 0
+    proc.kill = async () => { attempts++; throw new Error('SDK close timeout') }
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const result = await session.onModelEffortSelect(target.model, target.effort, 'switch', '', target.provider)
+        expect(result).toMatchObject({ ok: false, message: '模型切换失败: SDK close timeout' })
+        expect(session.conversationRouting()).toMatchObject({ provider: 'claude', tokenSourceId: 'glm',
+          model: 'GLM-5.2', effort: 'max' })
+        expect(session.proc).toBe(proc)
+        expect(session.blockedProc).toBe(proc)
+        expect(session.modelPanels.has('switch')).toBe(true)
+      }
+      expect(attempts).toBe(2)
+      expect(save).not.toHaveBeenCalled()
+      expect(sentTexts).toEqual([]) // The card-action dispatcher owns the visible failure receipt.
+
+      proc.kill = FakeAgentProc.prototype.kill.bind(proc)
+      const retry = await session.onModelEffortSelect(target.model, target.effort, 'switch', '', target.provider)
+      expect(retry.ok).toBe(true)
+      expect(session.proc).toBeNull()
+      expect(save).toHaveBeenCalledTimes(1)
+    } finally {
+      Object.assign(source, sourceBefore)
+      save.mockRestore()
+      session.dispose()
+    }
+  })
+
+  test('reselecting a previously saved target still stops the mismatched process', async () => {
+    const session = new Session('model-stale-selection', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-before-switch', 'glm')
+    session.proc = proc
+    session.selectedProvider = 'claude'; session.selectedTokenSourceId = 'deepseek'
+    session.selectedModel = 'deepseek-v4-pro'; session.selectedEffort = 'high'
+    session.modelPanels.set('switch', { models: [{ provider: 'claude', sourceId: 'deepseek',
+      model: 'deepseek-v4-pro', displayName: 'DeepSeek', efforts: [{ effort: 'high' }] }] })
+    try {
+      const result = await session.onModelEffortSelect('deepseek-v4-pro', 'high', 'switch', '', 'claude')
+      expect(result.ok).toBe(true)
+      expect(result.message).not.toContain('当前已是')
+      expect(proc.killCalls).toBe(1)
+      expect(proc.setModelSettingsCalls).toEqual([])
+      expect(session.proc).toBeNull()
+    } finally { session.dispose() }
+  })
+
+  test('reselecting the old model after an unconfirmed stop cannot report an unchanged healthy process', async () => {
+    const session = new Session('model-blocked-selection', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-stopping', 'glm')
+    session.proc = proc
+    session.blockedProc = proc
+    session.blockedProcReason = 'SDK close timeout'
+    session.selectedProvider = 'claude'; session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'; session.selectedEffort = 'max'
+    session.modelPanels.set('switch', { models: [{ provider: 'claude', sourceId: 'glm',
+      model: 'GLM-5.2', displayName: 'GLM', efforts: [{ effort: 'max' }] }] })
+    proc.kill = async () => { throw new Error('SDK close timeout') }
+    try {
+      const result = await session.onModelEffortSelect('GLM-5.2', 'max', 'switch', '', 'claude')
+      expect(result).toMatchObject({ ok: false, message: '模型切换失败: SDK close timeout' })
+      expect(proc.setModelSettingsCalls).toEqual([])
+    } finally { session.dispose() }
+  })
+
+  test('model selection write failure remains visible and does not change in-memory routing', async () => {
+    const session = new Session('model-write-failure', 'chat_id') as any
+    session.selectedProvider = 'claude'; session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'; session.selectedEffort = 'max'
+    session.modelPanels.set('switch', { models: [{ provider: 'claude', sourceId: 'deepseek',
+      model: 'deepseek-v4-pro', displayName: 'DeepSeek', efforts: [{ effort: 'high' }] }] })
+    const save = spyOn(feishu, 'bindSessionModelChecked').mockImplementation(() => { throw new Error('model map fsync failed') })
+    try {
+      const result = await session.onModelEffortSelect('deepseek-v4-pro', 'high', 'switch', '', 'claude')
+      expect(result).toMatchObject({ ok: false, message: '模型切换失败: model map fsync failed' })
+      expect(session.conversationRouting()).toMatchObject({ provider: 'claude', tokenSourceId: 'glm',
+        model: 'GLM-5.2', effort: 'max' })
+      expect(session.modelPanels.has('switch')).toBe(true)
+    } finally {
+      save.mockRestore()
+      session.dispose()
+    }
+  })
+
+  test.each([false, true])('provider switch preserves pending conversation state on write failure (restore failure: %s)', async restoreFails => {
+    const session = new Session('model-pending-write-failure', 'chat_id') as any
+    session.selectedProvider = 'claude'; session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'; session.selectedEffort = 'max'
+    const pending = { launch: { kind: 'fork' as const, source: {
+      provider: 'claude' as const, sessionId: 'fork-source', cwd: session.workDir,
+    } }, previousSessionId: 'previous-session' }
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    branchBaseBySession.set(session.sessionName, { kind: 'fresh' })
+    const save = spyOn(feishu, 'bindSessionModelChecked').mockImplementation(() => {
+      if (restoreFails) setTurnAnchorWriteError(new Error('turn state restore failed'))
+      throw new Error('model map fsync failed')
+    })
+    try {
+      const switching = session.applyModelSelection('codex', 'gpt-6-astra', 'max', 'codex-sub')
+      await expect(switching).rejects.toThrow(restoreFails
+        ? 'model selection write failed: model map fsync failed; conversation state restore failed: turn state restore failed'
+        : 'model map fsync failed')
+      expect(session.selectedProvider).toBe('claude')
+      expect(session.pendingConversationMaterialization).toBe(pending)
+      if (!restoreFails) {
+        expect(pendingConversationLaunchBySession.get(session.sessionName)).toEqual(pending)
+        expect(branchBaseBySession.get(session.sessionName)).toEqual({ kind: 'fresh' })
+      }
+    } finally {
+      setTurnAnchorWriteError(null)
+      save.mockRestore()
+      session.dispose()
+    }
+  })
+
+  test('a confirmed process exit does not hide an SDK close error or commit the target model', async () => {
+    const session = new Session('model-close-error', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-before-switch', 'glm')
+    session.proc = proc
+    session.selectedProvider = 'claude'; session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'; session.selectedEffort = 'max'
+    proc.kill = async () => { proc.alive = false; throw new Error('SDK close failed') }
+    try {
+      await expect(session.applyModelSelection('claude', 'deepseek-v4-pro', 'high', 'deepseek'))
+        .rejects.toThrow('SDK close failed')
+      expect(session.proc).toBeNull()
+      expect(session.selectedTokenSourceId).toBe('glm')
+      expect(session.selectedModel).toBe('GLM-5.2')
+    } finally { session.dispose() }
   })
 
   test('reselecting the active GLM model and max effort is idempotent', async () => {
