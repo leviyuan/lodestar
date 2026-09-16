@@ -169,7 +169,9 @@ export class DshProcess extends EventEmitter implements AgentProcess {
   async setModelSettings(model: string, effort: AgentReasoningEffort): Promise<void> {
     if (!isDshReasoningEffort(effort)) throw new Error(`invalid DSH effort: ${effort}`)
     await this.initializationPromise()
-    await this.runtime.request('session/model', { model, effort })
+    // This mutation cannot be cancelled by dropping its RPC response. Session
+    // presents a pending state while retaining the eventual acknowledgement.
+    await this.runtime.request('session/model', { model, effort }, null)
     if (!this.busy) { this.lastModel = model; this.lastEffort = effort }
   }
   async compactThread(): Promise<void> {

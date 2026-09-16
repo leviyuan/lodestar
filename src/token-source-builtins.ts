@@ -16,7 +16,6 @@ import './token-source-codex'
 import './token-source-glm'
 import './token-source-native'
 import './token-source-claude'
-import './token-source-reclaude'
 import './token-source-deepseek'
 import './token-source-openrouter'
 import './token-source-dsh'
@@ -48,18 +47,6 @@ export function buildTokenSourcesFromConfig(): number {
       updatedAt: Date.now(),
     }
   }
-  // ReClaude 客户端接管本机 Claude 登录；不能把同一账号再显示成原生订阅并查错额度。
-  const subscription = sources.find(s => s.kind === 'claude-subscription')
-  if (subscription && sources.some(s => s.kind === 'reclaude' && s.enabled)) {
-    const disable = () => {
-      subscription.enabled = false
-      subscription.models = []
-      subscription.modelCatalogState = { status: 'disabled', updatedAt: Date.now(),
-        error: '本机 Claude 登录由 ReClaude 管理，请选择 ReClaude 来源' }
-    }
-    disable()
-    subscription.refreshModels = async () => { disable() }
-  }
   for (const s of sources) registerTokenSource(s)
   const configuredDefault = sources.find(s => s.enabled && config.token_sources?.[s.id]?.default === true)
   const defaultSource = configuredDefault ?? sources.find(s => s.enabled)
@@ -80,7 +67,7 @@ export function tokenSourceSpawnRevision(
     auth: value?.auth,
     base_url: value?.base_url,
     auth_token: value?.auth_token,
-    api_key: kind === 'reclaude' ? undefined : value?.api_key,
+    api_key: value?.api_key,
     bin: value?.bin,
     model: value?.model,
     effort: value?.effort,

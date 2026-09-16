@@ -1,4 +1,4 @@
-import { isAgentProvider, isDshReasoningEffort } from './agent-process'
+import { isAgentProvider, isDshReasoningEffort, ModelSettingsUpdateError, type AgentProcess } from './agent-process'
 import { randomUUID } from 'node:crypto'
 
 import { Session } from './session'
@@ -16,7 +16,7 @@ import * as cards from './cards'
 import * as cardkit from './cardkit'
 import * as feishu from './feishu'
 import { log } from './log'
-import { messageOf, withTimeout, type ModelActionResult } from './session-util'
+import { messageOf, type ModelActionResult } from './session-util'
 
 export interface ModelPanelState {
   models: cards.ModelChoice[]
@@ -31,6 +31,97 @@ export interface ModelPanelState {
 }
 
 export const MODEL_PAGE_SIZE = 20
+
+export type ModelSettingsOutcome = { ok: true } | { ok: false; error: unknown }
+export interface ModelSettingsChange {
+  proc: AgentProcess
+  provider: AgentProvider
+  model: string
+  effort: AgentReasoningEffort
+  sourceId?: string
+  panelId: string
+  phase: 'pending' | 'failed'
+  confirmedModel: string | null
+  confirmedEffort: AgentReasoningEffort | null
+  error?: string
+  cancelled?: string
+  cancel(reason: string): void
+}
+
+function modelChangeFailure(s: Session, message: string): ModelActionResult {
+  return { ok: false, message, card: cards.modelChangeStatusCard(s.sessionName, false, message) }
+}
+
+/** Called under the lifecycle mutex, including late acknowledgements. */
+export async function finishModelSettingsChange(
+  s: Session, change: ModelSettingsChange, outcome: ModelSettingsOutcome,
+): Promise<ModelActionResult> {
+  if (change.cancelled || s.modelSettingsChange !== change || s.proc !== change.proc || !change.proc.isAlive()) {
+    return modelChangeFailure(s, `本次模型切换未保存：${change.cancelled ?? '原进程已退出或更换'}${outcome.ok ? '' : `；${messageOf(outcome.error)}`}`)
+  }
+  change.confirmedModel = outcome.ok || outcome.error instanceof ModelSettingsUpdateError && outcome.error.confirmedModel !== null
+    ? change.model : null
+  change.confirmedEffort = outcome.ok ? change.effort : null
+  let error: string | null = outcome.ok ? null : messageOf(outcome.error)
+  if (outcome.ok) {
+    try {
+      if (s.modelSelectionNeedsProcessStop(change.provider, change.sourceId ?? s.selectedTokenSourceId, change.model)) {
+        throw new Error('等待期间进程账号配置已变化，请 stop 后重新选择')
+      }
+      await s.applyModelSelectionUnlocked(change.provider, change.model, change.effort, change.sourceId)
+    } catch (cause) {
+      error = `模型和思考档位已应用，但保存选择失败：${messageOf(cause)}`
+    }
+  }
+  if (error !== null) {
+    change.phase = 'failed'
+    change.error = `${error}。本次完整设置未保存，后续输入暂停；请重新发送 md 完成选择，或 restart 恢复已保存的设置。`
+    log(`session "${s.sessionName}": model settings incomplete: ${change.error}`)
+    return modelChangeFailure(s, change.error)
+  }
+  s.modelSettingsChange = null
+  s.modelPanels.delete(change.panelId)
+  s.resumeInputAfterModelSettingsChange()
+  return {
+    ok: true,
+    message: `已选择 ${agentProviderLabel(change.provider)} · ${change.model} / ${change.effort}`,
+    card: cards.modelResultCard({ sessionName: s.sessionName, provider: change.provider,
+      model: change.model, effort: change.effort, scope: modelSelectionScope(s, change.provider) }),
+  }
+}
+
+async function changeLiveModelSettings(
+  s: Session, proc: AgentProcess, model: string, processModel: string, effort: AgentReasoningEffort,
+  panelId: string, sourceId?: string,
+): Promise<ModelActionResult> {
+  let cancel!: (outcome: ModelSettingsOutcome) => void
+  const cancelled = new Promise<ModelSettingsOutcome>(resolve => { cancel = resolve })
+  const change: ModelSettingsChange = {
+    proc, provider: proc.provider, model, effort, sourceId, panelId, phase: 'pending',
+    confirmedModel: null, confirmedEffort: null,
+    cancel(reason) { change.cancelled = reason; cancel({ ok: false, error: new Error(reason) }) },
+  }
+  s.modelSettingsChange = change
+  const applying = Promise.resolve().then(() => proc.setModelSettings(processModel, effort))
+    .then<ModelSettingsOutcome, ModelSettingsOutcome>(() => ({ ok: true }), error => ({ ok: false, error }))
+  const completion = Promise.race([applying, cancelled])
+  const waiting = Symbol('model-settings-pending')
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const outcome = await Promise.race([completion, new Promise<typeof waiting>(resolve => {
+      timer = setTimeout(() => resolve(waiting), 20_000)
+    })])
+    if (outcome !== waiting) return await finishModelSettingsChange(s, change, outcome)
+    const message = `正在等待 ${agentProviderLabel(proc.provider)} 确认 ${model} / ${effort}，尚不能判断切换结果。确认后会更新本卡；仍可回答 Agent 提问或用 stop 打断任务，取消本次切换请发 kill 或 restart。`
+    return {
+      ok: false, pending: true, message,
+      card: cards.modelChangeStatusCard(s.sessionName, true, message),
+      completion: completion.then(result => s.finishModelSettingsChange(change, result)),
+    }
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 // ── 第1级:账号(provider)选项 —— 每个 token source 一项 ─────
 function providerChoices(s: Session): cards.ProviderChoice[] {
@@ -337,11 +428,21 @@ export async function consumeModelCustomMessage(
   }
   if (selected.efforts.length === 1) {
     const result = await s.onModelEffortSelect(selected.model, selected.efforts[0].effort, pending.panelId, user, selected.provider)
-    await updateCardOrFallback(result.ok
-      ? cards.modelResultPanelElement({ sessionName: s.sessionName, provider: selected.provider,
-          model: selected.model, effort: selected.efforts[0].effort,
-          scope: modelSelectionScope(s, selected.provider ?? 'codex') })
-      : cards.modelCustomResultPanelElement(true, model, result.message), result.message)
+    const present = (result: ModelActionResult) => updateCardOrFallback(result.pending
+      ? cards.modelChangeStatusPanelElement(true, result.message)
+      : result.ok
+        ? cards.modelResultPanelElement({ sessionName: s.sessionName, provider: selected.provider,
+            model: selected.model, effort: selected.efforts[0].effort,
+            scope: modelSelectionScope(s, selected.provider ?? 'codex') })
+        : cards.modelChangeStatusPanelElement(false, result.message), result.message)
+    await present(result)
+    if (result.completion) {
+      void result.completion.then(present).catch(async error => {
+        const message = `模型补录后的切换结果呈现失败：${messageOf(error)}`
+        log(`model-custom: ${message}`)
+        await feishu.sendTextRaw(s.chatId, `❌ ${message}`)
+      })
+    }
     return true
   }
   await updateCardOrFallback(
@@ -388,6 +489,7 @@ function actionProvider(model: string, raw: any): AgentProvider {
 }
 
 function modelSelectionScope(s: Session, provider: AgentProvider): string {
+  if (provider === 'codex' && s.proc?.isAlive() && s.proc.provider === provider) return 'Codex 需重启进程生效(发 restart)。'
   if (s.currentTurn) return '当前 turn 不变,后续新 turn 使用。'
   if (s.proc?.isAlive() && s.proc.provider === provider) {
     // codex 热切换 setModelSettings no-op(thread/settings/update 踩坑避),需重启进程生效;
@@ -448,6 +550,10 @@ export async function onModelEffortSelect(
   _userOpenId = '',
   providerRaw = '',
 ): Promise<ModelActionResult> {
+  if (s.modelSettingsChangesClosed) return { ok: false, message: 'daemon 正在停止，本次模型选择未执行' }
+  if (s.modelSettingsChange?.proc === s.proc && s.modelSettingsChange?.phase === 'pending') {
+    return { ok: false, message: '上一项模型设置仍在等待后端确认，本次选择未执行；请等待结果，取消切换请发 kill 或 restart。' }
+  }
   const model = modelRaw.trim()
   const effortValue = effortRaw.trim()
   if (!model) return { ok: false, message: '模型为空' }
@@ -485,7 +591,7 @@ export async function onModelEffortSelect(
     !sourceChanged &&
     s.currentModelLabel() === model &&
     s.currentEffortLabel() === effort
-  if (selectionUnchanged && !processNeedsStop && !environmentChanged) {
+  if (selectionUnchanged && !s.modelSettingsChange && !processNeedsStop && !environmentChanged) {
     s.modelPanels.delete(panelId)
     return {
       ok: true,
@@ -539,7 +645,13 @@ export async function onModelEffortSelect(
       const processModel = choice.sourceId
         ? s.tokenSource(choice.sourceId)?.resolveSpawnModel(model) ?? model
         : model
-      await withTimeout(s.proc.setModelSettings(processModel, effort), 20_000, 'thread/settings/update')
+      if (provider === 'codex') {
+        // Codex only records a future launch selection; its settings method
+        // does not mutate the live thread and has no late acknowledgement.
+        await s.proc.setModelSettings(processModel, effort)
+      } else {
+        return await changeLiveModelSettings(s, s.proc, model, processModel, effort, panelId, choice.sourceId)
+      }
     }
     // The Session wrapper owns the lifecycle mutex for the whole card action
     // (validation + hot settings update + persisted selection). Calling the

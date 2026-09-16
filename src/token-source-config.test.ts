@@ -107,13 +107,3 @@ test('persists an OpenRouter account and reloads its catalog settings', () => {
     assert.ok(readFileSync(configFile, 'utf8').includes('[token_source.glm]'))
   `)
 })
-
-test('persists ReClaude login mode and organization while preserving its read-only key on update', () => {
-  runConfigUpdate(`
-    releaseRefresh()
-    await addTokenSource('reclaude', { agent: 'claude', auth: 'reclaude-login', org_id: '42', api_key: 'rck_test' })
-    await addTokenSource('reclaude', { org_id: '43', model: 'opus' })
-    assert.deepEqual(config.token_sources.reclaude, { agent: 'claude', auth: 'reclaude-login', org_id: '43', api_key: 'rck_test', model: 'opus' })
-    assert.ok(readFileSync(configFile, 'utf8').includes('[token_source.glm]'))
-  `)
-})

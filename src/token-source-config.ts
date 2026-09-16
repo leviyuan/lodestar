@@ -23,7 +23,6 @@ function cfgToToml(id: string, cfg: TokenSourceConfig): string {
   push('base_url', cfg.base_url)
   push('auth_token', cfg.auth_token)
   push('api_key', cfg.api_key)
-  push('org_id', cfg.org_id)
   push('bin', cfg.bin)
   push('model', cfg.model)
   push('effort', cfg.effort)

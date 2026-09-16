@@ -90,11 +90,11 @@ describe('token source model refresh', () => {
 })
 
 describe('token source spawn revision', () => {
-  test('ReClaude read-only quota credentials and organization do not replace model processes', () => {
-    expect(tokenSourceSpawnRevision('reclaude', {
-      auth: 'reclaude-login', api_key: 'rck_one', org_id: '1',
-    }, null)).toBe(tokenSourceSpawnRevision('reclaude', {
-      auth: 'reclaude-login', api_key: 'rck_two', org_id: '2',
+  test('API key changes replace model processes', () => {
+    expect(tokenSourceSpawnRevision('openrouter', {
+      api_key: 'key-one',
+    }, null)).not.toBe(tokenSourceSpawnRevision('openrouter', {
+      api_key: 'key-two',
     }, null))
   })
 

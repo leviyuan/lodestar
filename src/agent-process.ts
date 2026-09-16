@@ -70,6 +70,15 @@ export class NothingToCompactError extends Error {
   }
 }
 
+/** A multi-step backend update can acknowledge the model before effort fails.
+ * Null means unconfirmed, never an instruction to use a default value. */
+export class ModelSettingsUpdateError extends Error {
+  constructor(message: string, readonly confirmedModel: string | null, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'ModelSettingsUpdateError'
+  }
+}
+
 export interface AgentProcess extends EventEmitter {
   readonly provider: AgentProvider
   /** 该进程 spawn 时绑定的 token source id(= spawnEnv 注入 env 的那个 source)。

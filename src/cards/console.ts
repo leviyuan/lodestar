@@ -607,6 +607,18 @@ export function modelResultCard(opts: ModelResultPanelOpts): object {
   return modelCard(opts.sessionName, modelResultPanelElement(opts), 'green')
 }
 
+export function modelChangeStatusPanelElement(pending: boolean, message: string): object {
+  return {
+    tag: 'collapsible_panel', element_id: ELEMENTS.modelPanel, expanded: true,
+    header: { title: { tag: 'plain_text', content: pending ? '模型设置确认中' : '模型设置未完成' } },
+    elements: [{ tag: 'markdown', content: escapeMarkdown(message) }],
+  }
+}
+
+export function modelChangeStatusCard(sessionName: string, pending: boolean, message: string): object {
+  return modelCard(sessionName, modelChangeStatusPanelElement(pending, message), pending ? 'orange' : 'red')
+}
+
 function modelCard(sessionName: string, element: object, template = 'turquoise'): object {
   return {
     schema: '2.0',

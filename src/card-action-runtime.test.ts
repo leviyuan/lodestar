@@ -12,6 +12,7 @@ import {
   type ActionCompletion,
 } from './card-action-runtime'
 import { drainDynamicWork, trackWork } from './inflight-work'
+import { modelActionCompletion, type ModelActionResult } from './session-util'
 
 describe('PerKeyActor', () => {
   test('serializes one chat while allowing another chat to progress', async () => {
@@ -157,6 +158,7 @@ interface TestAck {
 interface TestResult {
   __businessOk?: boolean
   __cardActionCompletion?: Promise<ActionCompletion>
+  modelCompletion?: Promise<ModelActionResult>
 }
 
 function deferred<T>() {
@@ -185,6 +187,7 @@ function admissionHarness(overrides: Partial<{
   present: (data: any, result: TestResult) => Promise<void>
   presentExecutionFailure: (data: any, error: unknown) => Promise<void>
   presentPresentationFailure: (data: any, error: unknown) => Promise<void>
+  completion: (data: any, result: TestResult) => Promise<ActionCompletion> | null
 }> = {}) {
   const actor = new PerKeyActor()
   const deduper = new ActionDeduper(30_000)
@@ -216,7 +219,7 @@ function admissionHarness(overrides: Partial<{
     presentPresentationFailure: overrides.presentPresentationFailure
       ?? (async (_data, error) => { effects.push(`presentation-failure:${String(error)}`) }),
     businessSucceeded: (_data, result) => result.__businessOk !== false,
-    completion: (_data, result) => result.__cardActionCompletion ?? null,
+    completion: overrides.completion ?? ((_data, result) => result.__cardActionCompletion ?? null),
     track: promise => { trackWork(work, promise) },
     onBackgroundError: error => { errors.push(error) },
     responses: {
@@ -470,6 +473,43 @@ describe('CardActionAdmission integration', () => {
     expect(failureReceipts).toBe(1)
     expect(h.admission.accept(actionEvent('event-unknown-2'))).toEqual({ state: 'completed' })
     expect(executeCalls).toBe(1)
+  })
+
+  test.each([false, true])('model completion releases the chat actor and follows pending presentation (early result: %s)', async early => {
+    const backend = deferred<ModelActionResult>()
+    const presenting = deferred<void>()
+    const pendingCard = deferred<void>()
+    const events: string[] = []
+    const h = admissionHarness({
+      execute: async () => ({ __businessOk: false, modelCompletion: backend.promise }),
+      present: async () => {
+        events.push('pending-start')
+        presenting.resolve()
+        await pendingCard.promise
+        events.push('pending-end')
+      },
+      completion: (_data, result) => modelActionCompletion(result.modelCompletion, async final => {
+        events.push(final.ok ? 'confirmed' : 'failed')
+      }),
+    })
+    const value = { kind: 'model_effort_select', panel_id: 'model-panel', model: 'next', effort: 'high' }
+    expect(h.admission.accept(actionEvent('model-1', 'chat-a', value))).toEqual({ state: 'accepted' })
+    await presenting.promise
+    if (early) backend.resolve({ ok: true, message: 'confirmed' })
+    expect(h.admission.accept(actionEvent('model-duplicate', 'chat-a', value))).toEqual({ state: 'inflight' })
+    const answer = h.messages.accept({ chatId: 'chat-a', run: async () => { events.push('question-answer') } })
+    expect(answer.accepted).toBe(true)
+    pendingCard.resolve()
+    if (answer.accepted) await answer.completion
+    if (!early) {
+      expect(events).toEqual(['pending-start', 'pending-end', 'question-answer'])
+      backend.resolve({ ok: true, message: 'confirmed' })
+    }
+    await h.drain()
+    expect(events.indexOf('confirmed')).toBeGreaterThan(events.indexOf('pending-end'))
+    expect(events.filter(event => event === 'confirmed')).toHaveLength(1)
+    expect(h.admission.accept(actionEvent('model-done', 'chat-a', value))).toEqual({ state: 'completed' })
+    expect(h.errors).toEqual([])
   })
 
   test('notify retry releases business key while completion retains it', async () => {

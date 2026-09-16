@@ -14,7 +14,6 @@
 | `seed-debug-ctx.ts` | 查询群成员，将指定成员写入本机 debug context |
 | `test-openrouter.ts` | 使用明确提供的私有 Key 和 `--agent-runtimes` 目录做付费 API/SDK Read 实测；不连接飞书或 daemon，支持请求参数核验与原生 resume 序列 |
 | `test-dsh-glm.ts` | 使用已配置 GLM Coding Plan 做 DSH Read 与原生 resume 实测，只操作私有临时目录；不连接飞书或控制 daemon |
-| `watch-reclaude.ts` | 显式指定群项目名、模型和间隔，持续做可能计费的极短真实请求；首次成功后仅补发恢复通知，确认投递后退出。读取已配置 ReClaude，通过本机 `/notify` 通知；常驻运行交给用户 systemd，不启动或重启 Lodestar |
 | `test-model-panel-live.ts` | 使用现有 daemon，在明确目标群验证分组、隐藏/显示、补录/删除、无效补录拒绝及真实回复；等待最终 footer 后检查模型/effort 与余额/额度，恢复原设置。`--routes-only` 可单测指定模型路由；不自行创建 Session 或控制 daemon |
 | `postinstall.cjs` | 安装/更新时清理旧 `lodestar-files` 的三处受管副本，并提示安装步骤；不读凭据或启动 Agent/daemon，清理失败退出非零 |
 | `test-generated-image-card.ts` | 向明确的测试群发送一张图片折叠测试卡，使用指定的已有图片；检查提示词、卡内图片及预览。不会调用生图模型、单发图片或启动 Session |

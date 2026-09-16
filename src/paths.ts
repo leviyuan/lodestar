@@ -67,8 +67,6 @@ export const CODEX_ACCOUNTS_FILE = join(DATA_DIR, 'codex-accounts.json')
 export const CODEX_QUOTA_BLOCKS_FILE = join(DATA_DIR, 'codex-quota-blocks.json')
 /** Automatically updated, immutable Agent runtime installations and status. */
 export const AGENT_RUNTIMES_DIR = join(DATA_DIR, 'agent-runtimes')
-/** ReClaude 恢复检测结果与通知回执，成功后重启检测器也不会再次调用模型。 */
-export const RECLAUDE_WATCH_DIR = join(DATA_DIR, 'reclaude-watch')
 /** 真实窗口观测缓存:key = `<sourceId>:<model>`(如 `glm:GLM-5.3`),value = 窗口
  *  token 数(200000 / 1000000)。来源 = 每轮真实 turn 的 SDK modelUsage.contextWindow
  *  (CLI 按 [1m] 后缀记 1M)。仅使用 SDK 明确上报的数值，错误文本不构成容量观测。 */

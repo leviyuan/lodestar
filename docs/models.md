@@ -19,6 +19,8 @@
 
 同账号切换 Claude 或 DSH 模型从后续回复生效；Codex 的持久设置需重启会话生效。跨账号或后端切换只允许在空闲时进行。来源禁用或目录获取失败显示 `MISS`。
 
+模型设置超过 20 秒仍未收到后端确认时，面板显示“确认中”，最终结果回到原卡；等待期间仍可回答 Agent 提问或用 `stop` 打断任务，取消切换需发 `kill` 或 `restart`。模型和思考档位全部确认后才保存选择。若只有模型切换成功，或后端已应用但保存失败，会分别显示实际结果和错误，未确认的值显示 `MISS`；后续输入暂停，重新发送 `md` 完成选择后再继续。已有排队消息保留，设置确认后再提交。
+
 ## 额度
 
 发送 `hi` 查看会话和账号额度。GLM 展示套餐与各窗口用量；Codex 展示额度窗口和账号可用的重置卡次数。
@@ -29,37 +31,13 @@
 
 在运行 Lodestar 的本机通过 `claude auth login` 登录 Claude 订阅后，发送 `md` → Claude Code → **Claude Code 订阅**。来源 id 为 `claude-sub`，可与 GLM、DeepSeek、OpenRouter 同时使用；无需复制登录凭据或填写 API key。
 
-发送 `claude-sub` 查看开关和可用状态，`claude-sub on` 启用，`claude-sub off` 禁用。开关对这台 Lodestar 的所有群生效并持久保存，只控制「Claude Code 订阅」来源，保留本机登录态及其他来源。禁用后不查询订阅模型和额度、不接受新任务；尚未送入 Agent 的排队消息会提示重发，已经在执行的任务继续完成。再次启用后仍须有有效订阅登录；ReClaude 启用期间，订阅入口继续停用并显示原因。
+发送 `claude-sub` 查看开关和可用状态，`claude-sub on` 启用，`claude-sub off` 禁用。开关对这台 Lodestar 的所有群生效并持久保存，只控制「Claude Code 订阅」来源，保留本机登录态及其他来源。禁用后不查询订阅模型和额度、不接受新任务；尚未送入 Agent 的排队消息会提示重发，已经在执行的任务继续完成。再次启用后仍须有有效订阅登录。
 
 账号和模型目录通过 Claude Code 原生 SDK 查询，模型与 effort 随目录更新；未登录会显示启用引导，查询失败显示 `MISS`。可选配置节为 `[token_source.claude-sub]`，支持 `enabled`、`display`、`model`、`effort`、`hidden_models` 和 `custom_models`。`enabled = false` 禁用，`enabled = true` 或省略时沿用本机登录检测；群命令更新该字段。
 
 订阅额度通过原生 `/usage` 控制接口读取，无需发送模型对话。`hi` 展示 5 小时、总周额度和接口返回的模型专属周额度及重置倒计时。回复底部同时显示 5 小时额度与周额度：本轮所选模型有专属周额度时显示该模型的额度，否则显示总周额度，沿用紧凑格式。查询失败或缺失数据显示 `MISS`，不使用旧额度替代，也不将缺失的专属额度改成总额度。此 SDK 查询接口仍属实验接口，版本不支持或接口变化时明确报错。
 
 订阅进程保留本机和项目的 Claude 设置，并在进程内清除其他来源的 API key、模型映射和中转路由。发送任务前会再次核对实际账号是否为第一方订阅。Claude native 继续保留为使用本机完整配置的来源。
-
-## ReClaude 拼车
-
-在运行 Lodestar 的本机按 [ReClaude 官方说明](https://docs.reclaude.ai/cli/install)安装客户端，执行 `reclaude login` 完成浏览器设备授权并选择拼车组织，再运行 `reclaude daemon --detach` 启动官方后台。Linux 后台由用户 systemd 管理。
-
-**客户端会接管本机 Claude 登录**，并在账号变化时终止其管理的 Claude 进程。Lodestar 启用 ReClaude 后停用重复的「Claude Code 订阅」入口。退出 ReClaude 并恢复原生登录按官方客户端的 `reclaude logout` 流程操作。
-
-在群内发送 `reclaude-setup <拼车组织 ID> [个人只读 API key]`，然后通过 `md` → Claude Code → **ReClaude** 选择模型。也可以在配置文件中添加：
-
-```toml
-[token_source.reclaude]
-agent = "claude"
-auth = "reclaude-login"
-org_id = "填写拼车组织 ID"
-api_key = "填写 rck_ 个人只读 API key"
-# model = "opus"   # 可选；模型和 effort 来自 SDK 原生目录
-# effort = "max"
-```
-
-个人 `rck_` key 仅查询指定组织的拼车 5 小时额度，不用于模型认证。组织 ID 可从个人 API 的 `GET /api/v1/orgs` 查询。未填写只读 key 不影响已登录客户端的模型调用，额度显示 `MISS`。接口里的美元金额是该窗口的用量口径，不是账户余额；重置时间未返回时保留未知，不推算周额度。
-
-模型运行保持 Claude Agent SDK 默认入口，无需设置 `[claude].bin`。ReClaude 来源校验本机设备登录、对应 Claude 凭据、后台进程和 CA，然后只为此来源的 SDK 子进程设置官方本机代理。客户端未运行、登录不匹配、模型目录失败和网关错误均明确报错，不切换到其他账号。安装、登录和后台启动由用户管理，Lodestar 不自动安装或启动 ReClaude。
-
-恢复检测脚本为 `bun scripts/watch-reclaude.ts --project <群项目名> --model haiku --interval-seconds 300`。它用极短的真实对话确认恢复，可能消耗拼车额度；首次成功后停止模型请求，经本机通知接口确认群消息发送成功后退出。通知失败每分钟重试，仅重试通知。状态保存在数据目录的 `reclaude-watch/`，已成功或已通知的记录在再次运行时仍有效，不会重复消耗模型额度。`--once` 只执行一轮。常驻时用 `systemd-run --user --unit=cc-<项目>-reclaude-watch -- <Bun绝对路径> <脚本绝对路径> ...` 管理；这不会重启 Lodestar。
 
 ## OpenRouter
 

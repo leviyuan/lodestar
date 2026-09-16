@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -107,7 +107,11 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(await done).toMatchObject({ is_error: false })
     expect(JSON.stringify(f.requests[1].messages)).toContain('glm-tool-proof')
     expect(f.requests[0]).toMatchObject({ model: 'glm-5.3', reasoning_effort: 'low', thinking: { type: 'enabled' } })
-    await proc.setModelSettings('glm-5.3', 'max')
+    const requests = spyOn((proc as any).runtime, 'request')
+    try {
+      await proc.setModelSettings('glm-5.3', 'max')
+      expect(requests).toHaveBeenCalledWith('session/model', { model: 'glm-5.3', effort: 'max' }, null)
+    } finally { requests.mockRestore() }
     done = nextResult(proc); proc.sendUserText('continue at max')
     expect(await done).toMatchObject({ is_error: false })
     expect(f.requests[2].reasoning_effort).toBe('max')

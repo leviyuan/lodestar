@@ -49,6 +49,8 @@ export {
   modelEffortSelectionPanelElement,
   modelResultCard,
   modelResultPanelElement,
+  modelChangeStatusCard,
+  modelChangeStatusPanelElement,
   modelCancelledCard,
   modelCustomPromptCard,
   modelCustomResultPanelElement,

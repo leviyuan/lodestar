@@ -1570,6 +1570,268 @@ describe('Session automatic context compaction events', () => {
   })
 })
 
+describe('Session model settings completion', () => {
+  let previousSources: ReturnType<typeof listTokenSources>
+  beforeEach(() => { previousSources = listTokenSources() })
+  afterEach(() => {
+    resetTokenSourceRegistry()
+    for (const source of previousSources) registerTokenSource(source)
+  })
+
+  function setup(provider: 'claude' | 'dsh' | 'codex' = 'claude') {
+    const sourceId = `settings-${provider}`
+    registerTokenSource({ id: sourceId, kind: 'test', agent: provider, display: sourceId, enabled: true,
+      models: ['review-before', 'review-after'].map(model => ({ model, display: model,
+        efforts: ['high', 'max'], defaultEffort: 'high' })),
+      defaultModel: 'review-before', modelCatalogState: { status: 'ready', updatedAt: 1 },
+      refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    })
+    const session = new Session(`settings-${provider}`, 'chat_id') as any
+    const proc = new FakeAgentProc(provider, 'settings-session', sourceId)
+    proc.lastModel = 'review-before'; proc.lastEffort = 'high'
+    Object.assign(session, { proc, selectedProvider: provider, selectedTokenSourceId: sourceId,
+      selectedModel: 'review-before', selectedEffort: 'high', initCount: 1 })
+    session.modelPanels.set('settings', { models: ['review-before', 'review-after'].map(model => ({
+      provider, sourceId, model, displayName: model, efforts: [{ effort: 'high' }, { effort: 'max' }],
+    })) })
+    return { session, proc, sourceId }
+  }
+
+  function deferUpdate(proc: FakeAgentProc) {
+    let release!: () => void
+    let reject!: (error: Error) => void
+    const gate = new Promise<void>((resolve, fail) => { release = resolve; reject = fail })
+    proc.setModelSettings = async (model, effort) => {
+      proc.setModelSettingsCalls.push([model, effort])
+      await gate
+      proc.lastModel = model; proc.lastEffort = effort
+    }
+    const original = globalThis.setTimeout
+    const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: any, ms: number, ...args: any[]) =>
+      original(callback, ms === 20_000 ? 5 : ms, ...args)) as any)
+    return { release, reject, restore: () => { timer.mockRestore(); release() } }
+  }
+
+  test.each(['claude', 'dsh'] as const)('busy %s keeps the late acknowledgement and prevents overlapping selections', async provider => {
+    const { session, proc } = setup(provider)
+    session.currentTurn = { ...turnState(), provider }
+    const deferred = deferUpdate(proc)
+    const save = spyOn(feishu, 'bindSessionModelChecked')
+    const model = provider === 'claude' ? 'review-before' : 'review-after'
+    try {
+      const pending = await session.onModelEffortSelect(model, 'max', 'settings', '', provider)
+      expect(pending.pending).toBe(true)
+      expect(pending.message).toContain('尚不能判断')
+      expect(JSON.stringify(pending.card)).not.toContain('选择已保存')
+      expect(save).not.toHaveBeenCalled()
+      expect(session.selectedEffort).toBe('high')
+      expect((await session.onModelEffortSelect('review-before', 'high', 'settings', '', provider)).message).toContain('本次选择未执行')
+      await session.onUserMessage('new input while settings are unknown')
+      expect(proc.sentTexts).toEqual([])
+      expect(sentTexts.join('\n')).toContain('本条消息未送给 Agent')
+      deferred.release()
+      expect((await pending.completion).ok).toBe(true)
+      expect(session.selectedModel).toBe(model)
+      expect(session.selectedEffort).toBe('max')
+      expect(save).toHaveBeenCalledTimes(1)
+      expect(session.modelSettingsChange).toBeNull()
+      expect(proc.setModelSettingsCalls).toHaveLength(1)
+    } finally { deferred.restore(); save.mockRestore(); session.dispose() }
+  })
+
+  test('soft stop interrupts the task without claiming an uncancellable model update was cancelled', async () => {
+    const { session, proc } = setup('dsh')
+    session.currentTurn = { ...turnState(), provider: 'dsh' }
+    const interrupt = spyOn(proc, 'sendInterrupt')
+    const deferred = deferUpdate(proc)
+    try {
+      const pending = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'dsh')
+      expect(await session.runCommand('stop')).toBe(true)
+      expect(interrupt).toHaveBeenCalledTimes(1)
+      expect(proc.isAlive()).toBe(true)
+      expect(session.modelSettingsChange.phase).toBe('pending')
+      expect(session.selectedModel).toBe('review-before')
+      deferred.release()
+      expect((await pending.completion).ok).toBe(true)
+      expect(session.selectedModel).toBe('review-after')
+    } finally { deferred.restore(); interrupt.mockRestore(); session.dispose() }
+  })
+
+  test('process stop cancels the pending selection and ignores an old process acknowledgement', async () => {
+    const { session, proc } = setup()
+    const deferred = deferUpdate(proc)
+    const save = spyOn(feishu, 'bindSessionModelChecked')
+    try {
+      const pending = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')
+      expect(pending.pending).toBe(true)
+      await session.stop('test stop', { announce: false })
+      const replacement = new FakeAgentProc('claude', 'new-session', proc.tokenSourceId)
+      session.proc = replacement
+      deferred.release()
+      const result = await pending.completion
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain('原进程正在停止')
+      expect(save).not.toHaveBeenCalled()
+      expect(session.selectedModel).toBe('review-before')
+      expect(session.proc).toBe(replacement)
+    } finally { deferred.restore(); save.mockRestore(); session.dispose() }
+  })
+
+  test('shutdown settles an unanswered model update before draining card actions', async () => {
+    const { session, proc } = setup()
+    const deferred = deferUpdate(proc)
+    try {
+      const pending = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')
+      session.closeModelSettingsChanges()
+      expect((await pending.completion).message).toContain('daemon 正在停止')
+      expect(session.selectedModel).toBe('review-before')
+      expect((await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')).message).toContain('本次模型选择未执行')
+      expect(proc.setModelSettingsCalls).toHaveLength(1)
+    } finally { deferred.restore(); session.dispose() }
+  })
+
+  test('a late rejection remains visible and reselecting the saved model actually reapplies it', async () => {
+    const { session, proc } = setup()
+    const deferred = deferUpdate(proc)
+    try {
+      const pending = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')
+      deferred.reject(new Error('backend control rejected'))
+      const result = await pending.completion
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain('backend control rejected')
+      expect(session.currentModelLabel()).toBeNull()
+      expect(session.currentEffortLabel()).toBeNull()
+      await session.onUserMessage('must not reach an unconfirmed model')
+      expect(proc.sentTexts).toEqual([])
+      proc.setModelSettings = FakeAgentProc.prototype.setModelSettings.bind(proc)
+      const retry = await session.onModelEffortSelect('review-before', 'high', 'settings', '', 'claude')
+      expect(retry.ok).toBe(true)
+      expect(retry.message).not.toContain('当前已是')
+      expect(proc.setModelSettingsCalls.at(-1)).toEqual(['review-before', 'high'])
+      expect(session.modelSettingsChange).toBeNull()
+    } finally { deferred.restore(); session.dispose() }
+  })
+
+  test('partial Claude success shows the confirmed model and MISS effort until a successful retry', async () => {
+    const { session, sourceId } = setup()
+    const proc = new ClaudeAgentProcess({ workDir: session.workDir, tokenSourceId: sourceId,
+      model: 'review-before', effort: 'high' }) as any
+    session.proc = proc
+    proc.started = true
+    let actualModel = 'review-before'
+    proc.query = { setModel: async (model: string) => { actualModel = model },
+      applyFlagSettings: async () => { throw new Error('flag settings rejected') } }
+    const save = spyOn(feishu, 'bindSessionModelChecked')
+    try {
+      const failed = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')
+      expect(failed.ok).toBe(false)
+      expect(failed.message).toContain('模型已切换为 review-after')
+      expect(failed.message).toContain('思考档位未确认')
+      expect(failed.message).toContain('flag settings rejected')
+      expect(actualModel).toBe('review-after')
+      expect(session.currentModelLabel()).toBe('review-after')
+      expect(session.currentEffortLabel()).toBeNull()
+      expect(session.runtimeModelSelection()).toEqual({ provider: 'claude', model: 'review-after', effort: null })
+      expect(save).not.toHaveBeenCalled()
+      expect(session.selectedModel).toBe('review-before')
+      proc.query.applyFlagSettings = async () => {}
+      const retry = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')
+      expect(retry.ok).toBe(true)
+      expect(session.currentEffortLabel()).toBe('max')
+      expect(session.selectedModel).toBe('review-after')
+      expect(save).toHaveBeenCalledTimes(1)
+    } finally { save.mockRestore(); session.dispose() }
+  })
+
+  test('persistence failure after backend success preserves the confirmed runtime settings', async () => {
+    const { session, proc } = setup()
+    proc.setModelSettings = async (model, effort) => { proc.lastModel = model; proc.lastEffort = effort }
+    const save = spyOn(feishu, 'bindSessionModelChecked').mockImplementation(() => { throw new Error('model fsync failed') })
+    try {
+      const result = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain('模型和思考档位已应用，但保存选择失败')
+      expect(result.message).toContain('model fsync failed')
+      expect(session.selectedModel).toBe('review-before')
+      expect(session.runtimeModelSelection()).toEqual({ provider: 'claude', model: 'review-after', effort: 'max' })
+      save.mockImplementation(() => {})
+      expect((await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')).ok).toBe(true)
+      expect(session.selectedModel).toBe('review-after')
+      expect(session.modelSettingsChange).toBeNull()
+    } finally { save.mockRestore(); session.dispose() }
+  })
+
+  test('source configuration changes during confirmation cannot silently stop a process or save a stale selection', async () => {
+    const { session, proc, sourceId } = setup()
+    const source = getTokenSource(sourceId)!
+    source.spawnRevision = 'before'
+    session.procSourceRevisions.set(proc, tokenSourceProcessRevision(source, 'review-before'))
+    const deferred = deferUpdate(proc)
+    const save = spyOn(feishu, 'bindSessionModelChecked')
+    try {
+      const pending = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')
+      source.spawnRevision = 'changed'
+      deferred.release()
+      const result = await pending.completion
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain('进程账号配置已变化')
+      expect(proc.killCalls).toBe(0)
+      expect(save).not.toHaveBeenCalled()
+      expect(session.selectedModel).toBe('review-before')
+      expect(session.currentModelLabel()).toBe('review-after')
+    } finally { deferred.restore(); save.mockRestore(); session.dispose() }
+  })
+
+  test('queued input waits for model confirmation and resumes once using the selected model', async () => {
+    const { session, proc } = setup('dsh')
+    const deferred = deferUpdate(proc)
+    session.currentTurn = { ...turnState(), provider: 'dsh' }
+    session.pendingMidTurnMsgs.push({ text: 'queued request', wireText: 'queued request', userOpenId: 'ou_user', msgId: '' })
+    try {
+      const pending = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'dsh')
+      session.currentTurn = null
+      await session.drainMidTurnAndOpen()
+      expect(session.pendingMidTurnMsgs).toHaveLength(1)
+      expect(proc.sentTexts).toEqual([])
+      deferred.release()
+      expect((await pending.completion).ok).toBe(true)
+      await waitUntil(() => proc.sentTexts.length === 1)
+      expect(proc.sentTexts[0]).toContain('queued request')
+      expect(session.currentTurn.model).toBe('review-after')
+      expect(session.pendingMidTurnMsgs).toEqual([])
+    } finally {
+      deferred.restore()
+      if (session.currentTurn) await session.closeTurnCard()
+      session.dispose()
+    }
+  })
+
+  test('busy Codex selection accurately says restart is required', async () => {
+    const { session } = setup('codex')
+    session.currentTurn = turnState()
+    try {
+      const result = await session.onModelEffortSelect('review-after', 'high', 'settings', '', 'codex')
+      expect(result.ok).toBe(true)
+      expect(JSON.stringify(result.card)).toContain('需重启进程生效')
+      expect(JSON.stringify(result.card)).not.toContain('后续新 turn 使用')
+    } finally { session.dispose() }
+  })
+
+  test('Codex persistence failure cannot claim that the running model was already changed', async () => {
+    const { session } = setup('codex')
+    session.currentTurn = turnState()
+    const save = spyOn(feishu, 'bindSessionModelChecked').mockImplementation(() => { throw new Error('model fsync failed') })
+    try {
+      const result = await session.onModelEffortSelect('review-after', 'high', 'settings', '', 'codex')
+      expect(result).toMatchObject({ ok: false, message: '模型切换失败: model fsync failed' })
+      expect(session.selectedModel).toBe('review-before')
+      expect(session.runtimeModelSelection()).toEqual({ provider: 'codex', model: 'review-before', effort: 'high' })
+      expect(session.modelSettingsChange).toBeNull()
+    } finally { save.mockRestore(); session.dispose() }
+  })
+})
+
 describe('Session provider switching', () => {
   beforeAll(() => {
     buildTokenSourcesFromConfig()

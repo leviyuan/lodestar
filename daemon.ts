@@ -60,6 +60,7 @@ import {
   isStaleAtReceipt,
 } from './src/inbound-message'
 import { drainDynamicWork, trackWork } from './src/inflight-work'
+import { modelActionCompletion, type ModelActionResult } from './src/session-util'
 import { DaemonSessionRecovery } from './src/daemon-session-recovery'
 import {
   ActionDeduper,
@@ -118,6 +119,7 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
   // Seal both message and action admission synchronously before taking the
   // dynamic work snapshot. Already-admitted tails remain drainable.
   chatActor.close()
+  for (const session of sessions.values()) session.closeModelSettingsChanges()
   try { stopFeishuWs?.() }
   catch (error) {
     shutdownExitCode = 1
@@ -575,13 +577,16 @@ function withNotifyContext(reg: NotifyRegistration, response: any): any {
   }
 }
 
-function modelActionResponse(result: { ok: boolean; message: string; card?: object }): any {
-  return withBusinessOutcome(
+function modelActionResponse(result: ModelActionResult): any {
+  const response = withBusinessOutcome(
     result.card
       ? actionCardResponse(result.card)
       : { toast: { type: result.ok ? 'success' : 'error', content: result.message } },
     result.ok,
+    result.pending ? undefined : result.message,
   )
+  if (result.completion) response.__modelActionCompletion = result.completion
+  return response
 }
 
 async function sendActionReceipt(chatId: string, text: string): Promise<void> {
@@ -667,7 +672,10 @@ const cardActionAdmission = createCardActionAdmission<any, object>({
     }
     return String(data?.context?.open_chat_id ?? '') || '__notify_global__'
   },
-  execute: handleCardAction,
+  execute: data => {
+    if (shutdownRequested) sessions.get(String(data?.context?.open_chat_id ?? ''))?.closeModelSettingsChanges()
+    return handleCardAction(data)
+  },
   present: publishCardActionResult,
   presentExecutionFailure: async (data, error) => {
     const kind = String(data?.action?.value?.kind ?? 'unknown')
@@ -688,7 +696,14 @@ const cardActionAdmission = createCardActionAdmission<any, object>({
       && data?.action?.value?.decision === 'deny'
     return permissionDenied || result?.toast?.type !== 'error'
   },
-  completion: (_data, result) => {
+  completion: (data, result) => {
+    const modelCompletion: Promise<ModelActionResult> | undefined = result?.__modelActionCompletion
+    if (modelCompletion) {
+      // Start presentation only after the pending card has landed. The actor
+      // is released while the backend works, so stop/questions stay usable.
+      return modelActionCompletion(modelCompletion,
+        final => publishCardActionResult(data, modelActionResponse(final)))
+    }
     const completion = result?.__cardActionCompletion
     return completion && typeof completion.then === 'function' ? completion : null
   },

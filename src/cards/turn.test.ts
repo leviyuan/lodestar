@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, modelCustomPromptCard, modelEffortSelectionCard, modelResultCard, modelResultPanelElement, modelSelectionCard, providerSelectionCard, statusCard, streamingOffSettings } from './console'
+import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, modelChangeStatusCard, modelCustomPromptCard, modelEffortSelectionCard, modelResultCard, modelResultPanelElement, modelSelectionCard, providerSelectionCard, statusCard, streamingOffSettings } from './console'
 import {
   askUserQuestionElement,
   contextCompactionElement,
@@ -380,6 +380,17 @@ describe('main conversation card rendering', () => {
     }) as any
     expect(savedCard.header.template).toBe('green')
     expect(savedCard.body.elements[0].header.title.content).toBe('选择已保存')
+  })
+
+  test('pending and incomplete model changes cannot look like saved selections', () => {
+    const pending = modelChangeStatusCard('probe', true, '正在等待确认') as any
+    expect(pending.header.template).toBe('orange')
+    expect(pending.body.elements[0].header.title.content).toBe('模型设置确认中')
+    expect(JSON.stringify(pending)).not.toContain('已保存')
+    const failed = modelChangeStatusCard('probe', false, '模型已切换，档位未确认：HTTP 503') as any
+    expect(failed.header.template).toBe('red')
+    expect(failed.body.elements[0].header.title.content).toBe('模型设置未完成')
+    expect(JSON.stringify(failed)).toContain('HTTP 503')
   })
 
   test('model command card carries provider only for Claude backend actions', () => {

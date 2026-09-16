@@ -25,6 +25,7 @@ import {
   CLAUDE_EFFORT,
   isClaudeReasoningEffort,
   NothingToCompactError,
+  ModelSettingsUpdateError,
   type AgentReasoningEffort,
   type ClaudeReasoningEffort,
 } from './agent-process'
@@ -178,8 +179,7 @@ export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): Cl
   const configured = lookup.configuredBin === undefined ? config.claude.bin : lookup.configuredBin
   if (configured) {
     const exists = lookup.exists ?? existsSync
-    // [claude].bin 配错时必须 fail fast:静默回退会让用户以为在烧包装器
-    // (如 reclaude)的额度,实际走了别的 key。
+    // [claude].bin 配错时必须明确报错，避免改用其他入口或凭据。
     if (!exists(configured)) {
       throw new Error(`lodestar: [claude].bin not found: ${configured} (config.toml)`)
     }
@@ -885,11 +885,22 @@ export class ClaudeAgentProcess extends EventEmitter {
     await this.queryStart
     if (this.initializationError) throw this.initializationError
     if (!this.query) throw new Error('claude-agent-process: SDK query not initialized (sendInitialize failed or not called)')
-    if (claudeModel) await this.query.setModel(claudeModel)
-    await this.query.applyFlagSettings({ effortLevel: effort === 'default' ? null : effort, ultracode: null })
+    try {
+      await this.query.setModel(claudeModel)
+    } catch (cause) {
+      this.lastModel = null
+      this.lastEffort = null
+      throw new ModelSettingsUpdateError(`模型设置未确认：${cause instanceof Error ? cause.message : String(cause)}`, null, { cause })
+    }
     this.opts.model = model
-    this.opts.effort = effort
     this.lastModel = claudeModel ? claudeModelKey(model) : 'claude:default'
+    this.lastEffort = null
+    try {
+      await this.query.applyFlagSettings({ effortLevel: effort === 'default' ? null : effort, ultracode: null })
+    } catch (cause) {
+      throw new ModelSettingsUpdateError(`模型已切换为 ${model}，但思考档位未确认：${cause instanceof Error ? cause.message : String(cause)}`, model, { cause })
+    }
+    this.opts.effort = effort
     this.lastEffort = effort
   }
 

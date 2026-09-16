@@ -442,6 +442,8 @@ export class Session {
    *  null = 未配 token source,走旧路径(provider/model 自治)。 */
   selectedTokenSourceId: string | null = null
   modelPanels = new Map<string, sessionModel.ModelPanelState>()
+  modelSettingsChange: sessionModel.ModelSettingsChange | null = null
+  modelSettingsChangesClosed = false
   /** 补录应答态:点「➕ 补录模型」后置位,下一条群消息(裸词命令除外)作为
    *  模型名消费(校验/补录)。一次性,消费或取消即清。cardMessageId 是补录
    *  提示卡的消息 id —— 消费后原位更新它(通过→effort 卡;失败→红字),
@@ -779,6 +781,9 @@ export class Session {
   }
 
   currentModelLabel(): string | null {
+    if (this.modelSettingsChange?.proc === this.proc && this.modelSettingsChange.phase === 'failed') {
+      return this.modelSettingsChange.confirmedModel
+    }
     // 有 token source 时 fallback 到它声明的真实模型(ts.defaultModel 如 GLM-5.2[1m]),
     // 而非 proc.lastModel —— 那是 SDK alias(如 'opus'),用户看着像切错了模型。
     // 显示/比对统一出口:剥 claude: 前缀和 [1m] 记账后缀 —— 面板选中态比对
@@ -788,6 +793,9 @@ export class Session {
   }
 
   currentEffortLabel(): AgentReasoningEffort | null {
+    if (this.modelSettingsChange?.proc === this.proc && this.modelSettingsChange.phase === 'failed') {
+      return this.modelSettingsChange.confirmedEffort
+    }
     const source = this.currentTokenSource()
     if (this.selectedProvider === 'claude' && source?.agent === 'claude') {
       return this.selectedEffort ?? tokenSourceRuntimeModel(source, this.selectedModel ?? source.defaultModel)?.defaultEffort ?? null
@@ -804,6 +812,9 @@ export class Session {
   private runtimeModelSelection(): Pick<TurnState, 'provider' | 'model' | 'effort'> {
     const proc = this.proc?.isAlive() ? this.proc : null
     const provider = proc?.provider ?? this.selectedProvider
+    if (proc && this.modelSettingsChange?.proc === proc && this.modelSettingsChange.phase === 'failed') {
+      return { provider, model: this.modelSettingsChange.confirmedModel, effort: this.modelSettingsChange.confirmedEffort }
+    }
     const selectedMatchesProc = !proc || proc.provider === this.selectedProvider
     const model = (proc?.lastModel
       ?? (selectedMatchesProc ? this.currentModelLabel() : null))
@@ -1272,6 +1283,8 @@ export class Session {
   }
 
   private attachProc(proc: AgentProcess): void {
+    this.modelSettingsChange?.cancel('原进程已更换')
+    this.modelSettingsChange = null
     this.invalidateTurnOpen()
     this.stoppingProc = null
     this.blockedProc = null
@@ -1283,6 +1296,8 @@ export class Session {
 
   private detachProc(proc: AgentProcess): boolean {
     if (this.proc !== proc) return false
+    this.modelSettingsChange?.cancel('原进程已退出')
+    this.modelSettingsChange = null
     this.invalidateTurnOpen()
     this.proc = null
     this.agentCapability = null
@@ -1296,6 +1311,10 @@ export class Session {
   }
 
   private beginProcStop(proc: AgentProcess): void {
+    if (this.modelSettingsChange?.proc === proc) {
+      this.modelSettingsChange.cancel('原进程正在停止')
+      this.modelSettingsChange = null
+    }
     this.stoppingProc = proc
     this.agentCapability = null
   }
@@ -2496,6 +2515,31 @@ export class Session {
     return sessionModel.showModelPanel(this)
   }
 
+  finishModelSettingsChange(change: sessionModel.ModelSettingsChange, outcome: sessionModel.ModelSettingsOutcome): Promise<ModelActionResult> {
+    return this.runLifecycle('model-settings-complete', () => sessionModel.finishModelSettingsChange(this, change, outcome))
+  }
+
+  closeModelSettingsChanges(): void {
+    this.modelSettingsChangesClosed = true
+    this.modelSettingsChange?.cancel('daemon 正在停止')
+  }
+
+  private modelSettingsBlockReason(): string | null {
+    const change = this.modelSettingsChange
+    if (!change || change.proc !== this.proc || !change.proc.isAlive()) return null
+    return change.phase === 'pending'
+      ? '模型设置仍在等待后端确认，请等待结果；取消切换请发 kill 或 restart。'
+      : change.error ?? '模型设置未确认，请重新发送 md 选择模型。'
+  }
+
+  resumeInputAfterModelSettingsChange(): void {
+    void this.drainMidTurnAndOpen().catch(async error => {
+      const message = `模型设置已完成，但排队输入提交失败：${messageOf(error)}`
+      log(`session "${this.sessionName}": ${message}`)
+      await feishu.sendTextRaw(this.chatId, `❌ ${message}`)
+    })
+  }
+
   onModelSelect(modelRaw: string, panelIdRaw = '', userOpenId = '', actionValue: any = null): Promise<ModelActionResult> {
     return this.runLifecycle('model-select', () =>
       sessionModel.onModelSelect(this, modelRaw, panelIdRaw, userOpenId, actionValue)
@@ -2755,6 +2799,8 @@ export class Session {
    * may emit init/turn_started synchronously in tests or immediately on their
    * read loop, so incrementing after sendUserText leaves a boundary race. */
   private async sendClaimedUserText(proc: AgentProcess, text: string): Promise<boolean> {
+    const settingsBlocked = this.modelSettingsBlockReason()
+    if (settingsBlocked) throw new Error(settingsBlocked)
     // 其他群可能在开卡期间关闭全局开关；真正送入进程前再检查一次。
     const blocked = this.disabledSubscriptionMessage(proc.tokenSourceId)
     if (blocked) {
@@ -2848,6 +2894,11 @@ export class Session {
   }
 
   private async onUserMessageUnlocked(text: string, files: string[], userOpenId: string, msgId: string): Promise<void> {
+    const settingsBlocked = this.modelSettingsBlockReason()
+    if (settingsBlocked) {
+      await feishu.sendText(this.chatId, `⚠️ ${settingsBlocked} 本条消息未送给 Agent，请确认设置后重发。`)
+      return
+    }
     const subscriptionDisabled = this.disabledSubscriptionMessage()
     if (subscriptionDisabled) {
       await feishu.sendText(this.chatId, `❌ ${subscriptionDisabled}。消息未送给 Agent，请启用后重发或通过 md 切换来源。`)
@@ -4047,6 +4098,7 @@ export class Session {
    * SDK 不会自发开 user_batch 子 turn。 */
   private async drainMidTurnAndOpen(): Promise<void> {
     if (this.pendingMidTurnMsgs.length === 0) return
+    if (this.modelSettingsBlockReason()) return
     const proc = this.proc
     const epoch = this.procEpoch
     if (!proc?.isAlive()) return
@@ -4055,7 +4107,7 @@ export class Session {
     // Never replace the bg owner: wait until it has attached+closed its own
     // orphan output, then open the user batch as a distinct turn.
     if (!await this.waitForTurnOpenSlot(proc, epoch)) return
-    if (this.currentTurn || this.openingTurn || this.pendingMidTurnMsgs.length === 0) return
+    if (this.currentTurn || this.openingTurn || this.pendingMidTurnMsgs.length === 0 || this.modelSettingsBlockReason()) return
     let openOwner: TurnOpenOwner
     try {
       openOwner = this.beginTurnOpen(proc, epoch)

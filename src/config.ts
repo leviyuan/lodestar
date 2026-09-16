@@ -59,8 +59,8 @@ export interface LodestarConfig {
    * `@anthropic-ai/claude-agent-sdk`. Empty record = inherit the user's
    * local Claude Code configuration. */
   claude: {
-    /** 显式指定 SDK spawn 的 Claude Code 可执行文件(如 reclaude 这类
-     * 参数透传包装器)。未设置 = 自动查找。 */
+    /** 显式指定 SDK spawn 的 Claude Code 可执行文件或参数透传包装器。
+     * 未设置时使用 SDK 默认入口。 */
     bin?: string
     env: Record<string, string>
     models: Record<string, ClaudeModelConfig>
@@ -97,8 +97,6 @@ export interface TokenSourceConfig {
   base_url?: string
   auth_token?: string
   api_key?: string
-  /** ReClaude 个人只读 API 查询的拼车组织，避免网站切换组织后额度串号。 */
-  org_id?: string
   bin?: string
   model?: string
   effort?: string
@@ -311,7 +309,7 @@ export function loadConfig(): LodestarConfig {
           cfg.default = value === 'true'
         } else if (
           field === 'agent' || field === 'display' || field === 'auth' ||
-          field === 'base_url' || field === 'auth_token' || field === 'api_key' || field === 'org_id' ||
+          field === 'base_url' || field === 'auth_token' || field === 'api_key' ||
           field === 'bin' || field === 'model' || field === 'effort' ||
           field === 'models' || field === 'hidden_models' || field === 'custom_models' || field === 'slots' || field === 'usage'
         ) {

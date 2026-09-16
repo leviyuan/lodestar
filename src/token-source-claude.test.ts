@@ -127,15 +127,6 @@ test('disabled Claude subscription skips native queries and discovery until expl
     assert.equal((await buildAgentSkillIdentityCatalog([enabled])).identities.length, 2)
     assert.equal(modelQueries, 1)
     assert.equal(usageQueries, 1)
-    config.token_sources.reclaude = { auth: 'reclaude-login' }
-    buildTokenSourcesFromConfig()
-    const blocked = registry.getTokenSource('claude-sub')
-    await blocked.refreshModels()
-    await blocked.readUsage()
-    assert.equal(blocked.enabled, false)
-    assert.match(blocked.modelCatalogState.error, /ReClaude/)
-    assert.equal(modelQueries, 1)
-    assert.equal(usageQueries, 1)
   `)
 })
 

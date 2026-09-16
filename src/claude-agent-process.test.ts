@@ -98,6 +98,22 @@ describe('Claude model profiles', () => {
     await nativeDefault.setModelSettings('minimax/minimax-m3', 'default')
     expect(updates.at(-1)).toEqual({ effortLevel: null, ultracode: null })
   })
+  test('a rejected model control does not attempt effort or report the old settings as confirmed', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), model: 'old-model', effort: 'high' }) as any
+    proc.started = true
+    let flagCalls = 0
+    proc.query = {
+      setModel: async () => { throw new Error('model control transport closed') },
+      applyFlagSettings: async () => { flagCalls++ },
+    }
+    await expect(proc.setModelSettings('new-model', 'max')).rejects.toMatchObject({
+      confirmedModel: null, message: '模型设置未确认：model control transport closed',
+    })
+    expect(flagCalls).toBe(0)
+    expect(proc.lastModel).toBeNull()
+    expect(proc.lastEffort).toBeNull()
+  })
+
   test('loads daemon-managed Skills as a plugin only when user settings are excluded', () => {
     expect(claudeManagedSkillOptions(['project', 'local'], '/data/lodestar-plugin')).toEqual({
       plugins: [{ type: 'local', path: '/data/lodestar-plugin', skipMcpDiscovery: true }],
@@ -190,7 +206,7 @@ describe('Claude model profiles', () => {
 
 describe('Claude configured executable ([claude] bin)', () => {
   test('uses configured bin as the SDK executable', () => {
-    const bin = '/home/me/.local/bin/reclaude'
+    const bin = '/home/me/.local/bin/claude-wrapper'
     const executable = resolveClaudeExecutableConfig({
       platform: 'linux',
       configuredBin: bin,
@@ -205,13 +221,13 @@ describe('Claude configured executable ([claude] bin)', () => {
   test('throws instead of silently falling back when configured bin is missing', () => {
     expect(() => resolveClaudeExecutableConfig({
       platform: 'linux',
-      configuredBin: '/nope/reclaude',
+      configuredBin: '/nope/claude-wrapper',
       exists: () => false,
-    })).toThrow('/nope/reclaude')
+    })).toThrow('/nope/claude-wrapper')
   })
 
   test('runs configured Windows .cmd bin through the shell shim spawn hook', () => {
-    const bin = win32.join('C:\\Users\\me\\bin', 'reclaude.cmd')
+    const bin = win32.join('C:\\Users\\me\\bin', 'claude-wrapper.cmd')
     const executable = resolveClaudeExecutableConfig({
       platform: 'win32',
       configuredBin: bin,
@@ -239,7 +255,7 @@ describe('Claude configured executable ([claude] bin)', () => {
     // 修复确保该抛出在 sendInitialize 的 try/catch 内被捕获,转为事件输出,
     // 调用方不会收到同步异常,session 层可通过 error/exit 事件做正常清理。
     const previousBin = config.claude.bin
-    ;(config.claude as any).bin = '/nope/reclaude'
+    ;(config.claude as any).bin = '/nope/claude-wrapper'
     try {
       const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' })
       const errors: Error[] = []
@@ -252,7 +268,7 @@ describe('Claude configured executable ([claude] bin)', () => {
 
       // error 事件携带路径信息
       expect(errors).toHaveLength(1)
-      expect(errors[0].message).toContain('/nope/reclaude')
+      expect(errors[0].message).toContain('/nope/claude-wrapper')
 
       // exit 事件 code=1
       expect(exits).toHaveLength(1)
@@ -269,14 +285,14 @@ describe('Claude configured executable ([claude] bin)', () => {
     // "Cannot read properties of undefined (reading 'supportedModels')";
     // 保留初始化的原始路径错误，不能用泛化的 SDK 错误掩盖原因。
     const previousBin = config.claude.bin
-    ;(config.claude as any).bin = '/nope/reclaude'
+    ;(config.claude as any).bin = '/nope/claude-wrapper'
     try {
       const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' })
       proc.sendInitialize() // 走 catch,this.query 仍 undefined
 
-      await expect(proc.listModels()).rejects.toThrow('[claude].bin not found: /nope/reclaude')
-      await expect(proc.readSubscriptionUsage()).rejects.toThrow('[claude].bin not found: /nope/reclaude')
-      await expect(proc.setModelSettings('opus', 'high')).rejects.toThrow('[claude].bin not found: /nope/reclaude')
+      await expect(proc.listModels()).rejects.toThrow('[claude].bin not found: /nope/claude-wrapper')
+      await expect(proc.readSubscriptionUsage()).rejects.toThrow('[claude].bin not found: /nope/claude-wrapper')
+      await expect(proc.setModelSettings('opus', 'high')).rejects.toThrow('[claude].bin not found: /nope/claude-wrapper')
     } finally {
       if (previousBin === undefined) delete (config.claude as any).bin
       else config.claude.bin = previousBin

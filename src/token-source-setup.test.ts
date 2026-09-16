@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 
-test('Claude subscription commands persist a global switch and report auth, ReClaude and save failures', () => {
+test('Claude subscription commands persist a global switch and report auth and save failures', () => {
   const script = `
     import assert from 'node:assert/strict'
     import { mock } from 'bun:test'
@@ -34,7 +34,6 @@ test('Claude subscription commands persist a global switch and report auth, ReCl
     buildTokenSourcesFromConfig()
     const { runCommand } = await import('./src/session-commands')
     const { onTokenSourceEnable } = await import('./src/token-source-setup')
-    const { addTokenSource } = await import('./src/token-source-config')
     const session = { chatId: 'test-chat' }
     const claudeSettings = join(process.env.CLAUDE_CONFIG_DIR, 'settings.json')
     const previousSettings = readFileSync(claudeSettings, 'utf8')
@@ -67,10 +66,6 @@ test('Claude subscription commands persist a global switch and report auth, ReCl
     assert.equal(loadConfig().token_sources['claude-sub'].enabled, true)
     assert.equal(registry.getTokenSource('claude-sub').enabled, false)
 
-    await addTokenSource('reclaude', { auth: 'reclaude-login' })
-    await runCommand(session, 'claude-sub on')
-    assert.match(sentTexts.at(-1), /MISS.*ReClaude/)
-    assert.equal(registry.getTokenSource('claude-sub').enabled, false)
     assert.equal(config.token_sources.glm.auth_token, 'test-token')
     assert.equal(readFileSync(claudeSettings, 'utf8'), previousSettings)
     unlinkSync(CONFIG_FILE)

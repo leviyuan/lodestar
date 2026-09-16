@@ -21,7 +21,24 @@ export type LifecycleProgressOpts = {
 
 export type WorktreeActionResult = { ok: boolean; message: string; card: object }
 export type TasklistActionResult = { ok: boolean; message: string; card: object }
-export type ModelActionResult = { ok: boolean; message: string; card?: object }
+export type ModelActionResult = {
+  ok: boolean
+  message: string
+  card?: object
+  pending?: boolean
+  completion?: Promise<ModelActionResult>
+}
+
+/** Attach after presenting the pending result so a fast late reply cannot
+ * overwrite the final card with the older pending card. */
+export function modelActionCompletion(
+  completion: Promise<ModelActionResult> | undefined, present: (final: ModelActionResult) => Promise<void>,
+): Promise<'complete' | 'retry'> | null {
+  return completion?.then(async final => {
+    await present(final)
+    return final.ok ? 'complete' : 'retry'
+  }) ?? null
+}
 
 export function messageOf(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
