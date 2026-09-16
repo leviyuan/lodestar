@@ -26,7 +26,7 @@ lodestar-setup
 | `lodestar-stop` | 停止 daemon |
 | `lodestar-update` | 升级 Lodestar 及实际使用的 Codex、Claude Code/SDK、DSH；`--agents-only` 仅立即更新 Agent |
 | `lodestar-version` | 查看 Lodestar、实际 Agent 版本、运行目录及更新错误 |
-| `lodestar-agent` | 由会话中的 Agent 调用其他模型执行任务 |
+| `lodestar-agent` | 由主 Agent 调用已配置模型执行任务，也支持与自身相同的模型 |
 
 daemon 启动时不检查 Agent 版本，也不安装或更新 Agent。自动更新默认关闭；首次安装缺少运行文件或需要更新时，运行 `lodestar-update --agents-only`。手动更新和显式开启的自动更新都选择上游 `latest`，独立于 Lodestar 发版，不设置兼容版本白名单。
 

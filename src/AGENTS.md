@@ -33,7 +33,7 @@
 
 ## 委派 Agent
 
-- `agent-*` 提供单层模型委派。只有主 Agent 能发起任务或续跑；同一任务的多个身份放在一个 run 内并发。被委派的 Agent 自行完成任务，需要额外派工时报告主 Agent。
+- `agent-*` 提供单层模型委派。只有主 Agent 能发起任务或续跑；主 Agent 按任务和可用能力自行选择原生 subagent 或 `lodestar-agent`，调用自身模型或 Agent 时也适用。同一任务的多个身份放在一个 run 内并发。被委派的 Agent 自行完成任务，需要额外派工时报告主 Agent。
 - `lodestar-agent identities` / `GET /agents/identities` 通过原生订阅额度接口校验 Claude 订阅，成功和失败结论均缓存 30 分钟；首次查询或到期后的下一次取列表才刷新，并发请求共用一次校验。刷新失败替换旧结论，身份不进入 Skill 返回列表，原因保留在 `source_failures`；后续刷新确认恢复时重新列出。只缓存校验结论，配置重建后的来源重新校验，不修改 MD 的来源、模型目录和启用状态。
 - 共用 `agent-launch.ts` 的 coding-agent 启动入口。主会话保留原生能力；委派进程只关闭继续委派的工具（Codex `multi_agent`、Claude `Agent`/`Task`），其余代码工具、MCP、Skill、模型与 effort 保持不变。
 - 每个 worker 获得独立、可撤销的 `LODESTAR_AGENT_*` capability，运行时拒绝其再次发起任务或续跑；Skill 与 worker 提示词同步声明禁止继续委派。历史父子记录仍可读取和清理。

@@ -10,7 +10,7 @@ export const DELEGATED_AGENT_INSTRUCTIONS = [
 ].join('\n')
 
 export function agentSkillBody(): string {
-  const description = 'Main Agents can delegate a task to a different configured model or Agent through Lodestar and continue the same work across multiple turns. Delegated Agents and subagents must not use this Skill or delegate further. Main-Agent self-calls use native delegation capabilities.'
+  const description = 'Main Agents can delegate tasks to configured models or Agents through Lodestar, including their own model or Agent, and continue the same work across multiple turns. Delegated Agents and subagents must not use this Skill or delegate further.'
   return [
     '---',
     `name: ${AGENT_SKILL_NAME}`,
@@ -34,20 +34,15 @@ export function agentSkillBody(): string {
     '- Return additional work requests to the main Agent. It can assign separate',
     '  tasks, continue your session, or answer your questions.',
     '',
-    '## Hard rule: native Agent capabilities for self-calls',
+    '## Choosing a delegation method',
     '',
-    '- For the main Agent only: when calling yourself or your own model/Agent, use your current',
-    '  Agent\'s native Agent/subagent capabilities. You MUST NOT use this Skill',
-    '  or the `lodestar-agent` command for self-calls.',
-    '- For example, Codex calling Codex uses Codex native subagents; Claude',
-    '  calling Claude uses Claude native Agent capabilities.',
-    '- This does not exempt delegated Agents from the single-level rule above.',
-    '- If native delegation is unavailable, report that limitation. It does not',
-    '  permit routing a self-call through this Skill.',
+    '- The main Agent chooses between native Agent/subagent capabilities and',
+    '  `lodestar-agent` based on the task and available capabilities.',
+    '- Both methods are allowed when calling your own model or Agent.',
     '',
     '## Required workflow',
     '',
-    '1. For another model/Agent, query the live identity catalog immediately before',
+    '1. When using Lodestar, query the live identity catalog immediately before',
     '   every new task:',
     '',
     '```bash',
@@ -63,7 +58,7 @@ export function agentSkillBody(): string {
     '   Every run and follow-up also requires `--description`: a short, user-facing',
     '   single-line task summary (at most 60 characters). The card shows this line',
     '   with status; the full prompt, progress and results stay collapsed.',
-    '4. For the same prompt sent to several other models, pass every identity to one run',
+    '4. For the same prompt sent to several identities, pass them to one run',
     '   with repeated `--identity`; the daemon schedules them within concurrency limits.',
     '   OpenRouter allows at most 2 delegated tasks at once across projects and models',
     '   in the same daemon; additional tasks queue. This is a local limit, not an API quota.',

@@ -16,11 +16,10 @@ describe('lodestar-agent managed Skill', () => {
     expect(body.toLowerCase()).not.toContain('read-only')
   })
 
-  test('makes the worker prohibition apply to native tools and the self-call rule', () => {
+  test('makes the worker prohibition apply to native tools', () => {
     const body = agentSkillBody()
     expect(body).toContain('Only the main Agent may delegate work')
     expect(body).toContain('do not delegate further')
-    expect(body).toContain('This does not exempt delegated Agents')
     expect(body).toContain('Native subagents are also delegated Agents')
     expect(DELEGATED_AGENT_INSTRUCTIONS).toContain('must not create or invoke any further Agents or subagents')
     expect(DELEGATED_AGENT_INSTRUCTIONS).toContain('report the need to the main Agent')
