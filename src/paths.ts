@@ -6,6 +6,7 @@
 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { lodestarDataDir, managedClaudePluginDir } from './data-dir.cjs'
 
 const HOME = homedir()
 const IS_WIN = process.platform === 'win32'
@@ -24,25 +25,14 @@ function defaultConfigDir(): string {
   return join(HOME, '.config', 'lodestar')
 }
 
-/** Default data dir: %LOCALAPPDATA%\Lodestar on Windows (machine-
- * local, non-roaming; the standard place for app state/logs/cache),
- * XDG path on unix. */
-function defaultDataDir(): string {
-  if (IS_WIN) return join(process.env.LOCALAPPDATA ?? join(HOME, 'AppData', 'Local'), 'Lodestar')
-  return join(HOME, '.local', 'share', 'lodestar')
-}
-
 export const CONFIG_DIR = pickDir(
   process.env.LODESTAR_CONFIG_DIR,
   process.env.XDG_CONFIG_HOME,
   defaultConfigDir(),
 )
 
-export const DATA_DIR = pickDir(
-  process.env.LODESTAR_DATA_DIR,
-  process.env.XDG_DATA_HOME,
-  defaultDataDir(),
-)
+/** Shares platform/env resolution with npm's pre-build Skill cleanup. */
+export const DATA_DIR = lodestarDataDir()
 
 export const CONFIG_FILE = process.env.LODESTAR_CONFIG ?? join(CONFIG_DIR, 'config.toml')
 export const PID_FILE = join(DATA_DIR, 'daemon.pid')
@@ -68,7 +58,7 @@ export const AGENT_RUNS_DIR = join(DATA_DIR, 'agent-runs')
 export const AGENT_SESSION_IDS_FILE = join(DATA_DIR, 'agent-session-ids.json')
 /** Daemon-owned Claude Agent SDK plugin. It mirrors every managed Skill so
  * injected TokenSources can load them without enabling user settings/env. */
-export const MANAGED_CLAUDE_PLUGIN_DIR = join(DATA_DIR, 'managed-claude-plugin')
+export const MANAGED_CLAUDE_PLUGIN_DIR = managedClaudePluginDir()
 /** Private Harness profiles, skills and native session persistence. */
 export const DSH_HOME_DIR = join(DATA_DIR, 'dsh')
 /** Named Codex credentials and per-group selections; the default account stays in native CODEX_HOME. */

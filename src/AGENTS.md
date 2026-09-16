@@ -46,7 +46,7 @@
 - 委派历史索引和父子关系不能按缓存数量删除；仅淘汰已完成、已落盘且进程退出的旧正文缓存。`status` 按原 artifact 读取完整正文，读取失败报错；续接保留原生 session、最新一轮 effort 和群/目录边界。
 - 父 run 取消、Session stop/kill/restart 和 daemon shutdown 在首次 await 前关闭新建入口、吊销 capability，并递归回收后代进程。
 - Skill 内容由 `managed-skills.ts` 同源同步至 Codex/Claude standalone 目录和 Claude 本地插件。排除 user settings 的主会话显式加载插件，不能为发现 Skill 混入 user env。
-- `lodestar-files` Skill 与各后端交付指令共用 `instructions.ts`，`file-delivery-skill.ts` 通过既有受管 Skill 管线同步。`channelInstructions(provider, mode)` 在主 Agent 启动时按群设置生成，只有聊天附件模式在交付标记旁注入 30 MB 约束；云空间提示词和共享 Skill 不提这个数字。Skill 仅在宿主明确提供上限时要求检查大小，不让 Agent 查接口/配置来推断。Agent 只生成/检查本地文件并提交标记，不承担上传、分片、授权或发卡接口；委派 Agent 返回路径给主 Agent。群开关由用户操作，不能让 Agent 为交付读取凭据或修改配置。
+- 文件交付约定仅由 `instructions.ts` 注入会话，不生成或安装独立 Skill。npm 安装/更新与 daemon 启动共用 `managed-skill-cleanup.cjs` 清理旧 `lodestar-files` 的 Codex、Claude 和共享插件副本；`data-dir.cjs` 与 `paths.ts` 共用跨平台/自定义数据目录解析，清理失败明确报错。安装清理使用随包的 CommonJS 源文件，不依赖预先构建、配置或 Agent。`channelInstructions(provider, mode)` 在主 Agent 启动时按群设置生成，只有聊天附件模式在交付标记旁注入 30 MB 约束；云空间提示词不提这个数字。Agent 只生成/检查本地文件并提交标记，不承担上传、分片、授权或发卡接口；委派 Agent 返回路径给主 Agent。群开关由用户操作，不能让 Agent 为交付读取凭据、查询接口推断限制或修改配置。
 
 ## 卡片与持久化
 

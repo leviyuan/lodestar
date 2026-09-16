@@ -15,7 +15,7 @@
  * to auto-launch the wizard by hijacking /dev/tty, but that was fragile:
  * on some mac installs the wizard's readline got no input and deadlocked
  * against npm's wait (terminal froze, killing it tripped npm's rollback).
- * So postinstall now just prints a banner; the wizard runs here, on the
+ * Postinstall cleans retired Skills and prints a banner; the wizard runs here, on the
  * first `lodestar-daemon`, where the TTY check is trivially true.
  */
 

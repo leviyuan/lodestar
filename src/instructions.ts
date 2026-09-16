@@ -2,8 +2,6 @@ import type { AgentProvider } from './agent-process'
 import type { FileDeliveryMode } from './file-delivery-types'
 
 /** 注入各后端的文件收发、澄清提问和 shell 卡片标题约定。 */
-export const FILE_DELIVERY_SKILL_NAME = 'lodestar-files'
-
 const FILE_HANDOFF = '生成并检查本地文件后，在回复正文中独占一行输出 `[[send: /abs/path]]` 提交交付，路径必须替换成实际存在的绝对路径。只在用户要文件或交付最终产物时使用。'
 const FILE_TRANSPORT_OWNER = '交付本地任务产物时，上传、权限和卡片均由 Lodestar 处理。Agent 不直接调用这些飞书接口，不为交付读取凭据或查找 token，也不依赖飞书 CLI。被委派的 Agent 只返回文件路径和说明，由主 Agent 提交交付。'
 const FILE_DELIVERY_RESULT = '交付标记只表示提交，不能据此声称上传成功。以 Lodestar 实际发出的附件、交付卡或错误提示为准，不编造云空间链接，不用其他工具重复发送。'
@@ -43,48 +41,4 @@ export function channelInstructions(provider: AgentProvider, mode: FileDeliveryM
 /** Sent once when a live process needs new rules, never on every ordinary input. */
 export function fileDeliveryAgentContext(mode: FileDeliveryMode): string {
   return `[Lodestar 文件交付约定更新]\n以下约定从本轮起完整替换此前的文件交付约定：\n${fileDeliveryInstructions(mode)}`
-}
-
-/** The Skill and mandatory per-backend instructions share the same delivery contract. */
-export function fileDeliverySkillBody(): string {
-  const description = '在 Lodestar 飞书会话中交付本地生成或已有的报告、PDF、视频等任务文件。主 Agent 用交付标记交给宿主发送，委派 Agent 返回文件路径；不用于搜索或编辑用户指定的已有云文档。'
-  return [
-    '---',
-    `name: ${FILE_DELIVERY_SKILL_NAME}`,
-    `description: ${JSON.stringify(description)}`,
-    '---',
-    '',
-    '# Lodestar 文件交付',
-    '',
-    '仅用于 Lodestar 托管的会话。交付标记需要宿主处理，不能在普通终端或其他聊天环境里把它当作上传命令。',
-    '',
-    FILE_HANDOFF,
-    '',
-    '交付前完成文件生成与必要检查，确认文件存在、可读取。多个文件各写一行交付标记；把下面的示例路径替换成真实文件路径，不要在说明中原样发送示例标记。',
-    '标记写在主 Agent 的回复正文里，不写进脚本的标准输出、文件内容或仅放在工具返回值里。',
-    '',
-    '```text',
-    '[[send: /abs/path/report.pdf]]',
-    '[[send: /abs/path/video.mp4]]',
-    '```',
-    '',
-    FILE_TRANSPORT_OWNER,
-    '',
-    '## 交付要求',
-    '',
-    '以 Lodestar 启动 Agent 时注入的文件交付约定及后续约定更新为准。只有约定明确给出文件大小上限时，才按该上限检查和处理；不自行查询配置、推断限制或按账号认证状态决定交付方式。',
-    '',
-    FILE_DELIVERY_SWITCH,
-    '',
-    '## 宿主负责的结果',
-    '',
-    '云空间模式下，Lodestar 把本群各轮文件放进与群名一致的固定文件夹。独立卡片只列本轮文件，“管理群文件”打开本群所有历史云空间交付文件。目录复用、上传与重试、授权和发卡都由后台实现；这里不需要上传脚本或接口步骤。',
-    '',
-    FILE_DELIVERY_RESULT,
-    '',
-    '系统报告交付失败时，向用户说明实际错误；不要换上传工具、身份或存储来源掩盖失败。用户另行要求管理已有云文档时，按该请求的实际范围处理，不把它混入本地产物交付。',
-    '',
-    '图像生成工具的图片沿用 Lodestar 自动展示规则，不再重复提交交付标记。',
-    '',
-  ].join('\n')
 }

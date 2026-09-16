@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { removeManagedSkill, syncClaudePluginSkill, syncManagedSkill } from './managed-skills'
@@ -32,17 +32,40 @@ describe('managed skill sync', () => {
     expect(readFileSync(join(plugin, 'skills', 'lodestar-agent', 'SKILL.md'), 'utf8')).toBe('agent-v1\n')
   })
 
-  test('removes an obsolete daemon-owned Skill but preserves unclear ownership', () => {
+  test.each(['lodestar-consult', 'lodestar-files'])('removes obsolete %s across managed roots while preserving user replacements', name => {
     const root = mkdtempSync(join(tmpdir(), 'lodestar-managed-remove-'))
-    const owned = join(root, 'lodestar-consult', 'SKILL.md')
-    const custom = join(root, 'custom', 'SKILL.md')
-    mkdirSync(join(root, 'lodestar-consult'), { recursive: true })
-    mkdirSync(join(root, 'custom'), { recursive: true })
-    writeFileSync(owned, '---\nname: lodestar-consult\n---\n')
-    writeFileSync(custom, 'user content\n')
-    removeManagedSkill('lodestar-consult', [root])
-    removeManagedSkill('custom', [root])
-    expect(existsSync(owned)).toBe(false)
-    expect(existsSync(custom)).toBe(true)
+    try {
+      const roots = [join(root, 'codex'), join(root, 'claude'), join(root, 'plugin', 'skills')]
+      for (const [index, skillRoot] of roots.entries()) {
+        mkdirSync(join(skillRoot, name), { recursive: true })
+        const declaredName = [name, `"${name}"`, `'${name}'`][index]
+        writeFileSync(join(skillRoot, name, 'SKILL.md'), `---\nname: ${declaredName}\n---\n`)
+        mkdirSync(join(skillRoot, 'lodestar-agent'), { recursive: true })
+        writeFileSync(join(skillRoot, 'lodestar-agent', 'SKILL.md'), 'active skill\n')
+      }
+      const customRoot = join(root, 'custom')
+      const customFile = join(customRoot, name, 'SKILL.md')
+      mkdirSync(join(customRoot, name), { recursive: true })
+      writeFileSync(customFile, 'user content\n')
+
+      removeManagedSkill(name, [...roots, customRoot])
+      removeManagedSkill(name, [...roots, customRoot])
+      for (const skillRoot of roots) {
+        expect(existsSync(join(skillRoot, name))).toBe(false)
+        expect(readFileSync(join(skillRoot, 'lodestar-agent', 'SKILL.md'), 'utf8')).toBe('active skill\n')
+      }
+      expect(readFileSync(customFile, 'utf8')).toBe('user content\n')
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test.each(['---\nname: lodestar-files-custom\n---\n', '# Notes\nname: lodestar-files\n'])('preserves a same-path file without exact Skill ownership: %s', body => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-managed-custom-'))
+    try {
+      const file = join(root, 'lodestar-files', 'SKILL.md')
+      mkdirSync(join(root, 'lodestar-files'))
+      writeFileSync(file, body)
+      removeManagedSkill('lodestar-files', [root])
+      expect(readFileSync(file, 'utf8')).toBe(body)
+    } finally { rmSync(root, { recursive: true, force: true }) }
   })
 })

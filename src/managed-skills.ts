@@ -1,9 +1,10 @@
-import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { log } from './log'
 import { writeStateFileAtomic } from './state-store'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
+import { removeManagedSkill as cleanupManagedSkill } from './managed-skill-cleanup.cjs'
 
 export interface ManagedSkill {
   name: string
@@ -67,30 +68,5 @@ export function syncClaudePluginSkill(skill: ManagedSkill, pluginRoot: string): 
 /** Remove an obsolete daemon-owned Skill only when its exact SKILL.md still
  * identifies itself by that name. A same-named user replacement is preserved. */
 export function removeManagedSkill(name: string, roots?: string[]): void {
-  if (process.env.LODESTAR_DISABLE_SKILL_SYNC === '1') {
-    log(`skill: sync disabled, skip removal ${name}`)
-    return
-  }
-  const targetRoots = roots ?? [
-    join(homedir(), '.codex', 'skills'),
-    join(homedir(), '.claude', 'skills'),
-  ]
-  const dirs = targetRoots.map(root => join(root, name))
-  if (!roots) dirs.push(join(MANAGED_CLAUDE_PLUGIN_DIR, 'skills', name))
-  for (const dir of dirs) {
-    const skillFile = join(dir, 'SKILL.md')
-    if (!existsSync(skillFile)) continue
-    try {
-      const body = readFileSync(skillFile, 'utf8')
-      const selfIdentifies = body.includes(`name: ${name}`) || body.includes(`name: "${name}"`)
-      if (!selfIdentifies) {
-        log(`skill: obsolete path preserved because ownership is unclear ${skillFile}`)
-        continue
-      }
-      rmSync(dir, { recursive: true, force: false })
-      log(`skill: removed obsolete ${dir}`)
-    } catch (error) {
-      log(`skill: obsolete removal failed (${dir}): ${error}`)
-    }
-  }
+  cleanupManagedSkill(name, roots, log)
 }

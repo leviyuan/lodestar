@@ -58,6 +58,8 @@
     "dist/",
     "docs/",
     "scripts/postinstall.cjs",
+    "src/data-dir.cjs",
+    "src/managed-skill-cleanup.cjs",
     "README.md",
     "LICENSE"
   ],
