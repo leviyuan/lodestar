@@ -686,6 +686,9 @@ export class ClaudeAgentProcess extends EventEmitter {
       const baseEnv: Record<string, string | undefined> = { ...(process.env as Record<string, string>), PATH: buildClaudeSpawnPath(),
         ...config.claude.env, ...(this.opts.hostEnv ?? {}) }
       const env = this.opts.transformEnv ? this.opts.transformEnv(baseEnv) : baseEnv
+      // Claude Code 2.1.268+ hides task tracking on newer/unknown models unless
+      // the host opts in. The session card consumes these Task tool events.
+      env.CLAUDE_CODE_ENABLE_TODO_TOOLS = '1'
       if (this.opts.effort === 'default') env.CLAUDE_CODE_EFFORT_LEVEL = 'unset'
       log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} cwd=${this.opts.workDir} executable=${executable.description}`)
       this.query = query({

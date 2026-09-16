@@ -1,7 +1,7 @@
 import { homedir, tmpdir } from 'node:os'
 import { mkdtempSync, writeFileSync, unlinkSync } from 'node:fs'
 import { delimiter, join, win32 } from 'node:path'
-import { beforeEach, describe, expect, test } from 'bun:test'
+import { beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
 const {
   buildClaudeSpawnPath,
@@ -20,12 +20,46 @@ const {
   resolveClaudeSdkModel,
 } = await import('./claude-models')
 const { config } = await import('./config')
+const agentUpdates = await import('./agent-updates')
 
 // context window 是 daemon 全局缓存(按路由 key 跨 session 共享),
 // 每个用例前重置,避免互相污染。
 beforeEach(() => resetClaudeContextWindowCache())
 
 describe('Claude model profiles', () => {
+  test('SDK launches opt into task tracking while preserving routing and project tool restrictions', async () => {
+    const captured: any[] = []
+    const sdk = spyOn(agentUpdates, 'loadClaudeSdk').mockResolvedValue({
+      query: ({ options }: any) => {
+        captured.push(options)
+        return (async function* () {})()
+      },
+    } as any)
+    try {
+      for (const resumed of [false, true]) {
+        const proc = new ClaudeAgentProcess({
+          workDir: tmpdir(), model: resumed ? 'GLM-5.3-Flash' : 'claude-opus-5', effort: 'max',
+          ...(resumed ? { resumeSessionId: 'task-session' } : {}),
+          profile: resumed ? { tools: 'Read,TaskCreate,TaskUpdate,TaskList', loadProjectMcp: false } : { loadProjectMcp: false },
+          settingSources: resumed ? ['project', 'local'] : ['user', 'project', 'local'],
+          transformEnv: env => ({ ...env, CLAUDE_CODE_ENABLE_TODO_TOOLS: '0',
+            ANTHROPIC_BASE_URL: 'https://provider.invalid', ANTHROPIC_AUTH_TOKEN: 'test-only' }),
+        }) as any
+        proc.sendInitialize()
+        await proc.queryStart
+        expect(captured).toHaveLength(resumed ? 2 : 1)
+        const options = captured.at(-1)
+        expect(options.env.CLAUDE_CODE_ENABLE_TODO_TOOLS).toBe('1')
+        expect(options.env.ANTHROPIC_BASE_URL).toBe('https://provider.invalid')
+        expect(options.env.ANTHROPIC_AUTH_TOKEN).toBe('test-only')
+        expect(options.resume).toBe(resumed ? 'task-session' : undefined)
+        expect(options.tools).toEqual(resumed
+          ? ['Read', 'TaskCreate', 'TaskUpdate', 'TaskList']
+          : { type: 'preset', preset: 'claude_code' })
+      }
+    } finally { sdk.mockRestore() }
+  })
+
   test('thinking estimates update progress without changing billed usage', () => {
     const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high' }) as any
     const progress: unknown[] = []

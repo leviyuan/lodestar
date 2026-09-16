@@ -4431,6 +4431,54 @@ describe('Session background tasks in shared delegation cards', () => {
   })
 })
 
+describe('Session Claude task live panel (task_board_live)', () => {
+  test('native SDK task calls render creation and every status update in one live panel', async () => {
+    const session = new Session('claude-tasks', 'chat_id') as any
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max' }) as any
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_claude_tasks')
+    cardkit.recordCardCreated('card_claude_tasks', 1)
+    let index = 0
+    const task = async (name: string, input: any, content: string) => {
+      const id = `task-call-${index++}`
+      proc.handleMessage({ type: 'assistant', parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_use', id, name, input }] } })
+      proc.handleMessage({ type: 'user', parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_result', tool_use_id: id, content }] } })
+      await cardkit.flush('card_claude_tasks')
+      const writes = calls.filter(call => call.method === 'PUT'
+        && call.path === '/cards/card_claude_tasks/elements/task_board_live')
+      return JSON.parse(writes.at(-1)!.body.element)
+    }
+    try {
+      await task('TaskCreate', { subject: '验证任务创建' }, 'Task #1 created successfully: 验证任务创建')
+      const created = await task('TaskCreate', { subject: '验证任务完成' }, 'Task #2 created successfully: 验证任务完成')
+      expect(created.expanded).toBe(true)
+      expect(created.elements[0].content).toContain('- ⬜ 验证任务创建')
+      expect(created.elements[0].content).toContain('- ⬜ 验证任务完成')
+
+      const running = await task('TaskUpdate', { taskId: '1', status: 'in_progress' }, 'Updated task #1 status')
+      expect(running.elements[0].content).toContain('- 🔄 验证任务创建')
+      await task('TaskList', {}, '#1 [in_progress] 验证任务创建\n#2 [pending] 验证任务完成')
+      await task('TaskUpdate', { taskId: '1', status: 'completed' }, 'Updated task #1 status')
+      await task('TaskUpdate', { taskId: '2', status: 'in_progress' }, 'Updated task #2 status')
+      const completed = await task('TaskUpdate', { taskId: '2', status: 'completed' }, 'Updated task #2 status')
+      expect(completed.elements[0].content).toContain('- ✅ 验证任务创建')
+      expect(completed.elements[0].content).toContain('- ✅ 验证任务完成')
+      expect(session.taskBoard.map((entry: any) => entry.status)).toEqual(['completed', 'completed'])
+      const liveAdds = calls.filter(call => call.method === 'POST'
+        && call.path === '/cards/card_claude_tasks/elements'
+        && String(call.body?.elements).includes('"task_board_live"'))
+      expect(liveAdds).toHaveLength(1)
+      expect(liveAdds[0].body.target_element_id).toBe('footer')
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose('card_claude_tasks')
+    }
+  })
+})
+
 describe('Session codex plan live panel (plan_live)', () => {
   test('turn/plan/updated 首次建立 plan_live,后续原地 replace,最新计划始终在卡末', async () => {
     const session = new Session('probe', 'chat_id') as any

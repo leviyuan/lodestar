@@ -58,6 +58,8 @@ GLM、DeepSeek、OpenRouter 等来源先清除冲突的 Anthropic 环境变量�
 
 Claude 使用 `permissionMode: default`：普通工具在 `canUseTool` 中放行，`AskUserQuestion` 等待用户回答。不能改成 `bypassPermissions`，否则 SDK 会绕开提问回调。
 
+Lodestar 每次启动 Claude SDK 子进程时自动设置 `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`，让新版 Claude 及第三方模型继续提供任务清单工具。安装或升级后无需手动修改配置，已有进程需重新启动后生效。任务创建和状态更新显示在会话卡片中，是否使用清单由 Agent 判断，项目 `tools` 限制仍生效。
+
 ## OpenRouter
 
 - 来源 id 为 `openrouter`，通过 factory 注册 `openrouter-setup`。默认根地址 `https://openrouter.ai/api`，粘贴的 `/api/v1` 会规范成 SDK 根地址。API key 注入 `ANTHROPIC_AUTH_TOKEN`，`ANTHROPIC_API_KEY` 显式置空，模型 slug 完整透传，不自动追加 `[1m]`。
