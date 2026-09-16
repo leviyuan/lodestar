@@ -93,7 +93,7 @@ describe('desktop system proxy settings', () => {
     const settings = await readSystemProxySettings()
     expect(settings).toBeObject()
     for (const value of Object.values(settings)) expect(value === undefined || typeof value === 'string').toBe(true)
-  }, 10_000)
+  }, 20_000)
 
   test('Windows manual per-scheme/shared servers, bypass and automatic-proxy boundaries', () => {
     expect(parseWindowsProxy({ ProxyEnable: 1, ProxyServer: 'http=host:8080;https=secure:8443', ProxyOverride: '*.internal;<local>' }))

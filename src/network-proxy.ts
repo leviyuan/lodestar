@@ -166,8 +166,8 @@ export function parseKdeProxy(text: string): ProxySettings | undefined {
   return result
 }
 
-async function command(file: string, args: string[]): Promise<string> {
-  const { stdout } = await execute(file, args, { encoding: 'utf8', timeout: 5_000, maxBuffer: 256 * 1024, windowsHide: true })
+async function command(file: string, args: string[], timeout = 5_000): Promise<string> {
+  const { stdout } = await execute(file, args, { encoding: 'utf8', timeout, maxBuffer: 256 * 1024, windowsHide: true })
   return stdout
 }
 
@@ -216,7 +216,8 @@ try {
 export async function readSystemProxySettings(): Promise<ProxySettings> {
   if (process.platform === 'win32') {
     // Read the current user's settings; never import/change machine or browser configuration.
-    return parseWindowsProxy(JSON.parse(await command('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_PROXY_QUERY])))
+    // Allow for PowerShell startup and Add-Type compilation on cold Windows hosts.
+    return parseWindowsProxy(JSON.parse(await command('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_PROXY_QUERY], 15_000)))
   }
   if (process.platform === 'darwin') return parseMacProxy(await command('/usr/sbin/scutil', ['--proxy']))
   if (process.platform === 'linux') {
