@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
-import { CodexLogins } from './codex-login'
+import { CodexLogins, requireDefaultCodexLogin } from './codex-login'
+import { DEFAULT_CODEX_ACCOUNT, reserveCodexLogin } from './codex-accounts'
 
 class Client extends EventEmitter {
   alive = true
@@ -9,6 +10,7 @@ class Client extends EventEmitter {
   early = false
   malformed = false
   initError: Error | null = null
+  accountError: Error | null = null
   initialAuthUpdate = false
   account: any = { type: 'chatgpt', email: 'test@example.test', planType: 'pro' }
   async initialize() {
@@ -24,7 +26,10 @@ class Client extends EventEmitter {
       }
       return this.malformed ? {} : { type: 'chatgptDeviceCode', loginId: 'login-1', verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'TEST-CODE' }
     }
-    if (method === 'account/read') return { account: this.account }
+    if (method === 'account/read') {
+      if (this.accountError) throw this.accountError
+      return { account: this.account }
+    }
     if (method === 'account/login/cancel') {
       this.emit('notification', 'account/login/completed', { loginId: 'login-1', success: false, error: 'canceled' })
       return { status: 'canceled' }
@@ -35,6 +40,59 @@ class Client extends EventEmitter {
   isAlive() { return this.alive }
 }
 const owner = { chatId: 'chat-test', userOpenId: 'user-test' }
+
+describe('default account prerequisite for named login', () => {
+  test('accepts native ChatGPT auth without requiring files, quota or models', async () => {
+    const client = new Client()
+    await requireDefaultCodexLogin(id => { expect(id).toBe(DEFAULT_CODEX_ACCOUNT); return client })
+    expect(client.calls).toEqual([['account/read', { refreshToken: false }]])
+    expect(client.alive).toBe(false)
+  })
+
+  test('signed-out and API-key defaults require an unqualified codex-login first', async () => {
+    for (const account of [null, { type: 'apiKey' }]) {
+      const client = new Client(); client.account = account
+      await expect(requireDefaultCodexLogin(() => client)).rejects.toThrow('请先发送不带备注的 codex-login')
+      expect(client.calls).toEqual([['account/read', { refreshToken: false }]])
+      expect(client.alive).toBe(false)
+    }
+  })
+
+  test('a default login in progress is rejected before creating a probe', async () => {
+    const release = reserveCodexLogin(DEFAULT_CODEX_ACCOUNT)
+    let created = false
+    try {
+      await expect(requireDefaultCodexLogin(() => { created = true; return new Client() })).rejects.toThrow('默认账号正在登录')
+      expect(created).toBe(false)
+    } finally { release() }
+  })
+
+  test('probe failures and invalid responses remain errors rather than a signed-out diagnosis', async () => {
+    for (const mode of ['initialize', 'request', 'invalid']) {
+      const client = new Client()
+      if (mode === 'initialize') client.initError = new Error('native initialize failed')
+      else if (mode === 'request') client.accountError = new Error('native account read rejected')
+      else client.account = undefined
+      const message = mode === 'initialize' ? 'native initialize failed' : mode === 'request' ? 'native account read rejected' : '账号状态无效'
+      await expect(requireDefaultCodexLogin(() => client)).rejects.toThrow(message)
+      expect(client.alive).toBe(false)
+      expect(client.calls.every(([method]) => method === 'account/read')).toBe(true)
+    }
+    await expect(requireDefaultCodexLogin(() => { throw new Error('Codex executable unavailable') }))
+      .rejects.toThrow('默认账号登录检查失败：Codex executable unavailable')
+  })
+
+  test('a failed probe shutdown rejects successful auth and preserves prior errors', async () => {
+    for (const signedOut of [false, true]) {
+      const client = new Client(); client.closeError = new Error('SIGTERM rejected')
+      if (signedOut) client.account = null
+      const error = await requireDefaultCodexLogin(() => client).then(() => null, error => error as Error)
+      expect(error?.message).toContain('默认账号检查进程关闭失败：SIGTERM rejected')
+      if (signedOut) expect(error?.message).toContain('请先发送不带备注的 codex-login')
+      expect(client.alive).toBe(true)
+    }
+  })
+})
 
 describe('Codex device-code login controller', () => {
   test('returns instructions promptly and waits for the matching completion before registering auth', async () => {

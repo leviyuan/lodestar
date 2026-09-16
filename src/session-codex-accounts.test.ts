@@ -7,12 +7,15 @@ import { resetFeishuMock, sentCards, sentTexts } from './feishu-test-mock'
 import { Session } from './session'
 import { bindProcessCodexAccount, codexAccounts, CodexAccounts, reserveCodexLogin } from './codex-accounts'
 import { codexLogins } from './codex-login'
+import * as loginModule from './codex-login'
 import * as accountCommands from './session-codex-accounts'
 import { CodexAccountCard } from './codex-account-card'
 import type { CodexAccountCardView } from './cards/codex-account'
-import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, type TokenSource } from './token-source'
+import { getTokenSourceForAccount, listTokenSources, refreshAllTokenSourceModels, registerTokenSource, resetTokenSourceRegistry, type TokenSource } from './token-source'
 import { peekUsage, peekSuccessfulUsage, refreshUsageFromConnection } from './usage'
 import * as usageModule from './usage'
+import { codexAccountScheduler } from './codex-account-scheduler'
+import { codexAccountCard } from './cards/codex-account'
 
 let root: string
 let store: CodexAccounts
@@ -86,6 +89,91 @@ afterEach(async () => {
 })
 
 describe('bare Codex account commands', () => {
+  test('account list shows a logged-in named account even when the default account has no model', async () => {
+    const account = store.ensure('新登录账号')
+    const native = getTokenSourceForAccount('codex-sub')!
+    native.enabled = false; native.models = []; native.defaultModel = ''
+    native.modelCatalogState = { status: 'disabled', updatedAt: 1, error: 'Codex 订阅未登录' }
+    const s = session(); s.selectedProvider = 'claude'; s.selectedTokenSourceId = 'glm'
+    const read = spyOn(usageModule, 'readUsage').mockImplementation(async id => id === account.id
+      ? { state: 'ok', subscriptionType: 'plus', fiveHour: { percent: 7, resetsAt: null }, weekly: null,
+        resetCredits: 0, fetchedAt: 1, accountFingerprint: 'named-identity' }
+      : { state: 'no_credentials' })
+    const choose = spyOn(codexAccountScheduler, 'choose').mockResolvedValue({ selected: null, candidates: [] })
+    spies.push(read, choose)
+    await s.runCommand('codex-accounts', 'owner')
+    expect(read.mock.calls.map(([id]) => id)).toEqual(['default', account.id])
+    expect(choose).not.toHaveBeenCalled()
+    const view = cardViews.at(-1)!
+    expect(view.phase).toBe('accounts')
+    expect(view.scheduling).toBeUndefined()
+    expect(view.message).toContain('调度顺序 MISS')
+    expect(view.details).toContain('默认'); expect(view.details).toContain('未登录')
+    const card = JSON.stringify(codexAccountCard(view))
+    expect(card).toContain('新登录账号'); expect(card).toContain('5h · 7%')
+    expect(card).toContain('调度顺序 MISS'); expect(card).not.toContain('可调度 0')
+    expect(store.preferred(s.sessionName)).toBeNull(); expect(s.proc).toBeNull()
+  })
+
+  test('account list uses the selected named catalog while the current provider is Claude', async () => {
+    const account = store.ensure('已指定账号')
+    const s = session(); s.selectedProvider = 'claude'; s.selectedTokenSourceId = 'glm'
+    store.select(s.sessionName, account.id)
+    getTokenSourceForAccount('codex-sub', account.id)!.defaultModel = 'named-model'
+    const choose = spyOn(codexAccountScheduler, 'choose').mockResolvedValue({ selected: null, candidates: [] })
+    spies.push(choose)
+    await s.runCommand('codex-accounts', 'owner')
+    expect(choose).toHaveBeenCalledWith({ model: 'named-model', effort: undefined })
+    expect(cardViews.at(-1)?.phase).toBe('accounts')
+    expect(s.selectedProvider).toBe('claude')
+  })
+
+  test('account list refreshes a missing model and reports persistent catalog errors alongside quota', async () => {
+    const s = session(); s.selectedModel = null
+    const native = getTokenSourceForAccount('codex-sub')!
+    native.defaultModel = ''; native.models = []; native.modelCatalogState = { status: 'failed', updatedAt: 1, error: 'old timeout' }
+    const refresh = spyOn(native, 'refreshModels').mockImplementation(async () => {
+      native.defaultModel = 'recovered-model'; native.modelCatalogState = { status: 'ready', updatedAt: 2 }
+    })
+    const choose = spyOn(codexAccountScheduler, 'choose').mockResolvedValue({ selected: null, candidates: [] })
+    const read = spyOn(usageModule, 'readUsage').mockResolvedValue({ state: 'network', reason: 'quota HTTP 503' })
+    spies.push(refresh, choose, read)
+    await s.runCommand('codex-accounts', 'owner')
+    expect(refresh).toHaveBeenCalledTimes(1)
+    expect(choose).toHaveBeenCalledWith({ model: 'recovered-model', effort: 'high' })
+    expect(read).not.toHaveBeenCalled()
+    native.defaultModel = ''
+    refresh.mockImplementation(async () => { throw new Error('catalog HTTP 503 after 3 attempts') })
+    await s.runCommand('codex-accounts', 'owner')
+    const view = cardViews.at(-1)!
+    expect(view.phase).toBe('accounts'); expect(view.details).toContain('catalog HTTP 503 after 3 attempts')
+    expect(view.message).toContain('调度顺序 MISS')
+    expect(JSON.stringify(codexAccountCard(view))).toContain('quota HTTP 503')
+    expect(choose).toHaveBeenCalledTimes(1)
+  })
+
+  test('account list waits for an existing catalog refresh before resolving its model', async () => {
+    const s = session(); s.selectedModel = null
+    const native = getTokenSourceForAccount('codex-sub')!
+    native.defaultModel = ''
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const refresh = spyOn(native, 'refreshModels').mockImplementation(async () => {
+      await gate
+      native.defaultModel = 'loaded-model'; native.modelCatalogState = { status: 'ready', updatedAt: 2 }
+    })
+    const choose = spyOn(codexAccountScheduler, 'choose').mockResolvedValue({ selected: null, candidates: [] })
+    spies.push(refresh, choose)
+    const loading = refreshAllTokenSourceModels()
+    const command = s.runCommand('codex-accounts', 'owner')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const waiting = cardViews.at(-1)?.phase
+    release(); await loading; await command
+    expect(waiting).toBe('checking')
+    expect(refresh).toHaveBeenCalledTimes(1)
+    expect(choose).toHaveBeenCalledWith({ model: 'loaded-model', effort: 'high' })
+  })
+
   test('hi with a remark forces that account for one launch without persisting it or checking its catalog', async () => {
     const account = store.ensure('强制 Plus')
     const s = session(); s.selectedEffort = 'ultra'
@@ -554,8 +642,75 @@ describe('bare Codex account commands', () => {
     expect(cardViews.at(-1)?.phase).toBe('selected')
   })
 
+  test('named login refuses a missing or unconfirmed default before creating records or requesting a code', async () => {
+    const s = session()
+    const existing = store.ensure('已存在账号')
+    const before = store.list()
+    const check = spyOn(loginModule, 'requireDefaultCodexLogin')
+    const start = spyOn(codexLogins, 'start').mockRejectedValue(new Error('must not request a device code'))
+    spies.push(check, start)
+    for (const message of ['默认账号未登录 ChatGPT，请先发送不带备注的 codex-login 完成登录，再添加额外账号。',
+      '默认账号正在登录，请先完成默认账号授权，再添加额外账号。',
+      '默认账号登录检查失败：native account read rejected']) {
+      check.mockRejectedValue(new Error(message))
+      for (const name of ['新增账号', existing.name]) {
+        await s.runCommand(`codex-login ${name}`, 'owner')
+        expect(cardViews.at(-1)).toMatchObject({ phase: 'error', message })
+        expect(store.list()).toEqual(before)
+      }
+    }
+    expect(start).not.toHaveBeenCalled()
+    expect(cardViews.some(view => view.verification)).toBe(false)
+    expect(s.proc).toBeNull()
+  })
+
+  test('named login creates its record only after default auth is confirmed, even if its catalog is unavailable', async () => {
+    const s = session()
+    const native = getTokenSourceForAccount('codex-sub')!
+    native.enabled = false; native.models = []; native.defaultModel = ''
+    native.modelCatalogState = { status: 'failed', updatedAt: 1, error: 'model catalog offline' }
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const check = spyOn(loginModule, 'requireDefaultCodexLogin').mockReturnValue(gate)
+    let cancel!: (error: Error) => void
+    const done = new Promise<any>((_resolve, reject) => { cancel = reject })
+    const start = spyOn(codexLogins, 'start').mockImplementation(async id => ({
+      accountId: id, loginId: 'named-login', verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'TEST-CODE', done,
+    }))
+    spies.push(check, start)
+    const command = s.runCommand('codex-login 新账号', 'owner')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const before = store.list()
+    const startedEarly = start.mock.calls.length
+    release(); await command
+    try {
+      expect(before).toEqual([{ id: 'default', name: '默认' }]); expect(startedEarly).toBe(0)
+      expect(check).toHaveBeenCalledTimes(1)
+      expect(start).toHaveBeenCalledWith(store.find('新账号').id, { chatId: s.chatId, userOpenId: 'owner' })
+      expect(cardViews.at(-1)).toMatchObject({ phase: 'waiting', name: '新账号', verification: { code: 'TEST-CODE' } })
+    } finally {
+      cancel(new Error('test cancellation'))
+      await accountCommands.settleCodexAccountCards()
+    }
+  })
+
+  test('default login and its aliases do not require an existing default login', async () => {
+    const s = session()
+    const check = spyOn(loginModule, 'requireDefaultCodexLogin').mockRejectedValue(new Error('not logged in'))
+    const start = spyOn(codexLogins, 'start').mockRejectedValue(new Error('device-code sentinel'))
+    spies.push(check, start)
+    for (const command of ['codex-login', 'codex-login default', 'codex-login DEFAULT', 'codex-login 默认']) {
+      await s.runCommand(command, 'owner')
+      expect(cardViews.at(-1)?.message).toBe('device-code sentinel')
+    }
+    expect(check).not.toHaveBeenCalled()
+    expect(start.mock.calls.map(([id]) => id)).toEqual(['default', 'default', 'default', 'default'])
+    expect(store.list()).toEqual([{ id: 'default', name: '默认' }])
+  })
+
   test('login replies update cards with instructions and terminal cancellation', async () => {
     const s = session()
+    spies.push(spyOn(loginModule, 'requireDefaultCodexLogin').mockResolvedValue(undefined))
     const started: string[] = []
     let reject!: (error: Error) => void
     const done = new Promise<any>((_resolve, no) => { reject = no })

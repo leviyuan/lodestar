@@ -2,9 +2,9 @@ import type { Session } from './session'
 import { createHash } from 'node:crypto'
 import * as feishu from './feishu'
 import { codexAccounts, codexAccountInUse, processCodexAccount } from './codex-accounts'
-import { codexLogins } from './codex-login'
+import { codexLogins, requireDefaultCodexLogin } from './codex-login'
 import { getTokenSourceForAccount, waitForTokenSourceModelRefresh } from './token-source'
-import { aggregateCodexUsage } from './codex-account-usage'
+import { aggregateCodexUsage, readAllCodexUsage } from './codex-account-usage'
 import { codexAccountScheduler } from './codex-account-scheduler'
 import { CodexAccountCard } from './codex-account-card'
 import { codexAccountCard, type CodexAccountCardView } from './cards/codex-account'
@@ -67,9 +67,11 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
   }
 
   const name = command === 'login' ? argument || '默认' : command === 'account' || command === 'account-delete' ? argument || undefined : undefined
+  const namedLogin = command === 'login' && !!argument.trim() && !['default', '默认'].includes(argument.normalize('NFC').trim().toLowerCase())
   const card = await CodexAccountCard.open(s.chatId, { phase: command === 'login' ? 'connecting' : 'checking', name,
     ...(command === 'login' ? { flow: 'login' as const } : {}),
-    message: command === 'accounts' ? '正在读取各账号额度…' : command === 'login' ? '正在获取设备码…' : '正在核对账号…' })
+    message: command === 'accounts' ? '正在读取各账号额度…' : namedLogin ? '正在检查默认账号登录状态…'
+      : command === 'login' ? '正在获取设备码…' : '正在核对账号…' })
   try {
     if (command === 'account-delete') {
       if (!argument) throw new Error('请指定要删除的账号；使用 codex-account-delete 备注')
@@ -85,15 +87,32 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
     if (command === 'accounts') {
       if (argument && !/^[1-9]\d*$/.test(argument)) throw new Error('页码无效；使用 codex-accounts [页码]')
       const page = argument ? Number(argument) : 1
-      const model = s.currentProvider() === 'codex' ? s.currentModelLabel() : getTokenSourceForAccount('codex-sub')?.defaultModel
-      if (!model) throw new Error('Codex 模型 MISS，无法计算调度顺序')
+      await waitForTokenSourceModelRefresh()
+      const accountId = s.codexAccountId()
+      const source = getTokenSourceForAccount('codex-sub', accountId)
+      const modelLabel = () => s.currentProvider() === 'codex' ? s.currentModelLabel() : source?.defaultModel
+      let model = modelLabel()
+      let catalogError: string | undefined
+      if (!model) {
+        try {
+          if (!source) throw new Error('Codex 订阅来源尚未初始化')
+          await source.refreshModels()
+          model = modelLabel()
+          if (!model) throw new Error(source.modelCatalogState?.error ?? 'Codex 模型目录未提供可用的默认模型')
+        } catch (error) { catalogError = `${codexAccounts.get(accountId).name}：${error instanceof Error ? error.message : String(error)}` }
+      }
+      // Account/usage reads do not require a model. An uninitialized default
+      // account must not hide a successfully authenticated named account.
       const effort = s.currentProvider() === 'codex' ? s.currentEffortLabel() ?? undefined : undefined
-      const decision = await codexAccountScheduler.choose({ model, effort })
-      const total = aggregateCodexUsage(decision.candidates.flatMap(c => c.usage ? [{ account: c.account, usage: c.usage,
-        fingerprint: c.identity.startsWith('record:') ? null : c.identity }] : []))
-      await card.finish({ phase: 'accounts', total, currentId: s.codexAccountId(),
+      const decision = model ? await codexAccountScheduler.choose({ model, effort }) : null
+      const total = decision ? aggregateCodexUsage(decision.candidates.flatMap(c => c.usage ? [{ account: c.account, usage: c.usage,
+        fingerprint: c.identity.startsWith('record:') ? null : c.identity }] : [])) : await readAllCodexUsage()
+      if (catalogError) log(`codex-accounts: scheduling MISS: ${catalogError}`)
+      await card.finish({ phase: 'accounts', total, currentId: accountId,
         ...(codexAccounts.preferred(s.sessionName) ? { selectedId: codexAccounts.selected(s.sessionName) } : {}), page,
-        scheduling: { candidates: decision.candidates, ultra: effort === 'ultra' } })
+        ...(decision ? { scheduling: { candidates: decision.candidates, ultra: effort === 'ultra' } }
+          : { message: '⚠️ 调度顺序 MISS：尚未确定 Codex 模型', details: catalogError,
+            hint: '可用 hi 备注指定已登录账号，或通过 md 检查模型目录' }) })
       return
     }
     if (command === 'auto') {
@@ -126,6 +145,10 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
     }
     if (command !== 'login') throw new Error('未知 Codex 账号命令')
     if (!userOpenId) throw new Error('无法确认登录发起者')
+    if (namedLogin) {
+      await requireDefaultCodexLogin()
+      await card.update({ phase: 'connecting', flow: 'login', name, message: '正在获取设备码…' })
+    }
     const account = codexAccounts.ensure(argument)
     if (codexAccountInUse(account.id)) throw new Error('账号正在使用中；重新登录前先 kill 使用该账号的会话，或用新备注添加账号')
     if (loginReceipts.has(account.id)) throw new Error('登录结果正在更新，请稍等')

@@ -7,7 +7,7 @@ import { fetchGlmAnthropicModelIds } from './glm-models'
  * 失败都抛错 —— 调用方(refreshModels)按 MISS 留空 models,绝不假数据。
  */
 
-import { AppServerOnce } from './usage'
+import { AppServerOnce, requestCodexControlWithRetry } from './usage'
 import type { TokenSourceModel } from './token-source'
 import type { AgentReasoningEffort } from './agent-process'
 import { homedir } from 'node:os'
@@ -53,9 +53,9 @@ export async function fetchCodexModels(accountId = 'default'): Promise<TokenSour
   const app = new AppServerOnce({ accountId })
   try {
     await app.initialize('lodestar-models')
-    const account = await app.request('account/read', { refreshToken: false })
+    const account = await requestCodexControlWithRetry(() => app.request('account/read', { refreshToken: false }), '账号查询')
     if (account?.account?.type !== 'chatgpt') throw Object.assign(new Error('Codex 订阅未登录；发送 codex-login 或 codex-login 备注完成授权'), { code: 'CODEX_AUTH_MISSING' })
-    const res = await withTimeout(app.request('model/list', {}))
+    const res = await requestCodexControlWithRetry(() => app.request('model/list', {}), '模型查询')
     if (!Array.isArray(res?.data)) throw new Error('Codex model/list 缺少 data 数组')
     const data: any[] = res.data
     const out: TokenSourceModel[] = []
@@ -73,6 +73,7 @@ export async function fetchCodexModels(accountId = 'default'): Promise<TokenSour
         defaultEffort,
       })
     }
+    if (!out.length) throw new Error('Codex model/list 未返回可用模型')
     return out
   } finally {
     await app.close()

@@ -1,5 +1,5 @@
-import { AppServerOnce, invalidateCodexUsage } from './usage'
-import { codexAccounts, reserveCodexLogin } from './codex-accounts'
+import { AppServerOnce, invalidateCodexUsage, requestCodexControlWithRetry } from './usage'
+import { codexAccounts, DEFAULT_CODEX_ACCOUNT, isCodexLoginPending, reserveCodexLogin } from './codex-accounts'
 import { log } from './log'
 
 export interface CodexLoginClient {
@@ -12,6 +12,40 @@ export interface CodexLoginClient {
 }
 export interface CodexLoginOwner { chatId: string; userOpenId: string }
 export interface CodexLoginAccount { type: 'chatgpt'; email: string | null; planType: string }
+
+/** Check native auth before creating a named account; the default may use an OS keyring. */
+export async function requireDefaultCodexLogin(
+  createClient: (accountId: string) => CodexLoginClient = accountId => new AppServerOnce({ accountId }),
+): Promise<void> {
+  if (isCodexLoginPending(DEFAULT_CODEX_ACCOUNT)) throw new Error('默认账号正在登录，请先完成默认账号授权，再添加额外账号。')
+  let client: CodexLoginClient | undefined
+  let failure: Error | undefined
+  let response: any
+  try {
+    client = createClient(DEFAULT_CODEX_ACCOUNT)
+    await client.initialize('lodestar-login-check')
+    response = await requestCodexControlWithRetry(() => client!.request('account/read', { refreshToken: false }), '默认账号登录检查')
+  } catch (error) {
+    failure = new Error(`默认账号登录检查失败：${asError(error).message}`, { cause: error })
+  }
+  if (!failure) {
+    if (response?.account === null || response?.account?.type === 'apiKey') {
+      failure = new Error('默认账号未登录 ChatGPT，请先发送不带备注的 codex-login 完成登录，再添加额外账号。')
+    } else if (response?.account?.type !== 'chatgpt') {
+      failure = new Error('默认账号登录检查失败：account/read 返回的账号状态无效')
+    }
+  }
+  if (client) {
+    try {
+      await client.close()
+      if (client.isAlive()) throw new Error('检查进程仍未退出')
+    } catch (error) {
+      failure = new Error([failure?.message, `默认账号检查进程关闭失败：${asError(error).message}`].filter(Boolean).join('；'), { cause: error })
+    }
+  }
+  if (failure) throw failure
+}
+
 export interface CodexLoginHandle {
   accountId: string
   loginId: string
