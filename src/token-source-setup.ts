@@ -2,11 +2,12 @@
 
 import * as feishu from './feishu'
 import { getTokenSource, tokenSourceFactories } from './token-source'
-import { addTokenSource } from './token-source-config'
+import { addTokenSource, configureTokenSource, TokenSourceSetupError } from './token-source-config'
 import type { Session } from './session'
 import { codexAccountCard } from './cards/codex-account'
 import { config } from './config'
 import { log } from './log'
+import { tokenSourceErrorMessage } from './token-source-errors'
 
 /** 只控制 Lodestar 的订阅来源；本机 Claude 登录态保持不变。 */
 export async function runClaudeSubscriptionCommand(s: Session, action: string): Promise<void> {
@@ -45,13 +46,15 @@ export async function onTokenSourceEnable(s: Session, sourceId: string): Promise
     await feishu.sendText(s.chatId, `❌ 未知 token source: ${sourceId}`)
     return
   }
-  if (ts.enabled) {
+  if (ts.enabled && ts.modelCatalogState?.status !== 'failed') {
     await feishu.sendText(s.chatId, `${ts.display} 已启用,发 \`model\` 选择。`)
     return
   }
   const def = tokenSourceFactories().find(d => d.setup?.commandSuffix === sourceId || d.configSectionId === sourceId)
   if (def?.setup) {
-    await feishu.sendText(s.chatId, def.setup.hint(ts.display))
+    const failure = ts.modelCatalogState?.status === 'failed'
+      ? `${ts.display} 当前不可用：${tokenSourceErrorMessage(ts.modelCatalogState.error ?? 'MISS')}\n` : ''
+    await feishu.sendText(s.chatId, failure + def.setup.hint(ts.display))
   } else if (ts.kind === 'codex-subscription') {
     const sent = await feishu.sendCard(s.chatId, codexAccountCard({ phase: 'current', title: '添加账号',
       message: '通过设备码完成浏览器授权', hint: '默认：codex-login · 额外：codex-login 备注' }))
@@ -66,7 +69,7 @@ export async function onTokenSourceEnable(s: Session, sourceId: string): Promise
   }
 }
 
-/** `<source>-setup <args>` generic:路由到 factory setup.parseArgs → 写 config + 全量刷新 models。
+/** `<source>-setup <args>` generic:解析 → 校验候选凭据 → 写 config + 全量刷新 models。
  *  commandSuffix 不匹配 / 无 setup → 报错(codex login / native 无此命令)。 */
 export async function runTokenSourceSetup(s: Session, sourceId: string, args: string): Promise<void> {
   const def = tokenSourceFactories().find(d => d.setup?.commandSuffix === sourceId)
@@ -79,15 +82,20 @@ export async function runTokenSourceSetup(s: Session, sourceId: string, args: st
     await feishu.sendText(s.chatId, parsed.error)
     return
   }
+  let saved = false
   try {
-    await addTokenSource(def.configSectionId, parsed.config)
+    await configureTokenSource(def, parsed.config)
+    saved = true
     const ts = getTokenSource(def.configSectionId)
-    if (ts?.modelCatalogState?.status === 'failed') {
-      await feishu.sendText(s.chatId, `❌ ${ts.display} 配置已保存，但模型目录未就绪：${ts.modelCatalogState.error ?? 'MISS'}`)
+    if (ts?.modelCatalogState?.status !== 'ready') {
+      const reason = tokenSourceErrorMessage(ts?.modelCatalogState?.error ?? '模型目录尚未就绪', [parsed.config.api_key, parsed.config.auth_token])
+      await feishu.sendText(s.chatId, `❌ ${ts?.display ?? sourceId} 凭据校验通过、配置已保存，但暂不可用：${reason}\n处理后发送 md 刷新。`)
       return
     }
-    await feishu.sendText(s.chatId, `✅ ${ts?.display ?? sourceId} 已启用。发 \`model\` 重新选择。`)
+    await feishu.sendText(s.chatId, `✅ ${ts.display} 校验通过，配置已保存。发送 md 选择模型。`)
   } catch (e: any) {
-    await feishu.sendText(s.chatId, `❌ 启用失败: ${e?.message ?? e}`)
+    const state = saved || e instanceof TokenSourceSetupError && e.saved ? '配置已保存，但后续处理失败' : '配置失败，未保存，原配置保持不变'
+    const reason = tokenSourceErrorMessage(e, [parsed.config.api_key, parsed.config.auth_token])
+    await feishu.sendText(s.chatId, `❌ ${state}：${reason}`)
   }
 }

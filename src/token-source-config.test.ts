@@ -24,8 +24,8 @@ function runConfigUpdate(work: string): void {
     import { readFileSync, rmSync } from 'node:fs'
     let rebuilds = 0
     let refreshes = 0
-    let releaseRefresh
-    const refresh = new Promise(resolve => { releaseRefresh = resolve })
+    let releaseRefresh, rejectRefresh
+    const refresh = new Promise((resolve, reject) => { releaseRefresh = resolve; rejectRefresh = reject })
     mock.module(${JSON.stringify(join(import.meta.dir, 'token-source-builtins.ts'))}, () => ({
       buildTokenSourcesFromConfig: () => { rebuilds++ },
     }))
@@ -33,7 +33,7 @@ function runConfigUpdate(work: string): void {
       refreshAllTokenSourceModels: () => { refreshes++; return refresh },
       getTokenSourceForAccount: () => undefined,
     }))
-    const { addTokenSource } = await import(${JSON.stringify(join(import.meta.dir, 'token-source-config.ts'))})
+    const { addTokenSource, configureTokenSource, TokenSourceSetupError } = await import(${JSON.stringify(join(import.meta.dir, 'token-source-config.ts'))})
     const { config } = await import(${JSON.stringify(join(import.meta.dir, 'config.ts'))})
     const configFile = ${JSON.stringify(configFile)}
     ${work}
@@ -69,6 +69,71 @@ test('updates credentials without losing slots or adjacent sections and waits fo
     await pending
     assert.equal(completed, true)
     assert.equal(refreshes, 1)
+  `)
+})
+
+test('credential validation failure never writes, reloads or clears the active catalog', () => {
+  runConfigUpdate(`
+    const before = readFileSync(configFile, 'utf8')
+    const previous = config.token_sources.glm
+    const def = { configSectionId: 'glm', setup: { validate: async candidate => {
+      assert.equal(candidate.auth_token, 'invalid-token')
+      assert.equal(candidate.slots, previous.slots)
+      throw new Error('HTTP 401 invalid key')
+    } } }
+    await assert.rejects(configureTokenSource(def, { auth_token: 'invalid-token' }), error => {
+      assert.ok(error instanceof TokenSourceSetupError)
+      assert.equal(error.saved, false)
+      return /HTTP 401/.test(error.message)
+    })
+    assert.equal(readFileSync(configFile, 'utf8'), before)
+    assert.equal(config.token_sources.glm, previous)
+    assert.equal(rebuilds, 0)
+    assert.equal(refreshes, 0)
+  `)
+})
+
+test('queued credential checks complete before writing and allow retry after rejection', () => {
+  runConfigUpdate(`
+    const before = readFileSync(configFile, 'utf8')
+    const seen = []
+    let rejectValidation
+    const validation = new Promise((_, reject) => { rejectValidation = reject })
+    const def = { configSectionId: 'glm', setup: { validate: async candidate => {
+      seen.push(candidate.auth_token)
+      if (candidate.auth_token === 'invalid-token') await validation
+    } } }
+    const first = configureTokenSource(def, { auth_token: 'invalid-token' })
+    const rejected = assert.rejects(first, /invalid key/)
+    const next = configureTokenSource(def, { auth_token: 'valid-token' })
+    await Promise.resolve()
+    assert.deepEqual(seen, ['invalid-token'])
+    assert.equal(readFileSync(configFile, 'utf8'), before)
+    rejectValidation(new Error('invalid key'))
+    await rejected
+    releaseRefresh()
+    await next
+    assert.deepEqual(seen, ['invalid-token', 'valid-token'])
+    assert.equal(config.token_sources.glm.auth_token, 'valid-token')
+    assert.equal(rebuilds, 1)
+    assert.equal(refreshes, 1)
+  `)
+})
+
+test('post-save reload failures keep the fact that credentials were already saved', () => {
+  runConfigUpdate(`
+    const def = { configSectionId: 'glm', setup: { validate: async () => {} } }
+    const pending = configureTokenSource(def, { auth_token: 'valid-token' })
+    const rejected = assert.rejects(pending, error => {
+      assert.equal(error.saved, true)
+      return /refresh failed/.test(error.message)
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+    rejectRefresh(new Error('refresh failed'))
+    await rejected
+    assert.equal(config.token_sources.glm.auth_token, 'valid-token')
+    assert.ok(readFileSync(configFile, 'utf8').includes('valid-token'))
   `)
 })
 

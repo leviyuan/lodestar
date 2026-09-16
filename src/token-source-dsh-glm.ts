@@ -1,4 +1,4 @@
-import { networkFetch } from './network'
+import { fetchApiModelData } from './token-source-model-api'
 import { config, type TokenSourceConfig } from './config'
 import { isDshReasoningEffort } from './agent-process'
 import { registerTokenSourceFactory, scrubDshEnv, tokenSourceRuntimeModels, type TokenSource } from './token-source'
@@ -12,18 +12,17 @@ import { modelList, customModelEfforts } from './token-source-visibility'
 /** Coding Plan 的 OpenAI 入口，与 Claude 的 Anthropic 入口共用同一账号。 */
 export function glmCodingBaseUrl(raw: string): string {
   const url = new URL(raw)
-  if (!isGlmBaseUrl(url.origin)) throw new Error('DSH GLM 需要 bigmodel.cn 或 z.ai 的 Coding Plan 端点')
+  if (!isGlmBaseUrl(url.origin) || url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) {
+    throw new Error('DSH GLM 需要智谱或 Z.ai 的 Coding Plan HTTPS 端点；地址中不能包含凭据或查询参数')
+  }
   url.pathname = '/api/coding/paas/v4'
   url.search = ''; url.hash = ''
   return url.toString().replace(/\/$/, '')
 }
 
 export async function fetchGlmCodingModels(base: string, key: string): Promise<Array<{ model: string; display: string }>> {
-  const response = await networkFetch(`${base}/models`, { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(10_000) })
-  if (!response.ok) throw new Error(`GLM Coding Plan models HTTP ${response.status}`)
-  const payload = await response.json()
-  if (!Array.isArray(payload?.data) || !payload.data.length) throw new Error('GLM Coding Plan 模型目录为空或无效')
-  return payload.data.map((entry: any) => {
+  const data = await fetchApiModelData(`${base}/models`, key, 'GLM Coding Plan models')
+  return data.map(entry => {
     if (typeof entry?.id !== 'string' || !entry.id) throw new Error('GLM Coding Plan 模型 id 无效')
     return { model: entry.id, display: typeof entry.name === 'string' ? entry.name : entry.id }
   })
@@ -104,10 +103,13 @@ registerTokenSourceFactory({
     hint: () => 'DSH 可复用已配置的 GLM Coding Plan；独立账号用 `dsh-glm-setup [base_url] <api_key>`。',
     parseArgs(args) {
       const parts = args.trim().split(/\s+/).filter(Boolean)
-      if (parts.length < 1 || parts.length > 2) return { error: '用法：dsh-glm-setup [base_url] <api_key>' }
+      if (parts.length < 1 || parts.length > 2 || /^https?:\/\//i.test(parts.at(-1)!)) return { error: '用法：dsh-glm-setup [base_url] <api_key>' }
       try { return { config: { agent: 'dsh', api_key: parts.at(-1)!,
         base_url: glmCodingBaseUrl(parts.length === 2 ? parts[0]! : 'https://open.bigmodel.cn/api/coding/paas/v4') } } }
       catch (error) { return { error: error instanceof Error ? error.message : String(error) } }
+    },
+    async validate(cfg) {
+      await fetchGlmCodingModels(glmCodingBaseUrl(cfg.base_url ?? 'https://open.bigmodel.cn/api/coding/paas/v4'), cfg.api_key ?? cfg.auth_token ?? '')
     },
   },
 })

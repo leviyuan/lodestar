@@ -4,6 +4,23 @@
 
 账号配置使用 `[token_source.glm]`、`[token_source.deepseek]` 等节。GLM、DeepSeek 和 OpenRouter 也可以从本机 Claude settings 中识别；识别后由对应 Token Source 注入凭据，避免不同账号的环境变量串用。项目的工具限制只作用于主会话，委派 Agent 使用完整工具集。
 
+## 配置 API Key
+
+GLM Key 可在首次安装时跳过，之后用群命令添加或更换。以下命令先向对应平台校验凭据和模型目录，通过后才保存；认证、网络或响应错误均保留原配置并给出原因。校验无需调用付费模型，也不要求先安装对应 Agent。
+
+| 账号 | 群命令 |
+| --- | --- |
+| 智谱 GLM（Claude Code） | `glm-setup <api_key>` |
+| Z.ai GLM（Claude Code） | `glm-setup https://api.z.ai/api/anthropic <api_key>` |
+| DeepSeek（Claude Code） | `deepseek-setup [base_url] <api_key>` |
+| OpenRouter | `openrouter-setup [base_url] <api_key>` |
+| DeepSeek（DeepSeek Harness） | `deepseek-harness-setup [base_url] <api_key>` |
+| 独立 GLM 账号（DeepSeek Harness） | `dsh-glm-setup [base_url] <api_key>` |
+
+`[base_url]` 表示可选参数，命令中不输入方括号；API Key 只填原值，不加 `Bearer`。`glm-setup <base_url> <api_key>` 的原有格式仍可使用，GLM 的 Key 与平台地址必须对应。保存后发送 `md` 选择模型。账号配置由本机所有群共用，更新 Key 保留已有模型、档位和可见性设置。
+
+如果凭据校验通过，但保存后的模型加载因 Agent 未安装等原因失败，会明确提示“配置已保存，但暂不可用”；按提示处理后发送 `md` 刷新。认证失败会提示核对 Key，网络失败会提示检查连接和代理，不会将错误正文误报为“缺少 data 数组”。
+
 ## 选择与管理模型
 
 发送 `model`（`md`），在 Claude Code、Codex、DeepSeek Harness 分组下选择账号，再选择模型。有多个推理档位（effort）时继续选择档位，只有一个档位时直接应用。

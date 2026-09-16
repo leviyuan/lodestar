@@ -1,4 +1,4 @@
-import { networkFetch } from './network'
+import { fetchGlmAnthropicModelIds } from './glm-models'
 /**
  * Token source 模型列表拉取 —— 动态获取订阅真实模型,零写死。
  *
@@ -81,21 +81,6 @@ export async function fetchCodexModels(accountId = 'default'): Promise<TokenSour
 
 /** glm Coding Plan 可用模型(anthropic 端点 /v1/models)。用 display_name(端点接受的大写形式)。 */
 export async function fetchGlmModels(baseUrl: string, token: string): Promise<TokenSourceModel[]> {
-  const u = new URL(baseUrl)
-  const path = u.pathname.replace(/\/+$/, '')
-  const url = `${u.protocol}//${u.host}${path}/v1/models`
-  const res = await networkFetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  })
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  const json = await res.json()
-  if (!Array.isArray(json?.data)) throw new Error('GLM models 缺少 data 数组')
-  const data: any[] = json.data
-  return data
-    .filter(m => m && (m.display_name || m.id))
-    .map(m => {
-      const id = String(m.display_name || m.id)
-      return { model: id, display: id, efforts: CLAUDE_EFFORTS, defaultEffort: 'max' as AgentReasoningEffort }
-    })
+  const ids = await fetchGlmAnthropicModelIds(baseUrl, token)
+  return ids.map(id => ({ model: id, display: id, efforts: CLAUDE_EFFORTS, defaultEffort: 'max' }))
 }

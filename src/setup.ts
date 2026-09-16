@@ -1,4 +1,5 @@
 import { networkFetch } from './network'
+import { fetchGlmAnthropicModelIds, GLM_ANTHROPIC_BASE_URL } from './glm-models'
 /**
  * lodestar-setup 交互向导；cli.ts 首次启动且配置缺失时也可调用。
  * 配置 Claude Code、可选 GLM API key 和 Codex、飞书应用及项目目录。
@@ -84,48 +85,32 @@ function claudeConfigDir(): string {
   return process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
 }
 
-/** 安装向导的 slots 动态化:拉 GLM /v1/models,最新一代(版本号最大)给
- *  opus/sonnet,最老一代给 haiku。拉不到返回 null(只写凭据,不写 slots ——
- *  不猜,让 lodestar 运行时自己的 config/env 决定)。 */
-async function fetchGlmSetupSlots(glmKey: string): Promise<Record<string, string> | null> {
-  try {
-    const res = await networkFetch('https://open.bigmodel.cn/api/anthropic/v1/models', {
-      headers: { Authorization: `Bearer ${glmKey}` },
-      signal: AbortSignal.timeout(10_000),
-    })
-    if (!res.ok) return null
-    const json: any = await res.json()
-    const ids: string[] = (Array.isArray(json?.data) ? json.data : [])
-      .map((m: any) => typeof m?.display_name === 'string' && m.display_name ? m.display_name : String(m?.id ?? ''))
-      .filter(Boolean)
-    if (!ids.length) return null
-    // 版本号排序(取 "GLM-5.2" 的 5.2;无版本的排最后)。Turbo/Air 变体不进 slots。
-    const versionOf = (id: string): number => {
-      const m = id.match(/(\d+(?:\.\d+)?)/)
-      return m ? Number(m[1]) : -1
-    }
-    const base = (id: string): string => id.replace(/-Turbo|-Air$/i, '')
-    const plain = ids.filter(id => !/-Turbo|-Air/i.test(id))
-    const sorted = [...plain].sort((a, b) => versionOf(b) - versionOf(a))
-    const top = sorted[0]
-    const bottom = sorted[sorted.length - 1]
-    const out: Record<string, string> = {}
-    if (top) {
-      out.ANTHROPIC_DEFAULT_OPUS_MODEL = `${top}[1m]`
-      out.ANTHROPIC_DEFAULT_SONNET_MODEL = `${top}[1m]`
-    }
-    if (bottom && base(bottom) !== base(top)) out.ANTHROPIC_DEFAULT_HAIKU_MODEL = bottom
-    return Object.keys(out).length ? out : null
-  } catch {
-    return null
+/** 安装前校验模型目录；认证、网络和响应错误必须交给用户处理，不能保存后报成功。 */
+async function fetchGlmSetupSlots(glmKey: string): Promise<Record<string, string>> {
+  const ids = await fetchGlmAnthropicModelIds(GLM_ANTHROPIC_BASE_URL, glmKey)
+  // 版本号排序(取 "GLM-5.2" 的 5.2;无版本的排最后)。Turbo/Air 变体不进 slots。
+  const versionOf = (id: string): number => {
+    const m = id.match(/(\d+(?:\.\d+)?)/)
+    return m ? Number(m[1]) : -1
   }
+  const plain = ids.filter(id => !/-Turbo|-Air/i.test(id))
+  const sorted = [...plain].sort((a, b) => versionOf(b) - versionOf(a))
+  const top = sorted[0]
+  const bottom = sorted[sorted.length - 1]
+  if (!top) throw new Error('GLM 模型目录中没有可用于 Claude Code slots 的模型')
+  const out: Record<string, string> = {
+    ANTHROPIC_DEFAULT_OPUS_MODEL: `${top}[1m]`,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: `${top}[1m]`,
+  }
+  if (bottom && bottom !== top) out.ANTHROPIC_DEFAULT_HAIKU_MODEL = bottom
+  return out
 }
 
 /** 把 GLM Coding Plan 路由 merge 进 ~/.claude/settings.json 的 env 段。
  *  真相源与 docs/claude-agent-backend.md / glm-usage.ts 一致; 保留用户
  *  已有字段 (permissions / hooks / plugins …), 只覆盖 GLM 相关 env key。
  *  settings.json 存在但 JSON 解析失败时绝不静默覆盖 —— surface 出来。 */
-async function writeClaudeGlmEnv(glmKey: string): Promise<{ path: string } | { error: string }> {
+export async function writeClaudeGlmEnv(glmKey: string): Promise<{ path: string } | { error: string }> {
   try {
     const dir = claudeConfigDir()
     mkdirSync(dir, { recursive: true })
@@ -148,17 +133,16 @@ async function writeClaudeGlmEnv(glmKey: string): Promise<{ path: string } | { e
     const prevEnv = (settings.env && typeof settings.env === 'object' && !Array.isArray(settings.env))
       ? settings.env as Record<string, string>
       : {}
-    // 模型 slots 不再写死:安装时从 GLM 端点动态拉当前列表,最强的给 opus/sonnet、
-    // 最弱的给 haiku;拉不到就只写凭据(slots 留给 lodestar 的 config/env 决定)。
+    // 先确认凭据可读取有效目录，再写入路由；失败保留已有配置。
+    const slots = await fetchGlmSetupSlots(glmKey)
     // ANTHROPIC_AUTH_TOKEN 裸 token, 不带 Bearer。
     const glmEnv: Record<string, string> = {
       ANTHROPIC_AUTH_TOKEN: glmKey,
-      ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
+      ANTHROPIC_BASE_URL: GLM_ANTHROPIC_BASE_URL,
       API_TIMEOUT_MS: '3000000',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     }
-    const slots = await fetchGlmSetupSlots(glmKey)
-    if (slots) Object.assign(glmEnv, slots)
+    Object.assign(glmEnv, slots)
     settings.env = { ...prevEnv, ...glmEnv }
 
     writeStateFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + '\n')
@@ -273,21 +257,25 @@ export async function runSetup(): Promise<void> {
   console.log('GLM Coding Plan 给 Claude Code 接 GLM 系列模型 (支持 1M token 上下文, 中文友好)。')
   console.log('订阅后在智谱开放平台拿一个 API key, 粘到下面 —— 向导自动写进 ~/.claude/settings.json。')
   console.log(`  ${C.dim}拿 key: https://open.bigmodel.cn → 控制台 → API Keys${C.reset}`)
-  console.log(`  ${C.dim}直接回车跳过，可使用本机 Claude Code 订阅或其他已有配置。${C.reset}`)
+  console.log(`  ${C.dim}此项可选，直接回车跳过；以后可在群内发送 glm-setup <api_key> 补配。${C.reset}`)
+  console.log(`  ${C.dim}使用本机 Claude Code 或 Codex 订阅不需要 GLM Key。此处填写智谱国内站 Key；Z.ai 请之后用 glm-setup 指定对应地址。${C.reset}`)
   console.log()
 
-  const glmKey = await ask('GLM API key (直接回车跳过)', {})
-  if (glmKey) {
+  while (true) {
+    const glmKey = await ask('GLM API key (直接回车跳过)', {})
+    if (!glmKey) {
+      console.log(`${C.dim}已跳过 GLM, 以本机 Claude Code 现有配置启动。${C.reset}`)
+      break
+    }
     const r = await writeClaudeGlmEnv(glmKey)
     if ('path' in r) {
       console.log(`${C.green}✓ GLM 路由已写入${C.reset}: ${C.dim}${r.path}${C.reset}`)
       console.log(`${C.dim}模型 slots 按端点当前列表自动选取(最新一代 opus/sonnet, 1M ctx)${C.reset}`)
+      break
     } else {
-      console.log(`${C.red}✗ 写入失败:${C.reset} ${r.error}`)
-      console.log(`${C.dim}跳过 GLM 配置, 以本机 Claude Code 现有配置启动。${C.reset}`)
+      console.log(`${C.red}✗ GLM 配置失败:${C.reset} ${r.error}`)
+      console.log(`${C.dim}请按错误提示处理后重新输入；直接回车可跳过，之后用群命令补配。${C.reset}`)
     }
-  } else {
-    console.log(`${C.dim}已跳过 GLM, 以本机 Claude Code 现有配置启动。${C.reset}`)
   }
 
   // ── Codex (可选第二后端) ──────────────────────────────────────

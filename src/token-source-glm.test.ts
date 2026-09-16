@@ -71,6 +71,19 @@ function buildGlm(cfg: Record<string, any> = {}) {
 }
 
 describe('glm models config 补充', () => {
+  test('HTTP 200 业务认证失败保留上游原因，不把补录模型当成功目录', async () => {
+    const ts = buildGlm({ custom_models: 'GLM-5.3' })
+    await ts.refreshModels()
+    expect(ts.modelCatalogState?.status).toBe('ready')
+    globalThis.fetch = (async () => Response.json({
+      code: 401, msg: '令牌已过期或验证不正确', success: false,
+    })) as unknown as typeof fetch
+    await ts.refreshModels()
+    expect(ts.models).toEqual([])
+    expect(ts.modelCatalogState?.status).toBe('failed')
+    expect(ts.modelCatalogState?.error).toContain('code=401: 令牌已过期或验证不正确')
+  })
+
   test('config models 键的 slug 补登到动态列表尾(上游未列出时)', async () => {
     const ts = buildGlm({ models: 'GLM-5.3' })
     await ts.refreshModels()

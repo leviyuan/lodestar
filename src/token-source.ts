@@ -163,6 +163,8 @@ export interface TokenSourceSetup {
   hint: (display: string) => string
   /** 解析飞书命令参数 → 写 config.toml 的 cfg;失败返 { error }。 */
   parseArgs: (args: string) => { config: TokenSourceConfig } | { error: string }
+  /** 保存前使用候选凭据查询账号接口；不依赖本机 Agent 安装，不修改运行中来源。 */
+  validate: (cfg: TokenSourceConfig) => Promise<void>
 }
 
 /** 本机 settings.json 探测:config.toml 没配时,若本机 Claude Code 配的 host 命中本 source,

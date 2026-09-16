@@ -23,6 +23,7 @@ import { fetchGlmModels, CLAUDE_EFFORTS } from './token-source-models'
 import { resolveModelWithWindow, observedContextWindow } from './context-window-observe'
 import { verifyModelExists } from './model-existence'
 import { log } from './log'
+import { fetchGlmAnthropicModelIds, glmAnthropicBaseUrl, GLM_ANTHROPIC_BASE_URL } from './glm-models'
 
 type Env = Record<string, string | undefined>
 
@@ -180,12 +181,17 @@ registerTokenSourceFactory({
   },
   setup: {
     commandSuffix: 'glm',
-    hint: display => `启用 ${display}:发送\n\`\`\`\nglm-setup <base_url> <token>\n\`\`\``,
+    hint: display => `配置 ${display}：发送 \`glm-setup <api_key>\`（智谱国内站），或 \`glm-setup <base_url> <api_key>\`（指定平台）。校验通过后保存，失败保留原配置。`,
     parseArgs: args => {
-      const parts = args.trim().split(/\s+/)
-      if (parts.length < 2) return { error: '用法:`glm-setup <base_url> <token>\`' }
-      return { config: { agent: 'claude', base_url: parts[0], auth_token: parts[1] } }
+      const parts = args.trim().split(/\s+/).filter(Boolean)
+      if (parts.length < 1 || parts.length > 2 || /^https?:\/\//i.test(parts.at(-1)!)) {
+        return { error: '用法：glm-setup <api_key>，或 glm-setup <base_url> <api_key>；只填写 Key 本身，不加 Bearer 前缀。' }
+      }
+      try {
+        return { config: { agent: 'claude', base_url: glmAnthropicBaseUrl(parts.length === 2 ? parts[0] : GLM_ANTHROPIC_BASE_URL), auth_token: parts.at(-1)! } }
+      } catch (error) { return { error: error instanceof Error ? error.message : String(error) } }
     },
+    async validate(cfg) { await fetchGlmAnthropicModelIds(cfg.base_url ?? GLM_ANTHROPIC_BASE_URL, cfg.auth_token ?? '') },
   },
   detect: {
     fromSettingsEnv(env) {

@@ -30,6 +30,7 @@ import { CLAUDE_EFFORTS } from './token-source-models'
 import { resolveModelWithWindow, observedContextWindow } from './context-window-observe'
 import { verifyModelExists } from './model-existence'
 import { log } from './log'
+import { fetchApiModelData } from './token-source-model-api'
 
 type Env = Record<string, string | undefined>
 
@@ -72,18 +73,20 @@ function isDeepseekBaseUrl(baseUrl: string): boolean {
 
 /** OpenAI 风格 GET {origin}/models → 模型 id 列表(anthropic 侧 /v1/models 是 404)。 */
 async function fetchDeepseekModels(baseUrl: string, apiKey: string): Promise<TokenSourceModel[]> {
-  const origin = new URL(baseUrl).origin
-  const res = await networkFetch(`${origin}/models`, {
-    headers: { Authorization: `Bearer ${apiKey}` },
-    signal: AbortSignal.timeout(10_000),
+  const ids = await fetchDeepseekModelIds(new URL(baseUrl).origin, apiKey)
+  return ids.map(id => ({ model: id, display: id, efforts: CLAUDE_EFFORTS, defaultEffort: 'high' as const }))
+}
+
+export async function fetchDeepseekModelIds(baseUrl: string, apiKey: string): Promise<string[]> {
+  const url = new URL(baseUrl)
+  if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error('DeepSeek 需要无凭据和查询参数的 HTTP(S) API 根地址')
+  }
+  const data = await fetchApiModelData(`${url.toString().replace(/\/+$/, '')}/models`, apiKey, 'DeepSeek models')
+  return data.map(entry => {
+    if (typeof entry.id !== 'string' || !entry.id.trim()) throw new Error('DeepSeek models 模型 id 无效')
+    return entry.id
   })
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  const json: any = await res.json()
-  if (!Array.isArray(json?.data)) throw new Error('DeepSeek models 缺少 data 数组')
-  const data: any[] = json.data
-  return data
-    .filter(m => m && typeof m.id === 'string' && m.id)
-    .map(m => ({ model: m.id, display: m.id, efforts: CLAUDE_EFFORTS, defaultEffort: 'high' as const }))
 }
 
 const BALANCE_TIMEOUT_MS = 10_000
@@ -210,11 +213,12 @@ registerTokenSourceFactory({
     hint: display => `启用 ${display}:发送\n\`\`\`\ndeepseek-setup <api_key>\n\`\`\`\n默认官方 Anthropic 端点;自建中转用 \`deepseek-setup <base_url> <api_key>\`。`,
     parseArgs: args => {
       const parts = args.trim().split(/\s+/).filter(Boolean)
-      if (!parts.length) return { error: '用法:`deepseek-setup <api_key>`(官方端点)或 `deepseek-setup <base_url> <api_key>`(自建中转)' }
+      if (!parts.length || parts.length > 2 || /^https?:\/\//i.test(parts.at(-1)!)) return { error: '用法:`deepseek-setup <api_key>`(官方端点)或 `deepseek-setup <base_url> <api_key>`(自建中转)' }
       const baseUrl = parts.length >= 2 ? parts[0] : undefined
       const apiKey = parts.length >= 2 ? parts[1] : parts[0]
       return { config: { agent: 'claude', ...(baseUrl ? { base_url: baseUrl } : {}), api_key: apiKey } }
     },
+    async validate(cfg) { await fetchDeepseekModels(cfg.base_url ?? DEFAULT_BASE_URL, cfg.api_key ?? '') },
   },
   detect: {
     fromSettingsEnv(env) {

@@ -3,7 +3,7 @@ import { isDshReasoningEffort } from './agent-process'
 import { queryDshRuntime } from './dsh-runtime'
 import { DSH_HOME_DIR } from './paths'
 import type { DshModel } from './dsh-protocol'
-import { fetchDeepseekBalance } from './token-source-deepseek'
+import { fetchDeepseekBalance, fetchDeepseekModelIds } from './token-source-deepseek'
 import { modelList } from './token-source-visibility'
 
 registerTokenSourceFactory({
@@ -66,8 +66,9 @@ registerTokenSourceFactory({
     hint: () => '启用 DeepSeek Harness：发送 `deepseek-harness-setup <api_key>`，或 `deepseek-harness-setup <base_url> <api_key>`。',
     parseArgs(args) {
       const parts = args.trim().split(/\s+/).filter(Boolean)
-      if (parts.length < 1 || parts.length > 2) return { error: '用法：deepseek-harness-setup [base_url] <api_key>' }
+      if (parts.length < 1 || parts.length > 2 || /^https?:\/\//i.test(parts.at(-1)!)) return { error: '用法：deepseek-harness-setup [base_url] <api_key>' }
       return { config: { agent: 'dsh', api_key: parts.at(-1)!, ...(parts.length === 2 ? { base_url: parts[0] } : {}) } }
     },
+    async validate(cfg) { await fetchDeepseekModelIds(cfg.base_url ?? 'https://api.deepseek.com', cfg.api_key ?? '') },
   },
 })

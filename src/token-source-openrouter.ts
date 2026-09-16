@@ -9,6 +9,7 @@ import {
 import { observedContextWindow } from './context-window-observe'
 import { log } from './log'
 import { OPENROUTER_DEFAULT_MODELS, openRouterModelExcluded } from './openrouter-defaults'
+import { fetchApiModelData } from './token-source-model-api'
 
 const DEFAULT_BASE_URL = 'https://openrouter.ai/api'
 const TIMEOUT_MS = 10_000
@@ -74,11 +75,10 @@ async function request(base: string, apiKey: string, path: string): Promise<unkn
  * https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
  */
 export async function fetchOpenRouterModels(base: string, apiKey: string): Promise<TokenSourceModel[]> {
-  const json = await request(base, apiKey, 'models/user')
-  if (!object(json) || !Array.isArray(json.data)) throw new Error('OpenRouter models: data 数组缺失')
+  const data = await fetchApiModelData(`${baseUrl(base)}/v1/models/user`, apiKey, 'OpenRouter models')
   const models: TokenSourceModel[] = []
   const seen = new Set<string>()
-  for (const entry of json.data) {
+  for (const entry of data) {
     if (!object(entry) || typeof entry.id !== 'string' || !entry.id || typeof entry.name !== 'string') {
       throw new Error('OpenRouter models: 模型 id/name 无效')
     }
@@ -243,6 +243,7 @@ registerTokenSourceFactory({
           ...(parts.length === 2 ? { base_url: baseUrl(parts[0]) } : {}) } }
       } catch (error) { return { error: messageOf(error) } }
     },
+    async validate(cfg) { await fetchOpenRouterModels(cfg.base_url ?? DEFAULT_BASE_URL, cfg.api_key ?? cfg.auth_token ?? '') },
   },
   detect: {
     fromSettingsEnv(env) {

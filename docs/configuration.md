@@ -13,7 +13,9 @@ npm i -g @leviyuan/lodestar
 lodestar-setup
 ```
 
-向导会配置 Claude Code、可选的 GLM API key、飞书应用和项目目录，并启动 daemon；也可以同时配置 Codex 登录。Claude 按 API key 方式配置。
+向导会配置 Claude Code、可选的 GLM API key、飞书应用和项目目录，并启动 daemon；也可以同时配置 Codex 登录。GLM Key 不是安装必填项，使用本机 Claude Code 或 Codex 订阅无需填写。
+
+填写 GLM Key 后，向导先验证凭据和模型目录，通过后才写入配置；失败会显示原因并保留已有配置，可重新输入或直接回车跳过。安装完成后可在群内用 `glm-setup <api_key>` 补配智谱国内站账号；Z.ai 用 `glm-setup https://api.z.ai/api/anthropic <api_key>`。其他账号命令见[模型与账号](models.md#配置-api-key)。
 
 把机器人拉进群，群名设为 `projects_root` 下的目录名。目录不存在时会自动创建。首次消息默认使用 Claude 侧已配置的账号；发 `model` 可切换到其他账号。
 

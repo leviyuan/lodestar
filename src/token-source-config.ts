@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import { CONFIG_FILE } from './paths'
 import { config, loadConfig, reloadTokenSources, type TokenSourceConfig } from './config'
 import { buildTokenSourcesFromConfig } from './token-source-builtins'
-import { getTokenSourceForAccount, refreshAllTokenSourceModels } from './token-source'
+import { getTokenSourceForAccount, refreshAllTokenSourceModels, type TokenSourceFactoryDef } from './token-source'
 import { writeStateFileAtomic } from './state-store'
 import { modelList } from './token-source-visibility'
 
@@ -71,8 +71,9 @@ function serializeConfigUpdate<T>(work: () => Promise<T>): Promise<T> {
   return result
 }
 
-async function applyTokenSourceConfig(id: string, cfg: TokenSourceConfig): Promise<void> {
+async function applyTokenSourceConfig(id: string, cfg: TokenSourceConfig, saved?: () => void): Promise<void> {
   saveTokenSourceConfig(id, cfg)
+  saved?.()
   reloadTokenSources()
   buildTokenSourcesFromConfig()
   // 重建会清空各账号的目录；所有调用方共用这次刷新。
@@ -81,6 +82,28 @@ async function applyTokenSourceConfig(id: string, cfg: TokenSourceConfig): Promi
 
 export function addTokenSource(id: string, cfg: TokenSourceConfig): Promise<void> {
   return serializeConfigUpdate(() => applyTokenSourceConfig(id, cfg))
+}
+
+export class TokenSourceSetupError extends Error {
+  constructor(error: unknown, readonly saved: boolean) {
+    super(error instanceof Error ? error.message : String(error), { cause: error })
+  }
+}
+
+/** 群内补配先校验再保存；校验与写入共用队列，失败不会覆盖现有凭据或重建目录。 */
+export function configureTokenSource(def: TokenSourceFactoryDef, cfg: TokenSourceConfig): Promise<void> {
+  return serializeConfigUpdate(async () => {
+    let saved = false
+    try {
+      if (!def.configSectionId || !def.setup) throw new Error('此来源不支持配置命令')
+      const previous = loadConfig().token_sources[def.configSectionId] ?? {}
+      const incoming = Object.fromEntries(Object.entries(cfg).filter(([, value]) => value !== undefined))
+      await def.setup.validate({ ...previous, ...incoming })
+      await applyTokenSourceConfig(def.configSectionId, cfg, () => { saved = true })
+    } catch (error) {
+      throw new TokenSourceSetupError(error, saved)
+    }
+  })
 }
 
 /** 所有群共用同一账号的列表；在队列内部读取最新列表，避免并发增删互相覆盖。 */
