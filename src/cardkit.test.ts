@@ -326,6 +326,23 @@ describe('checked card writes', () => {
     }
   })
 
+  test('delete errors preserve upstream details without marking the element deleted', async () => {
+    const cardId = 'delete_error_details'
+    cardkit.recordCardCreated(cardId, 1)
+    globalThis.fetch = (async () => Response.json({ code: 99992402, msg: 'field validation failed' },
+      { status: 400, headers: { 'x-tt-logid': 'delete-error-request-id' } })) as unknown as typeof fetch
+    const failures: import('./cardkit').CardWriteFailure[] = []
+    try {
+      expect(await cardkit.deleteElementChecked(cardId, 'task_row', failure => { failures.push(failure) })).toBe(false)
+      expect(failures).toHaveLength(1)
+      expect(failures[0]).toMatchObject({ cardId, elementId: 'task_row', operation: 'deleteElement task_row',
+        code: 99992402, httpStatus: 400, logId: 'delete-error-request-id' })
+      expect(failures[0]!.message).toContain('field validation failed')
+      expect(cardkit.isDeadElement(cardId, 'task_row')).toBe(false)
+      expect(cardkit.getElementCount(cardId)).toBe(1)
+    } finally { await cardkit.dispose(cardId) }
+  })
+
   test('patchSettingsChecked reports whether the terminal PATCH landed', async () => {
     const cardId = 'card_checked_settings'
     cardkit.recordCardCreated(cardId, 1)

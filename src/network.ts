@@ -33,6 +33,12 @@ async function transport(url: URL, init: RequestInit, proxy?: string): Promise<R
   // Node's native fetch only reads proxy env on newer, opt-in runtimes. Serialize native
   // FormData/Blob with Request, then use node-fetch's explicit agent on every supported Node.
   const request = new Request(url, { ...init, redirect: 'manual', duplex: 'half' } as RequestInit)
+  // Request exposes even fixed-size payloads as streams, so node-fetch cannot
+  // infer Content-Length. Node does not frame DELETE streams automatically;
+  // explicitly frame unknown-length bodies so the server receives their bytes.
+  if (request.body && !request.headers.has('content-length') && !request.headers.has('transfer-encoding')) {
+    request.headers.set('transfer-encoding', 'chunked')
+  }
   const response = await nodeFetch(url, {
     method: request.method,
     headers: Object.fromEntries(request.headers),

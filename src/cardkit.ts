@@ -599,13 +599,20 @@ export function deleteElement(
   return s.queue
 }
 
-export async function deleteElementChecked(cardId: string, elementId: string): Promise<boolean> {
+export async function deleteElementChecked(
+  cardId: string,
+  elementId: string,
+  onFailure?: (failure: CardWriteFailure) => void,
+): Promise<boolean> {
   if (isDisposed(cardId)) return false
   const s = state(cardId)
   if (s.closing) return false
   if (s.deadElements.has(elementId) && !s.failedAdds.has(elementId) && !s.failedReplacements.has(elementId)) return true
   let failed = false
-  await deleteElement(cardId, elementId, () => { failed = true })
+  await deleteElement(cardId, elementId, (_code, failure) => {
+    failed = true
+    if (failure) onFailure?.(failure)
+  })
   return !failed && s.deadElements.has(elementId)
 }
 

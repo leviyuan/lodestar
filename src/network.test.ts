@@ -12,14 +12,16 @@ const worker = join(root, 'worker.mjs')
 const ca = join(root, 'ca.pem')
 const sockets = new Set<Socket>()
 const proxyRequests: Array<{ url: string; auth?: string }> = []
-const origins: Array<{ method?: string; auth?: string; body: string; type?: string }> = []
+const origins: Array<{ method?: string; auth?: string; body: string; type?: string; contentLength?: string; transferEncoding?: string }> = []
 let directUrl: string
 let proxyUrl: string
 
 async function respond(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) {
   let body = ''
+  req.setEncoding('utf8')
   for await (const chunk of req) body += chunk.toString()
-  origins.push({ method: req.method, auth: req.headers.authorization, body, type: req.headers['content-type'] })
+  origins.push({ method: req.method, auth: req.headers.authorization, body, type: req.headers['content-type'],
+    contentLength: req.headers['content-length'], transferEncoding: req.headers['transfer-encoding'] })
   if (req.url === '/escape') { res.writeHead(302, { location: 'https://network.invalid/escaped' }); res.end(); return }
   res.setHeader('content-type', 'application/json')
   if (req.url?.includes('/models/user')) res.end(JSON.stringify({ data: [{ id: 'vendor/model', name: 'Test model',
@@ -76,10 +78,16 @@ beforeAll(async () => {
       } else {
         const fetcher = args.kind === 'local' ? localFetch : args.kind === 'system'
           ? createNetworkFetch(createProxyResolver(async () => ({ http: args.proxy, https: args.proxy }), {})) : networkFetch
-        let body
+        let body = args.body ?? args.post
         if (args.kind === 'upload') { body = new FormData(); body.append('file', new Blob(['fixture-file-content']), 'fixture.txt') }
-        const res = await fetcher(args.url, { method: body || args.post ? 'POST' : 'GET', body: body ?? args.post,
-          headers: { authorization: 'Bearer private-fixture' }, signal: AbortSignal.timeout(args.timeout ?? 3000) })
+        if (args.kind === 'stream') {
+          const bytes = new TextEncoder().encode(body)
+          body = new ReadableStream({ start(controller) {
+            controller.enqueue(bytes.slice(0, 7)); controller.enqueue(bytes.slice(7)); controller.close()
+          } })
+        }
+        const res = await fetcher(args.url, { method: args.method ?? (body !== undefined ? 'POST' : 'GET'), body,
+          headers: { authorization: 'Bearer private-fixture', ...args.headers }, signal: AbortSignal.timeout(args.timeout ?? 3000) })
         console.log(JSON.stringify({ status: res.status, value: await res.json() }))
       }
     } catch (error) { console.log(JSON.stringify({ error: error.message, code: error.code ?? error.cause?.code })); }
@@ -142,9 +150,36 @@ for (const runtime of ['bun', 'node']) describe(`${runtime} real outbound proxy 
     expect(origins[0]?.body).toContain('fixture-file-content')
   })
 
+  test('DELETE carries the complete JSON body directly and through HTTPS CONNECT', async () => {
+    const body = JSON.stringify({ sequence: 3, uuid: '11111111-2222-4333-8444-555555555555', description: '删除旧任务面板' })
+    for (const route of ['direct', 'proxy']) {
+      const result = await run(runtime, {
+        kind: route === 'direct' ? 'local' : 'network',
+        url: route === 'direct' ? `${directUrl}/delete` : 'https://network.invalid/delete',
+        method: 'DELETE', body, headers: { 'content-type': 'application/json' },
+      }, route === 'proxy' ? { HTTPS_PROXY: proxyUrl } : {})
+      expect(result.status).toBe(200)
+      expect(result.value).toMatchObject({ method: 'DELETE', body })
+      expect(origins).toHaveLength(1)
+      expect(origins[0]?.body).toBe(body)
+      expect(proxyRequests).toHaveLength(route === 'proxy' ? 1 : 0)
+    }
+  })
+
+  test('DELETE respects an explicit content length without also adding chunked framing', async () => {
+    const body = JSON.stringify({ sequence: 4, message: '删除' })
+    const contentLength = String(Buffer.byteLength(body))
+    const result = await run(runtime, { kind: 'local', url: directUrl, method: 'DELETE', body,
+      headers: { 'content-type': 'application/json', 'content-length': contentLength } })
+    expect(result.status).toBe(200)
+    expect(origins[0]).toMatchObject({ method: 'DELETE', body, contentLength })
+    expect(origins[0]?.transferEncoding).toBeUndefined()
+  })
+
   test('redirect re-evaluates bypass and strips credentials before reaching another origin', async () => {
     const result = await run(runtime, { url: 'http://network.invalid/redirect', post: 'private-body' }, { HTTP_PROXY: proxyUrl })
     expect(result.value).toMatchObject({ ok: true, auth: null, method: 'GET', body: '' })
+    expect(origins[0]?.transferEncoding).toBeUndefined()
     expect(proxyRequests).toHaveLength(1)
   })
 
@@ -169,4 +204,17 @@ for (const runtime of ['bun', 'node']) describe(`${runtime} real outbound proxy 
     expect(aborted.error).toBeDefined()
     expect(proxyRequests).toHaveLength(1)
   })
+})
+
+// This regression covers the changed Node serialization branch. A separate
+// probe also found Bun 1.3.11 native ReadableStream uploads stall over CONNECT
+// (POST as well as DELETE); that pre-existing runtime issue remains unresolved.
+test('Node DELETE preserves a streaming body of unknown length through HTTPS CONNECT', async () => {
+  const body = '分段发送的删除请求正文'
+  const result = await run('node', { kind: 'stream', url: 'https://network.invalid/delete-stream', method: 'DELETE', body },
+    { HTTPS_PROXY: proxyUrl })
+  expect(result.status).toBe(200)
+  expect(origins[0]).toMatchObject({ method: 'DELETE', body, transferEncoding: 'chunked' })
+  expect(origins[0]?.contentLength).toBeUndefined()
+  expect(proxyRequests).toHaveLength(1)
 })

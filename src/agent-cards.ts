@@ -16,7 +16,7 @@ export interface AgentCardsDeps {
   getElementCount(cardId: string): number
   addElementResult(cardId: string, element: object): Promise<CardWriteResult>
   replaceElementResult(cardId: string, elementId: string, element: object): Promise<CardWriteResult>
-  deleteElementChecked(cardId: string, elementId: string): Promise<boolean>
+  deleteElementChecked(cardId: string, elementId: string, onFailure?: (failure: CardWriteFailure) => void): Promise<boolean>
   cancelSummary(cardId: string): void
   patchSettingsChecked(cardId: string, settings: object, onFailure?: (failure: CardWriteFailure) => void): Promise<boolean>
   dispose(cardId: string): Promise<void>
@@ -156,8 +156,10 @@ export class AgentCards {
         old.rows.delete(row.key)
         old.settled.delete(row.key)
         try {
-          if (!await this.deps.deleteElementChecked(old.cardId, row.elementId)) {
-            throw new Error('agent moved task row deletion MISS; the previous card may still show its earlier state')
+          let failure: CardWriteFailure | undefined
+          if (!await this.deps.deleteElementChecked(old.cardId, row.elementId, detail => { failure = detail })) {
+            const error = writeError('agent moved task row deletion', { landed: false, failure })
+            throw new Error(`${error.message}; the previous card may still show its earlier state`)
           }
         } catch (error) { errors.push(String(error)) }
         try { await this.settings(old) }

@@ -363,9 +363,12 @@ describe('shared delegation card lifecycle', () => {
     const replace = h.deps.replaceElementResult
     h.deps.replaceElementResult = async (id, key, element) => key === agentRunElementId('a')
       ? failure(200860) : replace(id, key, element)
-    h.deps.deleteElementChecked = async () => false
+    h.deps.deleteElementChecked = async (cardId, elementId, onFailure) => {
+      onFailure?.({ cardId, elementId, operation: 'deleteElement', code: 99992402, logId: 'delete-request-id', message: 'field validation failed' })
+      return false
+    }
     terminal(a)
-    await expect(h.cards.update(a, true)).rejects.toThrow('deletion MISS')
+    await expect(h.cards.update(a, true)).rejects.toThrow('deletion MISS: field validation failed (code=99992402, log_id=delete-request-id); the previous card may still show its earlier state')
     expect(h.settings.get('message-2').config.streaming_mode).toBe(false)
     terminal(b)
     await h.cards.update(b, true)
