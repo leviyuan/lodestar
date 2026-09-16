@@ -71,7 +71,7 @@ import * as feishu from './feishu'
 import { log } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { readSysInfo } from './sysinfo'
-import { readUsage, refreshUsageFromConnection, observeRateLimitsNotification, peekUsage, type UsageSnapshot } from './usage'
+import { readUsage, refreshUsageFromConnection, observeRateLimitsNotification, captureCodexUsageCache, type UsageSnapshot } from './usage'
 import { readGlmUsage, type GlmUsageSnapshot } from './glm-usage'
 import { claudeWeeklyUsageWindow } from './claude-usage'
 import {
@@ -212,7 +212,7 @@ interface TurnCloseSnapshot {
   lastTurnUsage: CodexUsage | null
   tokenSourceId: string | null
   tokenSource: TokenSource | undefined
-  codexUsage: UsageSnapshot | null
+  codexUsage: ReturnType<typeof captureCodexUsageCache> | null
   currentBatchReactionIds: Map<string, string>
   pendingReactionIds: Map<string, string>
 }
@@ -5522,13 +5522,13 @@ export class Session {
     turn.footerStatusLabel = null
   }
 
-  /** 页脚只显示当前来源的额度或余额；数据读取失败明确显示 MISS。 */
+  /** 页脚只显示当前来源额度；Codex 刷新失败时按原格式展示同账号缓存。 */
   private async footerUsageSuffix(
     provider: AgentProvider,
     proc: AgentProcess | null,
     selectedTokenSourceId: string | null,
     ts: TokenSource | undefined,
-    cachedCodexUsage: UsageSnapshot | null,
+    cachedCodexUsage: ReturnType<typeof captureCodexUsageCache> | null,
     model: string | null,
   ): Promise<string> {
     if (selectedTokenSourceId && (!ts || !ts.enabled || ts.agent !== provider)) return '  |  额度 MISS'
@@ -5547,13 +5547,19 @@ export class Session {
       return `  |  ${cards.unifiedUsageSummary(snap)}`
     }
     if (provider === 'codex') {
-      // turn 收尾:现有连接 read 端点刷新权威快照(整体替换桶 map),再渲染。
-      // 进程已死(中断/退出)时拿不到连接 → 用最近一次权威快照;没有就省略额度段。
+      const cache = cachedCodexUsage ?? (proc?.provider === 'codex' ? captureCodexUsageCache(processCodexAccount(proc)) : null)
+      if (!cache) return '  |  额度 MISS'
+      // Capture the account before any await: a closing card must not read a replacement account.
       const codexProc = proc?.isAlive() && proc.provider === 'codex' && proc.readRateLimits
+        && processCodexAccount(proc) === cache.accountId
         ? proc as CodexProcess : null
-      const fresh = codexProc ? await refreshUsageFromConnection(() => codexProc.readRateLimits!(), processCodexAccount(codexProc)) : null
-      const u = codexProc ? fresh : cachedCodexUsage
-      return u?.state === 'ok' ? this.fmtDualWindowSuffix(u.fiveHour ?? null, u.weekly ?? null) : '  |  额度 MISS'
+      const fresh = codexProc ? await refreshUsageFromConnection(() => {
+        if (processCodexAccount(codexProc) !== cache.accountId) throw new Error('Codex 额度查询所属账号已切换')
+        return codexProc.readRateLimits!()
+      }, cache.accountId) : null
+      const u = fresh?.state === 'ok' ? fresh : cache.read()
+      if (!u) return '  |  额度 MISS'
+      return this.fmtDualWindowSuffix(u.fiveHour, u.weekly)
     }
     return '  |  额度 MISS'
   }
@@ -5632,7 +5638,7 @@ export class Session {
       tokenSource: proc?.provider === 'codex'
         ? getTokenSourceForAccount(proc.tokenSourceId ?? this.selectedTokenSourceId, processCodexAccount(proc))
         : this.currentTokenSource(),
-      codexUsage: peekUsage(processCodexAccount(proc)),
+      codexUsage: proc?.provider === 'codex' ? captureCodexUsageCache(processCodexAccount(proc)) : null,
       currentBatchReactionIds: this.currentBatchReactionIds,
       pendingReactionIds: this.pendingReactionIds,
     }

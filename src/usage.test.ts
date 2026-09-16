@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { snapshotFromReadResponse, observeRateLimitsNotification, refreshUsageFromConnection, peekUsage, peekSuccessfulUsage, invalidateCodexUsage } from './usage'
+import { snapshotFromReadResponse, observeRateLimitsNotification, refreshUsageFromConnection, peekUsage, peekSuccessfulUsage, captureCodexUsageCache, invalidateCodexUsage } from './usage'
 
 describe('quota account isolation', () => {
   test('successful Plus reads without 5h consistently expose a full short window to footer and hi', () => {
@@ -40,6 +40,25 @@ describe('quota account isolation', () => {
     expect(peekUsage('relogin')).toBeNull()
     expect(peekSuccessfulUsage('relogin')).toBeNull()
   })
+
+  test('a captured footer cache follows the same account and cannot cross invalidation', async () => {
+    const account = 'footer-generation'
+    const reader = captureCodexUsageCache(account)
+    const other = captureCodexUsageCache('footer-other')
+    expect(reader.read()).toBeNull()
+    const first = await refreshUsageFromConnection(async () => ({ rateLimits: {
+      primary: { usedPercent: 10, windowDurationMins: 300 },
+    } }), account)
+    expect(first).toBe(reader.read())
+    expect(other.read()).toBeNull()
+    invalidateCodexUsage(account)
+    const second = await refreshUsageFromConnection(async () => ({ rateLimits: {
+      primary: { usedPercent: 20, windowDurationMins: 300 },
+    } }), account)
+    expect(reader.read()).toBeNull()
+    expect(second).toBe(captureCodexUsageCache(account).read())
+    invalidateCodexUsage(account)
+  })
 })
 
 describe('quota transient failures', () => {
@@ -57,7 +76,7 @@ describe('quota transient failures', () => {
     expect(snapshot).toMatchObject({ state: 'ok', weekly: { percent: 19 } })
   }, 10_000)
 
-  test('persistent network failures remain visible and retain the successful snapshot only for startup', async () => {
+  test('persistent network failures remain visible and retain the successful snapshot for startup and footer', async () => {
     const account = 'cached-startup'
     const cached = await refreshUsageFromConnection(async () => ({ rateLimits: { planType: 'pro',
       primary: { usedPercent: 30, windowDurationMins: 10080, resetsAt: 1_900_000_000 } } }), account)
@@ -84,6 +103,22 @@ describe('quota transient failures', () => {
     const snapshot = await refreshUsageFromConnection(async () => { calls++; throw new Error('HTTP 401 unauthorized') })
     expect(calls).toBe(1)
     expect(snapshot).toBeNull()
+  })
+
+  test('authentication rejection clears successful quota so it cannot appear in cached footers', async () => {
+    const account = 'footer-auth'
+    for (const message of ['HTTP 401 unauthorized', 'HTTP 403 forbidden', 'not authenticated']) {
+      await refreshUsageFromConnection(async () => ({ rateLimits: {
+        primary: { usedPercent: 12, windowDurationMins: 300 },
+      } }), account)
+      const reader = captureCodexUsageCache(account)
+      let calls = 0
+      expect(await refreshUsageFromConnection(async () => { calls++; throw new Error(message) }, account)).toBeNull()
+      expect(calls).toBe(1)
+      expect(reader.read()).toBeNull()
+      expect(peekSuccessfulUsage(account)).toBeNull()
+    }
+    invalidateCodexUsage(account)
   })
 })
 

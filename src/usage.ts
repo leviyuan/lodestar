@@ -64,8 +64,8 @@ export type UsageSnapshot =
     }
 
 const caches = new Map<string, UsageSnapshot>()
-// Startup may use the last successful observation even when a later quota query fails.
-// Keep it separate from the latest result so hi/footer still report that failure.
+// Startup and footer displays may use the last successful read.
+// Keep it separate from the latest result so live quota queries still report failures.
 const successfulCaches = new Map<string, Extract<UsageSnapshot, { state: 'ok' }>>()
 const inFlights = new Map<string, Promise<UsageSnapshot>>()
 
@@ -400,6 +400,7 @@ async function fetchUsage(accountId: string): Promise<UsageSnapshot> {
     return snapshotFromReadResponse(limitsRes, account.planType)
   } catch (e: any) {
     log(`usage: codex app-server usage failed: ${e?.message ?? e}`)
+    if (isUsageAuthError(e)) return { state: 'auth_failed' }
     return { state: 'network', reason: e?.message ?? String(e) }
   } finally {
     await app.close()
@@ -432,15 +433,23 @@ export function snapshotFromReadResponse(limitsRes: any, planType?: string | nul
   }
 }
 
-/** 读最近一次 usage cache,不触发 fetch。给 turn footer 用 —— cache 为空
- * (turn 中没收到 rateLimit)返回 null,调用方按 no_fallbacks 省略 5h 段。 */
+/** 最近一次查询结果；保留失败语义，不用成功缓存替换。 */
 export function peekUsage(accountId = DEFAULT_CODEX_ACCOUNT): UsageSnapshot | null {
   return caches.get(accountId) ?? null
 }
 
-/** Startup scheduling only: no request, no TTL, and never substitutes for a fresh UI read. */
+/** Last successful read for startup scheduling and footer displays. */
 export function peekSuccessfulUsage(accountId = DEFAULT_CODEX_ACCOUNT): Extract<UsageSnapshot, { state: 'ok' }> | null {
   return successfulCaches.get(accountId) ?? null
+}
+
+/** Bind a closing footer to its account; login, deletion or quota reset invalidates the reader. */
+export function captureCodexUsageCache(accountId = DEFAULT_CODEX_ACCOUNT) {
+  const generation = usageGenerations.get(accountId) ?? 0
+  return {
+    accountId,
+    read: () => (usageGenerations.get(accountId) ?? 0) === generation ? peekSuccessfulUsage(accountId) : null,
+  }
 }
 
 export function readUsage(accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot> {
@@ -460,8 +469,8 @@ export function readUsage(accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnaps
   return promise
 }
 
-/** 用现有连接刷新额度；失败返回 null，hi/footer 显示 MISS。
- * 上次成功快照单独保留给启动选号，重新登录时一起失效。 */
+/** 用现有连接刷新额度；请求失败返回 null 并记录原始错误。
+ * 成功快照另存供启动与页脚使用，页脚沿用原额度格式。 */
 export function refreshUsageFromConnection(request: (method: string, params: any) => Promise<any>, accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot | null> {
   const pending = refreshInFlights.get(accountId)
   if (pending) return pending
@@ -476,7 +485,10 @@ export function refreshUsageFromConnection(request: (method: string, params: any
     })
     .catch((e: any) => {
       log(`usage: refresh from connection failed: ${e?.message ?? e}`)
-      if ((usageGenerations.get(accountId) ?? 0) === generation) caches.delete(accountId)
+      if ((usageGenerations.get(accountId) ?? 0) === generation) {
+        caches.delete(accountId)
+        if (isUsageAuthError(e)) successfulCaches.delete(accountId)
+      }
       return null
     })
     .finally(() => { if (refreshInFlights.get(accountId) === promise) refreshInFlights.delete(accountId) })
@@ -492,6 +504,11 @@ export function invalidateCodexUsage(accountId: string): void {
   successfulCaches.delete(accountId)
   inFlights.delete(accountId)
   refreshInFlights.delete(accountId)
+}
+
+function isUsageAuthError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /\b(?:401|403)\b|unauthori[sz]ed|not authenticated|authentication (?:failed|required)|not logged in/i.test(message)
 }
 
 /** 网络抖动重试同一个额度接口；认证错误和无效响应仍直接报告。 */

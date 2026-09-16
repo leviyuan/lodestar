@@ -21,7 +21,7 @@ const mathRender = await import('./math-render')
 const { config } = await import('./config')
 const { getTokenSource, listTokenSources, registerTokenSource, refreshAllTokenSourceModels, resetTokenSourceRegistry, tokenSourceProcessRevision } = await import('./token-source')
 const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
-const { peekUsage, refreshUsageFromConnection } = await import('./usage')
+const { peekUsage, refreshUsageFromConnection, invalidateCodexUsage } = await import('./usage')
 
 const DETERMINISTIC_FOOTER_HANDLE = 0xdeadbeef as unknown as ReturnType<typeof setTimeout>
 
@@ -4404,6 +4404,41 @@ describe('Session claude subagent tool calls stay off the main card', () => {
 })
 
 describe('Session usage cache cross-backend isolation', () => {
+  test('a completed card retains the successful account cache when the latest query failed and the process exited', async () => {
+    const { bindProcessCodexAccount } = await import('./codex-accounts')
+    const accountId = 'closed-footer-cache'
+    const session = new Session('closed-footer-cache', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'quota-session')
+    bindProcessCodexAccount(proc, accountId)
+    session.proc = proc
+    session.selectedTokenSourceId = null
+    const turn = { ...turnState('card_closed_footer_cache'), provider: 'codex', model: 'shared-model', effort: 'high', userOpenId: '' }
+    session.currentTurn = turn
+    session.lastTurnUsage = { input_tokens: 100, output_tokens: 10, total_tokens: 110 }
+    cardkit.recordCardCreated(turn.cardId, 1)
+    try {
+      await refreshUsageFromConnection(async () => ({ rateLimits: {
+        primary: { usedPercent: 12, windowDurationMins: 300 },
+        secondary: { usedPercent: 34, windowDurationMins: 10080 },
+      } }), accountId)
+      await refreshUsageFromConnection(async () => { throw new Error('quota read failed') }, accountId)
+      expect(peekUsage(accountId)).toBeNull()
+      proc.alive = false
+      await session.closeTurnCard(undefined, { hasFreshResult: true })
+      const footer = calls.find(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+      const content = JSON.parse(footer?.body.element ?? '{}').content as string
+      expect(content).toContain('12%·[34%]')
+      expect(content).not.toContain('缓存')
+      expect(content).not.toContain('刷新失败')
+      expect(content).not.toContain('MISS')
+    } finally {
+      invalidateCodexUsage(accountId)
+      proc.emit('exit')
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
   test('claude 的 rate_limit_event payload 不触碰 codex 用量缓存', async () => {
     // 用 read 端点形状经真实 cache 写入路径(refresh)播种缓存(模块级单例)。
     const seeded = await refreshUsageFromConnection(async () => ({

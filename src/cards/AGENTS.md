@@ -6,7 +6,7 @@
 - 空 Markdown 使用占位，终态关闭 streaming；缺失值显示 `MISS`/`—`。模型行右侧窄按钮用单字（选、显、隐、删），宽按钮保留完整文案（补录模型、显示模型、返回模型列表、上一页、下一页、取消）。模型行之间加分隔线，文字和按钮垂直居中，不重复显示相同的模型名与 ID。
 - 模型面板首页用独立的展开式折叠面板承载 `claude`、`codex`、`dsh` 各组：浅蓝标题背景、边框和 `Agent · Claude Code/Codex/DeepSeek Harness` 标题，Token Source 行放在组内，不能将两层名称平铺成同级粗体。再进入模型 → effort；action 携带 `panel_id`、`source_id`，拒绝过期 panel。
 - 所有来源区分两类动作：接口项显示/隐藏（`model_add` / `model_remove`），列表外记录补录/删除（`model_custom_prompt` / `model_custom_remove`）。`origin` 决定行按钮，`custom_models` 持久化补录；补录成功后可直接选择使用；有多个 effort 档位才展示选择卡，单档位（含原生 default）直接应用，不能因目录未收录而设为空档位或仅显示 MISS。OpenRouter 默认十项（榜单八项加字节、美团两家，默认不含 Claude），其他来源跟随接口目录。删除仍被会话选用的补录项时拒绝操作；过期来源版本和跨页动作同样拒绝。
-- footer 模型标识固定为 `agent · 模型名/effort`（agent 小写）。窗口额度沿用 `4.1h·7%·[6.9d·17%]` 的紧凑倒计时格式，不改成“额度 5h 已用…”或加入月度工具明细；余额显示 `余额 $…` / `余额 ¥…`。失败显示 MISS，不附加套餐、累计消费或解释性括号。
+- footer 模型标识固定为 `agent · 模型名/effort`（agent 小写）。窗口额度沿用 `4.1h·7%·[6.9d·17%]` 的紧凑倒计时格式，不改成“额度 5h 已用…”或加入月度工具明细；余额显示 `余额 $…` / `余额 ¥…`。失败显示 MISS；Codex footer 刷新失败、进程已退出或换号时可按原格式直接展示本条回复所属账号的成功缓存，不加缓存或刷新失败标注，无缓存或认证失败仍 MISS。不附加套餐、累计消费或解释性括号。
 - Codex `request_user_input` 和 Claude `AskUserQuestion` 共用问答卡，保留各自回包语义、历史回答和自定义输入入口。
 - `tool.ts` 生成工具摘要，`shell-command.ts` 解析 Bash、PowerShell 及引号包装后的首行 `# desc:`。Claude TaskCreate/Update/List/Get 在 `task-board.ts` 中累积为完整任务板。
 - 生图工具默认收起，完整提示词放在折叠体内，图片以结构化 `img` 子组件展示并允许点击预览。不要把提示词塞进标题，也不要把已嵌入的图片再单独发送。图片上传由 Session helper 处理，模板只接收 image key。

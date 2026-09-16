@@ -188,6 +188,108 @@ describe('bare Codex account commands', () => {
     expect(suffix).not.toContain('份额')
   })
 
+  test('footer retains the live account quota across failed refreshes and updates it after recovery', async () => {
+    const account = store.ensure('footer-cache')
+    const next = store.ensure('footer-next')
+    const s = session()
+    const proc = new Proc() as any; procs.push(proc)
+    bindProcessCodexAccount(proc, account.id)
+    s.proc = proc
+    store.select(s.sessionName, next.id)
+    const response = (percent: number) => ({ rateLimits: {
+      primary: { usedPercent: percent, windowDurationMins: 300 },
+      secondary: { usedPercent: 23, windowDurationMins: 10080 },
+    } })
+    const cached = await refreshUsageFromConnection(async () => response(11), account.id)
+    await refreshUsageFromConnection(async () => response(99), next.id)
+    let reads = 0
+    proc.readRateLimits = async () => { reads++; throw new Error('quota read failed') }
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const suffix = await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)
+        expect(suffix).toBe('  |  11%·[23%]')
+        expect(peekUsage(account.id)).toBeNull()
+        expect(cached).toBe(peekSuccessfulUsage(account.id))
+      }
+      expect(reads).toBe(2)
+      proc.readRateLimits = async () => response(15)
+      expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null))
+        .toBe('  |  15%·[23%]')
+    } finally {
+      usageModule.invalidateCodexUsage(account.id)
+      usageModule.invalidateCodexUsage(next.id)
+    }
+  })
+
+  test('footer keeps MISS for cold caches, invalidated logins and malformed fresh percentages', async () => {
+    const account = store.ensure('footer-missing')
+    const s = session()
+    const proc = new Proc() as any; procs.push(proc)
+    bindProcessCodexAccount(proc, account.id); s.proc = proc
+    const read = () => s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)
+    try {
+      proc.readRateLimits = async () => { throw new Error('quota read failed') }
+      expect(await read()).toBe('  |  额度 MISS')
+      await refreshUsageFromConnection(async () => ({ rateLimits: {
+        primary: { usedPercent: 11, windowDurationMins: 300 },
+      } }), account.id)
+      proc.readRateLimits = async () => { throw new Error('HTTP 401 unauthorized') }
+      expect(await read()).toBe('  |  额度 MISS')
+      proc.readRateLimits = async () => ({ rateLimits: {
+        primary: { usedPercent: null, windowDurationMins: 300 },
+      } })
+      expect(await read()).toBe('  |  MISS')
+    } finally { usageModule.invalidateCodexUsage(account.id) }
+  })
+
+  test('a closing footer keeps its original account when the process switches before quota rendering', async () => {
+    const account = store.ensure('footer-old')
+    const next = store.ensure('footer-new')
+    const s = session()
+    const proc = new Proc() as any; procs.push(proc)
+    bindProcessCodexAccount(proc, account.id); s.proc = proc
+    let reads = 0
+    proc.readRateLimits = async () => { reads++; throw new Error('must not read the replacement account') }
+    try {
+      await refreshUsageFromConnection(async () => ({ rateLimits: {
+        primary: { usedPercent: 11, windowDurationMins: 300 },
+      } }), account.id)
+      const cache = usageModule.captureCodexUsageCache(account.id)
+      bindProcessCodexAccount(proc, next.id)
+      expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), cache))
+        .toBe('  |  11%')
+      expect(reads).toBe(0)
+      usageModule.invalidateCodexUsage(account.id)
+      expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), cache))
+        .toBe('  |  额度 MISS')
+    } finally { usageModule.invalidateCodexUsage(account.id) }
+  })
+
+  test('a quota reset during a footer refresh invalidates its old cache and late response', async () => {
+    const account = store.ensure('footer-reset')
+    const s = session()
+    const proc = new Proc() as any; procs.push(proc)
+    bindProcessCodexAccount(proc, account.id); s.proc = proc
+    const response = { rateLimits: { primary: { usedPercent: 11, windowDurationMins: 300 } } }
+    await refreshUsageFromConnection(async () => response, account.id)
+    let release!: (value: any) => void
+    proc.readRateLimits = () => new Promise(resolve => { release = resolve })
+    const pending = s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)
+    try {
+      usageModule.invalidateCodexUsage(account.id)
+      await refreshUsageFromConnection(async () => ({ rateLimits: {
+        primary: { usedPercent: 0, windowDurationMins: 300 },
+      } }), account.id)
+      release(response)
+      expect(await pending).toBe('  |  额度 MISS')
+      expect(peekSuccessfulUsage(account.id)?.fiveHour?.percent).toBe(0)
+    } finally {
+      release(response)
+      await pending
+      usageModule.invalidateCodexUsage(account.id)
+    }
+  })
+
   test('hi peer account names follow the live Codex process, including automatic switches', () => {
     const active = store.ensure('实际账号')
     const pending = store.ensure('下次账号')
