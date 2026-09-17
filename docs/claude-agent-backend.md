@@ -79,7 +79,7 @@ Lodestar 每次启动 Claude SDK 子进程时自动设置 `CLAUDE_CODE_ENABLE_TO
 
 `DshProcess` 使用当前安装的运行目录启动 Node DSH 子进程，以 `sdk` profile 加载 `dsh-bridge` Cordis 插件，替换默认 SDK JSON-RPC server。Lodestar 的 stdio 协议只承载控制和事件；Agent 循环、工具执行、持久化及子 Agent 由 DSH 管理。
 
-Agent 运行依赖由 `src/agent-updates.ts` 独立安装，daemon 启动时不检查或更新。自动更新默认关闭；手动运行 `lodestar-update --agents-only`，或在 `[runtime.agent_auto_update]` 中分别开启 `codex`、`claude`、`dsh` 后，各自每 6 小时检查 upstream latest。安装成功直接启用，旧任务继续使用各自目录。DSH 子包的 dist-tag 可能不同步，因此从主包最新版本递归读取 dependencies/peerDependencies/optionalDependencies，整族安装该次动态选中的版本。不存在兼容版本白名单；不兼容直接报告并后续适配。`dsh-bridge` 被放入选中运行目录，从同一依赖树加载，握手版本来自实际 package.json。开发依赖和 Bun 锁文件只是本地测试快照，不限制生产更新。普通安全 overrides 同时用于独立运行目录，tarball 验收真实执行更新器、包审计和原生查询。
+Agent 运行依赖由 `src/agent-updates.ts` 独立安装，daemon 启动时不检查或更新。自动更新默认关闭；手动运行 `lodestar-update --agents-only`，或在 `[runtime.agent_auto_update]` 中分别开启 `codex`、`claude`、`dsh` 后，各自每 6 小时检查 upstream latest。安装成功直接启用，旧任务继续使用各自目录。更新失败不修改当前安装记录，只记更新日志并向更新调用方返回失败；已有安装照常供新任务使用，已开启自动更新的 Agent 下个 6 小时周期再试。启动和版本查询不显示历史更新错误；没有可用安装记录或安装损坏仍报错。DSH 子包的 dist-tag 可能不同步，因此从主包最新版本递归读取 dependencies/peerDependencies/optionalDependencies，整族安装该次动态选中的版本。不存在兼容版本白名单；不兼容直接报告并后续适配。`dsh-bridge` 被放入选中运行目录，从同一依赖树加载，握手版本来自实际 package.json。开发依赖和 Bun 锁文件只是本地测试快照，不限制生产更新。普通安全 overrides 同时用于独立运行目录，tarball 验收真实执行更新器、包审计和原生查询。
 
 - `session/open` 完成原生 create/resume/fork 并 flush 后才公布恢复点。`rs` 通过原生持久化服务列出同工作目录会话；`fk/bk` 使用 `turn/end` 的事件序号作为 checkpoint，原生日志验证并加载分叉历史。
 - 实时文本来自 `agent/assistant-stream`，工具和计划来自会话事件。进入 idle 后等待持久化完成，再用真实 `turn/end` 原因结算；认证失败、token 耗尽及驱动异常均向调用方报告。

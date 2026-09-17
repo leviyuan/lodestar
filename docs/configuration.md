@@ -27,7 +27,7 @@ lodestar-setup
 | `lodestar-daemon` | 启动 daemon |
 | `lodestar-stop` | 停止 daemon |
 | `lodestar-update` | 升级 Lodestar 及实际使用的 Codex、Claude Code/SDK、DSH；`--agents-only` 仅立即更新 Agent |
-| `lodestar-version` | 查看 Lodestar、实际 Agent 版本、运行目录及更新错误 |
+| `lodestar-version` | 查看 Lodestar、实际 Agent 版本及运行目录 |
 | `lodestar-agent` | 由主 Agent 调用已配置模型执行任务，也支持与自身相同的模型 |
 
 daemon 启动时不检查 Agent 版本，也不安装或更新 Agent。自动更新默认关闭；首次安装缺少运行文件或需要更新时，运行 `lodestar-update --agents-only`。手动更新和显式开启的自动更新都选择上游 `latest`，独立于 Lodestar 发版，不设置兼容版本白名单。
@@ -36,7 +36,7 @@ Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`�
 
 运行文件放在 Lodestar 数据目录的 `agent-runtimes/` 下，每个版本使用独立目录；更新只切换新进程所用的目录，保留正在运行任务的程序和 SDK。Windows 下也不覆盖、重命名或删除正在使用的旧版 EXE/DLL。取消安装时按安装器 PID 终止其进程树，并等待退出；若无法确认终止，保留可能被占用的临时目录并报告错误。
 
-查询或安装失败会明确报错，`lodestar-version` 可查看错误；不会静默改用旧安装。文件占用只做有限重试，最终失败仍显示。显式配置的 `[claude].bin` 按该路径执行。
+后台更新失败只记日志，继续使用当前安装；已开启自动更新的 Agent 会在下一个 6 小时检查周期再试。启动和 `lodestar-version` 不提示历史更新错误，版本查询只显示当前安装。手动更新命令仍如实返回本次更新结果。尚未安装或本地安装损坏时无法启动。旧版若已因失败清除了安装选择记录，需要一次成功的 `lodestar-update --agents-only` 恢复记录，不会自动猜测目录中的版本。文件占用只做有限重试，最终失败仍显示。显式配置的 `[claude].bin` 按该路径执行。
 
 长期运行可交给 Linux `systemd --user`、macOS `launchd` 或 Windows 任务计划程序。daemon 重启后会恢复上次活跃的会话。
 

@@ -31,6 +31,7 @@ export interface AgentRuntimeState {
   directory?: string
   versions?: Record<string, string>
   checkedAt: number
+  /** Legacy diagnostic only; ignored when selecting an installed runtime. */
   error?: string
 }
 export interface AgentUpdateOptions {
@@ -56,15 +57,15 @@ function readState(agent: UpdatedAgent, root = AGENT_RUNTIMES_DIR): AgentRuntime
 
 export function agentRuntimeState(agent: UpdatedAgent): AgentRuntimeState | null { return readState(agent) }
 
-/** Constructors only read the selected local install; they never check versions. */
+/** Constructors only read the selected local install; they never query the registry. */
 export function agentRuntimeRoot(agent: UpdatedAgent): string {
   // Tests explicitly use their own dependency tree; production never substitutes it.
   if (process.env.NODE_ENV === 'test' && process.env.LODESTAR_TEST_AGENT_RUNTIME_ROOT) {
     return process.env.LODESTAR_TEST_AGENT_RUNTIME_ROOT
   }
   const state = readState(agent)
-  if (state?.error) throw new Error(`${agent} 更新失败: ${state.error}`)
   if (!state?.directory) throw new Error(`${agent} runtime 未安装，请运行 lodestar-update --agents-only`)
+  if (!existsSync(state.directory)) throw new Error(`${agent} runtime 安装目录不存在: ${state.directory}；请运行 lodestar-update --agents-only`)
   return state.directory
 }
 
@@ -203,8 +204,8 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
   let failure: unknown
   let preserveStaging = false
   try {
-    options.report?.(`${agent}: 检查 upstream latest`)
     const previous = readState(agent, root)
+    options.report?.(`${agent}: 检查 upstream latest`)
     const versions = await resolveAgentPackages(agent, options.metadata ?? ((name, version) => metadata(name, version, options.signal)))
     options.signal?.throwIfAborted()
     const security = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')).overrides ?? {}
@@ -227,18 +228,15 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
       staging = undefined
     }
     const state = { directory: destination, versions, checkedAt: Date.now() }
+    const unchanged = previous?.directory === destination
     await writeState(directory, state)
-    options.report?.(`${agent}: ${PACKAGES[agent][0]}@${versions[PACKAGES[agent][0]]}${previous?.directory === destination ? ' 已是 latest' : ' 已更新，新进程使用新版'}`)
+    options.report?.(`${agent}: ${PACKAGES[agent][0]}@${versions[PACKAGES[agent][0]]}${unchanged ? ' 已是 latest' : ' 已更新，新进程使用新版'}`)
     return state
   } catch (error) {
-    // Old processes own immutable paths. A failed refresh is visible and blocks new starts.
+    // Failed updates leave the selected installation untouched. The updater
+    // reports the failure; an enabled timer tries again at its next interval.
     failure = error
     preserveStaging = error instanceof AgentInstallTerminationError
-    try { await writeState(directory, { checkedAt: Date.now(), error: errorMessage(error) }) }
-    catch (stateError) {
-      failure = new AggregateError([error, stateError], `${errorMessage(error)}; recording update failure also failed: ${errorMessage(stateError)}`)
-      throw failure
-    }
     throw error
   } finally {
     const cleanupErrors: unknown[] = []
