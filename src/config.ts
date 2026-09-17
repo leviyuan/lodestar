@@ -97,6 +97,12 @@ export interface TokenSourceConfig {
   base_url?: string
   auth_token?: string
   api_key?: string
+  /** 独立的账户余额凭据，绝不传入模型进程。 */
+  management_token?: string
+  management_user_id?: string
+  management_url?: string
+  /** 只复用指定来源的余额账号，不复用它的模型 Key。 */
+  billing_source?: string
   bin?: string
   model?: string
   effort?: string
@@ -310,6 +316,7 @@ export function loadConfig(): LodestarConfig {
         } else if (
           field === 'agent' || field === 'display' || field === 'auth' ||
           field === 'base_url' || field === 'auth_token' || field === 'api_key' ||
+          field === 'management_token' || field === 'management_user_id' || field === 'management_url' || field === 'billing_source' ||
           field === 'bin' || field === 'model' || field === 'effort' ||
           field === 'models' || field === 'hidden_models' || field === 'custom_models' || field === 'slots' || field === 'usage'
         ) {

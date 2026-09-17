@@ -1,23 +1,14 @@
-/** 用户指定：Arena Agent Labs 前 12 家的代表模型，补充 Claude Opus、字节和美团；
- * 排除 OpenAI/Z.ai/DeepSeek，蚂蚁、阶跃不列为默认；Claude 与本机订阅独立可选。
- * 榜单快照 2026-09-08：https://arena.ai/leaderboard/agent?rankBy=labs
- * 顺序固定为该次榜单顺序；后续增删持久化在 token_source.openrouter.models。
+/** Gemini 转至 Packy 后，OpenRouter 保留腾讯、Meta、MiMo、字节和美团五款。
+ * 其他兼容模型仍可通过 MD 显示或补录；已配置的列表不会被默认值覆盖。
  */
 import type { ClaudeReasoningEffort } from './agent-process'
 
 export const OPENROUTER_DEFAULT_MODELS: ReadonlyArray<{
   rank?: number; lab: string; model: string; effort: ClaudeReasoningEffort
 }> = [
-  { rank: 1, lab: 'Anthropic', model: 'anthropic/claude-fable-5.1', effort: 'max' },
-  { lab: 'Anthropic', model: 'anthropic/claude-opus-5', effort: 'max' },
-  { rank: 3, lab: 'Moonshot', model: 'moonshotai/kimi-k3', effort: 'max' },
   { rank: 4, lab: 'Tencent', model: 'tencent/hy4-preview', effort: 'high' },
-  { rank: 7, lab: 'Google', model: 'google/gemini-3.8-flash', effort: 'high' },
-  { rank: 8, lab: 'SpaceXAI', model: 'x-ai/grok-4.5', effort: 'high' },
-  { rank: 9, lab: 'Alibaba', model: 'qwen/qwen3.8-max-0902', effort: 'xhigh' },
   { rank: 10, lab: 'Meta', model: 'meta/muse-spark-1.2', effort: 'xhigh' },
   { rank: 11, lab: 'Xiaomi', model: 'xiaomi/mimo-v2.5-pro', effort: 'default' },
-  { rank: 12, lab: 'MiniMax', model: 'minimax/minimax-m3', effort: 'default' },
   { lab: 'ByteDance', model: 'bytedance-seed/seed-2-1-turbo', effort: 'default' },
   { lab: 'Meituan', model: 'meituan/longcat-2.0', effort: 'default' },
 ]

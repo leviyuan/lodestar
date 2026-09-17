@@ -18,7 +18,7 @@ let pending: { key: string; promise: Promise<AccountUsage[]> } | undefined
 
 function cacheKey(): string {
   return JSON.stringify([tokenSourceRegistryRevision(), codexUsageCacheRevision(),
-    listTokenSources().map(source => [source.id, source.enabled, source.spawnRevision]),
+    listTokenSources().map(source => [source.id, source.enabled, source.spawnRevision, source.usageAccount]),
     codexAccounts.list().map(account => [account.id, account.name, account.revision])])
 }
 
@@ -46,11 +46,11 @@ export function readAllAccountUsage(): Promise<AccountUsage[]> {
       }))))
       continue
     }
-    const id = sharedAccountId(source.id)
+    const id = source.usageAccount?.id ?? sharedAccountId(source.id)
     if (seen.has(id)) continue
     seen.add(id)
-    const label = id === 'glm' ? 'GLM Coding Plan' : id === 'deepseek' ? 'DeepSeek'
-      : source.kind === 'claude-subscription' ? 'Claude 订阅' : source.display
+    const label = source.usageAccount?.label ?? (id === 'glm' ? 'GLM Coding Plan' : id === 'deepseek' ? 'DeepSeek'
+      : source.kind === 'claude-subscription' ? 'Claude 订阅' : source.display)
     reads.push(Promise.resolve().then(() => source.readUsage()).catch((error): UsageSnapshotUnified => {
       const reason = error instanceof Error ? error.message : String(error)
       log(`account usage ${id} MISS: ${reason}`)

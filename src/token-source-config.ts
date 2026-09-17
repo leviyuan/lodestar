@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import { CONFIG_FILE } from './paths'
 import { config, loadConfig, reloadTokenSources, type TokenSourceConfig } from './config'
 import { buildTokenSourcesFromConfig } from './token-source-builtins'
-import { getTokenSourceForAccount, refreshAllTokenSourceModels, type TokenSourceFactoryDef } from './token-source'
+import { getTokenSourceForAccount, refreshAllTokenSourceModels, type TokenSourceFactoryDef, type TokenSourceSetup } from './token-source'
 import { writeStateFileAtomic } from './state-store'
 import { modelList } from './token-source-visibility'
 import { sharedTokenSourceConfigs, tokenSourceConfigUpdates } from './token-source-accounts'
@@ -24,6 +24,10 @@ function cfgToToml(id: string, cfg: TokenSourceConfig): string {
   push('base_url', cfg.base_url)
   push('auth_token', cfg.auth_token)
   push('api_key', cfg.api_key)
+  push('management_token', cfg.management_token)
+  push('management_user_id', cfg.management_user_id)
+  push('management_url', cfg.management_url)
+  push('billing_source', cfg.billing_source)
   push('bin', cfg.bin)
   push('model', cfg.model)
   push('effort', cfg.effort)
@@ -40,10 +44,24 @@ function cfgToToml(id: string, cfg: TokenSourceConfig): string {
  * 已存在则与新 cfg 字段级合并(新值优先,旧键保留)—— 重跑 <source>-setup
  * 只更新凭据,不洗掉 models/slots/usage 等既有配置。写完热更新 registry。 */
 export function saveTokenSourceConfig(id: string, cfg: TokenSourceConfig): void {
+  saveTokenSourceConfigs({ [id]: cfg })
+}
+
+/** 多来源迁移一次原子写入；共享账号仍只保存一份凭据。 */
+export function saveTokenSourceConfigs(changes: Record<string, TokenSourceConfig>): void {
+  if (!Object.keys(changes).length) return
   const existing = readFileSync(CONFIG_FILE, 'utf8')
   // 逐行状态机找节:节边界 = 行首 [xxx](值里可含 '[',如 slots = "opus=GLM-5.2[1m]",
   // regex 硬截断会吞值,故不用正则切多行节体)。
-  const updates = tokenSourceConfigUpdates(loadConfig().token_sources, id, cfg)
+  let configs = loadConfig().token_sources
+  const updates: Record<string, TokenSourceConfig> = {}
+  for (const [id, cfg] of Object.entries(changes)) {
+    const changed = tokenSourceConfigUpdates(configs, id, cfg)
+    configs = { ...configs, ...changed }
+    Object.assign(updates, changed)
+  }
+  // 余额引用和旧账号冲突必须在写入前暴露；原文件保持不变。
+  sharedTokenSourceConfigs(configs)
   const headers = new Set(Object.keys(updates).map(id => `[token_source.${id}]`))
   const lines = existing.split('\n')
   let inSection = false
@@ -87,14 +105,14 @@ export class TokenSourceSetupError extends Error {
 }
 
 /** 群内补配先校验再保存；校验与写入共用队列，失败不会覆盖现有凭据或重建目录。 */
-export function configureTokenSource(def: TokenSourceFactoryDef, cfg: TokenSourceConfig): Promise<void> {
+export function configureTokenSource(def: TokenSourceFactoryDef, cfg: TokenSourceConfig, setup: TokenSourceSetup | undefined = def.setup): Promise<void> {
   return serializeConfigUpdate(async () => {
     let saved = false
     try {
-      if (!def.configSectionId || !def.setup) throw new Error('此来源不支持配置命令')
+      if (!def.configSectionId || !setup) throw new Error('此来源不支持配置命令')
       const previous = loadConfig().token_sources
       const candidate = { ...previous, ...tokenSourceConfigUpdates(previous, def.configSectionId, cfg) }
-      await def.setup.validate(sharedTokenSourceConfigs(candidate)[def.configSectionId])
+      await setup.validate(sharedTokenSourceConfigs(candidate)[def.configSectionId])
       await applyTokenSourceConfig(def.configSectionId, cfg, () => { saved = true })
     } catch (error) {
       throw new TokenSourceSetupError(error, saved)

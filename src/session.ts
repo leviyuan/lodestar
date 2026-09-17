@@ -545,6 +545,7 @@ export class Session {
       status: this.status,
       uptimeMs: this.startedAt ? (Date.now() - this.startedAt) : undefined,
       ...(this.proc?.isAlive() && this.proc.provider === 'codex'
+        && !this.currentTokenSource()?.codexApiProvider
         && this.proc.codexAccountSelectionMode?.() !== null
         && !(this.proc.turnRetry?.reason === 'quota' && this.proc.turnRetry.phase === 'waiting')
         ? { codexAccountName: codexAccounts.get(processCodexAccount(this.proc)).name } : {}),
@@ -603,13 +604,14 @@ export class Session {
   currentProvider(): AgentProvider { return this.selectedProvider }
 
   conversationRouting(): ConversationRouting {
+    const apiCodex = !!this.currentTokenSource()?.codexApiProvider
     return {
       provider: this.selectedProvider,
       tokenSourceId: this.selectedTokenSourceId,
       model: this.selectedModel,
       effort: this.selectedEffort,
-      ...(this.codexAccountId() === DEFAULT_CODEX_ACCOUNT ? {} : { codexAccountId: this.codexAccountId() }),
-      ...(codexAccounts.preferred(this.sessionName) === null ? { codexAccountAutomatic: true } : {}),
+      ...(apiCodex || this.codexAccountId() === DEFAULT_CODEX_ACCOUNT ? {} : { codexAccountId: this.codexAccountId() }),
+      ...(!apiCodex && codexAccounts.preferred(this.sessionName) === null ? { codexAccountAutomatic: true } : {}),
     }
   }
 
@@ -618,8 +620,8 @@ export class Session {
     if (this.isRunning() || this.currentTurn || this.openingTurn) {
       throw new Error('cannot change conversation routing while the session is running')
     }
-    if (routing.codexAccountId) codexAccounts.get(routing.codexAccountId)
     const source = getTokenSource(routing.tokenSourceId)
+    if (routing.codexAccountId && !source?.codexApiProvider) codexAccounts.get(routing.codexAccountId)
     if (source && source.agent !== routing.provider) {
       throw new Error(`token source "${source.id}" belongs to ${source.agent}, not ${routing.provider}`)
     }
@@ -640,9 +642,11 @@ export class Session {
       routing.effort,
       routing.tokenSourceId,
     )
-    const accountId = routing.codexAccountId ?? DEFAULT_CODEX_ACCOUNT
-    if (routing.codexAccountAutomatic) codexAccounts.selectAuto(this.sessionName)
-    else if (codexAccounts.selected(this.sessionName) !== accountId) codexAccounts.select(this.sessionName, accountId)
+    if (!source?.codexApiProvider) {
+      const accountId = routing.codexAccountId ?? DEFAULT_CODEX_ACCOUNT
+      if (routing.codexAccountAutomatic) codexAccounts.selectAuto(this.sessionName)
+      else if (codexAccounts.selected(this.sessionName) !== accountId) codexAccounts.select(this.sessionName, accountId)
+    }
   }
 
   dshEffortForSpawn() {
@@ -665,8 +669,8 @@ export class Session {
   /** Query Codex history without attaching the catalog process to this Session. */
   async listCodexConversations(): Promise<ConversationSummary[]> {
     if (this.selectedProvider !== 'codex') throw new Error('Codex history requested for a non-Codex session')
-    if (!feishu.isOpenAIChatGPTAuthenticated(this.codexAccountId())) throw new Error('Codex 未登录 ChatGPT 账号')
     const raw = this.currentTokenSource()
+    if (!raw?.codexApiProvider && !feishu.isOpenAIChatGPTAuthenticated(this.codexAccountId())) throw new Error('Codex 未登录 ChatGPT 账号')
     if (this.selectedTokenSourceId && (!raw || !raw.enabled)) {
       throw new Error(`token source "${this.selectedTokenSourceId}" 不可用，请重新配置或选择其他账号`)
     }
@@ -680,6 +684,7 @@ export class Session {
       launch: { kind: 'fresh' },
       tokenSourceId: source?.id ?? null,
       transformEnv,
+      ...(source?.codexApiProvider ? { apiProvider: source.codexApiProvider } : {}),
     })
     let conversations: ConversationSummary[] | null = null
     let queryError: unknown = null
@@ -714,8 +719,8 @@ export class Session {
       }
       resolved = { ...ref, cwd: this.workDir }
     } else {
-      if (!feishu.isOpenAIChatGPTAuthenticated(this.codexAccountId())) throw new Error('Codex 未登录 ChatGPT 账号')
       const raw = this.currentTokenSource()
+      if (!raw?.codexApiProvider && !feishu.isOpenAIChatGPTAuthenticated(this.codexAccountId())) throw new Error('Codex 未登录 ChatGPT 账号')
       if (this.selectedTokenSourceId && (!raw || !raw.enabled)) {
         throw new Error(`token source "${this.selectedTokenSourceId}" 不可用，请重新配置或选择其他账号`)
       }
@@ -726,6 +731,7 @@ export class Session {
         launch: { kind: 'fresh' },
         tokenSourceId: source?.id ?? null,
         transformEnv: source ? base => source.spawnEnv(base) : undefined,
+        ...(source?.codexApiProvider ? { apiProvider: source.codexApiProvider } : {}),
       })
       let readError: unknown = null
       try { resolved = await proc.readConversationRef(ref.sessionId) }
@@ -971,7 +977,7 @@ export class Session {
 
     // Keep both routing and its durable selection unchanged until the old
     // process has actually stopped. A failed close must remain retryable.
-    await this.stopIdleMismatchedProcessUnlocked(provider, nextSourceId, nextModel)
+    await this.stopIdleMismatchedProcessUnlocked(provider, nextSourceId, nextModel, nextEffort)
     const previousConversation = previousProvider !== provider ? {
       anchors: feishu.getTurnAnchors(this.sessionName).slice(),
       base: feishu.getSessionBranchBase(this.sessionName),
@@ -1016,12 +1022,15 @@ export class Session {
     provider = this.selectedProvider,
     tokenSourceId = this.selectedTokenSourceId,
     model = this.selectedModel,
+    effort = this.selectedEffort,
   ): boolean {
     const proc = this.proc
     return !!proc?.isAlive() && (
       this.blockedProc === proc
       || proc.provider !== provider
       || proc.tokenSourceId !== tokenSourceId
+      || provider === 'claude' && proc.provider === 'claude' && effort !== null
+        && ((proc.lastEffort ?? this.selectedEffort) === 'default') !== (effort === 'default')
       || !this.processSourceMatches(this.tokenSource(tokenSourceId), model)
     )
   }
@@ -1030,11 +1039,12 @@ export class Session {
     provider = this.selectedProvider,
     tokenSourceId = this.selectedTokenSourceId,
     model = this.selectedModel,
+    effort = this.selectedEffort,
   ): Promise<void> {
     // provider 或 token source 任一变化 = 进程 env 不再匹配 → idle 时杀掉,下轮重 spawn 换 env。
     // 同 provider 跨 source(GLM↔DeepSeek↔native)env(base_url/凭据)不同也必须重启,
     // 否则热切换只改 model 不换 env → 模型名打到上一个 source 的 base_url(silent divergence)。
-    if (!this.proc || !this.modelSelectionNeedsProcessStop(provider, tokenSourceId, model)) return
+    if (!this.proc || !this.modelSelectionNeedsProcessStop(provider, tokenSourceId, model, effort)) return
     if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return
     const proc = this.proc
     log(`session "${this.sessionName}": stop idle ${proc.provider} process before switching to ${provider}`)
@@ -1408,7 +1418,7 @@ export class Session {
   async startWithCodexAccount(accountId: string, opts: LifecycleProgressOpts = {}): Promise<boolean> {
     return this.runLifecycle('hi-account', async () => {
       codexAccounts.get(accountId)
-      if (this.selectedProvider !== 'codex') {
+      if (this.selectedProvider !== 'codex' || this.currentTokenSource()?.codexApiProvider) {
         if (this.proc?.isAlive()) await this.stopUnlocked('切换到 Codex', { ...opts, announce: false })
         const source = getTokenSourceForAccount('codex-sub', accountId)
         const model = source?.defaultModel || null
@@ -1460,9 +1470,10 @@ export class Session {
         return true
       }
     }
-    if (this.selectedProvider === 'codex') report?.('🔎 检查 Codex 登录')
+    if (this.selectedProvider === 'codex') report?.(this.currentTokenSource()?.codexApiProvider ? '🔎 检查 Codex API 来源' : '🔎 检查 Codex 登录')
     else report?.('🔎 检查 Claude Code')
     if (this.selectedProvider === 'codex' && this.selectedTokenSourceId !== 'codex-sub'
+      && !this.currentTokenSource()?.codexApiProvider
       && !feishu.isOpenAIChatGPTAuthenticated(this.codexAccountId())) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
@@ -3685,7 +3696,7 @@ export class Session {
       // Spark 桶内容会被贴上主桶标签)—— 通知不写 cache,只观察日志;
       // 权威状态在 turn 收尾用现有连接 read 端点整体刷新(closeTurnCard)。
       // claude 的 rate_limit_info 形状不同,同样不进 codex 快照。
-      if (p.provider === 'codex') observeRateLimitsNotification(rateLimits, processCodexAccount(p))
+      if (p.provider === 'codex' && !getTokenSource(p.tokenSourceId)?.codexApiProvider) observeRateLimitsNotification(rateLimits, processCodexAccount(p))
     })
     on('thread_goal_updated', (goal: ThreadGoal) => {
       this.handleThreadGoalUpdated(goal)
@@ -5516,7 +5527,7 @@ export class Session {
     model: string | null,
   ): Promise<string> {
     if (selectedTokenSourceId && (!ts || !ts.enabled || ts.agent !== provider)) return '  |  额度 MISS'
-    if (ts?.agent === provider && ts.enabled && (provider === 'claude' || provider === 'dsh')) {
+    if (ts?.agent === provider && ts.enabled && (provider === 'claude' || provider === 'dsh' || ts.codexApiProvider)) {
       const snap = await ts.readUsage()
       if (snap.state === 'ok' && snap.kind !== 'balance') {
         const fiveHour = snap.windows.find(w => w.kind === 'fiveHour')
@@ -5622,7 +5633,8 @@ export class Session {
       tokenSource: proc?.provider === 'codex'
         ? getTokenSourceForAccount(proc.tokenSourceId ?? this.selectedTokenSourceId, processCodexAccount(proc))
         : this.currentTokenSource(),
-      codexUsage: proc?.provider === 'codex' ? captureCodexUsageCache(processCodexAccount(proc)) : null,
+      codexUsage: proc?.provider === 'codex' && !getTokenSource(proc.tokenSourceId)?.codexApiProvider
+        ? captureCodexUsageCache(processCodexAccount(proc)) : null,
       currentBatchReactionIds: this.currentBatchReactionIds,
       pendingReactionIds: this.pendingReactionIds,
     }

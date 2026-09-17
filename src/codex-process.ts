@@ -95,6 +95,32 @@ export interface SpawnOpts {
   transformEnv?: (env: Record<string, string | undefined>) => Record<string, string | undefined>
   /** 该进程 spawn 时绑定的 token source id;stopIdleMismatchedProcess 据此判跨 source 重启。 */
   tokenSourceId?: string | null
+  /** API provider credentials are supplied through env; never bind a subscription account. */
+  apiProvider?: CodexApiProvider
+}
+
+export interface CodexApiProvider {
+  id: string
+  name: string
+  baseUrl: string
+  envKey: string
+}
+
+export function codexApiProviderArgs(provider: CodexApiProvider): string[] {
+  if (!/^[a-z][a-z0-9_-]*$/.test(provider.id) || ['openai', 'ollama', 'lmstudio'].includes(provider.id)) {
+    throw new Error('Codex API provider id 无效或属于保留名称')
+  }
+  if (!/^[A-Z][A-Z0-9_]*$/.test(provider.envKey)) throw new Error('Codex API key 环境变量名无效')
+  const prefix = `model_providers.${provider.id}`
+  const definition: Record<string, string | boolean> = {
+    name: provider.name, base_url: provider.baseUrl, env_key: provider.envKey,
+    wire_api: 'responses', requires_openai_auth: false, supports_websockets: false,
+  }
+  // Replace the provider definition as one value: local same-name auth/header settings must not leak in.
+  const table = `{${Object.entries(definition).map(([key, value]) => `${key}=${JSON.stringify(value)}`).join(',')}}`
+  return ['-c', `model_provider=${JSON.stringify(provider.id)}`, '-c', `${prefix}=${table}`,
+    // ChatGPT connectors require the subscription account; project MCP/skills remain native.
+    '-c', 'features.apps=false']
 }
 
 export function codexAppServerArgs(allowDelegation = true): string[] {
@@ -373,7 +399,10 @@ export class CodexProcess extends EventEmitter {
     this.tokenSourceId = opts.tokenSourceId ?? null
     this.launchKind = (opts.launch ?? { kind: 'fresh' }).kind
     const codexBin = resolveCodexBin()
-    const args = [...codexAppServerArgs(opts.allowDelegation !== false), ...codexAccounts.cliArgs(opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)]
+    const args = [...codexAppServerArgs(opts.allowDelegation !== false),
+      ...(opts.apiProvider ? codexApiProviderArgs(opts.apiProvider)
+        : [...(opts.tokenSourceId === 'codex-sub' ? ['-c', 'model_provider="openai"'] : []),
+          ...codexAccounts.cliArgs(opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)])]
     log(`codex-process: spawn ${codexBin} app-server (cwd=${opts.workDir})`)
     const baseEnv = {
       ...(process.env as Record<string, string>),
@@ -382,8 +411,10 @@ export class CodexProcess extends EventEmitter {
       ...config.codex.env,
       ...(opts.hostEnv ?? {}),
     }
-    const spawnEnv = codexAccounts.env(opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT,
-      opts.transformEnv ? opts.transformEnv(baseEnv) : baseEnv)
+    const routedEnv = opts.transformEnv ? opts.transformEnv(baseEnv) : baseEnv
+    const spawnEnv = opts.apiProvider
+      ? { ...routedEnv, CODEX_HOME: codexAccounts.defaultHome }
+      : codexAccounts.env(opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT, routedEnv)
     // cross-spawn resolves Windows .cmd shims without `shell:true`; keeping an
     // argv vector preserves quoted TOML values passed through --config.
     this.proc = crossSpawn(
@@ -398,7 +429,7 @@ export class CodexProcess extends EventEmitter {
     this.proc.on('exit', (code, signal) => this.handleChildExit(code, signal))
     this.proc.on('close', (code, signal) => this.handleChildClose(code, signal))
     this.proc.on('error', err => this.handleChildProcessError(err))
-    bindProcessCodexAccount(this, opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)
+    if (!opts.apiProvider) bindProcessCodexAccount(this, opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)
   }
 
   private handleStdinError(reason: unknown): void {
@@ -1636,6 +1667,8 @@ export class CodexProcess extends EventEmitter {
         ...(this.opts.effort ? { model_reasoning_effort: this.opts.effort } : {}),
       },
       ...(this.opts.model ? { model: this.opts.model } : {}),
+      ...(this.opts.apiProvider ? { modelProvider: this.opts.apiProvider.id }
+        : this.opts.tokenSourceId === 'codex-sub' ? { modelProvider: 'openai' } : {}),
       ...(this.opts.appendSystemPrompt ? { developerInstructions: this.opts.appendSystemPrompt } : {}),
       serviceName: this.opts.serviceName ?? 'lodestar',
     }

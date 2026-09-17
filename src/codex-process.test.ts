@@ -12,6 +12,7 @@ import {
   CodexProcess,
   CodexRpcResponseError,
   codexAppServerArgs,
+  codexApiProviderArgs,
   codexAppServerSpawnOptions,
   imageGenerationOutput,
   usageFromTokenUsagePayload,
@@ -43,6 +44,37 @@ function makeCodexLifecycleHarness(stdinOverrides: Record<string, unknown> = {})
   proc.exitPromise = new Promise<void>(resolve => { proc.resolveExit = resolve })
   return proc
 }
+
+test('custom Codex providers use environment auth without a subscription login override', () => {
+  const args = codexApiProviderArgs({ id: 'packy', name: 'Packy "API"', baseUrl: 'https://cf.api.fan/v1', envKey: 'PACKY_KEY' })
+  expect(args).toContain('model_provider="packy"')
+  const definition = args.find(arg => arg.startsWith('model_providers.packy='))!
+  expect(definition).toContain(`name=${JSON.stringify('Packy "API"')}`)
+  expect(definition).toContain('requires_openai_auth=false')
+  expect(definition).toContain('env_key="PACKY_KEY"')
+  expect(args.join(' ')).not.toContain('forced_login_method')
+  expect(() => codexApiProviderArgs({ id: 'openai', name: 'bad', baseUrl: 'https://host', envKey: 'KEY' })).toThrow('保留')
+})
+
+test('custom provider is explicit on fresh, resumed and forked Codex threads', async () => {
+  const apiProvider = { id: 'packy', name: 'PackyAPI', baseUrl: 'https://cf.api.fan/v1', envKey: 'PACKY_KEY' }
+  for (const kind of ['fresh', 'resume', 'fork'] as const) {
+    const launch = kind === 'fresh' ? { kind } : { kind, source: { provider: 'codex', sessionId: 'source-thread', cwd: '/repo' } }
+    const { proc, calls } = makeCodexProtocolHarness({ model: 'kimi-k3', effort: 'high', apiProvider, launch })
+    await proc.initializeAndStartThread()
+    const call = calls.find(call => call.method === `thread/${kind === 'fresh' ? 'start' : kind}`)!
+    expect(call.params.modelProvider).toBe('packy')
+    expect(call.params.model).toBe('kimi-k3')
+    expect(call.params.config.model_reasoning_effort).toBe('high')
+  }
+})
+
+test('returning to a Codex subscription overrides a previous API provider on resume', async () => {
+  const { proc, calls } = makeCodexProtocolHarness({ tokenSourceId: 'codex-sub', model: 'gpt-test', effort: 'high',
+    launch: { kind: 'resume', source: { provider: 'codex', sessionId: 'source-thread', cwd: '/repo' } } })
+  await proc.initializeAndStartThread()
+  expect(calls.find(call => call.method === 'thread/resume')!.params.modelProvider).toBe('openai')
+})
 
 type ProtocolCall = { method: string; params: any }
 

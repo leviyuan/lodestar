@@ -57,6 +57,43 @@ beforeEach(() => {
 })
 
 describe('Session delegated-agent capability', () => {
+  test('API Codex starts without ChatGPT login and uses its own quota in the footer', async () => {
+    const session = new Session('packy-api-start', 'chat_id') as any
+    const source = {
+      id: 'packy-api-test', kind: 'packy-api-test', agent: 'codex', display: 'Packy', enabled: true,
+      models: [{ model: 'kimi-k3', display: 'Kimi', efforts: ['medium'], defaultEffort: 'medium' }],
+      defaultModel: 'kimi-k3', modelCatalogState: { status: 'ready', updatedAt: 1 },
+      codexApiProvider: { id: 'packy', name: 'Packy', baseUrl: 'https://cf.api.fan/v1', envKey: 'PACKY_KEY' },
+      readUsage: async () => ({ state: 'ok', kind: 'quota', windows: [], quota: { remaining: 2, limit: 5, currency: 'USD' } }),
+    }
+    const proc = new FakeAgentProc('codex', 'packy-native-thread') as any
+    proc.tokenSourceId = source.id
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    proc.initializationPromise = () => Promise.resolve()
+    proc.sendInitialize = () => proc.emit('init', { session_id: proc.sessionId })
+    proc.readRateLimits = () => { throw new Error('must not read subscription limits') }
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = source.id
+    session.selectedModel = 'kimi-k3'
+    session.selectedEffort = 'medium'
+    session.currentTokenSource = () => source
+    session.spawnAgent = () => proc
+    Object.defineProperty(session, 'workDir', { value: process.cwd() })
+    const auth = spyOn(feishu, 'isOpenAIChatGPTAuthenticated').mockImplementation(() => { throw new Error('must not check ChatGPT auth') })
+    try {
+      expect(await session.start({ announce: false })).toBe(true)
+      expect(auth).not.toHaveBeenCalled()
+      expect(session.peerSnapshot().codexAccountName).toBeUndefined()
+      expect(await session.footerUsageSuffix('codex', proc, source.id, source, null, 'kimi-k3')).toBe('  |  额度 $2.00 / $5.00')
+      expect(session.conversationRouting().codexAccountId).toBeUndefined()
+      expect(session.conversationRouting().codexAccountAutomatic).toBeUndefined()
+    } finally {
+      auth.mockRestore()
+      await session.stop('API source test complete', { announce: false })
+    }
+  })
+
   test('accepts only the live process capability and delegates cancellation', async () => {
     const cancellations: Array<[string, string]> = []
     const session = new Session('agent-capability', 'chat_id', {
@@ -2363,6 +2400,37 @@ describe('Session provider switching', () => {
       expect(proc.killCalls).toBe(1)
       expect(session.selectedModel).toBe('glm-manual')
       expect(boundResumes).toContainEqual([session.sessionName, 'preserved-dsh-session', 'dsh'])
+    } finally {
+      session.dispose()
+      resetTokenSourceRegistry()
+      for (const entry of previous) registerTokenSource(entry)
+    }
+  })
+
+  test('the same Packy model can change default effort mode only by replacing its idle process', async () => {
+    const previous = listTokenSources()
+    const source = { id: 'packy-effort-test', kind: 'packy', agent: 'claude' as const, display: 'Packy', enabled: true,
+      models: [{ model: 'mimo-v2.5-pro', display: 'MiMo', efforts: ['default' as const, 'high' as const], defaultEffort: 'default' as const }],
+      defaultModel: 'mimo-v2.5-pro', modelCatalogState: { status: 'ready' as const, updatedAt: 1 },
+      refreshModels: async () => {}, spawnEnv: (env: Record<string, string | undefined>) => env,
+      resolveSpawnModel: (model: string) => model, readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
+    }
+    registerTokenSource(source)
+    const session = new Session('packy-effort-mode', 'chat_id') as any
+    try {
+      const proc = new FakeAgentProc('claude', 'packy-effort-session', source.id)
+      session.proc = proc
+      session.selectedProvider = 'claude'; session.selectedTokenSourceId = source.id
+      session.selectedModel = 'mimo-v2.5-pro'; session.selectedEffort = 'default'
+      proc.lastEffort = 'default'
+      session.modelPanels.set('packy-effort-panel', { models: [{ provider: 'claude', sourceId: source.id,
+        model: 'mimo-v2.5-pro', displayName: 'MiMo', efforts: [{ effort: 'default' }, { effort: 'high' }] }] })
+      const result = await session.onModelEffortSelect('mimo-v2.5-pro', 'high', 'packy-effort-panel', '', 'claude')
+      expect(result.ok).toBe(true)
+      expect(proc.setModelSettingsCalls).toEqual([])
+      expect(proc.killCalls).toBe(1)
+      expect(session.selectedEffort).toBe('high')
+      expect(boundResumes).toContainEqual([session.sessionName, 'packy-effort-session', 'claude'])
     } finally {
       session.dispose()
       resetTokenSourceRegistry()

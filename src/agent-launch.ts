@@ -133,7 +133,8 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
     hostEnv: opts.hostEnv,
     serviceName: opts.serviceName,
     codexAccountId: accountId,
+    ...(source?.codexApiProvider ? { apiProvider: source.codexApiProvider } : {}),
   })
-  bindProcessCodexAccount(process, accountId)
+  if (!source?.codexApiProvider) bindProcessCodexAccount(process, accountId)
   return { process, sourceRevision }
 }

@@ -1,10 +1,12 @@
 import type { TokenSourceConfig } from './config'
 import { glmAnthropicBaseUrl } from './glm-models'
+import { packyApiRoot, packyManagementRoot, PACKY_BASE_URL } from './packy-api'
 
 type Configs = Record<string, TokenSourceConfig>
 const SHARED_ACCOUNTS = [
   { id: 'deepseek', other: 'deepseek-harness', base: 'https://api.deepseek.com/anthropic' },
   { id: 'glm', other: 'dsh-glm', base: 'https://open.bigmodel.cn/api/anthropic' },
+  { id: 'packy', other: 'packy-codex', base: 'https://cf.api.fan' },
 ] as const
 type SharedAccount = typeof SHARED_ACCOUNTS[number]
 
@@ -25,6 +27,7 @@ function credential(config: TokenSourceConfig): string | undefined {
 
 /** Canonical config retains the Claude endpoint; the Harness view derives its protocol endpoint. */
 function accountBase(group: SharedAccount, raw: string): string {
+  if (group.id === 'packy') return packyApiRoot(raw)
   const url = new URL(raw)
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
     throw new Error(`${group.id} 接口地址必须是无凭据、查询参数和 fragment 的 HTTP(S) 地址`)
@@ -70,9 +73,42 @@ export function sharedTokenSourceConfigs(configs: Configs, detected: Configs = {
     result[group.id] = { ...withoutCredentials(configs[group.id] ?? {}), base_url: base,
       ...(group.id === 'glm' ? { auth_token: key ?? '' } : { api_key: key ?? '' }) }
     result[group.other] = { ...withoutCredentials(configs[group.other] ?? {}), api_key: key ?? '',
-      base_url: group.id === 'glm' ? `${new URL(base).origin}/api/coding/paas/v4` : base.replace(/\/anthropic$/, '') }
+      base_url: group.id === 'glm' ? `${new URL(base).origin}/api/coding/paas/v4`
+        : group.id === 'deepseek' ? base.replace(/\/anthropic$/, '') : base }
   }
+  resolvePackyBilling(result)
   return result
+}
+
+/** 余额引用与模型 Key 共享分开解析，防止第二令牌被主令牌覆盖。 */
+function resolvePackyBilling(configs: Configs): void {
+  const ids = new Set(['packy', 'packy-secondary', 'packy-codex'])
+  const resolved = new Set<string>(), visiting = new Set<string>()
+  const hasAccount = (cfg: TokenSourceConfig) => !!(cfg.management_token?.trim()
+    || cfg.management_user_id?.trim() || cfg.management_url?.trim())
+  const resolve = (id: string): TokenSourceConfig => {
+    if (visiting.has(id)) throw new Error(`PackyAPI 余额账号引用循环：${id}`)
+    if (resolved.has(id)) return configs[id]!
+    visiting.add(id)
+    const cfg = configs[id] ?? {}
+    const explicit = cfg.billing_source?.trim()
+    const reference = explicit || (id === 'packy-codex' && !hasAccount(cfg) ? 'packy' : undefined)
+    if (reference) {
+      if (!ids.has(reference) || !configs[reference]) throw new Error(`PackyAPI 余额账号引用不存在：${reference}`)
+      if (explicit && hasAccount(cfg)) throw new Error(`PackyAPI ${id} 不能同时配置 billing_source 和独立余额凭据`)
+      const account = resolve(reference)
+      configs[id] = { ...cfg, ...(explicit || hasAccount(account) || account.billing_source ? {
+        billing_source: reference, management_token: account.management_token,
+        management_user_id: account.management_user_id,
+        // 从被引用的账号解析管理域名，绝不向引用者的推理域名发送系统令牌。
+        management_url: account.management_url || packyManagementRoot(account.base_url || PACKY_BASE_URL),
+      } : {}) }
+    }
+    visiting.delete(id)
+    resolved.add(id)
+    return configs[id] ?? cfg
+  }
+  for (const id of ids) if (configs[id]) resolve(id)
 }
 
 /** One atomic config edit stores a shared credential once, including edits via legacy setup aliases. */

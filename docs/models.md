@@ -14,6 +14,11 @@ GLM Key 可在首次安装时跳过，之后用群命令添加或更换。以下
 | Z.ai GLM（两个 Agent 共用） | `glm-setup https://api.z.ai/api/anthropic <api_key>` |
 | DeepSeek（两个 Agent 共用） | `deepseek-setup [base_url] <api_key>` |
 | OpenRouter | `openrouter-setup [base_url] <api_key>` |
+| PackyAPI 主令牌 | `packy-setup [base_url] <api_key>` |
+| PackyAPI 第二令牌 | `packy-secondary-setup [base_url] <api_key>` |
+| PackyAPI / Codex（复用主令牌） | `packy-codex-setup [base_url] <api_key>` |
+| PackyAPI 真实余额（主令牌与 Codex 共用） | `packy-balance-setup [management_url] <user_id> <system_token>` |
+| PackyAPI 第二令牌共用主账号余额 | `packy-secondary-balance-setup share packy` |
 | DeepSeek 旧命令，同样更新共享账号 | `deepseek-harness-setup [base_url] <api_key>` |
 | GLM 旧命令，同样更新共享账号 | `dsh-glm-setup [base_url] <api_key>` |
 
@@ -73,30 +78,65 @@ api_key = "填写自己的 OpenRouter API key"
 # slots = "haiku=moonshotai/kimi-k3" # 可选：辅助任务模型，须获账号目录确认且使用相同的 effort 参数模式
 ```
 
-内置默认列表包含以下 **12 项**，定义见[默认模型配置](../src/openrouter-defaults.ts)。这是项目提供的初始列表，可在面板中自行调整；其中 Claude 模型通过 OpenRouter 使用，与本机 Claude Code 订阅独立。
+内置默认列表保留以下 **5 项**，定义见[默认模型配置](../src/openrouter-defaults.ts)。MiMo 保留在 OpenRouter；这是项目提供的初始列表，可在面板中自行调整，其他兼容模型仍可从账号目录显示或补录。
 
 | 厂商 | 模型 ID | 默认档位 |
 | --- | --- | --- |
-| Anthropic | `anthropic/claude-fable-5.1` | max |
-| Anthropic | `anthropic/claude-opus-5` | max |
-| Moonshot | `moonshotai/kimi-k3` | max |
 | Tencent | `tencent/hy4-preview` | high |
-| Google | `google/gemini-3.8-flash` | high |
-| SpaceXAI | `x-ai/grok-4.5` | high |
-| Alibaba | `qwen/qwen3.8-max-0902` | xhigh |
 | Meta | `meta/muse-spark-1.2` | xhigh |
 | Xiaomi | `xiaomi/mimo-v2.5-pro` | 模型默认 |
-| MiniMax | `minimax/minimax-m3` | 模型默认 |
 | 字节跳动 | `bytedance-seed/seed-2-1-turbo` | 模型默认 |
 | 美团 | `meituan/longcat-2.0` | 模型默认 |
 
-在 `md` → Claude Code → OpenRouter 中，点「显示模型」进入账号目录，再点「显」加入列表，点「隐」移出面板列表。可见性自动保存，不改当前运行模型；全部隐藏后也能继续显示或补录。未配置 `models` 时才使用上述十二项；`models = ""` 表示没有已显示的接口模型，刷新或重启不会补回默认项。内置列表更新不会覆盖用户维护的列表。
+在 `md` → Claude Code → OpenRouter 中，点「显示模型」进入账号目录，再点「显」加入列表，点「隐」移出面板列表。可见性自动保存，不改当前运行模型；全部隐藏后也能继续显示或补录。未配置 `models` 时才使用上述五项；`models = ""` 表示没有已显示的接口模型，刷新或重启不会补回默认项。内置列表更新不会覆盖用户维护的列表。
 
 候选目录来自 `/api/v1/models/user`，按账号供应商和隐私设置筛选，仅纳入支持文本和工具调用的交互模型；OpenAI、GLM、DeepSeek 及无法保证厂商范围的自动路由不会出现在添加候选中。目录刷新失败显示 `MISS`。显式配置但已下线的模型保留为可删除的 `MISS` 项。
 
 effort 按上游声明提供。小米、MiniMax、字节等没有 effort 选择器的模型直接选用原生默认行为，跳过 effort 卡，实际请求不携带 effort 参数。两种参数模式之间切换时，空闲进程会保存原生会话并在下一轮用新环境恢复；相同模式下继续使用 SDK 热切换。未配置 `model` 时需要通过面板明确选择运行模型。
 
 OpenRouter 余额来自 `/api/v1/credits`，按 `total_credits - total_usage` 计算；接口权限和错误以实际响应为准。账号目录可见不代表所有工具和请求都能成功，上游拒绝或路由不可用会明确报错。兼容接口、模型与档位的处理见[后端说明](claude-agent-backend.md#openrouter)。
+
+## PackyAPI
+
+PackyAPI 提供三个来源入口：Claude Code 下的 `PackyAPI`、`PackyAPI · 令牌2`，以及 Codex 下的 `PackyAPI`。第二令牌独立保存；Codex 与主令牌共用一次存储的 Key 和平台地址，模型、effort、可见性分别维护。
+
+```toml
+[token_source.packy]
+api_key = "填写主令牌"
+base_url = "https://cf.api.fan"
+model = "MiniMax-M3"
+effort = "default"
+custom_models = "gemini-3.8-flash" # 当前令牌需支持该模型的 Messages 接口
+management_token = "填写个人设置中的系统访问令牌"
+management_user_id = "填写该账号用户 ID"
+management_url = "https://www.packyapi.ai"
+
+[token_source.packy-secondary]
+api_key = "填写第二令牌"
+model = "qwen3.8-max-0902"
+effort = "default"
+billing_source = "packy" # 仅当第二令牌也属于同一余额账号
+
+[token_source.packy-codex]
+model = "kimi-k3"
+effort = "medium"
+```
+
+目录由各令牌的 `GET /v1/models` 实时返回，保留原始大小写。Claude Code 默认列声明 `anthropic` 的模型，Codex 默认列声明 `openai-response` 的模型。目录声明可能不完整：确认某个模型实际兼容后，可以通过补录或 `custom_models` 显式启用；条目仍标记为补录项，不改写上游协议声明。隐藏/显示、补录/删除与其他来源一致；目录失败显示 MISS，不更换令牌或模型。
+
+有推理档位声明时沿用声明。目录只给模型 ID 和协议、未声明推理档位时，面板提供 Agent 的请求选项：Claude Code 默认 `default`（不发送 effort），Codex 默认请求 `medium`；这些请求选项不保证所有上游模型接受，拒绝会如实报错。`effort` 可覆盖本来源默认请求档位。
+
+Claude Code 使用官方 SDK 和 `/v1/messages`，辅助角色也使用当前令牌与所选模型，保留项目 MCP、Skill 和原生 resume。Codex 使用独立 Responses provider 和进程环境变量注入 Key；不要求 ChatGPT 登录，不参与 Codex 订阅自动选号、重置卡或订阅额度查询，也不加载需要订阅认证的 ChatGPT 连接器。模型目录由 Lodestar 直接读取；上游 Codex 自身的模型元数据刷新若遇到 New API 的 `data` / `models` 格式差异，仍保留原始诊断，不伪造原生元数据。
+
+Gemini 3.8 Flash 使用 Claude Code 原生重试：请求超时 `API_TIMEOUT_MS=60000`、字节流空闲超时 `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=45000`、请求重试预算 `CLAUDE_CODE_MAX_RETRIES=2`，关闭无限重试看门狗。该策略只在选择 Gemini 3.8 Flash 为 Claude 主模型时注入；切换请求策略会替换空闲进程并保留原生会话。宿主不重放整轮用户输入或已完成的工具，不更换 Key、模型或来源；SDK 判定的最终失败仍会显示。
+
+官方推理入口为 `https://cf.api.fan`，管理入口为 `https://www.packyapi.ai`。真实余额使用系统访问令牌及 `New-Api-User` 用户 ID 请求 `/api/user/self`，读取账户剩余 `quota`，按 `/api/status` 声明的 `quota_per_unit` 换算 USD。`hi` 与回复页脚显示同一余额；不会使用 API Key 的令牌配额或无限额度占位值代替。
+
+系统访问令牌与模型 Key 分开保存，余额凭据不传入 Agent。`packy-codex` 自动共用主来源的余额；第二令牌只有显式设置 `billing_source = "packy"` 才共用。此引用只复用余额凭据，第二个模型 Key 保持独立，同一余额账号在 `hi` 中只列一行。第二令牌属于其他账号时，用 `packy-secondary-balance-setup [management_url] <user_id> <system_token>` 配置独立余额。模型与余额配置命令均先调用上游验证，失败不覆盖已有配置。
+
+同一余额凭据跨 Agent、模型 Key 共享 60 秒惰性缓存与并发查询；刷新失败显示 MISS，遵守失败冷却和 Retry-After，不展示旧成功余额或改查令牌配额。余额配置更新不改变 Agent 的启动身份。自建地址未指定 `management_url` 时按自己的 API 根地址查询管理接口，系统令牌请求拒绝重定向。引用其他余额来源时使用被引用来源的管理地址。
+
+未配置系统访问令牌时，只能通过 `/api/usage/token/` 查询令牌配额：有限令牌显示“额度”，无限令牌显示 `余额 —`。这不代表真实账户余额。
 
 ## DeepSeek Harness
 

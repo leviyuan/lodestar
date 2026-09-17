@@ -105,3 +105,36 @@ test('shared DeepSeek and GLM configuration makes both Agents read the same quot
     assert.equal(requests.length, 3)
   `)
 })
+
+test('Packy model tokens and both Agents use one wallet row and identical real balance footers', () => {
+  isolated(`
+    import assert from 'node:assert/strict'
+    const registry = await import('./src/token-source')
+    await import('./src/token-source-packy')
+    const { sharedTokenSourceConfigs } = await import('./src/token-source-accounts')
+    const { unifiedUsageSummary } = await import('./src/cards/console')
+    const { compactAccountUsage } = await import('./src/cards/account-usage')
+    const cfg = sharedTokenSourceConfigs({
+      packy: { api_key: 'model-one', management_token: 'system-account', management_user_id: '123' },
+      'packy-secondary': { api_key: 'model-two', billing_source: 'packy' },
+    })
+    registry.resetTokenSourceRegistry()
+    for (const id of ['packy', 'packy-secondary', 'packy-codex']) {
+      registry.registerTokenSource(registry.tokenSourceFactories().find(def => def.kind === id).build(cfg[id]))
+    }
+    const requests = []
+    globalThis.fetch = async (url, init) => {
+      requests.push(String(url))
+      if (String(url).endsWith('/api/status')) return Response.json({ success: true, data: { quota_per_unit: 500000, quota_display_type: 'USD' } })
+      assert.equal(new Headers(init.headers).get('authorization'), 'Bearer system-account')
+      return Response.json({ success: true, data: { id: 123, quota: 49834851 } })
+    }
+    const { readAllAccountUsage } = await import('./src/account-usage')
+    const [rows, ...footers] = await Promise.all([readAllAccountUsage(), ...registry.listTokenSources().map(source => source.readUsage())])
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].label, 'PackyAPI')
+    assert.equal(compactAccountUsage(rows[0].usage), '余额 $ 99.67')
+    assert.ok(footers.every(usage => unifiedUsageSummary(usage) === '余额 $99.67'))
+    assert.equal(requests.length, 2)
+  `)
+})

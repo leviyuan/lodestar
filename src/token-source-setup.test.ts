@@ -167,3 +167,65 @@ test('Claude subscription commands persist a global switch and report auth and s
   })
   expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
 })
+
+test('Packy balance setup validates fresh, keeps model keys, supports sharing and redacts failures', () => {
+  const script = `
+    import assert from 'node:assert/strict'
+    import { readFileSync } from 'node:fs'
+    const { sentTexts } = await import('./src/feishu-test-mock')
+    const { config, loadConfig } = await import('./src/config')
+    const { CONFIG_FILE } = await import('./src/paths')
+    const registry = await import('./src/token-source')
+    await import('./src/token-source-builtins')
+    for (const factory of registry.tokenSourceFactories()) {
+      const build = factory.build.bind(factory)
+      factory.build = (...args) => {
+        const source = build(...args)
+        source.refreshModels = async () => { source.modelCatalogState = { status: 'ready', updatedAt: 0 } }
+        return source
+      }
+    }
+    const { saveTokenSourceConfigs } = await import('./src/token-source-config')
+    saveTokenSourceConfigs({ packy: { api_key: 'model-one' }, 'packy-secondary': { api_key: 'model-two' } })
+    const { runCommand } = await import('./src/session-commands')
+    const session = { chatId: 'balance-test' }
+    let valid = true, reads = 0
+    const secret = 'private/system+test=='
+    globalThis.fetch = async (url, init) => {
+      if (String(url).endsWith('/api/status')) return Response.json({ data: { quota_per_unit: 500000, quota_display_type: 'USD' } })
+      reads++
+      assert.equal(new Headers(init.headers).get('new-api-user'), '123')
+      assert.equal(new Headers(init.headers).get('authorization'), 'Bearer ' + secret)
+      if (!valid) return Response.json({ message: 'denied ' + secret }, { status: 403 })
+      return Response.json({ success: true, data: { id: 123, quota: 50000000 } })
+    }
+    assert.equal(await runCommand(session, 'packy-balance-setup 123 ' + secret), true)
+    assert.match(sentTexts.at(-1), /真实余额校验通过，配置已保存/)
+    assert.equal(loadConfig().token_sources.packy.management_token, secret)
+    await runCommand(session, 'packy-secondary-balance-setup share packy')
+    assert.match(sentTexts.at(-1), /真实余额校验通过，配置已保存/)
+    const saved = loadConfig().token_sources
+    assert.equal(saved.packy.api_key, 'model-one')
+    assert.equal(saved['packy-secondary'].api_key, 'model-two')
+    assert.equal(saved['packy-secondary'].billing_source, 'packy')
+    assert.equal(saved['packy-secondary'].management_token, '')
+    assert.equal(readFileSync(CONFIG_FILE, 'utf8').split(secret).length - 1, 1)
+    assert.equal(reads, 2)
+    valid = false
+    const before = readFileSync(CONFIG_FILE, 'utf8')
+    await runCommand(session, 'packy-balance-setup 123 ' + secret)
+    assert.match(sentTexts.at(-1), /未保存.*403/)
+    assert.ok(!sentTexts.at(-1).includes(secret))
+    assert.equal(readFileSync(CONFIG_FILE, 'utf8'), before)
+    assert.equal(reads, 3)
+    await runCommand(session, 'packy-balance-setup share packy-secondary')
+    assert.match(sentTexts.at(-1), /未保存.*循环/)
+    assert.equal(readFileSync(CONFIG_FILE, 'utf8'), before)
+    assert.equal(reads, 3)
+    assert.equal(config.token_sources.packy.api_key, 'model-one')
+  `
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+    cwd: process.cwd(), stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: 20_000,
+  })
+  expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+})

@@ -3,6 +3,43 @@ import { createAgentProcess } from './agent-launch'
 import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, tokenSourceFactories, type TokenSource } from './token-source'
 import './token-source-openrouter'
 
+test('API Codex launch does not consult or bind a subscription account', () => {
+  const script = `
+    import { mock } from 'bun:test'
+    import { EventEmitter } from 'node:events'
+    import assert from 'node:assert/strict'
+    let child, captured
+    const spawn = (bin, args, options) => {
+      captured = { args, options }
+      child = new EventEmitter()
+      child.stdin = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter()
+      child.stdin.write = () => true
+      return child
+    }
+    mock.module('cross-spawn', () => ({ default: spawn, spawn }))
+    const { registerTokenSource } = await import('./src/token-source')
+    const { createAgentProcess } = await import('./src/agent-launch')
+    const { codexAccountInUse } = await import('./src/codex-accounts')
+    registerTokenSource({ id: 'api-test', kind: 'api-test', agent: 'codex', enabled: true,
+      models: [{ model: 'kimi-k3', display: 'Kimi', efforts: ['high'], defaultEffort: 'high' }],
+      defaultModel: 'kimi-k3', modelCatalogState: { status: 'ready', updatedAt: 1 },
+      codexApiProvider: { id: 'packy', name: 'Packy', baseUrl: 'https://gateway.test/v1', envKey: 'TEST_PACKY_KEY' },
+      spawnEnv: env => ({ ...env, TEST_PACKY_KEY: 'private-test-key' }), resolveSpawnModel: model => model })
+    const { process: proc } = createAgentProcess({ provider: 'codex', tokenSourceId: 'api-test', workDir: '/repo',
+      model: 'kimi-k3', effort: 'high', codexAccountId: 'nonexistent-subscription-account' })
+    assert.ok(captured.args.includes('model_provider="packy"'))
+    assert.ok(!captured.args.join(' ').includes('private-test-key'))
+    assert.ok(!captured.args.join(' ').includes('forced_login_method'))
+    assert.equal(captured.options.env.TEST_PACKY_KEY, 'private-test-key')
+    assert.equal(codexAccountInUse('nonexistent-subscription-account'), false)
+    child.emit('exit', 0, null); child.emit('close', 0, null)
+  `
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+    cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+  })
+  expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+})
+
 test('manual Codex launch bypasses failed catalogs and model restrictions while automatic launch still rejects them', () => {
   const script = `
     import { mock } from 'bun:test'

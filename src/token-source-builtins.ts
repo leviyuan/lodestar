@@ -19,6 +19,7 @@ import './token-source-native'
 import './token-source-claude'
 import './token-source-deepseek'
 import './token-source-openrouter'
+import './token-source-packy'
 import './token-source-dsh'
 import './token-source-dsh-glm'
 

@@ -159,7 +159,7 @@ describe('OpenRouter authoritative model catalog', () => {
     expect(source.models[0].model).toBe('anthropic/test-model[1m]')
   })
 
-  test('includes Fable and Opus alongside the ranked labs, ByteDance and Meituan in the defaults', async () => {
+  test('keeps MiMo on OpenRouter and routes Gemini through Packy in the five-model defaults', async () => {
     respond = () => json({ data: OPENROUTER_DEFAULT_MODELS.map(entry => model(entry.model, {
       reasoning: entry.effort === 'default' ? { mandatory: false }
         : { supported_efforts: [entry.effort, 'low'], default_effort: 'low' },
@@ -168,15 +168,9 @@ describe('OpenRouter authoritative model catalog', () => {
     await source.refreshModels()
     expect(source.models.map(entry => entry.model)).toEqual(OPENROUTER_DEFAULT_MODELS.map(entry => entry.model))
     expect(source.models.map(entry => entry.defaultEffort)).toEqual(OPENROUTER_DEFAULT_MODELS.map(entry => entry.effort))
-    expect(OPENROUTER_DEFAULT_MODELS.filter(entry => entry.rank).map(entry => entry.rank)).toEqual([1, 3, 4, 7, 8, 9, 10, 11, 12])
-    expect(OPENROUTER_DEFAULT_MODELS.filter(entry => !entry.rank).map(entry => entry.lab)).toEqual(['Anthropic', 'ByteDance', 'Meituan'])
-    expect(source.models).toHaveLength(12)
-    expect(new Set(OPENROUTER_DEFAULT_MODELS.map(entry => entry.lab)).size).toBe(11)
-    expect(source.models.filter(entry => entry.model.startsWith('anthropic/')).map(entry => ({
-      model: entry.model, defaultEffort: entry.defaultEffort,
-    }))).toEqual([
-      { model: 'anthropic/claude-fable-5.1', defaultEffort: 'max' },
-      { model: 'anthropic/claude-opus-5', defaultEffort: 'max' },
+    expect(source.models.map(entry => entry.model)).toEqual([
+      'tencent/hy4-preview', 'meta/muse-spark-1.2',
+      'xiaomi/mimo-v2.5-pro', 'bytedance-seed/seed-2-1-turbo', 'meituan/longcat-2.0',
     ])
     expect(source.models.every(entry => !openRouterModelExcluded(entry.model))).toBe(true)
   })
@@ -206,13 +200,13 @@ describe('OpenRouter authoritative model catalog', () => {
   })
 
   test('an unavailable preset effort stays MISS instead of silently selecting another effort', async () => {
-    respond = () => json({ data: [model('moonshotai/kimi-k3', {
-      reasoning: { supported_efforts: ['high', 'low'], default_effort: 'high' },
+    respond = () => json({ data: [model('tencent/hy4-preview', {
+      reasoning: { supported_efforts: ['medium', 'low'], default_effort: 'low' },
     })] })
-    const source = build({ models: 'moonshotai/kimi-k3' })
+    const source = build({ models: 'tencent/hy4-preview' })
     await source.refreshModels()
     expect(source.models[0].defaultEffort).toBeNull()
-    expect(source.models[0].efforts).toEqual(['high', 'low'])
+    expect(source.models[0].efforts).toEqual(['medium', 'low'])
   })
 
   test('does not keep stale or configured models when refresh fails, including malformed successes', async () => {

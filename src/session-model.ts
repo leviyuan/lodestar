@@ -65,7 +65,7 @@ export async function finishModelSettingsChange(
   let error: string | null = outcome.ok ? null : messageOf(outcome.error)
   if (outcome.ok) {
     try {
-      if (s.modelSelectionNeedsProcessStop(change.provider, change.sourceId ?? s.selectedTokenSourceId, change.model)) {
+      if (s.modelSelectionNeedsProcessStop(change.provider, change.sourceId ?? s.selectedTokenSourceId, change.model, change.effort)) {
         throw new Error('等待期间进程账号配置已变化，请 stop 后重新选择')
       }
       await s.applyModelSelectionUnlocked(change.provider, change.model, change.effort, change.sourceId)
@@ -586,7 +586,7 @@ export async function onModelEffortSelect(
   const sourceChanged = !!choice.sourceId && s.currentTokenSource()?.id !== choice.sourceId
   const environmentChanged = !s.processSourceMatches(source, model) || !!source?.modelEnvironmentRevision
     && source.modelEnvironmentRevision(s.currentModelLabel() ?? '') !== source.modelEnvironmentRevision(model)
-  const processNeedsStop = s.modelSelectionNeedsProcessStop(provider, choice.sourceId ?? s.selectedTokenSourceId, model)
+  const processNeedsStop = s.modelSelectionNeedsProcessStop(provider, choice.sourceId ?? s.selectedTokenSourceId, model, effort)
   const selectionUnchanged = s.currentProvider() === provider &&
     !sourceChanged &&
     s.currentModelLabel() === model &&

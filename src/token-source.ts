@@ -6,6 +6,7 @@
 import type { AgentProvider, AgentReasoningEffort } from './agent-process'
 import type { TokenSourceConfig } from './config'
 import type { AccountInfo, Settings } from '@anthropic-ai/claude-agent-sdk'
+import type { CodexApiProvider } from './codex-process'
 import { log } from './log'
 
 export type TokenSourceAgent = AgentProvider
@@ -80,6 +81,7 @@ export const ANTHROPIC_ENV_KEYS = [
 export function scrubAnthropicEnv(base: Env): Env {
   const out: Env = { ...base }
   for (const k of ANTHROPIC_ENV_KEYS) delete out[k]
+  delete out.LODESTAR_PACKY_API_KEY
   return out
 }
 
@@ -132,8 +134,12 @@ export interface TokenSource {
   settingSources?: readonly string[]
   /** Claude 来源的进程级设置覆盖；不修改本机 settings 文件。 */
   claudeSettings?: Settings
+  /** Custom Responses provider; subscription account selection/usage do not apply. */
+  codexApiProvider?: CodexApiProvider
   /** 在 Claude SDK 接收用户输入前确认实际认证来源。 */
   validateClaudeAccount?(account: AccountInfo): void
+  /** 同一真实计费账号的 Agent / 模型 Key 只占 hi 中一行。 */
+  usageAccount?: { id: string; label: string }
   readUsage(): Promise<UsageSnapshotUnified>
 }
 
@@ -182,6 +188,8 @@ export interface TokenSourceFactoryDef {
   build: (cfg: TokenSourceConfig, detected?: Partial<TokenSourceConfig> | null) => TokenSource
   /** 飞书 setup 命令接入(可选;codex login / native 无独立 setup)。 */
   setup?: TokenSourceSetup
+  /** 独立的余额凭据配置，校验通过后才保存；不改变推理凭据。 */
+  usageSetup?: TokenSourceSetup
   /** 本机 settings.json 探测(可选;codex / native 无)—— 命中 host 则自动启用。 */
   detect?: TokenSourceDetection
 }
