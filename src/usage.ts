@@ -120,7 +120,7 @@ export function consumeCodexResetCredit(
       let usage: UsageSnapshot
       try {
         usage = await usageReads.read(accountId, async () => snapshotFromReadResponse(
-          await withTimeout(app.request('account/rateLimits/read', {}), API_TIMEOUT_MS), account.planType))
+          await requestCodexQuotaWithRetry(() => app.request('account/rateLimits/read', {})), account.planType))
       } catch (error) {
         usage = { state: 'network', reason: error instanceof Error ? error.message : String(error) }
       }
@@ -397,7 +397,7 @@ async function fetchUsage(accountId: string): Promise<UsageSnapshot> {
     if (!account) return { state: 'no_credentials' }
     if (account.type !== 'chatgpt') return { state: 'auth_failed' }
 
-    const limitsRes = await app.request('account/rateLimits/read', {})
+    const limitsRes = await requestCodexQuotaWithRetry(() => app.request('account/rateLimits/read', {}))
     return snapshotFromReadResponse(limitsRes, account.planType)
   } catch (e: any) {
     log(`usage: codex app-server usage failed: ${e?.message ?? e}`)
@@ -482,7 +482,7 @@ export function refreshUsageFromConnection(request: (method: string, params: any
   const generation = usageGenerations.get(accountId) ?? 0
   return usageReads.read(accountId, async () => {
     try {
-      const snap = snapshotFromReadResponse(await withTimeout(request('account/rateLimits/read', {}), API_TIMEOUT_MS))
+      const snap = snapshotFromReadResponse(await requestCodexQuotaWithRetry(() => request('account/rateLimits/read', {})))
       if (snap.state !== 'ok') log(`usage: refresh from connection: ${snap.state === 'network' ? snap.reason : snap.state}`)
       return snap
     } catch (error) {
@@ -519,14 +519,20 @@ function isUsageAuthError(error: unknown): boolean {
   return /\b(?:401|403)\b|unauthori[sz]ed|not authenticated|authentication (?:failed|required)|not logged in/i.test(message)
 }
 
+function requestCodexQuotaWithRetry<T>(request: () => Promise<T>): Promise<T> {
+  return requestCodexControlWithRetry(request, '额度查询', { retryRateLimits: false })
+}
+
 /** 网络抖动重试同一个 Codex 控制请求；仅供只读或带幂等标识的操作。 */
-export async function requestCodexControlWithRetry<T>(request: () => Promise<T>, operation = '额度查询'): Promise<T> {
+export async function requestCodexControlWithRetry<T>(request: () => Promise<T>, operation = '额度查询',
+  options: { retryRateLimits?: boolean } = {}): Promise<T> {
   const delays = [1000, 4000]
   for (let attempt = 0; ; attempt++) {
     try { return await withTimeout(request(), API_TIMEOUT_MS) }
     catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       if (isUsageAuthError(error)) throw error
+      if (options.retryRateLimits === false && isUsageRateLimitError(error)) throw error
       const transient = /error sending request|timed? ?out|timeout|ECONNRESET|ETIMEDOUT|EAI_AGAIN|connection (?:reset|closed)|\b(?:429|502|503|504)\b/i.test(message)
       if (!transient) throw error
       if (attempt >= delays.length) throw new Error(`Codex ${operation}失败（已尝试 ${attempt + 1} 次）：${message}`, { cause: error })

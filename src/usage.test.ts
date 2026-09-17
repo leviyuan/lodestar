@@ -73,6 +73,24 @@ describe('quota account isolation', () => {
 })
 
 describe('quota transient failures', () => {
+  test('a transient quota connection failure retries within the shared read before entering cooldown', async () => {
+    const account = 'quota-transient-recovery'
+    let calls = 0
+    const request = async () => {
+      if (++calls === 1) throw new Error('failed to fetch codex rate limits: error sending request for url (https://chatgpt.com/backend-api/wham/usage)')
+      return { rateLimits: { planType: 'pro', primary: { usedPercent: 19, windowDurationMins: 10080, resetsAt: 1_900_000_000 } } }
+    }
+    const pending = refreshUsageFromConnection(request, account)
+    const shared = readUsage(account)
+    const result = await pending
+    if (result?.state !== 'ok') throw new Error('expected successful quota recovery')
+    expect(result).toMatchObject({ state: 'ok', weekly: { percent: 19 } })
+    expect(await shared).toBe(result)
+    expect(calls).toBe(2)
+    expect(peekSuccessfulUsage(account)).toBe(result)
+    invalidateCodexUsage(account)
+  })
+
   test('connection refresh and standalone reads share one request and a one-minute cooldown', async () => {
     let calls = 0
     let offline = true
@@ -106,10 +124,12 @@ describe('quota transient failures', () => {
     let calls = 0
     quotaNow += 60_000
     const snapshot = await refreshUsageFromConnection(async () => { calls++; throw new Error('error sending request') }, account)
-    expect(calls).toBe(1)
+    expect(calls).toBe(3)
     expect(snapshot).toBeNull()
     expect(peekUsage(account)).toBeNull()
     expect(cached).toBe(peekSuccessfulUsage(account))
+    expect((await readUsage(account)).state).toBe('network')
+    expect(calls).toBe(3)
     invalidateCodexUsage(account)
   }, 10_000)
 

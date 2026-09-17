@@ -49,16 +49,14 @@ export type GlmUsageSnapshot =
       state: 'ok'
       /** 套餐档位(open.bigmodel.cn 的 level 字段:max / standard / …) */
       level?: string
-      /** 5 小时 token 滚动窗口(TOKENS_LIMIT unit=3 number=5) */
+      /** 5 小时滚动窗口(TOKENS_LIMIT / CREDIT_LIMIT unit=3 number=5) */
       fiveHour: GlmUsageWindow | null
-      /** 周额度窗口(TOKENS_LIMIT unit=6 number=1);无周限额套餐为 null */
+      /** 周额度窗口(TOKENS_LIMIT / CREDIT_LIMIT unit=6 number=1);无周限额套餐为 null */
       weekly: GlmUsageWindow | null
       /** 月度工具/MCP 用量(TIME_LIMIT) */
       monthly: GlmMonthlyWindow | null
       fetchedAt: number
     }
-
-type GlmUsageSnapshotOk = Extract<GlmUsageSnapshot, { state: 'ok' }>
 
 const usageReads = new UsageReadCache<GlmUsageSnapshot>()
 
@@ -121,14 +119,15 @@ function resetDate(ms: unknown): Date | null {
   return typeof ms === 'number' && isFinite(ms) && ms > 0 ? new Date(ms) : null
 }
 
-/** 解析 quota/limit 响应 → ok 快照;limits 缺字段按 null(MISS)渲染。
- * TOKENS_LIMIT 有两条:5h 窗口(unit=3 number=5)和周窗口(unit=6 number=1)
+/** 解析 quota/limit 响应；窗口中的缺失数值按 null(MISS)渲染。
+ * TOKENS_LIMIT / CREDIT_LIMIT 的 5h 窗口(unit=3 number=5)和周窗口(unit=6 number=1)
  * —— 靠 unit/number 区分,不能只 find 第一条(有周限额的账号会丢窗口或错配;
  * 无周限额的账号响应里只有 5h 那条,weekly 落 null)。字段语义来自
  * opencode-glm-quota / pi-glm-usage 对同一 API 的解析,2026-08-17 核实。 */
-function parseQuotaLimit(data: any): GlmUsageSnapshotOk {
-  const limits: any[] = Array.isArray(data?.limits) ? data.limits : []
-  const tokens = limits.filter(l => l?.type === 'TOKENS_LIMIT')
+function parseQuotaLimit(data: any): GlmUsageSnapshot {
+  const limits: any[] | undefined = Array.isArray(data) ? data : Array.isArray(data?.limits) ? data.limits : undefined
+  if (!limits) return { state: 'network', reason: 'GLM 额度响应缺少 limits 数组' }
+  const tokens = limits.filter(l => l?.type === 'TOKENS_LIMIT' || l?.type === 'CREDIT_LIMIT')
   const fiveHourLimit = tokens.find(l => l?.unit === 3 && l?.number === 5)
   const weeklyLimit = tokens.find(l => l?.unit === 6 && l?.number === 1)
   const time = limits.find(l => l?.type === 'TIME_LIMIT')
@@ -144,6 +143,7 @@ function parseQuotaLimit(data: any): GlmUsageSnapshotOk {
         ...(typeof time.usage === 'number' ? { total: time.usage } : {}),
       }
     : null
+  if (!fiveHour && !weekly && !monthly) return { state: 'network', reason: 'GLM 额度响应没有可识别的额度窗口' }
   return {
     state: 'ok',
     level: typeof data?.level === 'string' && data.level ? data.level : undefined,
@@ -187,13 +187,18 @@ async function requestGlmUsage(domain: string, token: string): Promise<GlmUsageS
         retryAfterMs: usageRetryAfter(res.headers) }
     }
     const json = await res.json()
-    if (json?.success === false || (typeof json?.code === 'number' && json.code !== 200)) {
-      const reason = (json?.msg ? String(json.msg) : `code ${json?.code}`).replaceAll(token, '[redacted]')
+    const code = json?.error?.code ?? json?.code
+    if (json?.success === false || json?.error != null || (code !== undefined && String(code) !== '200')) {
+      const message = json?.error?.message ?? json?.msg ?? json?.message ?? (typeof json?.error === 'string' ? json.error : undefined)
+      const reason = [code === undefined ? '' : `code ${code}`, message === undefined ? '' : String(message)]
+        .filter(Boolean).join(': ').replaceAll(token, '[redacted]') || 'GLM 额度接口返回失败'
       log(`glm-usage: quota/limit MISS: ${reason}`)
-      return { state: json?.code === 429 ? 'rate_limited' : 'network', reason, retryAfterMs: usageRetryAfter(res.headers) }
+      return { state: String(code) === '429' ? 'rate_limited' : 'network', reason, retryAfterMs: usageRetryAfter(res.headers) }
     }
     const data = json?.data ?? json
-    return parseQuotaLimit(data)
+    const snapshot = parseQuotaLimit(data)
+    if (snapshot.state === 'network') log(`glm-usage: quota/limit MISS: ${snapshot.reason}`)
+    return snapshot
   } catch (e: any) {
     const reason = (e?.name === 'AbortError' ? `timeout ${API_TIMEOUT_MS}ms` : (e?.message ?? String(e))).replaceAll(token, '[redacted]')
     log(`glm-usage: quota/limit fetch failed: ${reason}`)
