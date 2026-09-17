@@ -1,9 +1,14 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { consoleUnifiedUsageContent, consoleUsageElement, unifiedUsageSummary } from './console'
 import { codexUsageToUnified } from '../token-source-codex'
 import { snapshotFromReadResponse } from '../usage'
 
 describe('compact hi account quota panel', () => {
+  let clock: ReturnType<typeof spyOn>
+  // Fixtures and countdown formatting must observe the same hour/day boundary.
+  beforeEach(() => { clock = spyOn(Date, 'now').mockReturnValue(1_900_000_000_000) })
+  afterEach(() => { clock.mockRestore() })
+
   test('one account occupies one row and includes main windows plus reset credits', () => {
     const usage = { state: 'ok' as const, resetCredits: 0, windows: [
       { kind: 'fiveHour', label: '5h 窗口', percent: 11, resetsAt: new Date(Date.now() + 3600_000) },
