@@ -17,12 +17,7 @@ export function worktreeProjectDir(s: Session): string {
 }
 
 export function worktreeSessionDir(s: Session): string {
-  const sessionName = feishu.tempProjectName(s.sessionName) ?? s.sessionName
-  const projectName = worktreeProjectName(s)
-  const projectDir = feishu.resolveProjectDir(projectName)
-  if (projectName === sessionName) return projectDir
-  const slug = sessionName.slice(projectName.length + 1, -1)
-  return worktree.expectedWorktreePath(projectDir, projectName, slug)
+  return feishu.resolveProjectDir(s.sessionName)
 }
 
 export function spawnDeveloperInstructions(s: Session, mode: FileDeliveryMode, provider: AgentProvider = s.currentProvider()): string {

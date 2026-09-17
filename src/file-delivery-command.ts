@@ -11,21 +11,21 @@ export interface FileDeliveryCommandDeps {
 
 export async function runFileDeliveryCommand(
   chatId: string, groupName: string, managerOpenId: string, argument: string, deps: FileDeliveryCommandDeps,
+  workDir: string,
 ): Promise<void> {
   let settings: GroupFileDeliverySettings | undefined
   let notice = ''
   let error = ''
   try {
-    settings = deps.get(chatId)
     switch (argument.trim().toLowerCase()) {
-      case '': case 'status': break
+      case '': case 'status': settings = deps.get(chatId); break
       case 'on':
         settings = await deps.enable(chatId, managerOpenId)
-        notice = '已开启本群云空间交付；之后新开始的交付使用此模式。'
+        notice = '已开启此工作目录的云空间交付；同目录各群从下一轮任务生效。'
         break
       case 'off':
         settings = await deps.disable(chatId)
-        notice = '已恢复直接发送聊天附件；云空间中的历史文件保留。'
+        notice = '此工作目录已恢复直接发送聊天附件；同目录各群从下一轮任务生效，云空间中的历史文件保留。'
         break
       default: throw new Error('用法：files、files on、files off')
     }
@@ -33,6 +33,6 @@ export async function runFileDeliveryCommand(
     error = cause instanceof Error ? cause.message : String(cause)
     try { settings = deps.get(chatId) } catch { settings = undefined }
   }
-  const card = fileDeliverySettingsCard({ groupName, settings, notice, error })
+  const card = fileDeliverySettingsCard({ groupName, workDir, settings, notice, error })
   if (!await deps.sendCard(card)) await deps.reportError(`❌ 文件交付设置卡发送失败${error ? `：${error}` : ''}`)
 }

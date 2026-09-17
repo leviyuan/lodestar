@@ -88,7 +88,7 @@ export const ALIVE_MARKER_FILE = join(DATA_DIR, 'alive-on-shutdown.json')
 export const INBOX_DIR = join(DATA_DIR, 'inbox')
 /** One private receipt per cloud-file delivery; remote files are managed in their Feishu folder. */
 export const FILE_DELIVERIES_DIR = join(DATA_DIR, 'file-deliveries')
-/** Per-chat opt-in and stable group Drive folder binding. Native chat attachments are the default. */
+/** Workspace delivery preferences and per-chat Drive folder bindings; v1 chat preferences migrate on access. */
 export const FILE_DELIVERY_GROUPS_FILE = join(DATA_DIR, 'file-delivery-groups.json')
 /** Unix-socket endpoint the daemon listens on for debug message
  * injection (see scripts/test-inject.ts). A real Feishu user sends

@@ -1,8 +1,22 @@
 import type { DeliveryFolder, FileDeliveryContext, FileDeliveryMode, GroupDeliveryFolder, GroupFileDeliverySettings } from './file-delivery-types'
+import { workspaceKey } from './workspace'
+
+interface GroupFolderBinding {
+  folder?: GroupDeliveryFolder
+  /** Unmigrated v1 preferences whose chat may no longer have a local name binding. */
+  legacyEnabled?: boolean
+}
+
+export interface FileDeliverySettingsState {
+  version: 2
+  workspaces: Record<string, { enabled: boolean }>
+  groups: Record<string, GroupFolderBinding>
+}
 
 export interface GroupFileDeliveryDeps {
   read(): string | undefined
-  write(value: { version: 1; groups: Record<string, GroupFileDeliverySettings> }): void
+  write(value: FileDeliverySettingsState): void
+  workDirForChat(chatId: string): string | undefined
   getChatName(chatId: string, signal?: AbortSignal): Promise<string>
   createFolder(name: string, signal?: AbortSignal): Promise<DeliveryFolder>
   getFolder(folder: DeliveryFolder, signal?: AbortSignal): Promise<GroupDeliveryFolder>
@@ -10,48 +24,62 @@ export interface GroupFileDeliveryDeps {
   grantFolderAccess(folder: DeliveryFolder, chatId: string, managerOpenId: string, signal?: AbortSignal): Promise<void>
 }
 
-/** Settings and folder identity are keyed by chat_id, independent of Session/thread lifetimes. */
+/** Preferences belong to a working directory. Remote folders and access remain per chat. */
 export class GroupFileDelivery {
-  private groups?: Map<string, GroupFileDeliverySettings>
+  private state?: FileDeliverySettingsState
   private readonly locks = new Map<string, Promise<void>>()
 
   constructor(private readonly deps: GroupFileDeliveryDeps) {}
 
-  get(chatId: string): GroupFileDeliverySettings {
-    return structuredClone(this.load().get(chatId) ?? { enabled: false })
+  get(chatId: string, workDir: string): GroupFileDeliverySettings {
+    const key = workspaceKey(workDir)
+    const state = this.load()
+    let enabled = state.workspaces[key]?.enabled
+    if (enabled === undefined) {
+      const values = new Set(this.legacyChats(chatId, key).map(id => state.groups[id].legacyEnabled!))
+      if (values.size > 1) throw new Error('同一工作目录的旧群文件交付设置冲突，请发送 files on 或 files off 统一设置')
+      if (values.size) {
+        enabled = values.values().next().value!
+        this.commitMode(chatId, key, enabled)
+      }
+    }
+    const folder = this.load().groups[chatId]?.folder
+    return { enabled: enabled ?? false, ...(folder ? { folder: structuredClone(folder) } : {}) }
   }
 
-  mode(chatId: string): FileDeliveryMode { return this.get(chatId).enabled ? 'drive' : 'chat' }
+  mode(chatId: string, workDir: string): FileDeliveryMode { return this.get(chatId, workDir).enabled ? 'drive' : 'chat' }
 
-  enable(chatId: string, managerOpenId: string): Promise<GroupFileDeliverySettings> {
-    return this.exclusive(chatId, async () => {
-      const folder = await this.prepare(chatId, managerOpenId, true)
-      this.commit(chatId, { enabled: true, folder })
-      return this.get(chatId)
+  enable(chatId: string, workDir: string, managerOpenId: string): Promise<GroupFileDeliverySettings> {
+    const key = workspaceKey(workDir)
+    return this.exclusive(`workspace:${key}`, () => this.exclusive(`chat:${chatId}`, async () => {
+      await this.prepare(chatId, managerOpenId, true)
+      this.commitMode(chatId, key, true)
+      return this.get(chatId, workDir)
+    }))
+  }
+
+  disable(chatId: string, workDir: string): Promise<GroupFileDeliverySettings> {
+    const key = workspaceKey(workDir)
+    return this.exclusive(`workspace:${key}`, async () => {
+      this.commitMode(chatId, key, false)
+      return this.get(chatId, workDir)
     })
   }
 
-  disable(chatId: string): Promise<GroupFileDeliverySettings> {
-    return this.exclusive(chatId, async () => {
-      this.commit(chatId, { ...this.get(chatId), enabled: false })
-      return this.get(chatId)
-    })
-  }
-
-  /** An admitted cloud batch retains its transport even if files off is sent while it uploads. */
+  /** An admitted cloud batch can create its chat's first folder even after files off. */
   resolveFolder(context: FileDeliveryContext, signal: AbortSignal): Promise<GroupDeliveryFolder> {
-    return this.exclusive(context.chatId, () => this.prepare(context.chatId, context.managerOpenId, false, signal))
+    return this.exclusive(`chat:${context.chatId}`, () => this.prepare(context.chatId, context.managerOpenId, true, signal))
   }
 
   /** Explicit adoption for known existing deliverables; never searches or merges folders by name. */
-  bindExisting(chatId: string, managerOpenId: string, existing: DeliveryFolder): Promise<GroupFileDeliverySettings> {
-    return this.exclusive(chatId, async () => {
-      const current = this.get(chatId)
-      if (current.folder && current.folder.token !== existing.token) throw new Error('本群已经绑定其他文件夹')
+  bindExisting(chatId: string, workDir: string, managerOpenId: string, existing: DeliveryFolder): Promise<GroupFileDeliverySettings> {
+    return this.exclusive(`chat:${chatId}`, async () => {
+      const current = this.load().groups[chatId]
+      if (current?.folder && current.folder.token !== existing.token) throw new Error('本群已经绑定其他文件夹')
       const folder = await this.deps.getFolder(existing)
-      this.commit(chatId, { ...current, folder })
+      this.commitFolder(chatId, folder)
       await this.prepare(chatId, managerOpenId, false)
-      return this.get(chatId)
+      return this.get(chatId, workDir)
     })
   }
 
@@ -60,63 +88,92 @@ export class GroupFileDelivery {
     if (!chatId.trim() || !managerOpenId.trim()) throw new Error('无法确认交付群或管理权限接收人')
     const name = await this.deps.getChatName(chatId, signal)
     if (!name.trim()) throw new Error('群名称 MISS')
-    const settings = this.get(chatId)
-    let folder: GroupDeliveryFolder
-    if (!settings.folder) {
-      if (!create) throw new Error('本群尚未绑定云空间文件夹，请先发送 files on')
+    let folder = this.load().groups[chatId]?.folder
+    if (!folder) {
+      if (!create) throw new Error('本群尚未绑定云空间文件夹')
       folder = { ...await this.deps.createFolder(name, signal), name }
-      // Save the remote identity before granting access; a later retry must reuse this exact folder.
-      this.commit(chatId, { ...settings, folder })
-    } else {
-      folder = settings.folder
+      // Save the remote identity before granting access; a retry must reuse this exact folder.
+      this.commitFolder(chatId, folder)
     }
     const remote = await this.deps.getFolder(folder, signal)
     if (remote.token !== folder.token) throw new Error('云空间返回的文件夹与本群绑定不一致')
     folder = remote.name === name ? remote : await this.deps.renameFolder(remote, name, signal)
     if (folder.name !== name) throw new Error('文件夹名称尚未与群名同步')
-    this.commit(chatId, { ...this.get(chatId), folder })
+    this.commitFolder(chatId, folder)
     await this.deps.grantFolderAccess(folder, chatId, managerOpenId, signal)
     return folder
   }
 
-  private exclusive<T>(chatId: string, action: () => Promise<T>): Promise<T> {
-    const previous = this.locks.get(chatId) ?? Promise.resolve()
+  private exclusive<T>(key: string, action: () => Promise<T>): Promise<T> {
+    const previous = this.locks.get(key) ?? Promise.resolve()
     const result = previous.then(action)
     const settled = result.then(() => {}, () => {})
-    this.locks.set(chatId, settled)
-    void settled.then(() => { if (this.locks.get(chatId) === settled) this.locks.delete(chatId) })
+    this.locks.set(key, settled)
+    void settled.then(() => { if (this.locks.get(key) === settled) this.locks.delete(key) })
     return result
   }
 
-  private load(): Map<string, GroupFileDeliverySettings> {
-    if (this.groups) return this.groups
+  private load(): FileDeliverySettingsState {
+    if (this.state) return this.state
     const raw = this.deps.read()
-    if (raw === undefined) { this.groups = new Map(); return this.groups }
+    if (raw === undefined) return this.state = { version: 2, workspaces: {}, groups: {} }
     const parsed = JSON.parse(raw)
-    if (parsed?.version !== 1 || !parsed.groups || typeof parsed.groups !== 'object' || Array.isArray(parsed.groups)) {
-      throw new Error('群文件交付设置格式无效')
+    if (![1, 2].includes(parsed?.version) || !record(parsed.groups)
+      || (parsed.version === 2 && !record(parsed.workspaces))) throw new Error('文件交付设置格式无效')
+    const state: FileDeliverySettingsState = { version: 2, workspaces: {}, groups: {} }
+    for (const [key, value] of Object.entries(parsed.workspaces ?? {})) {
+      if (!record(value) || typeof value.enabled !== 'boolean' || workspaceKey(key) !== key) throw new Error('工作目录文件交付开关无效')
+      state.workspaces[key] = { enabled: value.enabled }
     }
-    const groups = new Map<string, GroupFileDeliverySettings>()
     for (const [chatId, value] of Object.entries(parsed.groups)) {
-      const item = value as GroupFileDeliverySettings
-      if (!chatId || !item || typeof item.enabled !== 'boolean') throw new Error('群文件交付开关无效')
-      if (item.enabled && !item.folder) throw new Error('已启用的群缺少文件夹绑定')
-      if (item.folder) {
-        if (typeof item.folder.token !== 'string' || !item.folder.token.trim() || typeof item.folder.name !== 'string' || !item.folder.name.trim()
-          || typeof item.folder.url !== 'string') throw new Error('群文件夹绑定无效')
-        const url = new URL(item.folder.url)
-        if (url.protocol !== 'https:' || url.username || url.password) throw new Error('群文件夹链接无效')
+      if (!chatId || !record(value)) throw new Error('群文件夹绑定无效')
+      const legacyEnabled = parsed.version === 1 ? value.enabled : value.legacyEnabled
+      if ((parsed.version === 1 || legacyEnabled !== undefined) && typeof legacyEnabled !== 'boolean') throw new Error('群文件交付开关无效')
+      if (legacyEnabled && !value.folder) throw new Error('已启用的旧群缺少文件夹绑定')
+      if (value.folder !== undefined) validateFolder(value.folder)
+      state.groups[chatId] = {
+        ...(value.folder ? { folder: structuredClone(value.folder) as GroupDeliveryFolder } : {}),
+        ...(legacyEnabled === undefined ? {} : { legacyEnabled }),
       }
-      groups.set(chatId, structuredClone(item))
     }
-    this.groups = groups
-    return groups
+    return this.state = state
   }
 
-  private commit(chatId: string, value: GroupFileDeliverySettings): void {
-    const next = new Map(this.load())
-    next.set(chatId, structuredClone(value))
-    this.deps.write({ version: 1, groups: Object.fromEntries(next) })
-    this.groups = next
+  private legacyChats(chatId: string, key: string): string[] {
+    return Object.entries(this.load().groups).filter(([id, group]) => {
+      if (group.legacyEnabled === undefined) return false
+      if (id === chatId) return true
+      const dir = this.deps.workDirForChat(id)
+      return dir !== undefined && workspaceKey(dir) === key
+    }).map(([id]) => id)
   }
+
+  private commitMode(chatId: string, key: string, enabled: boolean): void {
+    const next = structuredClone(this.load())
+    next.workspaces[key] = { enabled }
+    for (const id of this.legacyChats(chatId, key)) delete next.groups[id].legacyEnabled
+    this.commit(next)
+  }
+
+  private commitFolder(chatId: string, folder: GroupDeliveryFolder): void {
+    const next = structuredClone(this.load())
+    next.groups[chatId] = { ...next.groups[chatId], folder }
+    this.commit(next)
+  }
+
+  private commit(next: FileDeliverySettingsState): void {
+    this.deps.write(next)
+    this.state = next
+  }
+}
+
+function record(value: unknown): value is Record<string, any> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function validateFolder(folder: unknown): asserts folder is GroupDeliveryFolder {
+  if (!record(folder) || typeof folder.token !== 'string' || !folder.token.trim()
+    || typeof folder.name !== 'string' || !folder.name.trim() || typeof folder.url !== 'string') throw new Error('群文件夹绑定无效')
+  const url = new URL(folder.url)
+  if (url.protocol !== 'https:' || url.username || url.password) throw new Error('群文件夹链接无效')
 }

@@ -38,6 +38,7 @@ import { log } from './log'
 import { sync as spawnSync } from 'cross-spawn'
 import { codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
 import { writeJsonStateAtomic } from './state-store'
+import { profileForWorkspace, resolveWorkspaceDir } from './workspace'
 import { neutralizeMarkdownImagesInCard } from './cards/elements'
 import {
   validateConversationLaunch,
@@ -127,8 +128,11 @@ export function projectProfile(sessionName: string): ProjectProfile | undefined 
 
 /** Session 与 worktree 共用项目目录解析，遵循 [projects.<name>].cwd。 */
 export function resolveProjectDir(projectName: string): string {
-  const override = projectProfile(projectName)?.cwd?.trim()
-  return override || join(PROJECTS_ROOT, projectName)
+  return resolveWorkspaceDir(projectName, PROJECTS_ROOT, config.projects)
+}
+
+export function projectProfileForDirectory(workDir: string): ProjectProfile | undefined {
+  return profileForWorkspace(workDir, PROJECTS_ROOT, config.projects)
 }
 
 export const client = new lark.Client({

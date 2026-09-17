@@ -5,7 +5,7 @@ import type { FileDeliveryMode } from './file-delivery-types'
 const FILE_HANDOFF = '生成并检查本地文件后，在回复正文中独占一行输出 `[[send: /abs/path]]` 提交交付，路径必须替换成实际存在的绝对路径。只在用户要文件或交付最终产物时使用。'
 const FILE_TRANSPORT_OWNER = '交付本地任务产物时，上传、权限和卡片均由 Lodestar 处理。Agent 不直接调用这些飞书接口，不为交付读取凭据或查找 token，也不依赖飞书 CLI。被委派的 Agent 只返回文件路径和说明，由主 Agent 提交交付。'
 const FILE_DELIVERY_RESULT = '交付标记只表示提交，不能据此声称上传成功。以 Lodestar 实际发出的附件、交付卡或错误提示为准，不编造云空间链接，不用其他工具重复发送。'
-const FILE_DELIVERY_SWITCH = '`files`、`files on`、`files off` 是用户在群里输入的管理命令，不是 Shell 命令；不要擅自切换交付方式或改写群配置。'
+const FILE_DELIVERY_SWITCH = '`files`、`files on`、`files off` 是用户在群里输入的管理命令，不是 Shell 命令；不要擅自切换交付方式或改写工作目录配置。'
 
 /** Only the selected transport contributes constraints; Drive has no IM-size instruction. */
 export function fileDeliveryInstructions(mode: FileDeliveryMode): string {
@@ -29,7 +29,7 @@ export function channelInstructions(provider: AgentProvider, mode: FileDeliveryM
   return [
     '- 以 `[file: /abs/path]` 开头的文本表示该路径上挂着一个文件,相关时去读它。',
     fileDeliveryInstructions(mode),
-    '- 文件交付约定由 Lodestar 按群设置生成；后续收到宿主注入的“文件交付约定更新”时，用其完整替换此前的文件交付约定。',
+    '- 文件交付约定由 Lodestar 按工作目录设置生成；后续收到宿主注入的“文件交付约定更新”时，用其完整替换此前的文件交付约定。',
     `- ${FILE_TRANSPORT_OWNER}`,
     `- ${FILE_DELIVERY_RESULT}`,
     `- ${FILE_DELIVERY_SWITCH}`,

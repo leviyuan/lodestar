@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 
-test('main Agent launches select the group delivery rules for Codex, Claude and DSH', () => {
+test('main Agent launches select the directory delivery rules for Codex, Claude and DSH', () => {
   // Isolate module mocks so no real Agent or Feishu service is started.
   const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', `
     import { mock } from 'bun:test'
@@ -49,5 +49,51 @@ test('main Agent launches select the group delivery rules for Codex, Claude and 
     }
     const questionTool = { codex: 'request_user_input', claude: 'AskUserQuestion', dsh: 'ask_user_question' }[launch.provider as 'codex' | 'claude' | 'dsh']
     expect(launch.instructions).toContain(questionTool)
+  }
+})
+
+test('BTW launches first with migrated directory settings; WT launches with its own profile and delivery rules', () => {
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', `
+    import { mock } from 'bun:test'
+    import { writeFileSync } from 'node:fs'
+    import { join } from 'node:path'
+    import { projectProfiles } from './src/feishu-test-mock'
+    const feishu = await import('./src/feishu')
+    const { FILE_DELIVERY_GROUPS_FILE } = await import('./src/paths')
+    const mainDir = join(process.env.LODESTAR_DATA_DIR, 'repo')
+    const wtDir = join(process.env.LODESTAR_DATA_DIR, 'project[feature]')
+    projectProfiles.set('project', { cwd: mainDir, tools: 'Read', loadProjectMcp: false })
+    projectProfiles.set('feature-profile', { cwd: wtDir, tools: 'Read,Edit', loadProjectMcp: true })
+    feishu.preferredChatForSession.set('project', 'main-chat')
+    writeFileSync(FILE_DELIVERY_GROUPS_FILE, JSON.stringify({ version: 1, groups: {
+      'main-chat': { enabled: true, folder: { token: 'old', name: 'project', url: 'https://example.com/folder/old' } },
+    } }))
+    const launches = []
+    mock.module('./src/agent-launch', () => ({ createAgentProcess: options => {
+      launches.push(options)
+      return { sourceRevision: null, process: { provider: options.provider } }
+    } }))
+    const { Session } = await import('./src/session')
+    for (const provider of ['codex', 'claude', 'dsh']) {
+      for (const name of ['project*0917-1234', 'project[feature]*0917-1234', 'project']) {
+        const session = new Session(name, name === 'project' ? 'main-chat' : name)
+        session.selectedProvider = provider
+        session.selectedTokenSourceId = null
+        session.selectedModel = 'test-model'
+        session.selectedEffort = 'high'
+        session.spawnAgent()
+      }
+    }
+    console.log(JSON.stringify({ launches, mainDir, wtDir }))
+  `], { env: { ...process.env, NODE_ENV: 'test' }, stdout: 'pipe', stderr: 'pipe' })
+  expect(result.exitCode, result.stderr.toString()).toBe(0)
+  const { launches, mainDir, wtDir } = JSON.parse(result.stdout.toString().trim().split('\n').at(-1)!)
+  expect(launches).toHaveLength(9)
+  for (const [index, launch] of launches.entries()) {
+    const wt = index % 3 === 1
+    expect(launch.workDir).toBe(wt ? wtDir : mainDir)
+    expect(launch.profile.tools).toBe(wt ? 'Read,Edit' : 'Read')
+    expect(launch.profile.loadProjectMcp).toBe(wt)
+    expect(launch.developerInstructions.includes('30 × 1024 × 1024')).toBe(wt)
   }
 })

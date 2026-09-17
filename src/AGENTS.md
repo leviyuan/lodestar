@@ -4,6 +4,7 @@
 
 ## 会话与后端
 
+- `workspace.ts` 定义工作目录键与项目 profile：BTW/FK 去临时后缀并共享原目录，WT 保留独立目录；别名和软链接归一化，冲突报错。主会话与委派按实际执行目录查工具/MCP 配置。文件交付开关按目录持久化；任务清单按主项目名持久化，主群、所有 WT 及其临时群共用。群文件夹/权限、模型/账号与会话历史各自保留原边界；临时会话模型/账号创建时继承，之后独立。
 - 命令、模型、权限、工具、临时会话、worktree、Agent 身份和任务清单放在对应 `session-*.ts` helper；这些模块可协作访问 Session 的内部字段。
 - 修改 `AgentProcess` 时检查 Codex、Claude、Session 消费方和卡片。单端能力用明确分支或 capability 表达。
 - Codex 通过 app-server JSON-RPC 管理 thread、turn、权限、提问、plan/goal、usage、compaction 和 collab 子 Agent。未知或畸形 payload 要记录。
@@ -49,9 +50,11 @@
 - 委派历史索引和父子关系不能按缓存数量删除；仅淘汰已完成、已落盘且进程退出的旧正文缓存。`status` 按原 artifact 读取完整正文，读取失败报错；续接保留原生 session、最新一轮 effort 和群/目录边界。
 - 父 run 取消、Session stop/kill/restart 和 daemon shutdown 在首次 await 前关闭新建入口、吊销 capability，并递归回收后代进程。
 - Skill 内容由 `managed-skills.ts` 同源同步至 Codex/Claude standalone 目录和 Claude 本地插件。排除 user settings 的主会话显式加载插件，不能为发现 Skill 混入 user env。
-- 文件交付约定仅由 `instructions.ts` 注入会话，不生成或安装独立 Skill。npm 安装/更新与 daemon 启动共用 `managed-skill-cleanup.cjs` 清理旧 `lodestar-files` 的 Codex、Claude 和共享插件副本；`data-dir.cjs` 与 `paths.ts` 共用跨平台/自定义数据目录解析，清理失败明确报错。安装清理使用随包的 CommonJS 源文件，不依赖预先构建、配置或 Agent。`channelInstructions(provider, mode)` 在主 Agent 启动时按群设置生成，只有聊天附件模式在交付标记旁注入 30 MB 约束；云空间提示词不提这个数字。Agent 只生成/检查本地文件并提交标记，不承担上传、分片、授权或发卡接口；委派 Agent 返回路径给主 Agent。群开关由用户操作，不能让 Agent 为交付读取凭据、查询接口推断限制或修改配置。
+- 文件交付约定仅由 `instructions.ts` 注入会话，不生成或安装独立 Skill。npm 安装/更新与 daemon 启动共用 `managed-skill-cleanup.cjs` 清理旧 `lodestar-files` 的 Codex、Claude 和共享插件副本；`data-dir.cjs` 与 `paths.ts` 共用跨平台/自定义数据目录解析，清理失败明确报错。安装清理使用随包的 CommonJS 源文件，不依赖预先构建、配置或 Agent。`channelInstructions(provider, mode)` 在主 Agent 启动时按工作目录设置生成，只有聊天附件模式在交付标记旁注入 30 MB 约束；云空间提示词不提这个数字。Agent 只生成/检查本地文件并提交标记，不承担上传、分片、授权或发卡接口；委派 Agent 返回路径给主 Agent。目录开关由用户操作，不能让 Agent 为交付读取凭据、查询接口推断限制或修改配置。
 
 ## 卡片与持久化
+
+- `tasklist.ts` 按主项目名保存清单绑定。`session-tasklist.ts` 的查看、启用与删除均使用 `worktreeProjectName()`，主群、多个 WT 以及 BTW/FK 临时群共用同一项目清单；清单生命周期按项目串行，不改为按工作目录拆分，也不迁移为目录键。
 
 - `usage-cache.ts` 统一额度读取的 60 秒缓存、并发合并和失败冷却（1、2、4、5 分钟，遵守更长 Retry-After）；缓存命中不续期，无定时刷新。Codex 独立查询与现有连接共用同一入口；登录、删除与重置使迟到响应失效。HTTP 来源按平台及凭据哈希隔离，失败保持可见。
 - `token-source-accounts.ts` 将 DeepSeek、GLM 的两种 Agent 入口解析为共享凭据与协议地址，模型和 effort 各自保留；旧配置冲突报错，任一 setup 入口原子归并凭据到 `deepseek` / `glm`。`account-usage.ts` 收集所有账号，合并共享来源并让 Hi 直接展示新鲜快照。
@@ -63,7 +66,7 @@
 - `hi` 的 Codex 重置卡次数来自额度接口 `rateLimitResetCredits.availableCount`，保留合法的零，缺失用 MISS；不推算剩余次数，也不显示在 footer。hi 的全部账号各占一行，重置卡简写为“重置”，GLM 月工具只显示百分比；footer 继续使用紧凑格式。`codex-reset [备注]` 经 `usage.ts` 的原生控制连接使用一次重置卡，同账号并发使用互斥，同消息与有限网络重试复用幂等标识；消费后失效旧额度查询并重新读取。四种原生结果必须区分，已确认消费后发生刷新或连接关闭失败仍保留消费结果并显示错误。
 - Codex 额度展示统一只用主额度的短时窗口和周窗口；`token-source-codex.ts` 不向统一展示导出 Spark（GPT-5.3）或其他模型的附加桶。全量桶继续供内部按模型调度，不能用附加桶替代缺失的主额度。
 - 生图完成事件补回的 prompt/revisedPrompt 要更新工具元数据。`session-tools.ts` 上传图片并通过 Card Kit 放入折叠面板，确认落地后才标记已交付；嵌入失败按用户约定单独发图。图片任务按原卡归属登记，关闭和换卡均须等待，避免图片在卡片退役后丢失。
-- 文件默认由 `feishu.ts` 直接发送聊天附件，保留 30 MB 上限。`files on/off` 通过 `group-file-delivery.ts` 按 chat_id 保存开关与固定云空间目录；目录名跟随实时群名，跨轮次/重启复用，关闭不删文件或解除绑定。`file-delivery.ts` 只收集本轮新文件，卡片只列本轮，管理入口指向该群全部历史云空间交付文件。`feishu-drive.ts` 直调 API，权限为开启者/交付发起人 full_access、群 view，失败不切回其他渠道。Session 在输入交给 Agent 时固定该轮方式，保证生成要求与实际通道一致；按进程记录已注入模式，开关切换在下一轮用户输入时更新一次，后台续跑沿用已注入规则，不能每条输入重复规则或为此重启进程。云空间收尾等待上传和独立卡，换卡及排队消息转交不重置或取消交付；卡片终态文案（含 Agent 错误）不能作为取消信号。停止/重启通过会话交付集合取消未完成上传（包括已捕获的旧轮次）。原附件、自动图片通道和旧聊天文件保留；云空间文件不自动删除。
+- 文件默认由 `feishu.ts` 直接发送聊天附件，保留 30 MB 上限。`files on/off` 通过 `group-file-delivery.ts` 按规范工作目录保存开关，按 chat_id 保存固定云空间目录；旧 v1 开关首次读取时迁移，有冲突则要求 files on/off 明确统一。继承云空间模式的新群在首次交付时建自己的文件夹，已接收的云空间任务即使随后关闭开关也可完成建目录与交付；目录名跟随实时群名，跨轮次/重启复用，关闭不删文件或解除绑定。`file-delivery.ts` 只收集本轮新文件，卡片只列本轮，管理入口指向该群全部历史云空间交付文件。`feishu-drive.ts` 直调 API，权限为开启者/交付发起人 full_access、群 view，失败不切回其他渠道。Session 在输入交给 Agent 时固定该轮方式，保证生成要求与实际通道一致；按进程记录已注入模式，开关切换在下一轮用户输入时更新一次，后台续跑沿用已注入规则，不能每条输入重复规则或为此重启进程。云空间收尾等待上传和独立卡，换卡及排队消息转交不重置或取消交付；卡片终态文案（含 Agent 错误）不能作为取消信号。停止/重启通过会话交付集合取消未完成上传（包括已捕获的旧轮次）。原附件、自动图片通道和旧聊天文件保留；云空间文件不自动删除。
 - 文件/图片上传和所有 SDK 消息发送共用 `feishu-retry.ts`：已知网络瞬态错误、HTTP 408/429/500/502/503/504 和飞书限流码 99991400/230020 最多尝试 3 次（间隔 1s、4s，遵守不超过 60s 的 Retry-After/x-ogw-ratelimit-reset）；权限、参数、本地文件和畸形成功响应直接报错。上传重试重建 multipart 和超时信号，消息重试复用同一 UUID 与上传 key；上传成功后的发送失败也须在群里显示，不能只返回 false。
 - 云空间新文件默认可能是 `tenant_readable`，不能认为文件夹关闭链接分享就覆盖了文件。`feishu-drive.ts` 在获取、发布文件链接之前通过 v2 public permission 将文件的 `link_share_entity` 设为 `closed` 并重新读取确认；失败保留已上传 token、报告错误，不得发布成功链接。协作者授权仍有效，人工转授权不属于此保证。
 - 生产 Card Kit mutation 经 per-card queue，在执行时分配 sequence，并共用 `feishu-retry.ts` 的有限网络重试。一次请求的重试复用同一 UUID、sequence 和序列化内容，每次重建超时信号；TTL 重开及重开后的写入各分配新 UUID 和 sequence。重试耗尽才触发写入失败回调，不把网络错误当容量超限。需要据结果更新 rendered 或持久状态的事务使用 checked API。

@@ -9,6 +9,7 @@ import { writeJsonStateAtomic } from './state-store'
 import { log } from './log'
 import type { FileDeliveryContext, FileDeliveryHandle } from './file-delivery-types'
 import { GroupFileDelivery } from './group-file-delivery'
+import { workspaceKey } from './workspace'
 
 export const groupFileDelivery = new GroupFileDelivery({
   read: () => {
@@ -16,6 +17,14 @@ export const groupFileDelivery = new GroupFileDelivery({
     catch (error: any) { if (error?.code === 'ENOENT') return undefined; throw error }
   },
   write: value => writeJsonStateAtomic(FILE_DELIVERY_GROUPS_FILE, value),
+  workDirForChat: chatId => {
+    const names = [...feishu.preferredChatForSession].filter(([, id]) => id === chatId).map(([name]) => name)
+    const cachedName = feishu.chatNameCache.get(chatId)
+    if (!names.length && cachedName) names.push(cachedName)
+    const dirs = new Set(names.map(name => workspaceKey(feishu.resolveProjectDir(name))))
+    if (dirs.size > 1) throw new Error(`旧文件交付群绑定了多个工作目录: ${chatId}`)
+    return dirs.values().next().value
+  },
   getChatName: (chatId, signal) => feishuDrive.getChatName(chatId, signal),
   createFolder: (name, signal) => feishuDrive.createFolder(name, signal),
   getFolder: (folder, signal) => feishuDrive.getFolder(folder, signal),

@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { fileDeliveryAgentContext } from './instructions'
 import { FileDeliveryBatch } from './file-delivery'
+import { GroupFileDelivery } from './group-file-delivery'
 import type { FileDeliverySnapshot } from './file-delivery-types'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import {
@@ -19,6 +20,7 @@ const cardkit = await import('./cardkit')
 const feishu = await import('./feishu')
 const mathRender = await import('./math-render')
 const { config } = await import('./config')
+const { groupFileDelivery } = await import('./file-delivery-runtime')
 const { getTokenSource, listTokenSources, registerTokenSource, refreshAllTokenSourceModels, resetTokenSourceRegistry, tokenSourceProcessRevision } = await import('./token-source')
 const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
 const { peekUsage, refreshUsageFromConnection, invalidateCodexUsage } = await import('./usage')
@@ -225,6 +227,35 @@ async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<vo
 }
 
 describe('Session cloud file receipts', () => {
+  for (const provider of ['codex', 'claude', 'dsh'] as const) {
+    test(`${provider} BTW uses its workspace mode and updates on the next input while WT stays separate`, async () => {
+      const registry = new GroupFileDelivery({
+        read: () => undefined, write: () => {}, workDirForChat: () => undefined,
+        getChatName: async id => id,
+        createFolder: async name => ({ token: name, url: `https://example.com/${name}` }),
+        getFolder: async folder => ({ ...folder, name: folder.token }),
+        renameFolder: async (folder, name) => ({ ...folder, name }),
+        grantFolderAccess: async () => {},
+      })
+      const mode = spyOn(groupFileDelivery, 'mode').mockImplementation((chatId, workDir) => registry.mode(chatId, workDir))
+      const main = new Session('workspace-modes', 'main')
+      const btw = new Session('workspace-modes*0917-1234', 'btw') as any
+      const wt = new Session('workspace-modes[feature]', 'wt')
+      try {
+        await registry.enable(main.chatId, main.workDir, 'user')
+        expect(btw.getFileDeliveryMode()).toBe('drive')
+        expect(wt.getFileDeliveryMode()).toBe('chat')
+        const proc = new FakeAgentProc(provider)
+        btw.procFileDeliveryModes.set(proc, 'drive')
+        btw.sendClaimedUserText(proc, 'first')
+        await registry.disable(main.chatId, main.workDir)
+        btw.sendClaimedUserText(proc, 'second')
+        btw.sendClaimedUserText(proc, 'third')
+        expect(proc.sentTexts).toEqual(['first', `${fileDeliveryAgentContext('chat')}\n\nsecond`, 'third'])
+      } finally { mode.mockRestore(); main.dispose(); btw.dispose(); wt.dispose() }
+    })
+  }
+
   test('keeps ordinary file and image messages as the default with no cloud card or upload', () => {
     const session = new Session('native-files', 'unconfigured-chat') as any
     const turn = turnState()
@@ -3594,6 +3625,64 @@ describe('Session card size capacity', () => {
       if (turn.rotating) await turn.rotating
       session.stopFooterStatus(turn)
       for (let i = 0; i <= replacementCount; i++) await cardkit.dispose(`card_size_persistent_${i}`)
+    }
+  })
+})
+
+describe('Session project tasklist', () => {
+  test('main, multiple worktrees and temporary groups share the project tasklist throughout its lifecycle', async () => {
+    const tasklist = await import('./tasklist')
+    const projectName = 'task-project'
+    const shared = {
+      projectName, guid: 'shared-tasklist', name: `${projectName}[lodestar]`,
+      url: 'https://example.com/tasks/shared', ownerOpenId: 'owner',
+    }
+    let enabled = false
+    let creations = 0
+    const reads: string[] = []
+    const enableCalls: Array<[string, string]> = []
+    const deleteCalls: Array<[string, string]> = []
+    const get = spyOn(tasklist, 'getTasklistBinding').mockImplementation(name => {
+      reads.push(name)
+      return name === projectName && enabled ? shared : null
+    })
+    const enable = spyOn(tasklist, 'enableTasklist').mockImplementation(async (name, chatId) => {
+      enableCalls.push([name, chatId])
+      if (name !== projectName) throw new Error('unexpected project')
+      if (!enabled) creations++
+      enabled = true
+      return shared
+    })
+    const remove = spyOn(tasklist, 'deleteTasklist').mockImplementation(async (name, guid) => {
+      deleteCalls.push([name, guid])
+      if (name !== projectName || guid !== shared.guid) throw new Error('unexpected tasklist')
+      enabled = false
+      return shared
+    })
+    const sessions = [
+      'task-project', 'task-project[feature-a]', 'task-project[feature-b]',
+      'task-project*0917-1234', 'task-project[feature-b]*0917-1234',
+    ].map((name, index) => new Session(name, `task-chat-${index}`))
+    try {
+      expect(new Set(sessions.map(session => session.workDir)).size).toBe(3)
+      // Creating from WT must attach to the project's shared list as well.
+      expect((await sessions[1].onTasklistEnable()).ok).toBe(true)
+      for (const session of sessions) {
+        expect((await session.onTasklistEnable()).ok).toBe(true)
+        await session.runCommand('task')
+        expect(session.onTasklistDeletePrompt(shared.guid).ok).toBe(true)
+      }
+      expect(creations).toBe(1)
+      expect(enableCalls.map(([name]) => name)).toEqual(Array(6).fill(projectName))
+      expect((await sessions[4].onTasklistDeleteConfirm(shared.guid)).ok).toBe(true)
+      expect(deleteCalls).toEqual([[projectName, shared.guid]])
+      for (const session of sessions) {
+        expect(session.onTasklistDeletePrompt(shared.guid).ok).toBe(false)
+      }
+      expect([...new Set(reads)]).toEqual([projectName])
+    } finally {
+      get.mockRestore(); enable.mockRestore(); remove.mockRestore()
+      for (const session of sessions) session.dispose()
     }
   })
 })

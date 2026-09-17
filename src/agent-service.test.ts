@@ -7,6 +7,7 @@ import type { AgentIdentity, AgentIdentityCatalog } from './agent-identities'
 import { AgentWorkerFailure, type AgentWorkerHandle, type AgentWorkerResult } from './agent-runner'
 import type { AgentRunSnapshot } from './agent-run-types'
 import { AGENT_RUNS_DIR } from './paths'
+import { projectProfiles } from './feishu-test-mock'
 
 function identity(id: string, name = id): AgentIdentity {
   return {
@@ -147,6 +148,25 @@ async function waitForCondition(check: () => boolean): Promise<void> {
 }
 
 describe('AgentService', () => {
+  test('delegated launch profile follows the selected execution directory', async () => {
+    const profiles: unknown[] = []
+    projectProfiles.set('parent-profile', { cwd: session.workDir, settingSources: 'project' })
+    projectProfiles.set('child-profile', { cwd: join(session.workDir, 'packages', 'app'), settingSources: 'local' })
+    const { service, root } = harness({ startWorker: opts => {
+      profiles.push(opts.profile)
+      return resolvedHandle(result(`profile-${profiles.length}`))
+    } })
+    try {
+      for (const workDir of [undefined, 'packages/app']) {
+        const started = await service.startRun(root, { description: '目录配置', identityIds: ['agent:a'], prompt: 'inspect', workDir })
+        await waitFor(service, root, started.runId, 'completed')
+      }
+      expect(profiles).toMatchObject([{ settingSources: 'project' }, { settingSources: 'local' }])
+    } finally {
+      projectProfiles.delete('parent-profile'); projectProfiles.delete('child-profile')
+    }
+  })
+
   test('defaults to the main directory and resolves relative, absolute and symlinked subdirectories', async () => {
     const calls: string[] = []
     const { service, root, artifacts } = harness({

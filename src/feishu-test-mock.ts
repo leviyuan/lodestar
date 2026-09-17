@@ -13,6 +13,8 @@
 import { mock } from 'bun:test'
 import type { TurnAnchor } from './feishu'
 import type { ConversationBranchBase, PendingConversationLaunch } from './conversation'
+import type { ProjectProfile } from './config'
+import { profileForWorkspace, resolveWorkspaceDir } from './workspace'
 
 export const sentCards: object[] = []
 export const chatTailMessages = new Map<string, string>()
@@ -51,7 +53,7 @@ export const modelSelections = new Map<string, {
 }>()
 export const resumeRefs = new Map<string, { provider: 'codex' | 'claude' | 'dsh'; sessionId: string; cwd: string | null }>()
 /** [projects.<name>] 项目 profile 替身,测试往里 set 后 Session 构造时可查到。 */
-export const projectProfiles = new Map<string, { cwd?: string }>()
+export const projectProfiles = new Map<string, ProjectProfile>()
 
 export function resetFeishuMock(): void {
   for (const arr of [
@@ -75,7 +77,8 @@ export function resetFeishuMock(): void {
 
 mock.module('./feishu', () => ({
   PROJECTS_ROOT: '/tmp/lodestar-projects',
-  resolveProjectDir: (name: string) => projectProfiles.get(name)?.cwd?.trim() || `/tmp/lodestar-projects/${name}`,
+  resolveProjectDir: (name: string) => resolveWorkspaceDir(name, '/tmp/lodestar-projects', Object.fromEntries(projectProfiles)),
+  projectProfileForDirectory: (workDir: string) => profileForWorkspace(workDir, '/tmp/lodestar-projects', Object.fromEntries(projectProfiles)),
   getSessionResumeRef: (sessionName: string, provider = 'codex') => {
     const ref = resumeRefs.get(`${sessionName}:${provider}`)
     return ref ? { ...ref } : null
@@ -89,6 +92,7 @@ mock.module('./feishu', () => ({
   sendImage: async (chatId: string, key: string) => { sentImages.push([chatId, key]); return `om_image_${sentImages.length}` },
   uploadAndSend: async (chatId: string, path: string) => { sentLocalFiles.push([chatId, path]); return true },
   preferredChatForSession: new Map(),
+  chatNameCache: new Map(),
   getChatTailMessageId: async (chatId: string) => chatTailMessages.get(chatId) ?? null,
   sendCard: async (chatId: string, card: object) => {
     sentCards.push(card)

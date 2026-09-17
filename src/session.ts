@@ -935,7 +935,7 @@ export class Session {
         : this.selectedProvider === 'claude' ? this.claudeEffortForSpawn() : this.effortForSpawn(),
       launch,
       developerInstructions: this.spawnDeveloperInstructions(fileDeliveryMode),
-      profile: feishu.projectProfile(this.worktreeProjectName()),
+      profile: feishu.projectProfileForDirectory(this.workDir),
       ...(process.env.LODESTAR_DISABLE_SKILL_SYNC === '1' ? {} : { managedSkillPluginPath: MANAGED_CLAUDE_PLUGIN_DIR }),
       hostEnv,
     })
@@ -2601,19 +2601,19 @@ export class Session {
     return sessionCommands.runCommand(this, raw, userOpenId, messageId)
   }
 
-  getFileDeliveryMode(): FileDeliveryMode { return groupFileDelivery.mode(this.chatId) }
+  getFileDeliveryMode(): FileDeliveryMode { return groupFileDelivery.mode(this.chatId, this.workDir) }
 
   runFileDeliveryCommand(argument: string, userOpenId: string): Promise<void> {
     return runFileDeliveryCommand(this.chatId, this.sessionName, userOpenId, argument, {
-      get: chatId => groupFileDelivery.get(chatId),
-      enable: (chatId, managerOpenId) => groupFileDelivery.enable(chatId, managerOpenId),
-      disable: chatId => groupFileDelivery.disable(chatId),
+      get: chatId => groupFileDelivery.get(chatId, this.workDir),
+      enable: (chatId, managerOpenId) => groupFileDelivery.enable(chatId, this.workDir, managerOpenId),
+      disable: chatId => groupFileDelivery.disable(chatId, this.workDir),
       sendCard: card => feishu.sendCard(this.chatId, card),
       reportError: async message => {
         log(`session "${this.sessionName}": ${message}`)
         if (!await feishu.sendText(this.chatId, message)) throw new Error(message)
       },
-    })
+    }, this.workDir)
   }
 
   /** Build the hi-panel data snapshot for this session.

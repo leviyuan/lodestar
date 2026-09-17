@@ -386,7 +386,7 @@ export class AgentService {
         prompt,
         resumeSessionId,
         developerInstructions: run.session!.delegatedAgentDeveloperInstructions(identity.provider),
-        profile: fullAgentProfile(feishu.projectProfile(run.session!.worktreeProjectName())),
+        profile: fullAgentProfile(feishu.projectProfileForDirectory(run.snapshot.workDir)),
         ...(process.env.LODESTAR_DISABLE_SKILL_SYNC === '1' ? {} : { managedSkillPluginPath: MANAGED_CLAUDE_PLUGIN_DIR }),
         hostEnv: {
           LODESTAR_AGENT_URL: agentApiUrl(config.notify.bind, config.notify.port),

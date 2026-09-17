@@ -38,8 +38,8 @@ function extract(r: FreshResult): any {
   return JSON.parse(m[1])
 }
 
-// 临时群(*MMDD-HHMM 后缀)不入 session-model-map,读取时转发查主群名(tempProjectName
-// 反解),实现临时群首启继承主群档位。临时群永不入档 → 无废记录堆积,也无需清理。
+// 临时群创建时保存独立 routing 快照，之后各自修改；旧临时群尚无快照时
+// 按 tempProjectName 读取来源会话选择，保持升级兼容。
 describe('getSessionModelSelection — 临时群转发继承主群', () => {
   test('临时群名(*MMDD-HHMM)转发查到主群档位', () => {
     const r = runFreshModelMap(`

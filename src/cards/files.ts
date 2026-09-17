@@ -82,6 +82,7 @@ export function fileDeliveryCard(snapshot: FileDeliverySnapshot): object {
 
 export function fileDeliverySettingsCard(opts: {
   groupName: string
+  workDir: string
   settings?: GroupFileDeliverySettings
   notice?: string
   error?: string
@@ -89,17 +90,19 @@ export function fileDeliverySettingsCard(opts: {
   const mode = !opts.settings ? 'MISS' : opts.settings.enabled ? '云空间交付' : '聊天附件（默认）'
   return {
     schema: '2.0', config: { update_multi: true },
-    header: { title: { tag: 'plain_text', content: 'files · 群文件交付' }, template: opts.error ? 'red' : 'blue' },
+    header: { title: { tag: 'plain_text', content: 'files · 工作目录交付设置' }, template: opts.error ? 'red' : 'blue' },
     body: { elements: [
-      { tag: 'markdown', content: `**当前模式：${mode}**\n群：${escapeText(opts.settings?.folder?.name ?? opts.groupName)}` },
+      { tag: 'markdown', content: `**当前模式：${mode}**\n工作目录：${escapeText(opts.workDir)}\n群：${escapeText(opts.groupName)}` },
+      { tag: 'markdown', content: '同一工作目录的群共享交付方式，BTW / FK 沿用此设置；WT 使用独立目录设置。云空间文件夹及权限仍各群独立。' },
       ...(opts.notice ? [{ tag: 'markdown', content: escapeText(opts.notice) }] : []),
       ...(opts.error ? [{ tag: 'markdown', content: `<font color='red'>${escapeText(opts.error)}</font>` }] : []),
       {
         tag: 'column_set', background_style: 'grey-50',
         columns: [{ tag: 'column', width: 'weighted', weight: 1, padding: '12px', elements: [{
-          tag: 'markdown', content: '`files on` 开启本群云空间交付\n`files off` 恢复直接发送聊天附件\n`files` 查看本群设置',
+          tag: 'markdown', content: '`files on` 开启此工作目录的云空间交付\n`files off` 恢复直接发送聊天附件\n`files` 查看工作目录设置',
         }] }],
       },
+      ...(opts.settings?.enabled && !opts.settings.folder ? [{ tag: 'markdown', content: '本群首次交付时创建独立云空间文件夹。' }] : []),
       ...(opts.settings?.folder ? [{
         tag: 'button', text: { tag: 'plain_text', content: '管理群文件' }, type: 'primary_filled', width: 'fill',
         behaviors: [{ type: 'open_url', default_url: linkUrl(opts.settings.folder.url) }],
