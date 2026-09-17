@@ -88,15 +88,15 @@ describe('Codex earned reset redemption', () => {
     expect(peekUsage(ACCOUNT)).toBeNull(); expect(peekSuccessfulUsage(ACCOUNT)).toBeNull()
   }, 10_000)
 
-  test('failed quota readback reports the real retry count and preserves the confirmed redemption', async () => {
+  test('failed quota readback enters cooldown and preserves the confirmed redemption and original error', async () => {
     const app = new ResetApp()
     app.readError = new Error(JSON.stringify({ code: -32603,
       message: 'failed to fetch codex rate limits: error sending request for url (https://chatgpt.com/backend-api/wham/usage)' }))
     const result = await consumeCodexResetCredit(ACCOUNT, 'quota-network-failed', () => app)
     expect(result).toMatchObject({ outcome: 'reset', usage: { state: 'network',
-      reason: `Codex 额度查询失败（已尝试 3 次）：${app.readError.message}` } })
+      reason: app.readError.message } })
     expect(app.calls.filter(c => c.method === 'account/rateLimitResetCredit/consume')).toHaveLength(1)
-    expect(app.calls.filter(c => c.method === 'account/rateLimits/read')).toHaveLength(3)
+    expect(app.calls.filter(c => c.method === 'account/rateLimits/read')).toHaveLength(1)
     expect(app.calls.at(-1)?.method).toBe('close')
     expect(peekUsage(ACCOUNT)).toEqual(result.usage)
     expect(peekSuccessfulUsage(ACCOUNT)).toBeNull()

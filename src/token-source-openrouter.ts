@@ -10,9 +10,11 @@ import { observedContextWindow } from './context-window-observe'
 import { log } from './log'
 import { OPENROUTER_DEFAULT_MODELS, openRouterModelExcluded } from './openrouter-defaults'
 import { fetchApiModelData } from './token-source-model-api'
+import { UsageReadCache, usageCredentialKey, usageRetryAfter } from './usage-cache'
 
 const DEFAULT_BASE_URL = 'https://openrouter.ai/api'
 const TIMEOUT_MS = 10_000
+const usageReads = new UsageReadCache<UsageSnapshotUnified>()
 const SLOT_ENV = {
   opus: 'ANTHROPIC_DEFAULT_OPUS_MODEL',
   sonnet: 'ANTHROPIC_DEFAULT_SONNET_MODEL',
@@ -44,7 +46,7 @@ function baseUrl(raw: string): string {
 }
 
 class OpenRouterHttpError extends Error {
-  constructor(readonly status: number, detail: string) {
+  constructor(readonly status: number, detail: string, readonly retryAfterMs?: number) {
     super(`HTTP ${status}${detail ? `: ${detail}` : ''}`)
   }
 }
@@ -65,7 +67,7 @@ async function request(base: string, apiKey: string, path: string): Promise<unkn
         if (object(json) && object(json.error) && typeof json.error.message === 'string') detail = json.error.message
       } catch { /* 非 JSON 错误仍由下面的 HTTP 状态向调用方报告。 */ }
     }
-    throw new OpenRouterHttpError(response.status, detail.replaceAll(apiKey, '[redacted]'))
+    throw new OpenRouterHttpError(response.status, detail.replaceAll(apiKey, '[redacted]'), usageRetryAfter(response.headers))
   }
   return response.json()
 }
@@ -116,6 +118,10 @@ function nonnegative(value: unknown): value is number {
 /** 账户余额直接读取 /credits；失败显示 MISS，不换用 Key 限额或累计用量。 */
 export async function fetchOpenRouterUsage(base: string, apiKey: string): Promise<UsageSnapshotUnified> {
   if (!apiKey) return { kind: 'balance', state: 'no_credentials', windows: [] }
+  return usageReads.read(usageCredentialKey('openrouter', baseUrl(base), apiKey), () => requestOpenRouterUsage(base, apiKey))
+}
+
+async function requestOpenRouterUsage(base: string, apiKey: string): Promise<UsageSnapshotUnified> {
   try {
     const json = await request(base, apiKey, 'credits')
     if (!object(json) || !object(json.data)) throw new Error('OpenRouter credits: data 对象缺失')
@@ -129,7 +135,7 @@ export async function fetchOpenRouterUsage(base: string, apiKey: string): Promis
     const reason = messageOf(error)
     log(`openrouter readUsage MISS: ${reason}`)
     return { kind: 'balance', state: error instanceof OpenRouterHttpError && error.status === 429 ? 'rate_limited' : 'network',
-      windows: [], reason }
+      windows: [], reason, ...(error instanceof OpenRouterHttpError ? { retryAfterMs: error.retryAfterMs } : {}) }
   }
 }
 

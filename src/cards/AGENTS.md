@@ -10,7 +10,7 @@
 - Codex `request_user_input` 和 Claude `AskUserQuestion` 共用问答卡，保留各自回包语义、历史回答和自定义输入入口。
 - `tool.ts` 生成工具摘要，`shell-command.ts` 解析 Bash、PowerShell 及引号包装后的首行 `# desc:`。Claude TaskCreate/Update/List/Get 在 `task-board.ts` 中累积为完整任务板。
 - 生图工具默认收起，完整提示词放在折叠体内，图片以结构化 `img` 子组件展示并允许点击预览。不要把提示词塞进标题，也不要把已嵌入的图片再单独发送。图片上传由 Session helper 处理，模板只接收 image key。
-- `hi` 的额度区用展开式浅蓝面板，与 `codex-accounts` 共用 `usage.ts` 的六格彩色进度条和重置倒计时；各窗口纵向分行，重置卡另起一行只展示 Codex 账号的可用次数，统一额度摘要与 footer 不附带它。活跃项目行尾显示实际 Codex 进程的账号备注；账号未知时省略整个备注，不显示账号 MISS。账号列表每页附完整 Codex 账号命令说明，底部「Codex 命令」面板默认折叠。
+- `hi` 的额度区用展开式浅蓝面板，全局所有账号各占一行、notation 字号、2px 行间距，无进度条和底部解释。Codex 按账号备注分行，只显示主额度及“重置 N”，排除 Spark/gpt-reserve；DeepSeek、GLM 的跨 Agent 入口合为一行；GLM 月工具只显示百分比。统一额度摘要与 footer 不附带重置次数。活跃项目行尾显示实际 Codex 进程的账号备注；账号未知时省略整个备注，不显示账号 MISS。账号列表每页附完整 Codex 账号命令说明，底部「Codex 命令」面板默认折叠。
 - Codex 的 `hi`、footer 和账号额度只显示主额度；保留主额度自身的短时窗口、周窗口，不展示 GPT-5.3-Codex-Spark 等模型的附加额度。
 - Claude 订阅 footer 同时保留 5 小时与周额度，周额度按该条回复的模型选择专属窗口或总窗口；已返回的专属窗口缺数据时显示 MISS。hi 仍列出全部额度窗口。
 - `background.ts` 累积 Claude `task_*`、Codex collab 和 DSH 子 Agent 事件；子 Agent 直接展示，普通前台命令留在 pending。任务行与委派共用 `agent-cards.ts`：默认折叠，标题仅状态与最多 40 字说明，类型、完整说明、结果、错误和最近三步动作放在详情；完成后显示实际耗时，运行中不放需要定时刷新的计时。禁止恢复独立后台卡和游标迁移。

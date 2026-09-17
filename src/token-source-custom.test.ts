@@ -48,13 +48,15 @@ api_key="test-key"
     const { config } = await import(${modulePath('config.ts')})
     const registry = await import(${modulePath('token-source.ts')})
     const { withModelVisibility } = await import(${modulePath('token-source-visibility.ts')})
+    const { sharedTokenSourceConfigs } = await import(${modulePath('token-source-accounts.ts')})
     for (const name of ['codex', 'glm', 'native', 'claude', 'deepseek', 'openrouter', 'dsh', 'dsh-glm']) {
       await import(${JSON.stringify(join(import.meta.dir, 'token-source-'))} + name + '.ts')
     }
     const rebuild = () => {
       registry.resetTokenSourceRegistry()
+      const effective = sharedTokenSourceConfigs(config.token_sources)
       for (const factory of registry.tokenSourceFactories()) {
-        const cfg = config.token_sources[factory.configSectionId] ?? {}
+        const cfg = effective[factory.configSectionId] ?? {}
         const source = withModelVisibility(factory.build(cfg), cfg)
         source.enabled = true // 本测试隔离凭据发现，不依赖测试机上的本地登录态。
         registry.registerTokenSource(source)

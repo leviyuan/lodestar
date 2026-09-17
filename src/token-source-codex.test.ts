@@ -11,7 +11,7 @@ test('hi preserves a Plus main full-window annotation through unified conversion
   })
   expect(snapshot.windows[0]).toMatchObject({ label: '5h 窗口', percent: 0, resetsAt: null, unreportedFull: true })
   const content = consoleUnifiedUsageContent(snapshot)
-  expect(content).toContain('满窗 · 0.15 份')
+  expect(content).toContain('5h 0%（满窗）')
   expect(content).not.toContain('重置时间')
 })
 
@@ -34,7 +34,7 @@ test('Codex quota displays only main windows, regardless of model-specific bucke
     expect(unified.windows.map(w => [w.kind, w.percent])).toEqual(fiveHour ? [['fiveHour', 0], ['weekly', 24]] : [['weekly', 24]])
     expect(unified.resetCredits).toBe(2)
     for (const content of [consoleUnifiedUsageContent(unified), unifiedUsageSummary(unified),
-      JSON.stringify(consoleUsageElement({ sessionName: 'test', status: 'idle', unifiedUsage: unified }))]) {
+      JSON.stringify(consoleUsageElement({ sessionName: 'test', status: 'idle', accountUsages: [{ id: 'codex:default', label: 'Codex·默认', usage: unified }] }))]) {
       expect(content).toContain('24%')
       expect(content).not.toMatch(/Spark|5\.3|bengalfox|Another model|11%|25%|99%/)
     }

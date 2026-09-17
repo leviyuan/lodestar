@@ -63,7 +63,7 @@ registerTokenSourceFactory({
   },
   setup: {
     commandSuffix: 'deepseek-harness',
-    hint: () => '启用 DeepSeek Harness：发送 `deepseek-harness-setup <api_key>`，或 `deepseek-harness-setup <base_url> <api_key>`。',
+    hint: () => 'DeepSeek 账号由 Claude Code 和 DeepSeek Harness 共用。发送 `deepseek-setup <api_key>` 配置两边；`deepseek-harness-setup [base_url] <api_key>` 同样更新共享账号。',
     parseArgs(args) {
       const parts = args.trim().split(/\s+/).filter(Boolean)
       if (parts.length < 1 || parts.length > 2 || /^https?:\/\//i.test(parts.at(-1)!)) return { error: '用法：deepseek-harness-setup [base_url] <api_key>' }

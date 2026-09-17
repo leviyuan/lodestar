@@ -22,6 +22,7 @@ import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { log } from './log'
+import { UsageReadCache, usageCredentialKey, usageRetryAfter } from './usage-cache'
 
 const API_TIMEOUT_MS = 10_000
 
@@ -42,8 +43,8 @@ export interface GlmMonthlyWindow extends GlmUsageWindow {
 export type GlmUsageSnapshot =
   | { state: 'no_credentials' }
   | { state: 'not_glm'; baseUrl?: string }
-  | { state: 'rate_limited' }
-  | { state: 'network'; reason?: string }
+  | { state: 'rate_limited'; retryAfterMs?: number }
+  | { state: 'network'; reason?: string; retryAfterMs?: number }
   | {
       state: 'ok'
       /** 套餐档位(open.bigmodel.cn 的 level 字段:max / standard / …) */
@@ -59,8 +60,7 @@ export type GlmUsageSnapshot =
 
 type GlmUsageSnapshotOk = Extract<GlmUsageSnapshot, { state: 'ok' }>
 
-let cache: GlmUsageSnapshot | null = null
-let inFlight: Promise<GlmUsageSnapshot> | null = null
+const usageReads = new UsageReadCache<GlmUsageSnapshot>()
 
 /** Claude Code settings 目录:优先 CLAUDE_CONFIG_DIR,否则 ~/.claude。 */
 function claudeConfigDir(): string {
@@ -155,7 +155,7 @@ function parseQuotaLimit(data: any): GlmUsageSnapshotOk {
 }
 
 export async function fetchGlmUsage(baseUrlOverride?: string, tokenOverride?: string): Promise<GlmUsageSnapshot> {
-  const env = (baseUrlOverride && tokenOverride)
+  const env = (baseUrlOverride !== undefined || tokenOverride !== undefined)
     ? { ANTHROPIC_BASE_URL: baseUrlOverride, ANTHROPIC_AUTH_TOKEN: tokenOverride }
     : readClaudeSettingsEnv()
   const token = env.ANTHROPIC_AUTH_TOKEN
@@ -165,6 +165,10 @@ export async function fetchGlmUsage(baseUrlOverride?: string, tokenOverride?: st
   const domain = glmDomain(baseUrl)
   if (!domain) return { state: 'not_glm', baseUrl: baseUrl || undefined }
 
+  return usageReads.read(usageCredentialKey('glm', domain, token), () => requestGlmUsage(domain, token))
+}
+
+async function requestGlmUsage(domain: string, token: string): Promise<GlmUsageSnapshot> {
   const url = `${domain}/api/monitor/usage/quota/limit`
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS)
@@ -177,16 +181,21 @@ export async function fetchGlmUsage(baseUrlOverride?: string, tokenOverride?: st
       },
       signal: controller.signal,
     })
-    if (res.status === 429) return { state: 'rate_limited' }
-    if (!res.ok) return { state: 'network', reason: `HTTP ${res.status}` }
+    if (!res.ok) {
+      log(`glm-usage: quota/limit HTTP ${res.status}`)
+      return { state: res.status === 429 ? 'rate_limited' : 'network', reason: `HTTP ${res.status}`,
+        retryAfterMs: usageRetryAfter(res.headers) }
+    }
     const json = await res.json()
     if (json?.success === false || (typeof json?.code === 'number' && json.code !== 200)) {
-      return { state: 'network', reason: json?.msg ? String(json.msg) : `code ${json?.code}` }
+      const reason = (json?.msg ? String(json.msg) : `code ${json?.code}`).replaceAll(token, '[redacted]')
+      log(`glm-usage: quota/limit MISS: ${reason}`)
+      return { state: json?.code === 429 ? 'rate_limited' : 'network', reason, retryAfterMs: usageRetryAfter(res.headers) }
     }
     const data = json?.data ?? json
     return parseQuotaLimit(data)
   } catch (e: any) {
-    const reason = e?.name === 'AbortError' ? `timeout ${API_TIMEOUT_MS}ms` : (e?.message ?? String(e))
+    const reason = (e?.name === 'AbortError' ? `timeout ${API_TIMEOUT_MS}ms` : (e?.message ?? String(e))).replaceAll(token, '[redacted]')
     log(`glm-usage: quota/limit fetch failed: ${reason}`)
     return { state: 'network', reason }
   } finally {
@@ -194,21 +203,4 @@ export async function fetchGlmUsage(baseUrlOverride?: string, tokenOverride?: st
   }
 }
 
-export async function readGlmUsage(): Promise<GlmUsageSnapshot> {
-  if (inFlight) return inFlight
-  inFlight = fetchGlmUsage()
-    .then(d => {
-      inFlight = null
-      // 网络态保留上次成功的 cache(若有),否则如实返回失败态 ——
-      // 与 usage.ts 一致:绝不假数据。
-      if (d.state === 'network') return cache ?? d
-      cache = d
-      return d
-    })
-    .catch(e => {
-      log(`glm-usage: fetchGlmUsage threw: ${e}`)
-      inFlight = null
-      return cache ?? { state: 'network', reason: String(e) }
-    })
-  return inFlight
-}
+export const readGlmUsage = fetchGlmUsage

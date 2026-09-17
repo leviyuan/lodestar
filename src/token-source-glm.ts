@@ -75,6 +75,7 @@ export function glmUsageToUnified(s: GlmUsageSnapshot): UsageSnapshotUnified {
         : s.state === 'rate_limited' ? 'rate_limited'
         : 'network',
       windows: [],
+      ...('retryAfterMs' in s ? { retryAfterMs: s.retryAfterMs } : {}),
       ...(s.state === 'network' && s.reason ? { reason: s.reason } : {}),
     }
   }
@@ -181,7 +182,7 @@ registerTokenSourceFactory({
   },
   setup: {
     commandSuffix: 'glm',
-    hint: display => `配置 ${display}：发送 \`glm-setup <api_key>\`（智谱国内站），或 \`glm-setup <base_url> <api_key>\`（指定平台）。校验通过后保存，失败保留原配置。`,
+    hint: display => `配置 ${display}：发送 \`glm-setup <api_key>\`（智谱国内站），或 \`glm-setup <base_url> <api_key>\`（指定平台）。Claude Code 和 DeepSeek Harness 共用该账号；校验失败保留原配置。`,
     parseArgs: args => {
       const parts = args.trim().split(/\s+/).filter(Boolean)
       if (parts.length < 1 || parts.length > 2 || /^https?:\/\//i.test(parts.at(-1)!)) {

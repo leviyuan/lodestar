@@ -3,8 +3,10 @@ import type { ClaudeSpawnOpts } from './claude-agent-process'
 import type { UsageSnapshotUnified, UsageWindowUnified } from './token-source'
 import { log } from './log'
 import { resolveClaudeSdkModel } from './claude-models'
+import { UsageReadCache, isUsageRateLimitError } from './usage-cache'
 
 const TIMEOUT_MS = 30_000
+const usageReads = new UsageReadCache<UsageSnapshotUnified>()
 type JsonObject = Record<string, unknown>
 
 function object(value: unknown): value is JsonObject {
@@ -97,6 +99,11 @@ export function claudeUsageSnapshot(data: unknown): UsageSnapshotUnified {
 /** 沿用订阅来源的认证隔离；独立控制查询用完即关，失败不复用旧快照。 */
 export async function fetchClaudeSubscriptionUsage(options: Pick<ClaudeSpawnOpts,
   'settingSources' | 'settings' | 'transformEnv' | 'validateAccount' | 'tokenSourceId'>): Promise<UsageSnapshotUnified> {
+  return usageReads.read('claude-subscription', () => requestClaudeSubscriptionUsage(options))
+}
+
+async function requestClaudeSubscriptionUsage(options: Pick<ClaudeSpawnOpts,
+  'settingSources' | 'settings' | 'transformEnv' | 'validateAccount' | 'tokenSourceId'>): Promise<UsageSnapshotUnified> {
   try {
     const { ClaudeAgentProcess } = await import('./claude-agent-process')
     const proc = new ClaudeAgentProcess({ workDir: homedir(), effort: 'default',
@@ -128,7 +135,8 @@ export async function fetchClaudeSubscriptionUsage(options: Pick<ClaudeSpawnOpts
     const reason = error instanceof Error ? error.message : String(error)
     log(`claude-sub readUsage MISS: ${reason}`)
     return {
-      state: (error as { code?: string })?.code === 'CLAUDE_SUBSCRIPTION_AUTH_MISSING' ? 'no_credentials' : 'network',
+      state: (error as { code?: string })?.code === 'CLAUDE_SUBSCRIPTION_AUTH_MISSING' ? 'no_credentials'
+        : isUsageRateLimitError(error) ? 'rate_limited' : 'network',
       windows: [], reason,
     }
   }

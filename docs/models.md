@@ -10,12 +10,12 @@ GLM Key 可在首次安装时跳过，之后用群命令添加或更换。以下
 
 | 账号 | 群命令 |
 | --- | --- |
-| 智谱 GLM（Claude Code） | `glm-setup <api_key>` |
-| Z.ai GLM（Claude Code） | `glm-setup https://api.z.ai/api/anthropic <api_key>` |
-| DeepSeek（Claude Code） | `deepseek-setup [base_url] <api_key>` |
+| 智谱 GLM（两个 Agent 共用） | `glm-setup <api_key>` |
+| Z.ai GLM（两个 Agent 共用） | `glm-setup https://api.z.ai/api/anthropic <api_key>` |
+| DeepSeek（两个 Agent 共用） | `deepseek-setup [base_url] <api_key>` |
 | OpenRouter | `openrouter-setup [base_url] <api_key>` |
-| DeepSeek（DeepSeek Harness） | `deepseek-harness-setup [base_url] <api_key>` |
-| 独立 GLM 账号（DeepSeek Harness） | `dsh-glm-setup [base_url] <api_key>` |
+| DeepSeek 旧命令，同样更新共享账号 | `deepseek-harness-setup [base_url] <api_key>` |
+| GLM 旧命令，同样更新共享账号 | `dsh-glm-setup [base_url] <api_key>` |
 
 `[base_url]` 表示可选参数，命令中不输入方括号；API Key 只填原值，不加 `Bearer`。`glm-setup <base_url> <api_key>` 的原有格式仍可使用，GLM 的 Key 与平台地址必须对应。保存后发送 `md` 选择模型。账号配置由本机所有群共用，更新 Key 保留已有模型、档位和可见性设置。
 
@@ -40,9 +40,11 @@ GLM Key 可在首次安装时跳过，之后用群命令添加或更换。以下
 
 ## 额度
 
-发送 `hi` 查看会话和账号额度。GLM 展示套餐与各窗口用量；Codex 展示额度窗口和账号可用的重置卡次数。
+发送 `hi` 查看全部已配置账号的额度，一账号一行。Codex 按备注展示主额度窗口及“重置”次数，不展示 Spark、gpt-reserve；Claude 订阅保留主窗口和模型专属周额度；GLM 月工具仅显示已用百分比，DeepSeek、OpenRouter 显示余额。DeepSeek、GLM 的两个 Agent 入口各合并为一行。
 
-回复底部显示 `agent · 模型名/effort`，其中 Agent 为 `claude`、`codex` 或 `dsh`。窗口额度如 `4.1h·7%·[6.9d·17%]`，分别表示重置倒计时与已用百分比，方括号内为周窗口；余额显示 `余额 $12.34` 或 `余额 ¥12.34`。Codex 的短暂网络失败会有限重试；最终刷新失败或进程已退出时，回复底部按原格式保留同账号上次成功的额度。没有成功缓存、登录认证失败或缓存已被重新登录、删除账号、额度重置操作清除时显示 `MISS`。`hi`、`codex-accounts` 和其他来源的查询失败仍显示 `MISS`。
+所有群、Agent、`hi`、账号列表、页脚和自动选号共用账号级惰性缓存：一分钟内直接复用，过期后有查询需求才请求，并发查询只发送一次。失败后冷却 1 分钟，连续失败依次延长为 2、4、5 分钟；上游提供更长的 `Retry-After` 时遵守其等待时间。额度请求不在一次失败后紧接着重试，冷却期间返回已有错误。重新登录、删除 Codex 账号或显式使用重置卡会使对应缓存失效；使用重置卡后重新查询实际额度。
+
+回复底部显示 `agent · 模型名/effort`，其中 Agent 为 `claude`、`codex` 或 `dsh`。窗口额度如 `4.1h·7%·[6.9d·17%]`，分别表示重置倒计时与已用百分比，方括号内为周窗口；余额显示 `余额 $12.34` 或 `余额 ¥12.34`。Codex 刷新失败或进程已退出时，回复底部按原格式保留同账号上次成功的额度。没有成功缓存、登录认证失败或缓存已被重新登录、删除账号、额度重置操作清除时显示 `MISS`。`hi`、`codex-accounts` 和其他来源的过期刷新失败仍显示 `MISS`。
 
 ## Claude Code 订阅
 
@@ -98,12 +100,13 @@ OpenRouter 余额来自 `/api/v1/credits`，按 `total_credits - total_usage` �
 
 ## DeepSeek Harness
 
-DeepSeek Harness 使用独立的 `[token_source.deepseek-harness]` 账号与原生会话。在群内发送 `deepseek-harness-setup <api_key>`，再通过 `model` 面板选择该来源即可启用。自建端点用 `deepseek-harness-setup <base_url> <api_key>`；这里使用原生 API 根地址，不带 `/anthropic`。
+DeepSeek Harness 与 Claude Code 共用 `[token_source.deepseek]` 中的 DeepSeek Key 和平台地址。发送 `deepseek-setup <api_key>` 后，两边都可在 `model` 面板中选择；旧命令 `deepseek-harness-setup` 也更新同一共享账号。两个 Agent 保留各自的原生会话、默认模型、effort 和模型可见性。
 
 ```toml
+[token_source.deepseek]
+api_key = "填写自己的 API key"
 [token_source.deepseek-harness]
 agent = "dsh"
-api_key = "填写自己的 API key"
 # bin = "/abs/path/to/node"  # 可选：运行 DSH 的 Node 可执行文件
 # model = "deepseek-v4-pro" # 可选：默认模型
 # effort = "high"          # 可选：默认请求档位
@@ -111,6 +114,8 @@ api_key = "填写自己的 API key"
 
 ### GLM Coding Plan
 
-DSH 也支持 GLM Coding Plan：已有 `[token_source.glm]` 时自动复用该账号，在 `md` → DeepSeek Harness → GLM Coding Plan 中选择模型。独立凭据用 `dsh-glm-setup [base_url] <api_key>`，配置节为 `[token_source.dsh-glm]`。它调用 Coding Plan 的 OpenAI 端点，复用 GLM 额度查询；不经过 OpenRouter 或 Claude SDK。账号接口模型和补录模型一起交给原生适配器，均可选择请求档位；接口项用「隐 / 显」，补录项用「删」。
+DSH 与 Claude Code 共用 `[token_source.glm]` 中的 GLM Coding Plan Key 和平台地址，在 `md` → DeepSeek Harness → GLM Coding Plan 中选择模型。`glm-setup` 与旧命令 `dsh-glm-setup` 都会更新两边，`[token_source.dsh-glm]` 只保留 DSH 的模型、effort、可见性等设置。两边分别使用 Anthropic 与 Coding Plan OpenAI 端点，并共享同一额度缓存。账号接口模型和补录模型一起交给原生适配器，均可选择请求档位；接口项用「隐 / 显」，补录项用「删」。
+
+只有旧 Harness 配置时，会读取它的账号供两边共用；下次保存该来源配置时，凭据归并到上述共享配置节。两边旧配置的 Key 或平台不一致时明确报配置冲突，不自动挑选账号；重新执行对应 `setup` 命令可统一为指定的新配置。
 
 手动修改配置后需重启 daemon；群内账号启用和模型补录会自行重载相关配置。模型路由、配置优先级和后端差异见 [后端说明](claude-agent-backend.md)。

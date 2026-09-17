@@ -8,6 +8,7 @@ import { codexAccountCard } from './cards/codex-account'
 import { config } from './config'
 import { log } from './log'
 import { tokenSourceErrorMessage } from './token-source-errors'
+import { sharedAccountSourceIds } from './token-source-accounts'
 
 /** 只控制 Lodestar 的订阅来源；本机 Claude 登录态保持不变。 */
 export async function runClaudeSubscriptionCommand(s: Session, action: string): Promise<void> {
@@ -87,12 +88,14 @@ export async function runTokenSourceSetup(s: Session, sourceId: string, args: st
     await configureTokenSource(def, parsed.config)
     saved = true
     const ts = getTokenSource(def.configSectionId)
-    if (ts?.modelCatalogState?.status !== 'ready') {
-      const reason = tokenSourceErrorMessage(ts?.modelCatalogState?.error ?? '模型目录尚未就绪', [parsed.config.api_key, parsed.config.auth_token])
+    const related = sharedAccountSourceIds(def.configSectionId).map(id => getTokenSource(id))
+    const failed = related.find(source => source?.modelCatalogState?.status !== 'ready')
+    if (failed || related.some(source => !source)) {
+      const reason = tokenSourceErrorMessage(failed?.modelCatalogState?.error ?? '模型目录尚未就绪', [parsed.config.api_key, parsed.config.auth_token])
       await feishu.sendText(s.chatId, `❌ ${ts?.display ?? sourceId} 凭据校验通过、配置已保存，但暂不可用：${reason}\n处理后发送 md 刷新。`)
       return
     }
-    await feishu.sendText(s.chatId, `✅ ${ts.display} 校验通过，配置已保存。发送 md 选择模型。`)
+    await feishu.sendText(s.chatId, `✅ ${ts!.display} 校验通过，配置已保存。${related.length > 1 ? 'Claude Code 和 DeepSeek Harness 共用该账号。' : ''}发送 md 选择模型。`)
   } catch (e: any) {
     const state = saved || e instanceof TokenSourceSetupError && e.saved ? '配置已保存，但后续处理失败' : '配置失败，未保存，原配置保持不变'
     const reason = tokenSourceErrorMessage(e, [parsed.config.api_key, parsed.config.auth_token])

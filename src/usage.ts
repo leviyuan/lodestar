@@ -17,6 +17,7 @@ import { createHash } from 'node:crypto'
 import { config } from './config'
 import { bindProcessCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
 import { plusFiveHourWindow } from './codex-quota'
+import { UsageReadCache, USAGE_FRESH_MS, isUsageRateLimitError } from './usage-cache'
 
 const API_TIMEOUT_MS = 10_000
 
@@ -67,7 +68,7 @@ const caches = new Map<string, UsageSnapshot>()
 // Startup and footer displays may use the last successful read.
 // Keep it separate from the latest result so live quota queries still report failures.
 const successfulCaches = new Map<string, Extract<UsageSnapshot, { state: 'ok' }>>()
-const inFlights = new Map<string, Promise<UsageSnapshot>>()
+const usageReads = new UsageReadCache<UsageSnapshot>()
 
 function cacheUsage(accountId: string, snapshot: UsageSnapshot): void {
   caches.set(accountId, snapshot)
@@ -118,8 +119,8 @@ export function consumeCodexResetCredit(
       const generation = usageGenerations.get(accountId)
       let usage: UsageSnapshot
       try {
-        usage = snapshotFromReadResponse(
-          await requestCodexControlWithRetry(() => app.request('account/rateLimits/read', {})), account.planType)
+        usage = await usageReads.read(accountId, async () => snapshotFromReadResponse(
+          await withTimeout(app.request('account/rateLimits/read', {}), API_TIMEOUT_MS), account.planType))
       } catch (error) {
         usage = { state: 'network', reason: error instanceof Error ? error.message : String(error) }
       }
@@ -396,11 +397,12 @@ async function fetchUsage(accountId: string): Promise<UsageSnapshot> {
     if (!account) return { state: 'no_credentials' }
     if (account.type !== 'chatgpt') return { state: 'auth_failed' }
 
-    const limitsRes = await requestCodexControlWithRetry(() => app.request('account/rateLimits/read', {}))
+    const limitsRes = await app.request('account/rateLimits/read', {})
     return snapshotFromReadResponse(limitsRes, account.planType)
   } catch (e: any) {
     log(`usage: codex app-server usage failed: ${e?.message ?? e}`)
     if (isUsageAuthError(e)) return { state: 'auth_failed' }
+    if (isUsageRateLimitError(e)) return { state: 'rate_limited' }
     return { state: 'network', reason: e?.message ?? String(e) }
   } finally {
     await app.close()
@@ -443,6 +445,11 @@ export function peekSuccessfulUsage(accountId = DEFAULT_CODEX_ACCOUNT): Extract<
   return successfulCaches.get(accountId) ?? null
 }
 
+export function peekFreshUsage(accountId = DEFAULT_CODEX_ACCOUNT): Extract<UsageSnapshot, { state: 'ok' }> | null {
+  const snapshot = peekSuccessfulUsage(accountId)
+  return snapshot && Date.now() >= snapshot.fetchedAt && Date.now() - snapshot.fetchedAt < USAGE_FRESH_MS ? snapshot : null
+}
+
 /** Bind a closing footer to its account; login, deletion or quota reset invalidates the reader. */
 export function captureCodexUsageCache(accountId = DEFAULT_CODEX_ACCOUNT) {
   const generation = usageGenerations.get(accountId) ?? 0
@@ -453,57 +460,58 @@ export function captureCodexUsageCache(accountId = DEFAULT_CODEX_ACCOUNT) {
 }
 
 export function readUsage(accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot> {
-  const pending = inFlights.get(accountId)
-  if (pending) return pending
   const generation = usageGenerations.get(accountId) ?? 0
-  const promise = Promise.resolve().then(() => fetchUsage(accountId))
+  return usageReads.read(accountId, async () => {
+    try { return await fetchUsage(accountId) }
+    catch (error) { log(`usage: ${accountId} fetch failed: ${error}`); throw error }
+  })
     .catch((e): UsageSnapshot => {
-      log(`usage: ${accountId} fetch failed: ${e}`)
+      if (isUsageAuthError(e)) return { state: 'auth_failed' }
+      if (isUsageRateLimitError(e)) return { state: 'rate_limited' }
       return { state: 'network', reason: String(e) }
     }).then((snapshot): UsageSnapshot => {
       if ((usageGenerations.get(accountId) ?? 0) !== generation) return { state: 'auth_failed' }
       cacheUsage(accountId, snapshot)
       return snapshot
-    }).finally(() => { if (inFlights.get(accountId) === promise) inFlights.delete(accountId) })
-  inFlights.set(accountId, promise)
-  return promise
+    })
 }
 
 /** 用现有连接刷新额度；请求失败返回 null 并记录原始错误。
  * 成功快照另存供启动与页脚使用，页脚沿用原额度格式。 */
 export function refreshUsageFromConnection(request: (method: string, params: any) => Promise<any>, accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot | null> {
-  const pending = refreshInFlights.get(accountId)
-  if (pending) return pending
   const generation = usageGenerations.get(accountId) ?? 0
-  const promise = requestCodexControlWithRetry(() => request('account/rateLimits/read', {}))
-    .then((limitsRes: any) => {
-      if ((usageGenerations.get(accountId) ?? 0) !== generation) return null
-      const snap = snapshotFromReadResponse(limitsRes)
-      if ((usageGenerations.get(accountId) ?? 0) === generation) cacheUsage(accountId, snap)
+  return usageReads.read(accountId, async () => {
+    try {
+      const snap = snapshotFromReadResponse(await withTimeout(request('account/rateLimits/read', {}), API_TIMEOUT_MS))
       if (snap.state !== 'ok') log(`usage: refresh from connection: ${snap.state === 'network' ? snap.reason : snap.state}`)
+      return snap
+    } catch (error) {
+      log(`usage: refresh from connection failed: ${error instanceof Error ? error.message : String(error)}`)
+      throw error
+    }
+  }).then((snap) => {
+      if ((usageGenerations.get(accountId) ?? 0) !== generation) return null
+      if ((usageGenerations.get(accountId) ?? 0) === generation) cacheUsage(accountId, snap)
       return snap
     })
     .catch((e: any) => {
-      log(`usage: refresh from connection failed: ${e?.message ?? e}`)
       if ((usageGenerations.get(accountId) ?? 0) === generation) {
         caches.delete(accountId)
         if (isUsageAuthError(e)) successfulCaches.delete(accountId)
       }
       return null
     })
-    .finally(() => { if (refreshInFlights.get(accountId) === promise) refreshInFlights.delete(accountId) })
-  refreshInFlights.set(accountId, promise)
-  return promise
 }
 
-const refreshInFlights = new Map<string, Promise<UsageSnapshot | null>>()
 const usageGenerations = new Map<string, number>()
+let usageRevision = 0
+export function codexUsageCacheRevision(): number { return usageRevision }
 export function invalidateCodexUsage(accountId: string): void {
+  usageRevision++
   usageGenerations.set(accountId, (usageGenerations.get(accountId) ?? 0) + 1)
   caches.delete(accountId)
   successfulCaches.delete(accountId)
-  inFlights.delete(accountId)
-  refreshInFlights.delete(accountId)
+  usageReads.invalidate(accountId)
 }
 
 function isUsageAuthError(error: unknown): boolean {

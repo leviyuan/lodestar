@@ -19,7 +19,7 @@ describe('glm quota/limit 窗口解析(TOKENS_LIMIT 双条按 unit/number 区分
       },
     }), { status: 200 })) as any
     try {
-      const snap = await fetchGlmUsage('https://open.bigmodel.cn/api/anthropic', 'test-token')
+      const snap = await fetchGlmUsage('https://open.bigmodel.cn/api/anthropic', 'quota-no-week-account')
       expect(snap.state).toBe('ok')
       if (snap.state !== 'ok') throw new Error('expected ok')
       expect(snap.fiveHour?.percent).toBe(1)
@@ -40,7 +40,7 @@ describe('glm quota/limit 窗口解析(TOKENS_LIMIT 双条按 unit/number 区分
       },
     }), { status: 200 })) as any
     try {
-      const snap = await fetchGlmUsage('https://open.bigmodel.cn/api/anthropic', 'test-token')
+      const snap = await fetchGlmUsage('https://open.bigmodel.cn/api/anthropic', 'quota-week-account')
       expect(snap.state).toBe('ok')
       if (snap.state !== 'ok') throw new Error('expected ok')
       expect(snap.fiveHour?.percent).toBe(1)

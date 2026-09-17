@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -13,6 +13,9 @@ const originalDataDir = process.env.LODESTAR_DATA_DIR
 const testDir = mkdtempSync(join(tmpdir(), 'lodestar-openrouter-'))
 let requests: { url: string; init?: RequestInit }[] = []
 let respond: () => Response
+let quotaNow = Date.now(), quotaTestId = 0
+let quotaClock: ReturnType<typeof spyOn>
+let quotaTestKey: string
 
 function model(id = 'anthropic/test-model', overrides: Record<string, unknown> = {}) {
   return { id, name: `Name: ${id}`, architecture: { output_modalities: ['text'] },
@@ -26,6 +29,9 @@ const build = (cfg: Parameters<typeof factory.build>[0] = {}) => factory.build({
 
 beforeAll(() => { process.env.LODESTAR_DATA_DIR = testDir })
 beforeEach(() => {
+  quotaNow = Date.now()
+  quotaClock = spyOn(Date, 'now').mockImplementation(() => quotaNow)
+  quotaTestKey = `quota-test-key-${++quotaTestId}`
   requests = []
   resetContextWindowCache()
   respond = () => json({ data: [model()] })
@@ -34,7 +40,7 @@ beforeEach(() => {
     return respond()
   }) as typeof fetch
 })
-afterEach(() => { globalThis.fetch = originalFetch; resetContextWindowCache() })
+afterEach(() => { globalThis.fetch = originalFetch; resetContextWindowCache(); quotaClock.mockRestore() })
 afterAll(() => {
   if (originalDataDir === undefined) delete process.env.LODESTAR_DATA_DIR
   else process.env.LODESTAR_DATA_DIR = originalDataDir
@@ -231,7 +237,7 @@ describe('OpenRouter authoritative model catalog', () => {
 describe('OpenRouter account balance', () => {
   test('reads account credits and subtracts account usage independently of key limits', async () => {
     respond = () => json({ data: { total_credits: 100.5, total_usage: 25.75 } })
-    const usage = await fetchOpenRouterUsage('https://openrouter.ai/api', 'test-key')
+    const usage = await fetchOpenRouterUsage('https://openrouter.ai/api', quotaTestKey)
     expect(requests.map(r => r.url)).toEqual(['https://openrouter.ai/api/v1/credits'])
     expect(usage).toMatchObject({ kind: 'balance', state: 'ok', windows: [], balance: { currency: 'USD' } })
     expect(usage.balance?.remaining).toBe(74.75)
@@ -241,31 +247,34 @@ describe('OpenRouter account balance', () => {
 
   test('zero and overdrawn account balances are not replaced or clamped', async () => {
     respond = () => json({ data: { total_credits: 0, total_usage: 0 } })
-    expect(await fetchOpenRouterUsage('https://openrouter.ai/api', 'test-key')).toMatchObject({
+    expect(await fetchOpenRouterUsage('https://openrouter.ai/api', quotaTestKey)).toMatchObject({
       kind: 'balance', state: 'ok', windows: [], balance: { remaining: 0, currency: 'USD' },
     })
     respond = () => json({ data: { total_credits: 1, total_usage: 1.25 } })
-    expect((await fetchOpenRouterUsage('https://openrouter.ai/api', 'test-key')).balance?.remaining).toBe(-0.25)
+    quotaNow += 60_000
+    expect((await fetchOpenRouterUsage('https://openrouter.ai/api', quotaTestKey)).balance?.remaining).toBe(-0.25)
   })
 
   test('HTTP, malformed response and network failures remain visible and do not query another endpoint', async () => {
     for (const failure of [
-      () => json({ error: { message: 'forbidden test-key' } }, 403),
+      () => json({ error: { message: 'forbidden ' + quotaTestKey } }, 403),
       () => new Response('<html>bad gateway</html>', { status: 502 }),
       () => json({ data: { total_credits: 10 } }),
       () => json({ data: { total_credits: 10, total_usage: 'unknown' } }),
       () => { throw new Error('timeout') },
     ]) {
       respond = failure
-      const snap = await fetchOpenRouterUsage('https://openrouter.ai/api', 'test-key')
+      quotaNow += 300_000
+      const snap = await fetchOpenRouterUsage('https://openrouter.ai/api', quotaTestKey)
       expect(snap.state).toBe('network')
       expect(snap.windows).toEqual([])
       expect(snap.reason).toBeTruthy()
-      expect(snap.reason).not.toContain('test-key')
+      expect(snap.reason).not.toContain(quotaTestKey)
     }
     expect(requests).toHaveLength(5)
     expect(requests.every(request => request.url.endsWith('/credits'))).toBe(true)
     respond = () => json({ error: { message: 'rate limited' } }, 429)
-    expect((await fetchOpenRouterUsage('https://openrouter.ai/api', 'test-key')).state).toBe('rate_limited')
+    quotaNow += 300_000
+    expect((await fetchOpenRouterUsage('https://openrouter.ai/api', quotaTestKey)).state).toBe('rate_limited')
   })
 })

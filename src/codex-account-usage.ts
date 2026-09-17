@@ -40,13 +40,21 @@ export function aggregateCodexUsage(input: CodexAccountUsage[]): CodexUsageTotal
 }
 
 export async function readAllCodexUsage(current?: { id: string; usage: UsageSnapshot }): Promise<CodexUsageTotal> {
+  const reads = new Map<string, Promise<UsageSnapshot>>()
   const entries = await Promise.all(codexAccounts.list().map(async account => {
-    const usage = current?.id === account.id ? current.usage : await readUsage(account.id)
     let fingerprint: string | null = null
-    try { fingerprint = usage.state === 'ok' && usage.accountFingerprint ? usage.accountFingerprint : codexAccounts.fingerprint(account.id) }
+    try { fingerprint = codexAccounts.fingerprint(account.id) }
     catch (error) {
       return { account, fingerprint, usage: { state: 'network' as const, reason: `账号身份读取失败：${String(error)}` } }
     }
+    const key = fingerprint ?? account.id
+    let pending = reads.get(key)
+    if (!pending) {
+      pending = current?.id === account.id ? Promise.resolve(current.usage) : readUsage(account.id)
+      reads.set(key, pending)
+    }
+    const usage = await pending
+    if (usage.state === 'ok' && usage.accountFingerprint) fingerprint = usage.accountFingerprint
     return { account, usage, fingerprint }
   }))
   return aggregateCodexUsage(entries)

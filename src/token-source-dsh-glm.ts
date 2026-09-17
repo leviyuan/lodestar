@@ -100,7 +100,7 @@ registerTokenSourceFactory({
   },
   setup: {
     commandSuffix: 'dsh-glm',
-    hint: () => 'DSH 可复用已配置的 GLM Coding Plan；独立账号用 `dsh-glm-setup [base_url] <api_key>`。',
+    hint: () => 'GLM Coding Plan 账号由 Claude Code 和 DeepSeek Harness 共用。发送 `glm-setup <api_key>` 配置两边；`dsh-glm-setup [base_url] <api_key>` 同样更新共享账号。',
     parseArgs(args) {
       const parts = args.trim().split(/\s+/).filter(Boolean)
       if (parts.length < 1 || parts.length > 2 || /^https?:\/\//i.test(parts.at(-1)!)) return { error: '用法：dsh-glm-setup [base_url] <api_key>' }

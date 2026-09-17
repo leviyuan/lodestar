@@ -59,6 +59,8 @@ export interface UsageSnapshotUnified {
   windows: UsageWindowUnified[]
   reason?: string
   fetchedAt?: number
+  /** Minimum delay reported by the quota service after a failed read. */
+  retryAfterMs?: number
   /** Codex 账号可用的额度重置卡次数，仅在 hi 中展示。 */
   resetCredits?: number | null
 }
@@ -200,6 +202,8 @@ export function tokenSourceFactories(): TokenSourceFactoryDef[] {
 const registry = new Map<string, TokenSource>()
 let defaultId: string | null = null
 let registryGeneration = 0
+
+export function tokenSourceRegistryRevision(): number { return registryGeneration }
 
 export function registerTokenSource(s: TokenSource, opts?: { default?: boolean }): void {
   registry.set(s.id, s)

@@ -10,6 +10,7 @@ import {
 } from './token-source'
 import { readClaudeSettingsEnv } from './glm-usage'
 import { withModelVisibility } from './token-source-visibility'
+import { sharedTokenSourceConfigs } from './token-source-accounts'
 
 // provider 模块 —— import 即登记到 factory registry(副作用)。
 import './token-source-codex'
@@ -24,14 +25,18 @@ import './token-source-dsh-glm'
 /** 遍历已登记 factory 构建 source 实例,注册到 instance registry。
  *  daemon 启动调;飞书改 token source 配置后也可重调(热更新)。 */
 export function buildTokenSourcesFromConfig(): number {
-  resetTokenSourceRegistry()
   const settingsEnv = readClaudeSettingsEnv()
+  const detectedConfigs = Object.fromEntries(tokenSourceFactories().flatMap(def => {
+    const detected = def.detect?.fromSettingsEnv(settingsEnv)
+    return def.configSectionId && detected ? [[def.configSectionId, detected]] : []
+  }))
+  const sharedConfigs = sharedTokenSourceConfigs(config.token_sources ?? {}, detectedConfigs)
   const sources = tokenSourceFactories().map(def => {
     // config.token_sources ?? {}：防御 test 环境 mock.module('./config') 跨文件污染
     // (claude-agent-process.test mock 的 config 无 token_sources);生产 loadConfig 总返 record。
-    const cfg = def.configSectionId ? ((config.token_sources ?? {})[def.configSectionId] ?? {}) : {}
+    const cfg = def.configSectionId ? (sharedConfigs[def.configSectionId] ?? {}) : {}
     // config.toml 没配时,若本机 settings.json 命中本 source 的 detect host,自动启用(凭据从 settings.json 取)
-    const detected = def.detect?.fromSettingsEnv(settingsEnv) ?? null
+    const detected = def.configSectionId ? detectedConfigs[def.configSectionId] ?? null : null
     const source = withModelVisibility(def.build(cfg, detected), cfg)
     source.spawnRevision = tokenSourceSpawnRevision(def.kind, cfg, detected)
     return source
@@ -47,6 +52,7 @@ export function buildTokenSourcesFromConfig(): number {
       updatedAt: Date.now(),
     }
   }
+  resetTokenSourceRegistry()
   for (const s of sources) registerTokenSource(s)
   const configuredDefault = sources.find(s => s.enabled && config.token_sources?.[s.id]?.default === true)
   const defaultSource = configuredDefault ?? sources.find(s => s.enabled)

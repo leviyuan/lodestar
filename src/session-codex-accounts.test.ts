@@ -18,6 +18,7 @@ import { codexAccountScheduler } from './codex-account-scheduler'
 import { codexAccountCard } from './cards/codex-account'
 
 let root: string
+let quotaNow: number
 let store: CodexAccounts
 const spies: Array<{ mockRestore(): void }> = []
 let previous: TokenSource[]
@@ -55,6 +56,9 @@ function session(): any {
   return s
 }
 beforeEach(() => {
+  usageModule.invalidateCodexUsage('default')
+  quotaNow = Date.now()
+  spies.push(spyOn(Date, 'now').mockImplementation(() => quotaNow))
   resetFeishuMock()
   cardViews.length = 0
   spies.push(spyOn(CodexAccountCard, 'open').mockImplementation(async (_chatId, view) => {
@@ -81,6 +85,7 @@ beforeEach(() => {
   registerTokenSource(native)
 })
 afterEach(async () => {
+  usageModule.invalidateCodexUsage('default')
   for (const proc of procs.splice(0)) if (proc.isAlive()) await proc.kill()
   for (const s of sessions.splice(0)) s.dispose()
   for (const spy of spies.splice(0)) spy.mockRestore()
@@ -293,14 +298,18 @@ describe('bare Codex account commands', () => {
     let reads = 0
     proc.readRateLimits = async () => { reads++; throw new Error('quota read failed') }
     try {
+      expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)).toBe('  |  11%·[23%]')
+      expect(reads).toBe(0)
+      quotaNow += 60_000
       for (let attempt = 0; attempt < 2; attempt++) {
         const suffix = await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)
         expect(suffix).toBe('  |  11%·[23%]')
         expect(peekUsage(account.id)).toBeNull()
         expect(cached).toBe(peekSuccessfulUsage(account.id))
       }
-      expect(reads).toBe(2)
+      expect(reads).toBe(1)
       proc.readRateLimits = async () => response(15)
+      quotaNow += 60_000
       expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null))
         .toBe('  |  15%·[23%]')
     } finally {
@@ -318,14 +327,17 @@ describe('bare Codex account commands', () => {
     try {
       proc.readRateLimits = async () => { throw new Error('quota read failed') }
       expect(await read()).toBe('  |  额度 MISS')
+      quotaNow += 60_000
       await refreshUsageFromConnection(async () => ({ rateLimits: {
         primary: { usedPercent: 11, windowDurationMins: 300 },
       } }), account.id)
       proc.readRateLimits = async () => { throw new Error('HTTP 401 unauthorized') }
+      quotaNow += 60_000
       expect(await read()).toBe('  |  额度 MISS')
       proc.readRateLimits = async () => ({ rateLimits: {
         primary: { usedPercent: null, windowDurationMins: 300 },
       } })
+      quotaNow += 60_000
       expect(await read()).toBe('  |  MISS')
     } finally { usageModule.invalidateCodexUsage(account.id) }
   })
@@ -360,9 +372,11 @@ describe('bare Codex account commands', () => {
     bindProcessCodexAccount(proc, account.id); s.proc = proc
     const response = { rateLimits: { primary: { usedPercent: 11, windowDurationMins: 300 } } }
     await refreshUsageFromConnection(async () => response, account.id)
+    quotaNow += 60_000
     let release!: (value: any) => void
     proc.readRateLimits = () => new Promise(resolve => { release = resolve })
     const pending = s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)
+    await Promise.resolve()
     try {
       usageModule.invalidateCodexUsage(account.id)
       await refreshUsageFromConnection(async () => ({ rateLimits: {
@@ -530,8 +544,10 @@ describe('bare Codex account commands', () => {
     s.tokenSource('codex-sub').modelCatalogState = { status: 'failed', error: 'offline' }
     await refreshUsageFromConnection(async () => ({ rateLimits: { primary: { usedPercent: 15, windowDurationMins: 300 } } }), account.id)
     expect(peekSuccessfulUsage(account.id)).not.toBeNull()
+    quotaNow += 60_000
     let release!: (value: any) => void
     const pending = refreshUsageFromConnection(() => new Promise(resolve => { release = resolve }), account.id)
+    await Promise.resolve()
 
     expect(await s.runCommand('codex-account-delete 工作 订阅', 'owner')).toBe(true)
     expect(cardViews.at(-1)).toMatchObject({ phase: 'deleted', name: account.name })

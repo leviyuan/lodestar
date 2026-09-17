@@ -41,6 +41,7 @@ export function codexUsageToUnified(s: UsageSnapshot): UsageSnapshotUnified {
         : 'network',
       windows: [],
       resetCredits: null,
+      ...(s.state === 'network' && s.reason ? { reason: s.reason } : {}),
     }
   }
   const windows: UsageWindowUnified[] = []

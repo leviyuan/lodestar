@@ -4416,11 +4416,14 @@ describe('Session usage cache cross-backend isolation', () => {
     session.currentTurn = turn
     session.lastTurnUsage = { input_tokens: 100, output_tokens: 10, total_tokens: 110 }
     cardkit.recordCardCreated(turn.cardId, 1)
+    let quotaNow = Date.now()
+    const quotaClock = spyOn(Date, 'now').mockImplementation(() => quotaNow)
     try {
       await refreshUsageFromConnection(async () => ({ rateLimits: {
         primary: { usedPercent: 12, windowDurationMins: 300 },
         secondary: { usedPercent: 34, windowDurationMins: 10080 },
       } }), accountId)
+      quotaNow += 60_000
       await refreshUsageFromConnection(async () => { throw new Error('quota read failed') }, accountId)
       expect(peekUsage(accountId)).toBeNull()
       proc.alive = false
@@ -4432,6 +4435,7 @@ describe('Session usage cache cross-backend isolation', () => {
       expect(content).not.toContain('刷新失败')
       expect(content).not.toContain('MISS')
     } finally {
+      quotaClock.mockRestore()
       invalidateCodexUsage(accountId)
       proc.emit('exit')
       session.stopFooterStatus(turn)
@@ -4494,6 +4498,7 @@ describe('Session usage cache cross-backend isolation', () => {
 
   test('Claude 的 hi 展示全部窗口，footer 按当前模型选择周额度并保留 5h', async () => {
     const { claudeUsageSnapshot } = await import('./claude-usage')
+    const accountUsage = await import('./account-usage')
     const session = new Session('claude-quota', 'chat_id') as any
     let snapshot = claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
       five_hour: { utilization: 7, resets_at: new Date(Date.now() + 4.1 * 3600_000).toISOString() },
@@ -4505,12 +4510,15 @@ describe('Session usage cache cross-backend isolation', () => {
     session.currentTokenSource = () => source
     session.buildConsoleOpts = async () => ({ sessionName: 'claude-quota', status: 'idle', provider: 'claude' })
     const replaceSpy = spyOn(cardkit, 'replaceElementChecked').mockResolvedValue(true)
+    const readAllSpy = spyOn(accountUsage, 'readAllAccountUsage').mockImplementation(async () => [
+      { id: source.id, label: 'Claude 订阅', usage: snapshot },
+    ])
     try {
       await session.patchConsoleUsage('quota-card')
       const panel = replaceSpy.mock.calls.at(-1)?.[2] as any
       expect(panel.element_id).toBe('console_usage')
-      expect(panel.elements.filter((e: any) => e.tag === 'markdown' && e.content.startsWith('**'))
-        .map((e: any) => e.content.split('\n')[0])).toEqual(['**5h 窗口 · 7%**', '**周额度 · 17%**', '**Fable 周额度 · 42%**'])
+      expect(panel.elements).toHaveLength(1)
+      expect(panel.elements[0].content).toBe('**Claude 订阅**　5h 7%/4.1h · 周 17%/6.9d · Fable周 42%/MISS')
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'opus')).toBe('  |  4.1h·7%·[6.9d·17%]')
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'default')).toBe('  |  4.1h·7%·[6.9d·17%]')
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'claude-fable-5-1[1m]')).toBe('  |  4.1h·7%·[42%]')
@@ -4519,11 +4527,11 @@ describe('Session usage cache cross-backend isolation', () => {
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, null)).toBe('  |  4.1h·7%·[MISS]')
       snapshot = { state: 'network', windows: [], reason: 'query failed' }
       await session.patchConsoleUsage('quota-card')
-      expect((replaceSpy.mock.calls.at(-1)?.[2] as any).content).toBe('**📊 额度** MISS')
+      expect((replaceSpy.mock.calls.at(-1)?.[2] as any).elements[0].content).toContain('MISS · query failed')
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null)).toBe('  |  额度 MISS')
       expect(await session.footerUsageSuffix('codex', null, source.id, source, null)).toBe('  |  额度 MISS')
       expect(await session.footerUsageSuffix('claude', null, 'other-source', undefined, null)).toBe('  |  额度 MISS')
-    } finally { replaceSpy.mockRestore() }
+    } finally { replaceSpy.mockRestore(); readAllSpy.mockRestore() }
   })
 
   test('Claude 收尾查询等待期间切换模型，不改变旧回复的专属周额度', async () => {

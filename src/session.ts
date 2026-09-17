@@ -71,8 +71,9 @@ import * as feishu from './feishu'
 import { log } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { readSysInfo } from './sysinfo'
-import { readUsage, refreshUsageFromConnection, observeRateLimitsNotification, captureCodexUsageCache, type UsageSnapshot } from './usage'
-import { readGlmUsage, type GlmUsageSnapshot } from './glm-usage'
+import { refreshUsageFromConnection, observeRateLimitsNotification, captureCodexUsageCache, type UsageSnapshot } from './usage'
+import type { GlmUsageSnapshot } from './glm-usage'
+import { peekAllAccountUsage, readAllAccountUsage } from './account-usage'
 import { claudeWeeklyUsageWindow } from './claude-usage'
 import {
   contextLimitFromAppServer,
@@ -2640,6 +2641,7 @@ export class Session {
         })),
       usage,
       glmUsage,
+      accountUsages: peekAllAccountUsage(),
       sysinfo,
     }
   }
@@ -2649,29 +2651,12 @@ export class Session {
   }
 
   private async patchConsoleUsage(cardId: string): Promise<void> {
-    // 按当前 provider 只拉对应后端那一个数据源(方案 C,始终一行):
-    //   claude/GLM → src/glm-usage.ts(open.bigmodel.cn / z.ai quota/limit)
-    //   codex      → src/usage.ts(codex app-server rate-limit)
     const opts = await this.buildConsoleOpts(undefined)
-    const provider = opts.provider ?? this.currentProvider()
-    const selectedTs = this.currentTokenSource()
-    const ts = (selectedTs && selectedTs.agent === provider && selectedTs.enabled)
-      ? selectedTs
-      : this.selectedTokenSourceId
-        ? undefined
-        : listEnabledTokenSourcesByAgent(provider)[0]
-    if (ts) {
-      opts.unifiedUsage = await ts.readUsage()
-    } else if (this.selectedTokenSourceId) {
-      opts.unifiedUsage = {
-        state: 'no_credentials',
-        windows: [],
-        reason: `token source ${this.selectedTokenSourceId} unavailable`,
-      }
-    } else if (opts.provider === 'claude') {
-      opts.glmUsage = await readGlmUsage()
-    } else {
-      opts.usage = await readUsage(this.codexAccountId())
+    try { opts.accountUsages = await readAllAccountUsage() }
+    catch (error) {
+      const reason = messageOf(error)
+      log(`console usage MISS: ${reason}`)
+      opts.accountUsages = [{ id: 'error', label: '额度', usage: { state: 'network', windows: [], reason } }]
     }
     const landed = await cardkit.replaceElementChecked(
       cardId,
@@ -2759,13 +2744,12 @@ export class Session {
   }
 
   async showConsole(): Promise<void> {
-    // Initial paint without usage → cards.ts renders the
-    // `_加载中…_` placeholder in the consoleUsage element. We patch
-    // it in below once readUsage() resolves; not worth blocking the
-    // panel on the Codex account/rate-limit round trip.
-    const card = await this.buildConsoleCard(undefined)
+    // Fresh cached accounts render immediately; only a missing/expired snapshot needs an async patch.
+    const opts = await this.buildConsoleOpts(undefined)
+    const card = cards.consoleCard(opts)
     const messageId = await feishu.sendCard(this.chatId, card)
     if (!messageId) return
+    if (opts.accountUsages !== undefined) return
     // Patch the usage element asynchronously so the rest of the panel
     // stays responsive. We don't await; failures are logged and the
     // placeholder stays visible (no fallback fabrication).

@@ -12,11 +12,14 @@ import type { UsageSnapshotUnified, TokenSourceModelCatalogState } from '../toke
 import type { AgentProvider } from '../agent-process'
 import { ELEMENTS } from './elements'
 import { formatDuration } from './duration'
-import { fmtResetIn, usageWindowElements } from './usage'
+import { fmtResetIn } from './usage'
+import type { AccountUsage } from '../account-usage'
+import { accountUsageRow, compactAccountUsage } from './account-usage'
 
 export { fmtResetIn } from './usage'
 
 export interface ConsoleOpts {
+  accountUsages?: AccountUsage[]
   sessionName: string
   status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
   provider?: AgentProvider
@@ -430,40 +433,18 @@ function usageWindowSummary(w: UsageSnapshotUnified['windows'][number]): string 
 }
 
 export function consoleUnifiedUsageContent(snap: UsageSnapshotUnified | undefined): string {
-  const summary = snap?.state === 'ok' && snap.kind !== 'balance' && !snap.quota && snap.windows.length
-    ? ['**📊 额度**', ...snap.windows.flatMap(w => usageWindowElements(w, w.label).map(element => element.content))].join('\n')
-    : unifiedUsageSummary(snap).replace(/^(额度|余额)/, '**📊 $1**')
-  const resetCards = consoleResetCreditsContent(snap)
-  return resetCards ? `${summary}\n${resetCards}` : summary
+  return compactAccountUsage(snap)
 }
 
-function consoleResetCreditsContent(snap: UsageSnapshotUnified | undefined): string {
-  return snap?.resetCredits === undefined ? ''
-    : `**重置卡**　${snap.resetCredits === null ? 'MISS' : `${snap.resetCredits} 次可用`}`
-}
-
-/** Window quotas share the account card's bar style; each window gets its own row. */
+/** The expanded quota panel lists each billing account once, without per-window rows. */
 export function consoleUsageElement(opts: ConsoleOpts): object {
-  const snap = opts.unifiedUsage
-  if (snap?.state === 'ok' && snap.kind !== 'balance' && !snap.quota && snap.windows.length) {
-    const elements: object[] = []
-    for (const window of snap.windows) {
-      if (elements.length) elements.push({ tag: 'hr' })
-      elements.push(...usageWindowElements(window, window.label))
-    }
-    const resetCards = consoleResetCreditsContent(snap)
-    if (resetCards) elements.push({ tag: 'hr' }, { tag: 'markdown', content: resetCards })
-    return {
-      tag: 'collapsible_panel', element_id: ELEMENTS.consoleUsage, expanded: true,
-      header: { title: { tag: 'plain_text', content: '📊 额度' }, background_color: 'blue-50' },
-      border: { color: 'blue-100', corner_radius: '8px' }, padding: '12px', vertical_spacing: '4px',
-      elements,
-    }
-  }
+  const rows = opts.accountUsages
   return {
-    tag: 'markdown',
-    element_id: ELEMENTS.consoleUsage,
-    content: consoleUnifiedUsageContent(snap),
+    tag: 'collapsible_panel', element_id: ELEMENTS.consoleUsage, expanded: true,
+    header: { title: { tag: 'plain_text', content: '全部账号额度 · 已用 / 距重置' }, background_color: 'blue-50' },
+    border: { color: 'blue-100', corner_radius: '8px' }, padding: '8px', vertical_spacing: '2px',
+    elements: rows === undefined ? [{ tag: 'markdown', text_size: 'notation', content: '加载中…' }]
+      : rows.length ? rows.map(accountUsageRow) : [{ tag: 'markdown', text_size: 'notation', content: '暂无已配置账号' }],
   }
 }
 

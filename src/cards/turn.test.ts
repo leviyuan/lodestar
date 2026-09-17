@@ -272,7 +272,7 @@ describe('main conversation card rendering', () => {
     expect(elements[2].elements[0].content).not.toContain('**💽 磁盘**')
 
     expect(elements[3].element_id).toBe('console_usage')
-    expect(elements[3].content).toContain('加载中')
+    expect(elements[3].elements[0].content).toContain('加载中')
 
     const body = JSON.stringify(elements)
     expect(body).not.toContain('活跃上下文')

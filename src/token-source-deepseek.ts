@@ -31,6 +31,7 @@ import { resolveModelWithWindow, observedContextWindow } from './context-window-
 import { verifyModelExists } from './model-existence'
 import { log } from './log'
 import { fetchApiModelData } from './token-source-model-api'
+import { UsageReadCache, usageCredentialKey, usageRetryAfter } from './usage-cache'
 
 type Env = Record<string, string | undefined>
 
@@ -90,23 +91,33 @@ export async function fetchDeepseekModelIds(baseUrl: string, apiKey: string): Pr
 }
 
 const BALANCE_TIMEOUT_MS = 10_000
+const balanceReads = new UsageReadCache<UsageSnapshotUnified>()
 
 /** GET {host}/user/balance(OpenAI 根路径,Bearer 认证)→ 剩余余额标量。
  *  DeepSeek 是充值余额模型，返回结构化余额、windows 空;
  *  失败如实 MISS(no_fallbacks),绝不假数据。 */
 export async function fetchDeepseekBalance(baseUrl: string, apiKey: string): Promise<UsageSnapshotUnified> {
+  if (!apiKey.trim()) return { kind: 'balance', state: 'no_credentials', windows: [] }
   let origin: string
   try {
     origin = new URL(baseUrl).origin
   } catch {
     return { kind: 'balance', state: 'network', windows: [], reason: 'bad base_url' }
   }
+  return balanceReads.read(usageCredentialKey('deepseek', origin, apiKey), () => requestDeepseekBalance(origin, apiKey))
+}
+
+async function requestDeepseekBalance(origin: string, apiKey: string): Promise<UsageSnapshotUnified> {
   try {
     const res = await networkFetch(`${origin}/user/balance`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(BALANCE_TIMEOUT_MS),
     })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    if (!res.ok) {
+      log(`deepseek readUsage MISS: HTTP ${res.status}`)
+      return { kind: 'balance', state: res.status === 429 ? 'rate_limited' : 'network', windows: [],
+        reason: `HTTP ${res.status}`, retryAfterMs: usageRetryAfter(res.headers) }
+    }
     const json: any = await res.json()
     const infos: any[] = Array.isArray(json?.balance_infos) ? json.balance_infos : []
     const info = infos[0]
@@ -115,7 +126,7 @@ export async function fetchDeepseekBalance(baseUrl: string, apiKey: string): Pro
     if (!currency || (typeof total !== 'string' && typeof total !== 'number')
       || String(total).trim() === '' || !Number.isFinite(Number(total))) throw new Error('余额明细缺失或无效')
     return {
-      kind: 'balance', state: 'ok',
+      kind: 'balance', state: 'ok', fetchedAt: Date.now(),
       windows: [],
       balance: { remaining: Number(total), currency },
     }
@@ -210,7 +221,7 @@ registerTokenSourceFactory({
   },
   setup: {
     commandSuffix: 'deepseek',
-    hint: display => `启用 ${display}:发送\n\`\`\`\ndeepseek-setup <api_key>\n\`\`\`\n默认官方 Anthropic 端点;自建中转用 \`deepseek-setup <base_url> <api_key>\`。`,
+    hint: display => `配置 ${display}：发送 \`deepseek-setup <api_key>\`；Claude Code 和 DeepSeek Harness 共用该账号。自建端点用 \`deepseek-setup <base_url> <api_key>\`。`,
     parseArgs: args => {
       const parts = args.trim().split(/\s+/).filter(Boolean)
       if (!parts.length || parts.length > 2 || /^https?:\/\//i.test(parts.at(-1)!)) return { error: '用法:`deepseek-setup <api_key>`(官方端点)或 `deepseek-setup <base_url> <api_key>`(自建中转)' }

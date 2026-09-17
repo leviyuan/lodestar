@@ -7,6 +7,7 @@ import { buildTokenSourcesFromConfig } from './token-source-builtins'
 import { getTokenSourceForAccount, refreshAllTokenSourceModels, type TokenSourceFactoryDef } from './token-source'
 import { writeStateFileAtomic } from './state-store'
 import { modelList } from './token-source-visibility'
+import { sharedTokenSourceConfigs, tokenSourceConfigUpdates } from './token-source-accounts'
 
 /** TOML 基本字符串转义(与 setup.ts escapeTomlString / config.ts parseToml 反转义对称) */
 function esc(v: string): string {
@@ -42,25 +43,20 @@ export function saveTokenSourceConfig(id: string, cfg: TokenSourceConfig): void 
   const existing = readFileSync(CONFIG_FILE, 'utf8')
   // 逐行状态机找节:节边界 = 行首 [xxx](值里可含 '[',如 slots = "opus=GLM-5.2[1m]",
   // regex 硬截断会吞值,故不用正则切多行节体)。
-  const header = `[token_source.${id}]`
+  const updates = tokenSourceConfigUpdates(loadConfig().token_sources, id, cfg)
+  const headers = new Set(Object.keys(updates).map(id => `[token_source.${id}]`))
   const lines = existing.split('\n')
   let inSection = false
-  const prev = loadConfig().token_sources[id] ?? {}
   const kept: string[] = []
   for (const line of lines) {
     const section = line.match(/^\s*(\[[^\]]+\])\s*(?:#.*)?$/)?.[1]
-    if (section) inSection = section === header
+    if (section) inSection = headers.has(section)
     if (!inSection) kept.push(line)
   }
-  // undefined 才表示不改字段；空列表、空默认模型和 false 必须可以持久化。
-  type ConfigScalar = string | boolean | undefined
-  const combined: Record<string, ConfigScalar> = { ...prev }
-  const incoming: Record<string, ConfigScalar> = { ...cfg }
-  for (const k of Object.keys(incoming)) if (incoming[k] !== undefined) combined[k] = incoming[k]
-  const merged = combined as TokenSourceConfig
   // 去掉 kept 尾部空行再拼新节,保持节间一个空行的布局。
   while (kept.length && kept[kept.length - 1] === '') kept.pop()
-  writeStateFileAtomic(CONFIG_FILE, kept.join('\n') + '\n\n' + cfgToToml(id, merged) + '\n')
+  writeStateFileAtomic(CONFIG_FILE, kept.join('\n') + '\n\n'
+    + Object.entries(updates).map(([sourceId, value]) => cfgToToml(sourceId, value)).join('\n\n') + '\n')
 }
 
 let configUpdateTail: Promise<void> = Promise.resolve()
@@ -96,9 +92,9 @@ export function configureTokenSource(def: TokenSourceFactoryDef, cfg: TokenSourc
     let saved = false
     try {
       if (!def.configSectionId || !def.setup) throw new Error('此来源不支持配置命令')
-      const previous = loadConfig().token_sources[def.configSectionId] ?? {}
-      const incoming = Object.fromEntries(Object.entries(cfg).filter(([, value]) => value !== undefined))
-      await def.setup.validate({ ...previous, ...incoming })
+      const previous = loadConfig().token_sources
+      const candidate = { ...previous, ...tokenSourceConfigUpdates(previous, def.configSectionId, cfg) }
+      await def.setup.validate(sharedTokenSourceConfigs(candidate)[def.configSectionId])
       await applyTokenSourceConfig(def.configSectionId, cfg, () => { saved = true })
     } catch (error) {
       throw new TokenSourceSetupError(error, saved)

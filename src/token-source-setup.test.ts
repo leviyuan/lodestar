@@ -8,6 +8,7 @@ test('all API key setup commands validate before saving and report post-save run
     const { config } = await import('./src/config')
     const { CONFIG_FILE } = await import('./src/paths')
     const registry = await import('./src/token-source')
+    const { sharedTokenSourceConfigs } = await import('./src/token-source-accounts')
     const { buildTokenSourcesFromConfig } = await import('./src/token-source-builtins')
     let rebuilds = 0, unavailable = false
     for (const factory of registry.tokenSourceFactories()) {
@@ -66,7 +67,7 @@ test('all API key setup commands validate before saving and report post-save run
     for (const id of sources) {
       assert.equal(await runCommand(session, id + '-setup private-valid-key'), true)
       assert.match(sentTexts.at(-1), /校验通过，配置已保存/)
-      assert.equal(config.token_sources[id][id === 'glm' ? 'auth_token' : 'api_key'], 'private-valid-key')
+      assert.equal(sharedTokenSourceConfigs(config.token_sources)[id][id === 'glm' ? 'auth_token' : 'api_key'], 'private-valid-key')
     }
     assert.equal(await runCommand(session, 'glm-setup https://api.z.ai/api/anthropic international-test-key'), true)
     assert.equal(config.token_sources.glm.base_url, 'https://api.z.ai/api/anthropic')
@@ -74,7 +75,8 @@ test('all API key setup commands validate before saving and report post-save run
 
     unavailable = true
     await runCommand(session, 'dsh-glm-setup valid-without-runtime')
-    assert.equal(config.token_sources['dsh-glm'].api_key, 'valid-without-runtime')
+    assert.equal(config.token_sources.glm.auth_token, 'valid-without-runtime')
+    assert.equal(config.token_sources['dsh-glm'].api_key, undefined)
     assert.match(sentTexts.at(-1), /校验通过、配置已保存，但暂不可用.*runtime 未安装/)
     assert.doesNotMatch(sentTexts.at(-1), /认证失败|未保存/)
     await onTokenSourceEnable(session, 'dsh-glm')
