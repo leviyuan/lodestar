@@ -2,7 +2,8 @@ import { CLAUDE_REASONING_EFFORTS, type AgentReasoningEffort } from './agent-pro
 import { CODEX_REASONING_EFFORTS } from './codex-process'
 import type { TokenSourceConfig } from './config'
 import { fetchPackyBalance, fetchPackyModels, fetchPackyUsage, packyApiRoot, packyManagementRoot, PACKY_BASE_URL, type PackyModel } from './packy-api'
-import { modelList } from './token-source-visibility'
+import { isPackyDefaultModel } from './packy-defaults'
+import { customModelEfforts, modelList } from './token-source-visibility'
 import { tokenSourceErrorMessage } from './token-source-errors'
 import { log } from './log'
 import { usageCredentialKey } from './usage-cache'
@@ -50,6 +51,9 @@ const definitions = [
 for (const definition of definitions) {
   const { id, agent, display } = definition
   const protocol = agent === 'claude' ? 'anthropic' : 'openai-response'
+  // Gemini 已显式接入 Messages；默认可见性本身不能替其他模型声明协议。
+  const acceptsProtocol = (entry: PackyModel) => entry.protocols.includes(protocol)
+    || agent === 'claude' && usesGeminiRetryProfile(entry.id)
   registerTokenSourceFactory({
     kind: id, configSectionId: id,
     build(cfg): TokenSource {
@@ -60,17 +64,20 @@ for (const definition of definitions) {
       const managementUserId = cfg.management_user_id?.trim() || ''
       const hasBalanceAccount = !!(managementToken || managementUserId || cfg.management_url?.trim() || cfg.billing_source?.trim())
       const configuredModel = cfg.model?.trim()
-      const customIds = new Set([...modelList(cfg.custom_models), ...modelList(cfg.models)])
+      const configuredModelIds = cfg.models === undefined ? undefined : modelList(cfg.models)
+      const customIds = new Set([...modelList(cfg.custom_models), ...(configuredModelIds ?? [])])
+      const defaultModelAllowed = (model: string) => isPackyDefaultModel(model, id)
       let catalog: PackyModel[] = []
       const validateRequestModel = (model: string) => {
         const entry = catalog.find(entry => entry.id === model)
-        if (entry && !entry.protocols.includes(protocol) && !customIds.has(model)) {
+        if (entry && !acceptsProtocol(entry) && !customIds.has(model)) {
           throw new Error(`PackyAPI ${model} 未声明 ${protocol}；确认兼容后可显式补录`)
         }
       }
       const source: TokenSource = {
         id, kind: id, agent, display: cfg.display?.trim() || display,
         enabled: !!key && cfg.enabled !== false, models: [], defaultModel: configuredModel ?? '',
+        modelSelection: { mode: 'allowlist', modelIds: configuredModelIds ?? [], availableModels: [] },
         ...(hasBalanceAccount ? { usageAccount: {
           id: usageCredentialKey('packy-account', managementBase, managementUserId), label: 'PackyAPI',
         } } : {}),
@@ -87,19 +94,34 @@ for (const definition of definitions) {
           source.modelCatalogState = { status: 'loading', updatedAt: null }
           try {
             catalog = await fetchPackyModels(base, key)
-            const compatible = catalog.filter(entry => entry.protocols.includes(protocol) || customIds.has(entry.id))
+            const compatible = catalog.filter(entry => acceptsProtocol(entry) || customIds.has(entry.id))
             if (!compatible.length && !customIds.size) throw new Error(`PackyAPI 此令牌没有声明支持 ${protocol} 的模型，请检查分组和模型限制`)
-            const models = compatible.map(entry => ({ ...modelEntry(entry, agent, cfg),
-              ...(!entry.protocols.includes(protocol) ? { origin: 'custom' as const } : {}) }))
-            if (configuredModel && !models.some(entry => entry.model === configuredModel)) {
+            const catalogModels = compatible.map(entry => ({ ...modelEntry(entry, agent, cfg),
+              ...(!entry.protocols.includes(protocol) && customIds.has(entry.id) ? { origin: 'custom' as const } : {}) }))
+            for (const customId of customIds) {
+              if (catalogModels.some(entry => entry.model.toLowerCase() === customId.toLowerCase())) continue
+              catalogModels.push({ model: customId, display: customId, origin: 'custom',
+                ...customModelEfforts(source, cfg) })
+            }
+            if (configuredModel && !catalogModels.some(entry => entry.model === configuredModel)) {
               const known = catalog.find(entry => entry.id === configuredModel)
               if (known) throw new Error(`PackyAPI ${configuredModel} 未声明 ${protocol}，确认兼容后请显式补录`)
-              if (![...modelList(cfg.custom_models), ...modelList(cfg.models)].includes(configuredModel)) {
+              if (!customIds.has(configuredModel)) {
                 throw new Error(`PackyAPI 默认模型不在目录中且未补录: ${configuredModel}`)
               }
             }
-            source.models = models
-            source.defaultModel = configuredModel ?? models[0]?.model ?? [...customIds][0]!
+            const desiredIds = configuredModelIds ?? catalogModels.filter(entry =>
+              entry.origin === 'custom' || defaultModelAllowed(entry.model)).map(entry => entry.model)
+            if (configuredModelIds === undefined && configuredModel && !desiredIds.some(id => id.toLowerCase() === configuredModel.toLowerCase())) {
+              desiredIds.unshift(configuredModel)
+            }
+            const selected = desiredIds.map(id => catalogModels.find(entry => entry.model === id)
+              ?? { model: id, display: id, efforts: [], defaultEffort: null,
+                unavailableReason: '账号目录未返回该模型' })
+            source.modelSelection!.availableModels = catalogModels
+            source.models = selected
+            source.modelSelection!.modelIds = selected.map(entry => entry.model)
+            source.defaultModel = configuredModel ?? selected.find(entry => !entry.unavailableReason)?.model ?? [...customIds][0] ?? ''
             source.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
           } catch (error) {
             source.models = []; catalog = []
@@ -160,7 +182,8 @@ for (const definition of definitions) {
       },
       async validate(cfg) {
         const models = await fetchPackyModels(cfg.base_url ?? PACKY_BASE_URL, cfg.api_key ?? cfg.auth_token ?? '')
-        if (!models.some(entry => entry.protocols.includes(protocol)) && !modelList(cfg.custom_models).length && !modelList(cfg.models).length) {
+        if (!models.some(acceptsProtocol)
+          && !modelList(cfg.custom_models).length && !modelList(cfg.models).length) {
           throw new Error(`此令牌没有声明支持 ${protocol} 的模型`)
         }
       },

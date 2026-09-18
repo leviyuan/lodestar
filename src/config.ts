@@ -83,7 +83,7 @@ export interface ClaudeModelConfig {
  *  bin         — Claude 包装器，或 DeepSeek Harness 使用的 Node 可执行文件
  *  model       — 默认模型 slug(codex 下发 gpt-5.6-sol;claude 真实模型走 slots)
  *  effort      — 默认 effort
- *  models      — OpenRouter 显式可选列表；GLM/DeepSeek 经验证的补录模型
+ *  models      — OpenRouter/Packy 显式可选列表；GLM/DeepSeek 经验证的补录模型
  *  hidden_models — 非 OpenRouter 来源从接口目录中隐藏的模型(逗号分隔)
  *  custom_models — 所有来源的列表外补录记录(逗号分隔，不代表已验证可运行)
  *  slots       — claude 槽位映射 'opus=X,sonnet=Y,haiku=Z'

@@ -37,7 +37,7 @@ GLM Key 可在首次安装时跳过，之后用群命令添加或更换。以下
 | 补录模型 | 添加接口目录外的模型，可选择推理档位并使用 |
 | 删 | 删除补录记录；仍有会话选用时需先切换模型 |
 
-除 OpenRouter 使用内置默认列表外，各来源默认显示接口目录中的模型，新模型会随目录刷新出现。所有来源都支持补录，记录保存在 `custom_models`；支持端点验证的来源会先验证。目录未收录不会阻止选择，实际不支持的请求由后端报告错误。接口后来收录同名模型时自动转为接口项，不重复显示。删除补录记录也会清理默认模型和辅助模型中的相关引用。
+除 OpenRouter 和 PackyAPI 使用内置精选列表外，各来源默认显示接口目录中的模型，新模型会随目录刷新出现。所有来源都支持补录，记录保存在 `custom_models`；支持端点验证的来源会先验证。目录未收录不会阻止选择，实际不支持的请求由后端报告错误。接口后来收录同名模型时自动转为接口项，不重复显示。删除补录记录也会清理默认模型和辅助模型中的相关引用。
 
 同账号切换 Claude 或 DSH 模型从后续回复生效；Codex 的持久设置需重启会话生效。跨账号或后端切换只允许在空闲时进行。来源禁用或目录获取失败显示 `MISS`。
 
@@ -78,17 +78,18 @@ api_key = "填写自己的 OpenRouter API key"
 # slots = "haiku=moonshotai/kimi-k3" # 可选：辅助任务模型，须获账号目录确认且使用相同的 effort 参数模式
 ```
 
-内置默认列表保留以下 **5 项**，定义见[默认模型配置](../src/openrouter-defaults.ts)。MiMo 保留在 OpenRouter；这是项目提供的初始列表，可在面板中自行调整，其他兼容模型仍可从账号目录显示或补录。
+内置默认列表保留以下 **6 项**，定义见[默认模型配置](../src/openrouter-defaults.ts)。Gemini 和 MiMo 使用 OpenRouter；这是项目提供的初始列表，可在面板中自行调整，其他兼容模型仍可从账号目录显示或补录。
 
 | 厂商 | 模型 ID | 默认档位 |
 | --- | --- | --- |
 | Tencent | `tencent/hy4-preview` | high |
+| Google | `google/gemini-3.8-flash` | high |
 | Meta | `meta/muse-spark-1.2` | xhigh |
 | Xiaomi | `xiaomi/mimo-v2.5-pro` | 模型默认 |
 | 字节跳动 | `bytedance-seed/seed-2-1-turbo` | 模型默认 |
 | 美团 | `meituan/longcat-2.0` | 模型默认 |
 
-在 `md` → Claude Code → OpenRouter 中，点「显示模型」进入账号目录，再点「显」加入列表，点「隐」移出面板列表。可见性自动保存，不改当前运行模型；全部隐藏后也能继续显示或补录。未配置 `models` 时才使用上述五项；`models = ""` 表示没有已显示的接口模型，刷新或重启不会补回默认项。内置列表更新不会覆盖用户维护的列表。
+在 `md` → Claude Code → OpenRouter 中，点「显示模型」进入账号目录，再点「显」加入列表，点「隐」移出面板列表。可见性自动保存，不改当前运行模型；全部隐藏后也能继续显示或补录。未配置 `models` 时才使用上述六项；`models = ""` 表示没有已显示的接口模型，刷新或重启不会补回默认项。内置列表更新不会覆盖用户维护的列表。
 
 候选目录来自 `/api/v1/models/user`，按账号供应商和隐私设置筛选，仅纳入支持文本和工具调用的交互模型；OpenAI、GLM、DeepSeek 及无法保证厂商范围的自动路由不会出现在添加候选中。目录刷新失败显示 `MISS`。显式配置但已下线的模型保留为可删除的 `MISS` 项。
 
@@ -100,13 +101,15 @@ OpenRouter 余额来自 `/api/v1/credits`，按 `total_credits - total_usage` �
 
 PackyAPI 提供三个来源入口：Claude Code 下的 `PackyAPI`、`PackyAPI · 令牌2`，以及 Codex 下的 `PackyAPI`。第二令牌独立保存；Codex 与主令牌共用一次存储的 Key 和平台地址，模型、effort、可见性分别维护。
 
+Packy 的 Claude 入口默认展示 MiniMax-M3、claude-opus-5、claude-fable-5-1、qwen3.8-max-0902；Codex 入口默认展示 kimi-k3 和 grok-4.6。Fable 5.1 的 API ID 使用连字符 `claude-fable-5-1`；Grok 4.6 通过 Responses 接口调用。Packy 目录中其余兼容模型只放在「显示模型」目录，不会自动出现在选择面板；已配置的 `model`、`models` 或 `custom_models` 仍按显式配置保留。
+
 ```toml
 [token_source.packy]
 api_key = "填写主令牌"
 base_url = "https://cf.api.fan"
 model = "MiniMax-M3"
 effort = "default"
-custom_models = "gemini-3.8-flash" # 当前令牌需支持该模型的 Messages 接口
+# models = "MiniMax-M3,qwen3.8-max-0902" # 可选：显式覆盖默认精选列表
 management_token = "填写个人设置中的系统访问令牌"
 management_user_id = "填写该账号用户 ID"
 management_url = "https://www.packyapi.ai"
@@ -122,11 +125,13 @@ model = "kimi-k3"
 effort = "medium"
 ```
 
-目录由各令牌的 `GET /v1/models` 实时返回，保留原始大小写。Claude Code 默认列声明 `anthropic` 的模型，Codex 默认列声明 `openai-response` 的模型。目录声明可能不完整：确认某个模型实际兼容后，可以通过补录或 `custom_models` 显式启用；条目仍标记为补录项，不改写上游协议声明。隐藏/显示、补录/删除与其他来源一致；目录失败显示 MISS，不更换令牌或模型。
+目录由各令牌的 `GET /v1/models` 实时返回，保留原始 ID 和大小写。预设只筛选真实目录项；目录外模型须显式补录，不把预设伪装成上游模型。Claude Code 默认列声明 `anthropic` 的模型，Codex 默认列声明 `openai-response` 的模型。目录声明可能不完整：确认某个模型实际兼容后，可以通过补录或 `custom_models` 显式启用；条目仍标记为补录项，不改写上游协议声明。隐藏/显示、补录/删除与其他来源一致；目录失败显示 MISS，不更换令牌或模型。
 
 有推理档位声明时沿用声明。目录只给模型 ID 和协议、未声明推理档位时，面板提供 Agent 的请求选项：Claude Code 默认 `default`（不发送 effort），Codex 默认请求 `medium`；这些请求选项不保证所有上游模型接受，拒绝会如实报错。`effort` 可覆盖本来源默认请求档位。
 
 Claude Code 使用官方 SDK 和 `/v1/messages`，辅助角色也使用当前令牌与所选模型，保留项目 MCP、Skill 和原生 resume。Codex 使用独立 Responses provider 和进程环境变量注入 Key；不要求 ChatGPT 登录，不参与 Codex 订阅自动选号、重置卡或订阅额度查询，也不加载需要订阅认证的 ChatGPT 连接器。模型目录由 Lodestar 直接读取；上游 Codex 自身的模型元数据刷新若遇到 New API 的 `data` / `models` 格式差异，仍保留原始诊断，不伪造原生元数据。
+
+Gemini 3.8 Flash 默认使用 OpenRouter 的 `google/gemini-3.8-flash`，Packy 默认隐藏。Packy 的 Messages 转换可能拒绝 Claude 工具 schema 中的 `propertyNames`、`const`；显式使用该路由时会显示真实 HTTP 400 错误。
 
 Gemini 3.8 Flash 使用 Claude Code 原生重试：请求超时 `API_TIMEOUT_MS=60000`、字节流空闲超时 `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=45000`、请求重试预算 `CLAUDE_CODE_MAX_RETRIES=2`，关闭无限重试看门狗。该策略只在选择 Gemini 3.8 Flash 为 Claude 主模型时注入；切换请求策略会替换空闲进程并保留原生会话。宿主不重放整轮用户输入或已完成的工具，不更换 Key、模型或来源；SDK 判定的最终失败仍会显示。
 

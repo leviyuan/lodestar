@@ -35,8 +35,12 @@ describe('Packy sources', () => {
     const claude = build(), codex = build('packy-codex')
     await Promise.all([claude.refreshModels(), codex.refreshModels()])
     expect(requests).toEqual([{ url: 'https://cf.api.fan/v1/models', authorization: `Bearer ${key}` }])
-    expect(claude.models.map(m => m.model)).toEqual(['MiniMax-M3', 'mimo-v2.5-pro'])
-    expect(codex.models.map(m => m.model)).toEqual(['mimo-v2.5-pro', 'kimi-k3'])
+    expect(claude.models.map(m => m.model)).toEqual(['MiniMax-M3'])
+    expect(codex.models.map(m => m.model)).toEqual(['kimi-k3'])
+    expect(claude.modelSelection?.mode).toBe('allowlist')
+    expect(claude.modelSelection?.availableModels.map(m => m.model)).toEqual([
+      'MiniMax-M3', 'mimo-v2.5-pro', 'gemini-3.8-flash',
+    ])
     expect(claude.models[0]!.defaultEffort).toBe('default')
     expect(codex.models[0]!.defaultEffort).toBe('medium')
     expect(() => claude.resolveSpawnModel('kimi-k3')).toThrow('未声明 anthropic')
@@ -53,6 +57,82 @@ describe('Packy sources', () => {
     const invalid = build('packy-codex', { effort: 'ultra' })
     await invalid.refreshModels()
     expect(invalid.modelCatalogState).toMatchObject({ status: 'failed', error: expect.stringContaining('effort') })
+  })
+
+  test('defaults to the curated replacement models while keeping other catalog entries available to add', async () => {
+    respond = () => Response.json({ data: [
+      { id: 'MiniMax-M3', supported_endpoint_types: ['anthropic'] },
+      { id: 'qwen3.8-max-0902', supported_endpoint_types: ['anthropic'] },
+      { id: 'mimo-v2.5-pro', supported_endpoint_types: ['anthropic', 'openai-response'] },
+      { id: 'unlisted-packy-model', supported_endpoint_types: ['anthropic', 'openai-response'] },
+    ] })
+    const source = build()
+    await source.refreshModels()
+    expect(source.models.map(m => m.model)).toEqual([
+      'MiniMax-M3', 'qwen3.8-max-0902',
+    ])
+    expect(source.modelSelection?.availableModels.map(m => m.model)).toEqual([
+      'MiniMax-M3', 'qwen3.8-max-0902', 'mimo-v2.5-pro', 'unlisted-packy-model',
+    ])
+  })
+
+  test('Fable 5.1 retains its authoritative hyphenated ID and Grok 4.6 uses only Responses', async () => {
+    respond = () => Response.json({ data: [
+      { id: 'MiniMax-M3', supported_endpoint_types: ['anthropic'] },
+      { id: 'grok-4.6', supported_endpoint_types: ['openai-response'] },
+      { id: 'claude-opus-5', supported_endpoint_types: ['anthropic'] },
+      { id: 'claude-fable-5-1', supported_endpoint_types: ['anthropic'] },
+      { id: 'gemini-3.8-flash', supported_endpoint_types: ['gemini', 'openai'] },
+      { id: 'qwen3.8-max-0902', supported_endpoint_types: ['anthropic'] },
+      { id: 'claude-fable-5', supported_endpoint_types: ['anthropic'] },
+      { id: 'grok-4.5', supported_endpoint_types: ['openai-response'] },
+    ] })
+    const source = build()
+    const secondary = build('packy-secondary')
+    const codex = build('packy-codex')
+    await Promise.all([source.refreshModels(), secondary.refreshModels(), codex.refreshModels()])
+    expect(source.models.map(m => m.model)).toEqual([
+      'MiniMax-M3', 'claude-opus-5', 'claude-fable-5-1', 'qwen3.8-max-0902',
+    ])
+    expect(secondary.models).toEqual(source.models)
+    expect(codex.models.map(m => m.model)).toEqual(['grok-4.6'])
+    expect(source.spawnEnv({}, 'claude-fable-5-1').ANTHROPIC_MODEL).toBe('claude-fable-5-1')
+    expect(() => source.spawnEnv({}, 'grok-4.6')).toThrow('未声明 anthropic')
+    expect(codex.resolveSpawnModel('grok-4.6')).toBe('grok-4.6')
+    expect(codex.codexApiProvider?.baseUrl).toBe('https://cf.api.fan/v1')
+    expect(source.models.some(m => m.model === 'gemini-3.8-flash')).toBe(false)
+    expect(secondary.models.some(m => m.model === 'gemini-3.8-flash')).toBe(false)
+    expect(source.modelSelection?.availableModels.find(m => m.model === 'gemini-3.8-flash')?.origin).toBe('upstream')
+    expect(source.models.find(m => m.model === 'qwen3.8-max-0902')).toBeDefined()
+  })
+
+  test('an explicit Packy models list replaces the curated defaults', async () => {
+    const source = build('packy', { models: 'MiniMax-M3' })
+    await source.refreshModels()
+    expect(source.models.map(m => m.model)).toEqual(['MiniMax-M3'])
+    expect(source.modelSelection?.availableModels.map(m => m.model)).toEqual([
+      'MiniMax-M3', 'mimo-v2.5-pro', 'gemini-3.8-flash',
+    ])
+  })
+
+  test('an empty explicit list stays empty without disabling its configured runtime model', async () => {
+    const source = build('packy', { models: '', model: 'MiniMax-M3' })
+    await source.refreshModels()
+    await source.refreshModels()
+    expect(source.models).toEqual([])
+    expect(source.modelSelection?.availableModels.some(m => m.model === 'MiniMax-M3')).toBe(true)
+    expect(source.spawnEnv({}).ANTHROPIC_MODEL).toBe('MiniMax-M3')
+  })
+
+  test('a token without a model does not acquire invented Grok or Fable entries', async () => {
+    respond = () => Response.json({ data: [{ id: 'qwen3.8-max-0902', supported_endpoint_types: ['anthropic'] }] })
+    const source = build('packy-secondary')
+    await source.refreshModels()
+    expect(source.models.map(m => m.model)).toEqual(['qwen3.8-max-0902'])
+    expect(source.modelSelection?.availableModels.map(m => m.model)).toEqual(['qwen3.8-max-0902'])
+    const manual = build('packy-secondary', { custom_models: 'claude-fable-5-1' })
+    await manual.refreshModels()
+    expect(manual.models.find(m => m.model === 'claude-fable-5-1')?.origin).toBe('custom')
   })
 
   test('keeps the two keys independent and routes all Claude role models through the selected key', async () => {
@@ -84,7 +164,7 @@ describe('Packy sources', () => {
       () => Response.json({ data: [{ id: 'unknown' }] }),
       () => Response.json({ data: [{ ...mixed[0], supported_endpoint_types: [] }] }),
       () => Response.json({ data: [mixed[0], mixed[0]] }),
-      () => Response.json({ data: [mixed[3]] }),
+      () => Response.json({ data: [{ id: 'unsupported-model', supported_endpoint_types: ['other'] }] }),
       () => Response.json({ error: { message: `invalid ${key}` } }, { status: 401 }),
       () => { throw new Error(`disconnected ${key}`) },
     ]
@@ -104,7 +184,9 @@ describe('Packy sources', () => {
   test('supports hide/show and out-of-catalog registration without inventing upstream entries', async () => {
     const source = build('packy', { hidden_models: 'MiniMax-M3', custom_models: 'future-model' })
     await source.refreshModels()
-    expect(source.models.map(m => m.model)).toEqual(['mimo-v2.5-pro', 'future-model'])
+    expect(source.models.map(m => m.model)).toEqual([
+      'future-model',
+    ])
     expect(source.modelSelection?.availableModels.find(m => m.model === 'MiniMax-M3')?.origin).toBe('upstream')
     expect(source.models.find(m => m.model === 'future-model')?.origin).toBe('custom')
     expect(source.resolveSpawnModel('future-model')).toBe('future-model')
@@ -112,7 +194,7 @@ describe('Packy sources', () => {
 
   test('an explicitly registered Gemini can use Messages without rewriting its upstream protocol declaration', async () => {
     respond = () => Response.json({ data: [mixed[3]] })
-    const source = build('packy', { model: 'gemini-3.8-flash', custom_models: 'gemini-3.8-flash', effort: 'default' })
+    const source = build('packy', { model: 'gemini-3.8-flash', models: 'gemini-3.8-flash', custom_models: 'gemini-3.8-flash', effort: 'default' })
     await source.refreshModels()
     expect(source.modelCatalogState?.status).toBe('ready')
     expect(source.models).toHaveLength(1)
@@ -149,7 +231,7 @@ describe('Packy sources', () => {
       config: { agent: 'claude', base_url: 'https://cf.api.fan', api_key: 'test-key' },
     })
     respond = () => Response.json({ data: [mixed[3]] })
-    await expect(factory('packy').setup!.validate({ api_key: key })).rejects.toThrow('anthropic')
+    await expect(factory('packy').setup!.validate({ api_key: key })).resolves.toBeUndefined()
     expect(factory('packy').setup!.parseArgs('https://cf.api.fan')).toHaveProperty('error')
   })
 })

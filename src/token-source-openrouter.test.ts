@@ -159,7 +159,7 @@ describe('OpenRouter authoritative model catalog', () => {
     expect(source.models[0].model).toBe('anthropic/test-model[1m]')
   })
 
-  test('keeps MiMo on OpenRouter and routes Gemini through Packy in the five-model defaults', async () => {
+  test('keeps Gemini and MiMo on OpenRouter in the six-model defaults', async () => {
     respond = () => json({ data: OPENROUTER_DEFAULT_MODELS.map(entry => model(entry.model, {
       reasoning: entry.effort === 'default' ? { mandatory: false }
         : { supported_efforts: [entry.effort, 'low'], default_effort: 'low' },
@@ -169,7 +169,7 @@ describe('OpenRouter authoritative model catalog', () => {
     expect(source.models.map(entry => entry.model)).toEqual(OPENROUTER_DEFAULT_MODELS.map(entry => entry.model))
     expect(source.models.map(entry => entry.defaultEffort)).toEqual(OPENROUTER_DEFAULT_MODELS.map(entry => entry.effort))
     expect(source.models.map(entry => entry.model)).toEqual([
-      'tencent/hy4-preview', 'meta/muse-spark-1.2',
+      'tencent/hy4-preview', 'google/gemini-3.8-flash', 'meta/muse-spark-1.2',
       'xiaomi/mimo-v2.5-pro', 'bytedance-seed/seed-2-1-turbo', 'meituan/longcat-2.0',
     ])
     expect(source.models.every(entry => !openRouterModelExcluded(entry.model))).toBe(true)

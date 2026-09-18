@@ -29,15 +29,15 @@ Token Source 管理账号凭据、模型目录、启动环境、默认模型、e
 | Claude Code 订阅 | `claude-sub` 复用本机原生订阅登录态；通过 SDK `accountInfo()` 确认账号，`supportedModels()` 读取模型和 effort，与第三方来源独立共存 |
 | GLM Coding Plan | `[token_source.glm]` 或本机 Claude settings；模型来自兼容端点，可补录已验证模型 |
 | DeepSeek | `[token_source.deepseek]` 或本机 Claude settings；模型来自兼容端点，可补录已验证模型 |
-| OpenRouter | `[token_source.openrouter]` 或本机 Claude settings；默认保留五款模型（含 MiMo），账号目录验证能力，MD 面板维护增删 |
-| PackyAPI | `[token_source.packy]`、`[token_source.packy-secondary]`；按令牌目录筛选 Anthropic 模型，主令牌与 `packy-codex` 共用凭据 |
+| OpenRouter | `[token_source.openrouter]` 或本机 Claude settings；默认保留六款模型（含 Gemini、MiMo），账号目录验证能力，MD 面板维护增删 |
+| PackyAPI | `[token_source.packy]`、`[token_source.packy-secondary]`；按令牌目录筛选模型，Claude 入口默认展示 MiniMax、Opus、Fable 5.1（claude-fable-5-1）、Qwen；Codex 入口展示 Kimi、Grok 4.6，主令牌与 `packy-codex` 共用凭据 |
 | DeepSeek Harness | `[token_source.deepseek-harness]`；模型、effort 与上下文容量来自当前安装的 DSH 原生目录 |
 | DSH GLM Coding Plan | `[token_source.dsh-glm]` 或复用 `glm`；账号接口返回模型，DSH 原生适配器提供能力和推理档位 |
 | Claude native | 沿用本机 Claude 配置，目录来自 SDK `supportedModels()`；有已启用的第三方 Claude 侧来源时让位 |
 
 `model` 按 Claude Code、Codex、DeepSeek Harness 分组，组 ID 由 `ELEMENTS.modelAgentGroup` 生成。两个 Agent 下的 DeepSeek 来源都显示为 DeepSeek，协议 id 保持不变。选账号后进入模型列表；多个档位才展示 effort 卡，只有一个档位时直接应用，获取失败显示 `MISS`。同 provider/source 的切换调用 `setModelSettings`：Claude 和 DSH 从后续 turn 使用，Codex 保存选择并在重启进程后应用。跨 provider/source 或需要变更项目启动配置时，只能在空闲状态更换进程。
 
-除 OpenRouter 保留默认十项的显式列表外，所有来源由 `withModelVisibility` 在真实接口目录上应用 `hidden_models`。接口项通过显示/隐藏调整可见性，新增上游模型自动进入列表。所有来源都支持用 `custom_models` 补录列表外模型，`origin` 区分接口项和补录项；GLM / DeepSeek 会先做端点验证，补录模型可直接选择请求档位使用，DSH 原生解析目录外模型，其余来源使用 Agent 请求档位；不能用目录白名单挡住用户补录。接口收录同名模型后按接口项管理，不重复展示。
+OpenRouter 和 PackyAPI 使用各自不重叠的显式精选列表，其余来源由 `withModelVisibility` 在真实接口目录上应用 `hidden_models`。接口项通过显示/隐藏调整可见性，新增上游模型自动进入列表。所有来源都支持用 `custom_models` 补录列表外模型，`origin` 区分接口项和补录项；GLM / DeepSeek 会先做端点验证，补录模型可直接选择请求档位使用，DSH 原生解析目录外模型，其余来源使用 Agent 请求档位；不能用目录白名单挡住用户补录。接口收录同名模型后按接口项管理，不重复展示。
 
 `tokenSourceRuntimeModel(s)` 使用完整能力目录，隐藏不修改会话、`model`、`effort`、slots 或启动配置指纹。`model_custom_remove` 只删除补录项，拒绝删接口项；删除前要求会话不再选用该项，并清理默认模型和 slots 的悬空引用。补录/删除和显示/隐藏均串行写配置，旧面板失效。
 
@@ -65,9 +65,9 @@ Lodestar 每次启动 Claude SDK 子进程时自动设置 `CLAUDE_CODE_ENABLE_TO
 
 - 来源 id 为 `openrouter`，通过 factory 注册 `openrouter-setup`。默认根地址 `https://openrouter.ai/api`，粘贴的 `/api/v1` 会规范成 SDK 根地址。API key 注入 `ANTHROPIC_AUTH_TOKEN`，`ANTHROPIC_API_KEY` 显式置空，模型 slug 完整透传，不自动追加 `[1m]`。
 - 主会话和委派共用 `agent-launch.ts`，将所选模型传给 `spawnEnv`。辅助角色在进程启动时绑定所选模型，可用 `slots` 配置 opus/sonnet/haiku；主模型后续切换不改动进程启动时的辅助角色。
-- 默认列表由 `src/openrouter-defaults.ts` 定义，共五项，详见[账号与模型](models.md#openrouter)。账号目录来自 `GET /api/v1/models/user`，遵循账号供应商、隐私和 guardrail 设置；过滤 OpenAI、GLM、DeepSeek 等被排除厂商、自动路由、非文本输出、无 tools 和 `:batch` 模型。厂商排除也在启动路由和 slot 校验中执行。
+- 默认列表由 `src/openrouter-defaults.ts` 定义，共六项，详见[账号与模型](models.md#openrouter)。账号目录来自 `GET /api/v1/models/user`，遵循账号供应商、隐私和 guardrail 设置；过滤 OpenAI、GLM、DeepSeek 等被排除厂商、自动路由、非文本输出、无 tools 和 `:batch` 模型。厂商排除也在启动路由和 slot 校验中执行。
 - `modelSelection` 保存可见模型 id 和完整允许候选；`models` 只暴露面板可见项。`model_list_open` / `model_add` / `model_remove` 对应接口项显示/隐藏，服务端校验当前页、模式与配置版本。`model_custom_remove` 删除补录记录，不能用于接口项；厂商排除也应用于手动补录。
-- `models` 未配置时使用默认十项，空字符串表示用户主动清空，不能当作未配置。默认模型、effort、slots、Key 及相邻配置节保留；启动和 slots 按完整允许目录验证。上游不再返回的已选项显示 `unavailableReason`，不能启动，但可以删除。
+- `models` 未配置时使用默认六项，空字符串表示用户主动清空，不能当作未配置。默认模型、effort、slots、Key 及相邻配置节保留；启动和 slots 按完整允许目录验证。上游不再返回的已选项显示 `unavailableReason`，不能启动，但可以删除。
 - effort 来自 `reasoning.supported_efforts`，仅暴露 Claude SDK 支持的档位；显式 `null` 表示全部网关档位。没有 effort 选择器的模型使用 `default`，含义是请求不携带 `output_config.effort`，不代表关闭推理，选择模型后直接应用并跳过 effort 卡。其他缺失的默认档位保留 `null`，要求用户明确选择。已选榜单代表模型使用榜单明确的档位或账号目录的默认档位。
 - `default` 用显式启动档位配合子进程环境中的 `CLAUDE_CODE_EFFORT_LEVEL=unset`，避免 CLI 为请求补上 effort。`settings.env` 不能替代真实环境，单纯省略 SDK 选项也不成立。显式 `max` 通过 `effortLevel: 'max'` 下发，不能映射成 `ultracode`。
 - `modelEnvironmentRevision` 参与进程配置比较。`default` 与显式档位之间切换需要新进程环境，Session 在空闲时保存并恢复原生 session；相同模式继续走 `setModelSettings`。slots 不能混合两种参数模式，避免辅助任务继承不适用的环境。模型切换不触发 daemon 重启。
