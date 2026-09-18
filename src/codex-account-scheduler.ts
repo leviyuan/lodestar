@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { codexAccounts, isCodexLoginPending, type CodexAccount } from './codex-accounts'
-import { peekFreshUsage, readUsage, type UsageSnapshot } from './usage'
+import { peekSuccessfulUsage, readUsage, type UsageSnapshot } from './usage'
 import { codexModelQuota, codexQuotaMeter, rankCodexQuota, type CodexQuotaRank } from './codex-quota'
 import { getTokenSourceForAccount, tokenSourceRuntimeModel } from './token-source'
 import type { AgentReasoningEffort } from './agent-process'
@@ -30,7 +30,7 @@ export interface CodexSelectionOptions {
   effort?: AgentReasoningEffort
   preferred?: string | null
   signal?: AbortSignal
-  /** Launch from fresh cached quota if possible; all reads share the same cooldown. */
+  /** Launch from the last successful cached quota if possible; all reads share the same cooldown. */
   preferCachedUsage?: boolean
   /** Native quota error from a manually chosen process whose quota had not been read. Only used once. */
   failedAccountId?: string
@@ -153,7 +153,7 @@ export class CodexAccountScheduler {
 }
 
 export const codexAccountScheduler = new CodexAccountScheduler({
-  accounts: () => codexAccounts.list(), usage: readUsage, cachedUsage: peekFreshUsage,
+  accounts: () => codexAccounts.list(), usage: readUsage, cachedUsage: peekSuccessfulUsage,
   identity: id => codexAccounts.fingerprint(id), pendingLogin: isCodexLoginPending,
   now: Date.now, stateFile: CODEX_QUOTA_BLOCKS_FILE,
   compatible: async (id, model, effort) => {
