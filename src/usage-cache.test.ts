@@ -43,6 +43,44 @@ describe('shared quota freshness and cooldown', () => {
     expect(calls).toBe(before + 1)
   })
 
+  test('readStale keeps the last successful value through transient failures and clears it on credential loss', async () => {
+    let now = 0, state = 'ok', calls = 0
+    const cache = new UsageReadCache<{ state: string; value?: number }>(() => now)
+    const read = async () => ({ state, ...(state === 'ok' ? { value: ++calls } : {}) })
+    const first = await cache.readStale('account', read)
+    now = 60_000
+    state = 'network'
+    expect(await cache.readStale('account', read)).toBe(first)
+    expect(cache.peekSuccessful('account')).toBe(first)
+    now = 120_000
+    state = 'rate_limited'
+    expect(await cache.readStale('account', read)).toBe(first)
+    now = 240_000
+    state = 'no_credentials'
+    expect((await cache.readStale('account', read)).state).toBe('no_credentials')
+    expect(cache.peekSuccessful('account')).toBeUndefined()
+  })
+
+  test('readStale only hides transient thrown transport errors when a successful value exists', async () => {
+    let now = 0
+    const cache = new UsageReadCache<{ state: string; value?: number }>(() => now)
+    const first = await cache.readStale('account', async () => ({ state: 'ok', value: 1 }))
+    now = 60_000
+    expect(await cache.readStale('account', async () => { throw new Error('timeout') })).toBe(first)
+    now = 120_000
+    await expect(cache.readStale('account', async () => { throw new Error('invalid response shape') })).rejects.toThrow('invalid response shape')
+  })
+
+  test('readStale clears a successful value when the upstream reports authentication loss', async () => {
+    let now = 0
+    const cache = new UsageReadCache<{ state: string; reason?: string }>(() => now)
+    await cache.readStale('account', async () => ({ state: 'ok' }))
+    now = 60_000
+    const failed = await cache.readStale('account', async () => ({ state: 'network', reason: 'HTTP 401 token expired' }))
+    expect(failed).toMatchObject({ state: 'network' })
+    expect(cache.peekSuccessful('account')).toBeUndefined()
+  })
+
   test('rejected requests retain diagnostics and share the same cooldown', async () => {
     let now = 0, calls = 0
     const cache = new UsageReadCache<{ state: string }>(() => now)

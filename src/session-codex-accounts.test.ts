@@ -304,7 +304,7 @@ describe('bare Codex account commands', () => {
       for (let attempt = 0; attempt < 2; attempt++) {
         const suffix = await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)
         expect(suffix).toBe('  |  11%·[23%]')
-        expect(peekUsage(account.id)).toBeNull()
+        expect(peekUsage(account.id)?.state).toBe('ok')
         expect(cached).toBe(peekSuccessfulUsage(account.id))
       }
       expect(reads).toBe(1)

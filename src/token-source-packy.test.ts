@@ -359,19 +359,19 @@ describe('Packy real account balance', () => {
     expect(requests).toHaveLength(1)
   })
 
-  test('failed refresh replaces success, respects Retry-After, redacts tokens and allows rotation', async () => {
+  test('failed refresh keeps success visible, respects Retry-After, redacts tokens and allows rotation', async () => {
     const originalNow = Date.now
     let now = originalNow()
     Date.now = () => now
     try {
       respond = url => url.endsWith('/api/status') ? status() : balance()
-      expect((await fetchPackyBalance(root, key, userId)).state).toBe('ok')
+      const cached = await fetchPackyBalance(root, key, userId)
+      expect(cached.state).toBe('ok')
       now += 60000
       respond = () => Response.json({ message: `rate limited ${key}` }, { status: 429, headers: { 'Retry-After': '300' } })
       const failed = await fetchPackyBalance(root, key, userId)
-      expect(failed).toMatchObject({ state: 'rate_limited', retryAfterMs: 300000 })
-      expect(failed.balance).toBeUndefined()
-      expect(failed.reason).not.toContain(key)
+      expect(failed).toBe(cached)
+      expect(failed.state).toBe('ok')
       const count = requests.length
       now += 299999
       expect(await fetchPackyBalance(root, key, userId)).toBe(failed)

@@ -16,7 +16,7 @@ import {
   scrubAnthropicEnv,
   registerTokenSourceFactory,
 } from './token-source'
-import { readUsage, type UsageSnapshot, type UsageWindow } from './usage'
+import { readUsageForDisplay, type UsageSnapshot, type UsageWindow } from './usage'
 import { fetchCodexModels } from './token-source-models'
 import type { AgentReasoningEffort } from './agent-process'
 import { log } from './log'
@@ -110,7 +110,7 @@ registerTokenSourceFactory({
           return model
         },
         async readUsage(): Promise<UsageSnapshotUnified> {
-          return codexUsageToUnified(await readUsage(accountId))
+          return codexUsageToUnified(await readUsageForDisplay(accountId))
         },
       }
       return ts

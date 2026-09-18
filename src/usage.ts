@@ -71,9 +71,21 @@ const successfulCaches = new Map<string, Extract<UsageSnapshot, { state: 'ok' }>
 const usageReads = new UsageReadCache<UsageSnapshot>()
 
 function cacheUsage(accountId: string, snapshot: UsageSnapshot): void {
-  caches.set(accountId, snapshot)
-  if (snapshot.state === 'ok') successfulCaches.set(accountId, snapshot)
-  else if (snapshot.state === 'no_credentials' || snapshot.state === 'auth_failed') successfulCaches.delete(accountId)
+  if (snapshot.state === 'ok') {
+    caches.set(accountId, snapshot)
+    successfulCaches.set(accountId, snapshot)
+    return
+  }
+  // A timeout, rate limit, or malformed upstream response must not replace
+  // the last usable quota. Keep the failure as the live return value while
+  // leaving the display cache intact; authentication/invalidation is handled
+  // explicitly below and is allowed to clear it.
+  if (snapshot.state === 'no_credentials' || snapshot.state === 'auth_failed') {
+    caches.set(accountId, snapshot)
+    successfulCaches.delete(accountId)
+  } else if (!successfulCaches.has(accountId)) {
+    caches.set(accountId, snapshot)
+  }
 }
 
 export type CodexResetOutcome = 'reset' | 'alreadyRedeemed' | 'nothingToReset' | 'noCredit'
@@ -435,7 +447,7 @@ export function snapshotFromReadResponse(limitsRes: any, planType?: string | nul
   }
 }
 
-/** 最近一次查询结果；保留失败语义，不用成功缓存替换。 */
+/** 最近一次可用额度；瞬态失败不覆盖成功快照，认证失效仍返回失败态。 */
 export function peekUsage(accountId = DEFAULT_CODEX_ACCOUNT): UsageSnapshot | null {
   return caches.get(accountId) ?? null
 }
@@ -476,6 +488,15 @@ export function readUsage(accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnaps
     })
 }
 
+/** Query for a user-visible panel while retaining the last successful quota on transient failure. */
+export async function readUsageForDisplay(accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot> {
+  const snapshot = await readUsage(accountId)
+  if ((snapshot.state === 'network' || snapshot.state === 'rate_limited')) {
+    return peekSuccessfulUsage(accountId) ?? snapshot
+  }
+  return snapshot
+}
+
 /** 用现有连接刷新额度；请求失败返回 null 并记录原始错误。
  * 成功快照另存供启动与页脚使用，页脚沿用原额度格式。 */
 export function refreshUsageFromConnection(request: (method: string, params: any) => Promise<any>, accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot | null> {
@@ -496,8 +517,12 @@ export function refreshUsageFromConnection(request: (method: string, params: any
     })
     .catch((e: any) => {
       if ((usageGenerations.get(accountId) ?? 0) === generation) {
-        caches.delete(accountId)
-        if (isUsageAuthError(e)) successfulCaches.delete(accountId)
+        if (isUsageAuthError(e)) {
+          caches.set(accountId, { state: 'auth_failed' })
+          successfulCaches.delete(accountId)
+        } else if (!successfulCaches.has(accountId)) {
+          caches.set(accountId, { state: isUsageRateLimitError(e) ? 'rate_limited' : 'network', reason: String(e) })
+        }
       }
       return null
     })
@@ -523,16 +548,16 @@ function requestCodexQuotaWithRetry<T>(request: () => Promise<T>): Promise<T> {
   return requestCodexControlWithRetry(request, '额度查询', { retryRateLimits: false })
 }
 
-/** 网络抖动重试同一个 Codex 控制请求；仅供只读或带幂等标识的操作。 */
+/** 网络抖动重试同一个 Codex 控制请求；命中限流立即返回，不把限流继续打成重试风暴。 */
 export async function requestCodexControlWithRetry<T>(request: () => Promise<T>, operation = '额度查询',
-  options: { retryRateLimits?: boolean } = {}): Promise<T> {
+  _options: { retryRateLimits?: boolean } = {}): Promise<T> {
   const delays = [1000, 4000]
   for (let attempt = 0; ; attempt++) {
     try { return await withTimeout(request(), API_TIMEOUT_MS) }
     catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       if (isUsageAuthError(error)) throw error
-      if (options.retryRateLimits === false && isUsageRateLimitError(error)) throw error
+      if (isUsageRateLimitError(error)) throw error
       const transient = /error sending request|timed? ?out|timeout|ECONNRESET|ETIMEDOUT|EAI_AGAIN|connection (?:reset|closed)|\b(?:429|502|503|504)\b/i.test(message)
       if (!transient) throw error
       if (attempt >= delays.length) throw new Error(`Codex ${operation}失败（已尝试 ${attempt + 1} 次）：${message}`, { cause: error })

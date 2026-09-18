@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
-import { snapshotFromReadResponse, observeRateLimitsNotification, refreshUsageFromConnection, readUsage, peekUsage, peekSuccessfulUsage, captureCodexUsageCache, invalidateCodexUsage } from './usage'
+import { snapshotFromReadResponse, observeRateLimitsNotification, refreshUsageFromConnection, readUsage, readUsageForDisplay, peekUsage, peekSuccessfulUsage, captureCodexUsageCache, invalidateCodexUsage, requestCodexControlWithRetry } from './usage'
 
 let quotaNow: number
 let quotaClock: ReturnType<typeof spyOn>
@@ -73,6 +73,15 @@ describe('quota account isolation', () => {
 })
 
 describe('quota transient failures', () => {
+  test('a rate-limited Codex control request stops immediately without retrying', async () => {
+    let calls = 0
+    await expect(requestCodexControlWithRetry(async () => {
+      calls++
+      throw new Error('HTTP 429 too many requests')
+    })).rejects.toThrow('429')
+    expect(calls).toBe(1)
+  })
+
   test('a transient quota connection failure retries within the shared read before entering cooldown', async () => {
     const account = 'quota-transient-recovery'
     let calls = 0
@@ -117,28 +126,30 @@ describe('quota transient failures', () => {
     expect(snapshot).toMatchObject({ state: 'ok', weekly: { percent: 19 } })
   })
 
-  test('persistent network failures remain visible and retain the successful snapshot for startup and footer', async () => {
+  test('persistent network failures remain visible to live callers while the successful snapshot stays on display', async () => {
     const account = 'cached-startup'
     const cached = await refreshUsageFromConnection(async () => ({ rateLimits: { planType: 'pro',
       primary: { usedPercent: 30, windowDurationMins: 10080, resetsAt: 1_900_000_000 } } }), account)
+    if (!cached || cached.state !== 'ok') throw new Error('expected an initial quota snapshot')
     let calls = 0
     quotaNow += 60_000
     const snapshot = await refreshUsageFromConnection(async () => { calls++; throw new Error('error sending request') }, account)
     expect(calls).toBe(3)
     expect(snapshot).toBeNull()
-    expect(peekUsage(account)).toBeNull()
-    expect(cached).toBe(peekSuccessfulUsage(account))
+    expect(peekUsage(account)).toBe(cached)
+    expect(peekSuccessfulUsage(account)?.fetchedAt).toBe(cached.fetchedAt)
     expect((await readUsage(account)).state).toBe('network')
+    expect(await readUsageForDisplay(account)).toBe(cached)
     expect(calls).toBe(3)
     invalidateCodexUsage(account)
   }, 10_000)
 
-  test('an invalid quota response is shown as MISS while the previous successful observation remains cached', async () => {
+  test('an invalid quota response remains a live MISS while the previous successful observation stays cached', async () => {
     const account = 'invalid-refresh'
     const cached = await refreshUsageFromConnection(async () => ({ rateLimits: { primary: { usedPercent: 12, windowDurationMins: 300 } } }), account)
     quotaNow += 60_000
     expect(await refreshUsageFromConnection(async () => ({}), account)).toMatchObject({ state: 'network' })
-    expect(peekUsage(account)).toMatchObject({ state: 'network' })
+    expect(peekUsage(account)).toBe(cached)
     expect(cached).toBe(peekSuccessfulUsage(account))
     invalidateCodexUsage(account)
   })

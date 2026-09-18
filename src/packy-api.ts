@@ -126,7 +126,7 @@ export async function fetchPackyBalance(base: string, token: string, userId: str
         ...(error instanceof PackyHttpError && error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}) }
     }
   }
-  if (!fresh) return usageReads.read(cacheKey, load)
+  if (!fresh) return usageReads.readStale(cacheKey, load)
   // setup 必须重新验证，不能靠此前的成功缓存接受失效凭据。
   const result = await load()
   if (result.state === 'ok') usageReads.prime(cacheKey, result)
@@ -138,7 +138,7 @@ export async function fetchPackyBalance(base: string, token: string, userId: str
 export async function fetchPackyUsage(base: string, key: string): Promise<UsageSnapshotUnified> {
   if (!key) return { state: 'no_credentials', kind: 'quota', windows: [] }
   const root = packyManagementRoot(base)
-  return usageReads.read(usageCredentialKey('packy', root, key), async () => {
+  return usageReads.readStale(usageCredentialKey('packy', root, key), async () => {
     try {
       const json = await readJson(`${root}/api/usage/token/`, key)
       const data = json.data

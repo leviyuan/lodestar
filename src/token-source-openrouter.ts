@@ -115,10 +115,10 @@ export async function fetchOpenRouterModels(base: string, apiKey: string): Promi
 function nonnegative(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0
 }
-/** 账户余额直接读取 /credits；失败显示 MISS，不换用 Key 限额或累计用量。 */
+/** 账户余额直接读取 /credits；瞬态失败沿用该账号最近成功余额，不换用 Key 限额或累计用量。 */
 export async function fetchOpenRouterUsage(base: string, apiKey: string): Promise<UsageSnapshotUnified> {
   if (!apiKey) return { kind: 'balance', state: 'no_credentials', windows: [] }
-  return usageReads.read(usageCredentialKey('openrouter', baseUrl(base), apiKey), () => requestOpenRouterUsage(base, apiKey))
+  return usageReads.readStale(usageCredentialKey('openrouter', baseUrl(base), apiKey), () => requestOpenRouterUsage(base, apiKey))
 }
 
 async function requestOpenRouterUsage(base: string, apiKey: string): Promise<UsageSnapshotUnified> {

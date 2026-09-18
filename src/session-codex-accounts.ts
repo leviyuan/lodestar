@@ -9,7 +9,7 @@ import { codexAccountScheduler } from './codex-account-scheduler'
 import { CodexAccountCard } from './codex-account-card'
 import { codexAccountCard, type CodexAccountCardView } from './cards/codex-account'
 import { log } from './log'
-import { consumeCodexResetCredit, invalidateCodexUsage, type CodexResetOutcome } from './usage'
+import { consumeCodexResetCredit, invalidateCodexUsage, peekSuccessfulUsage, type CodexResetOutcome } from './usage'
 
 const loginReceipts = new Map<string, Promise<void>>()
 
@@ -105,8 +105,14 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
       // account must not hide a successfully authenticated named account.
       const effort = s.currentProvider() === 'codex' ? s.currentEffortLabel() ?? undefined : undefined
       const decision = model ? await codexAccountScheduler.choose({ model, effort }) : null
-      const total = decision ? aggregateCodexUsage(decision.candidates.flatMap(c => c.usage ? [{ account: c.account, usage: c.usage,
-        fingerprint: c.identity.startsWith('record:') ? null : c.identity }] : [])) : await readAllCodexUsage()
+      // The scheduler still receives the live failure and must not rank from
+      // stale data; only the account panel gets the last successful rows.
+      const total = decision ? aggregateCodexUsage(decision.candidates.flatMap(c => {
+        const stale = c.usage?.state === 'network' || c.usage?.state === 'rate_limited'
+          ? peekSuccessfulUsage(c.account.id) : null
+        const usage = stale ?? c.usage
+        return usage ? [{ account: c.account, usage, fingerprint: c.identity.startsWith('record:') ? null : c.identity }] : []
+      })) : await readAllCodexUsage()
       if (catalogError) log(`codex-accounts: scheduling MISS: ${catalogError}`)
       await card.finish({ phase: 'accounts', total, currentId: accountId,
         ...(codexAccounts.preferred(s.sessionName) ? { selectedId: codexAccounts.selected(s.sessionName) } : {}), page,

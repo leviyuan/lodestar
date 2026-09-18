@@ -95,7 +95,7 @@ const balanceReads = new UsageReadCache<UsageSnapshotUnified>()
 
 /** GET {host}/user/balance(OpenAI 根路径,Bearer 认证)→ 剩余余额标量。
  *  DeepSeek 是充值余额模型，返回结构化余额、windows 空;
- *  失败如实 MISS(no_fallbacks),绝不假数据。 */
+ *  瞬态失败沿用同一凭据最近成功余额，认证失败仍显示 MISS。 */
 export async function fetchDeepseekBalance(baseUrl: string, apiKey: string): Promise<UsageSnapshotUnified> {
   if (!apiKey.trim()) return { kind: 'balance', state: 'no_credentials', windows: [] }
   let origin: string
@@ -104,7 +104,7 @@ export async function fetchDeepseekBalance(baseUrl: string, apiKey: string): Pro
   } catch {
     return { kind: 'balance', state: 'network', windows: [], reason: 'bad base_url' }
   }
-  return balanceReads.read(usageCredentialKey('deepseek', origin, apiKey), () => requestDeepseekBalance(origin, apiKey))
+  return balanceReads.readStale(usageCredentialKey('deepseek', origin, apiKey), () => requestDeepseekBalance(origin, apiKey))
 }
 
 async function requestDeepseekBalance(origin: string, apiKey: string): Promise<UsageSnapshotUnified> {

@@ -14,8 +14,8 @@ import { networkFetch } from './network'
  *   ANTHROPIC_AUTH_TOKEN → 裸 token,直接作 Authorization header(不带 Bearer)
  *   ANTHROPIC_BASE_URL   → 判定平台 host(open.bigmodel.cn=ZHIPU / api.z.ai=ZAI)
  *
- * 失败可见 (no_fallbacks):无凭据 / 非 GLM 后端 / 限流 / 网络各自显式标 MISS,
- * 绝不假数据。与 src/usage.ts(Codex 侧)的 snapshot 模式对齐。
+ * 瞬态限流/网络失败沿用同一凭据的最近成功快照；无凭据或非 GLM 后端仍显式标 MISS。
+ * 与 src/usage.ts(Codex 侧)的 snapshot 模式对齐。
  */
 
 import { readFileSync } from 'node:fs'
@@ -165,7 +165,7 @@ export async function fetchGlmUsage(baseUrlOverride?: string, tokenOverride?: st
   const domain = glmDomain(baseUrl)
   if (!domain) return { state: 'not_glm', baseUrl: baseUrl || undefined }
 
-  return usageReads.read(usageCredentialKey('glm', domain, token), () => requestGlmUsage(domain, token))
+  return usageReads.readStale(usageCredentialKey('glm', domain, token), () => requestGlmUsage(domain, token))
 }
 
 async function requestGlmUsage(domain: string, token: string): Promise<GlmUsageSnapshot> {

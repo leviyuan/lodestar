@@ -1,5 +1,5 @@
 import { codexAccounts, type CodexAccount } from './codex-accounts'
-import { readUsage, type UsageSnapshot, type UsageWindow } from './usage'
+import { readUsageForDisplay, type UsageSnapshot, type UsageWindow } from './usage'
 
 export interface CodexAccountUsage {
   account: CodexAccount
@@ -50,7 +50,7 @@ export async function readAllCodexUsage(current?: { id: string; usage: UsageSnap
     const key = fingerprint ?? account.id
     let pending = reads.get(key)
     if (!pending) {
-      pending = current?.id === account.id ? Promise.resolve(current.usage) : readUsage(account.id)
+      pending = current?.id === account.id ? Promise.resolve(current.usage) : readUsageForDisplay(account.id)
       reads.set(key, pending)
     }
     const usage = await pending

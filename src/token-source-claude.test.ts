@@ -130,7 +130,7 @@ test('disabled Claude subscription skips native queries and discovery until expl
   `)
 })
 
-test('Claude subscription quota uses authenticated native control, closes queries and surfaces failures', () => {
+test('Claude subscription quota uses authenticated native control and keeps the last data through transient failures', () => {
   isolated(`
     import assert from 'node:assert/strict'
     import { mock } from 'bun:test'
@@ -191,27 +191,27 @@ test('Claude subscription quota uses authenticated native control, closes querie
     readFailure = new Error('quota transport failed')
     quotaNow += 300_000
     const failed = await source.readUsage()
-    assert.equal(failed.state, 'network')
-    assert.match(failed.reason, /quota transport failed/)
-    assert.deepEqual(failed.windows, [])
+    assert.equal(failed.state, 'ok')
+    assert.equal(failed.windows[0].percent, 12.5)
     assert.equal(queries.at(-1).closed, true)
 
     closeFailure = true
     quotaNow += 300_000
     const bothFailed = await source.readUsage()
-    assert.match(bothFailed.reason, /quota transport failed.*close failed/)
+    assert.equal(bothFailed.state, 'ok')
+    assert.equal(bothFailed.windows[0].percent, 12.5)
     readFailure = null
     quotaNow += 300_000
     const closeFailed = await source.readUsage()
-    assert.equal(closeFailed.state, 'network')
-    assert.match(closeFailed.reason, /close failed/)
+    assert.equal(closeFailed.state, 'ok')
+    assert.equal(closeFailed.windows[0].percent, 12.5)
     closeFailure = false
 
     methodAvailable = false
     quotaNow += 300_000
     const unsupported = await source.readUsage()
-    assert.equal(unsupported.state, 'network')
-    assert.match(unsupported.reason, /不支持原生订阅额度查询/)
+    assert.equal(unsupported.state, 'ok')
+    assert.equal(unsupported.windows[0].percent, 12.5)
     assert.equal(queries.at(-1).closed, true)
     methodAvailable = true
 
@@ -224,6 +224,7 @@ test('Claude subscription quota uses authenticated native control, closes querie
     account = { subscriptionType: 'Claude Max', apiProvider: 'vertex' }
     quotaNow += 300_000
     const wrongProvider = await source.readUsage()
+    assert.equal(wrongProvider.state, 'network')
     assert.match(wrongProvider.reason, /不是第一方订阅/)
     assert.deepEqual(queries.at(-1).requests, [])
 

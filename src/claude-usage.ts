@@ -96,10 +96,10 @@ export function claudeUsageSnapshot(data: unknown): UsageSnapshotUnified {
   return { state: 'ok', windows, fetchedAt: Date.now() }
 }
 
-/** 沿用订阅来源的认证隔离；独立控制查询用完即关，失败不复用旧快照。 */
+/** 沿用订阅来源的认证隔离；独立控制查询用完即关，瞬态失败沿用最近成功快照。 */
 export async function fetchClaudeSubscriptionUsage(options: Pick<ClaudeSpawnOpts,
   'settingSources' | 'settings' | 'transformEnv' | 'validateAccount' | 'tokenSourceId'>): Promise<UsageSnapshotUnified> {
-  return usageReads.read('claude-subscription', () => requestClaudeSubscriptionUsage(options))
+  return usageReads.readStale('claude-subscription', () => requestClaudeSubscriptionUsage(options))
 }
 
 async function requestClaudeSubscriptionUsage(options: Pick<ClaudeSpawnOpts,

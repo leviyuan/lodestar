@@ -4582,7 +4582,7 @@ describe('Session usage cache cross-backend isolation', () => {
       } }), accountId)
       quotaNow += 60_000
       await refreshUsageFromConnection(async () => { throw new Error('quota read failed') }, accountId)
-      expect(peekUsage(accountId)).toBeNull()
+      expect(peekUsage(accountId)).toBeTruthy()
       proc.alive = false
       await session.closeTurnCard(undefined, { hasFreshResult: true })
       const footer = calls.find(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
