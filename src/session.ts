@@ -3263,7 +3263,7 @@ export class Session {
     }
   }
 
-  // ── 原生子 Agent / 后台任务 → 共享委派面板 ───────────────────────
+  // ── 原生子 Agent / 后台任务 → 共享任务面板 ───────────────────────
 
   /** 当前双池快照 —— 喂给纯函数累积器的入参。 */
   private bgStore(): cards.BgStore {
@@ -3332,10 +3332,10 @@ export class Session {
 
   private async reportBackgroundWriteFailure(error: unknown): Promise<void> {
     const detail = messageOf(error)
-    log(`session "${this.sessionName}": delegation panel update failed: ${detail}`)
+    log(`session "${this.sessionName}": task panel update failed: ${detail}`)
     if (this.backgroundWriteError === detail) return
     this.backgroundWriteError = detail
-    await feishu.sendTextRaw(this.chatId, `⚠️ 委派面板更新失败：${detail}`)
+    await feishu.sendTextRaw(this.chatId, `⚠️ 运行任务面板更新失败：${detail}`)
   }
 
   /** Drain admitted writes and settle only this process's rows. The shared card
@@ -3706,7 +3706,7 @@ export class Session {
     })
     on('assistant_text', ({ text, parentToolUseId }: { text: string; parentToolUseId: string | null }) => {
       // SDK/CLI 若转发子 Agent assistant 正文，会在 parentToolUseId 上标归属；
-      // 其工具已进委派面板，正文同样不得泄漏进主对话卡。后台任务的可见进度/
+      // 其工具已进共享任务面板，正文同样不得泄漏进主对话卡。后台任务的可见进度/
       // 终稿由 task_progress/task_notification 权威事件承载。
       if (parentToolUseId) return
       this.appendAssistant(text)
@@ -3723,7 +3723,7 @@ export class Session {
     })
     on('tool_use', ({ id, name, input, parentToolUseId }: { id: string; name: string; input: any; parentToolUseId: string | null }) => {
       // 子 agent 内的工具调用(parentToolUseId 非空)不上主卡 —— 只累积进对应后台
-      // task 的 steps[](委派面板展开可见)。与 codex 侧 isSubagentThread 分流同构:
+      // task 的 steps[](共享任务面板展开可见)。与 codex 侧 isSubagentThread 分流同构:
       // 主卡只承载主 agent,子 agent 过程不把主卡面板数刷爆。parentToolUseId 无
       // 归属 task(如 canUseTool 合成的 AskUserQuestion)不在此列,仍走主卡。
       if (parentToolUseId && this.bgTaskOwns(parentToolUseId)) {
@@ -3916,7 +3916,7 @@ export class Session {
       }
     })
     on('subagent_step', (e: { thread_id: string; item_id: string; tool: string; phase: 'started' | 'completed'; brief: string }) => {
-      // Codex 子 agent 的过程步骤 → 委派面板 steps(主卡不承载,见 codex-process
+      // Codex 子 agent 的过程步骤 → 共享任务面板 steps(主卡不承载,见 codex-process
       // isSubagentThread 过滤)。未知 thread(先于 started 到达的极早期)丢弃。
       this.applyBgStore(cards.applySubagentStep(this.bgStore(), e.thread_id, e.item_id, e.tool, e.phase, e.brief))
       this.onBackgroundTaskChanged()

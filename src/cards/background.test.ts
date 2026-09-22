@@ -407,7 +407,7 @@ describe('任务面板：标题简洁，详情折叠', () => {
     expect(panel.tag).toBe('collapsible_panel')
     expect(panel.expanded).toBe(false)
     expect(panel.element_id).toBe(BG_ELEMENTS.panel('t1'))
-    expect(panel.header.title.content).toBe('⏳ 正在执行 · 搜索认证')
+    expect(panel.header.title.content).toBe('⏳ 子 Agent正在执行 · 搜索认证')
     expect(panel.elements[0].content).toContain('Explore')
     expect(panel.elements[0].content).not.toContain('<1m')
   })
@@ -452,6 +452,35 @@ describe('任务面板：标题简洁，详情折叠', () => {
     expect(body.content).toContain('命中 3 处')
     expect(body.content).not.toContain('执行过程')
     expect(body.content).toContain('找 auth 代码')
+  })
+
+  test('标题明确区分后台进程和子 Agent', () => {
+    const processPanel = backgroundTaskPanel(mk({ id: 'shell', type: 'shell', description: '构建', status: 'failed' })) as any
+    const childPanel = backgroundTaskPanel(mk({ id: 'child', type: 'subagent', description: '检查', status: 'failed' })) as any
+    expect(processPanel.header.title.content).toContain('❌ 后台进程失败')
+    expect(childPanel.header.title.content).toContain('❌ 子 Agent失败')
+    expect(processPanel.elements[0].content).toContain('后台进程')
+    expect(childPanel.elements[0].content).toContain('子 Agent')
+  })
+
+  test('终态结果完整展示，任务说明只显示精简摘要', () => {
+    const panel = backgroundTaskPanel(mk({
+      id: 'long-content', type: 'subagent', description: '检查', status: 'completed',
+      prompt: `先检查 ${'任务细节 '.repeat(200)}任务末尾标记`,
+      summary: `${'完整结果 '.repeat(1000)}结果末尾标记`,
+    })) as any
+    const body = panel.elements[0].content
+    expect(body).toContain('任务内容已精简')
+    expect(body).not.toContain('任务末尾标记')
+    expect(body).toContain('结果末尾标记')
+
+    const oversized = backgroundTaskPanel(mk({
+      id: 'oversized-result', type: 'subagent', description: '检查', status: 'completed',
+      summary: `${'完整结果 '.repeat(2000)}结果截断标记`,
+    })) as any
+    const oversizedBody = oversized.elements[0].content
+    expect(oversizedBody).toContain('结果超过卡片安全上限，已截断')
+    expect(oversizedBody).not.toContain('结果截断标记')
   })
 })
 

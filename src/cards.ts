@@ -131,8 +131,10 @@ export {
   hasActiveBgTask,
   backgroundTaskPanel,
   backgroundTaskSummary,
+  backgroundTaskKind,
   elapsedBucket,
   liveElapsed,
   LIVE_ELAPSED_SECOND_FOOTER_TICK_MS,
   type LiveElapsedMode,
 } from './cards/background'
+export { type AgentCardTaskKind } from './cards/task-kind'

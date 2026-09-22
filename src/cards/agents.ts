@@ -3,8 +3,16 @@ import type { AgentIdentity, AgentSourceFailure } from '../agent-identities'
 import type { AgentRunSnapshot, AgentWorkerResult } from '../agent-run-types'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
 import { formatDuration } from './duration'
+import {
+  AGENT_CARD_TASK_KIND_ORDER,
+  agentCardTaskKindIcon,
+  agentCardTaskKindLabel,
+  type AgentCardTaskKind,
+} from './task-kind'
+import { boundedResultContent, compactTaskContent } from './task-content'
 
-const PROMPT_PREVIEW_CHARS = 10_000
+export type { AgentCardTaskKind } from './task-kind'
+
 const WORKER_TOTAL_PREVIEW_CHARS = 48_000
 const WORKER_MAX_PREVIEW_CHARS = 8_000
 const WORKER_MIN_PREVIEW_CHARS = 512
@@ -71,8 +79,8 @@ export function agentRunElement(run: AgentRunSnapshot): object {
       content: [
         `**${escapeMarkdown(run.description ?? '说明 MISS')}**`,
         agentRunFooterElement(run).content,
-        `**任务说明**\n${promptPreview(run.prompt)}`,
-        ...run.workers.map(worker => agentWorkerElement(worker, agentWorkerPreviewChars(run.workers.length)).content),
+        `**任务说明**\n${sanitizeMarkdownForCardKit(compactTaskContent(run.prompt))}`,
+        ...run.workers.map(worker => agentWorkerElement(worker).content),
       ].join('\n\n'),
     }],
   }
@@ -84,18 +92,29 @@ export function agentRunElementId(runId: string): string {
 
 export function agentCardSummary(runs: AgentRunSnapshot[]): string {
   return delegationCardSummary(runs.map(run => ({
-    summary: agentRunSummary(run), status: run.status, terminal: isTerminal(run.status),
+    summary: agentRunSummary(run), status: run.status, terminal: isTerminal(run.status), kind: 'delegated',
   })))
 }
 
-export function delegationCardSummary(tasks: Array<{ summary: string; status: string; terminal: boolean }>): string {
+export function delegationCardSummary(tasks: Array<{
+  summary: string
+  status: string
+  terminal: boolean
+  kind?: AgentCardTaskKind
+}>): string {
   if (tasks.length === 1) return tasks[0]!.summary
   const done = tasks.filter(task => task.terminal).length
   const failed = tasks.filter(task => task.status === 'failed').length
   const waiting = tasks.filter(task => task.status === 'needs_input' || task.status === 'paused').length
-  return `🧠 委派任务 · 已结束 ${done}/${tasks.length}${failed ? ` · 失败 ${failed}` : ''}${waiting ? ` · 待处理 ${waiting}` : ''}`
+  const kinds = new Set(tasks.map(task => task.kind ?? 'delegated'))
+  const kindList = AGENT_CARD_TASK_KIND_ORDER.filter(kind => kinds.has(kind))
+  const category = kindList.length === 1
+    ? `${agentCardTaskKindIcon(kindList[0]!)} ${agentCardTaskKindLabel(kindList[0]!)}`
+    : `🧩 运行任务 · ${kindList.map(kind => `${agentCardTaskKindLabel(kind)} ${tasks.filter(task => (task.kind ?? 'delegated') === kind).length}`).join(' · ')}`
+  return `${category} · 已结束 ${done}/${tasks.length}${failed ? ` · 失败 ${failed}` : ''}${waiting ? ` · 待处理 ${waiting}` : ''}`
 }
 
+/** Render a bounded worker result; only the task prompt uses the shorter limit. */
 export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars = WORKER_MAX_PREVIEW_CHARS) {
   const status = workerStatusLabel(worker)
   const body: string[] = [`模型 ${inlineCode(worker.model)} · 推理 ${inlineCode(worker.effort)}`]
@@ -109,7 +128,7 @@ export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars
     }
   }
   if (worker.error) body.push('', worker.status === 'cancelled' ? '**停止原因**' : '**失败原因**', sanitizeMarkdownForCardKit(worker.error))
-  if (worker.output) body.push('', worker.status === 'failed' || worker.status === 'cancelled' ? '**已生成的内容**' : '**结果**', truncate(sanitizeMarkdownForCardKit(worker.output), outputPreviewChars))
+  if (worker.output) body.push('', worker.status === 'failed' || worker.status === 'cancelled' ? '**已生成的内容**' : '**结果**', sanitizeMarkdownForCardKit(boundedResultContent(worker.output, outputPreviewChars)))
   if (!worker.output && !worker.error && !worker.pendingInput) {
     body.push('', worker.status === 'completed'
       ? '_任务已完成，没有正文输出。_'
@@ -156,6 +175,7 @@ export function agentRunFooterElement(run: AgentRunSnapshot) {
 }
 
 export function agentWorkerPreviewChars(workerCount: number): number {
+  // Keep the shared-card budget bounded when several workers finish together.
   const count = Math.max(1, Math.floor(workerCount))
   return Math.min(WORKER_MAX_PREVIEW_CHARS, Math.max(WORKER_MIN_PREVIEW_CHARS, Math.floor(WORKER_TOTAL_PREVIEW_CHARS / count)))
 }
@@ -216,28 +236,16 @@ function isTerminal(status: AgentRunSnapshot['status']): boolean {
 }
 
 function runStatusLabel(run: AgentRunSnapshot): string {
+  const kindLabel = agentCardTaskKindLabel('delegated')
   switch (run.status) {
-    case 'completed': return '✅ 委派完成'
-    case 'failed': return '❌ 委派失败'
-    case 'cancelled': return '🛑 委派已取消'
-    case 'needs_input': return '❓ 等待主 Agent 回复'
-    case 'queued': return '⏳ 等待执行'
+    case 'completed': return `✅ ${kindLabel}完成`
+    case 'failed': return `❌ ${kindLabel}失败`
+    case 'cancelled': return `🛑 ${kindLabel}已取消`
+    case 'needs_input': return `❓ ${kindLabel}等待主 Agent 回复`
+    case 'queued': return `⏳ ${kindLabel}等待执行`
     case 'running': return run.workers.length > 0 && run.workers.every(worker => isTerminal(worker.status))
-      ? '⏳ 正在收尾' : '⏳ 正在执行'
+      ? `⏳ ${kindLabel}正在收尾` : `⏳ ${kindLabel}正在执行`
   }
-}
-
-function promptPreview(value: string): string {
-  const sanitized = sanitizeMarkdownForCardKit(value)
-  if (sanitized.length <= PROMPT_PREVIEW_CHARS) return sanitized
-  const receipt = '_这里仅显示任务预览，Agent 使用的是完整任务内容。_'
-  return `${sanitized.slice(0, PROMPT_PREVIEW_CHARS - receipt.length - 2)}\n\n${receipt}`
-}
-
-function truncate(value: string, max: number): string {
-  if (value.length <= max) return value
-  const receipt = '_这里仅显示结果预览，完整内容已保存。_'
-  return `${value.slice(0, Math.max(0, max - receipt.length - 2))}\n\n${receipt}`
 }
 
 function inlineCode(value: string): string {

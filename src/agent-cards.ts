@@ -2,6 +2,7 @@ import * as cards from './cards'
 import { isCardCapacityFailure, type CardWriteFailure, type CardWriteResult } from './cardkit'
 import type { AgentRunSnapshot } from './agent-run-types'
 import type { BgTaskEntry } from './cards/background'
+import type { AgentCardTaskKind } from './cards/task-kind'
 import { withChatMessageOrder } from './chat-message-order'
 
 // Each row has one panel and one Markdown body. Leave room below the
@@ -38,12 +39,13 @@ interface TaskRow {
   elementId: string
   element: object
   summary: string
+  kind: AgentCardTaskKind
   status: string
   terminal: boolean
   attach?: (messageId: string) => void
 }
 
-/** All delegated work shares placement, capacity and streaming ownership. */
+/** All carded work shares placement, capacity and streaming ownership. */
 export class AgentCards {
   private readonly tails = new Map<string, CardGroup>()
   private readonly byTask = new Map<string, CardGroup>()
@@ -76,7 +78,8 @@ export class AgentCards {
         const row: TaskRow = {
           key, chatId, elementId: cards.BG_ELEMENTS.panel(key),
           element: cards.backgroundTaskPanel({ ...task, id: key }),
-          summary: cards.backgroundTaskSummary(task), status: task.status, terminal: cards.isBgTerminal(task),
+          summary: cards.backgroundTaskSummary(task), kind: cards.backgroundTaskKind(task),
+          status: task.status, terminal: cards.isBgTerminal(task),
         }
         try {
           if (!previous || restarted) await this.addRow(row)
@@ -240,7 +243,7 @@ export class AgentCards {
 function runRow(run: AgentRunSnapshot): TaskRow {
   return {
     key: `run:${run.runId}`, chatId: run.chatId, elementId: cards.agentRunElementId(run.runId),
-    element: cards.agentRunElement(run), summary: cards.agentRunSummary(run), status: run.status,
+    element: cards.agentRunElement(run), summary: cards.agentRunSummary(run), kind: 'delegated', status: run.status,
     terminal: run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled',
     attach: messageId => { run.cardMessageId = messageId },
   }

@@ -1,4 +1,4 @@
-/** Native task state and compact rows for the shared delegation card.
+/** Native task state and compact rows for the shared task card.
  * Children are visible on start; ordinary foreground commands stay in pending
  * until the backend marks them backgrounded or the main thread advances.
  */
@@ -13,6 +13,8 @@ import type {
 import { sanitizeMarkdownForCardKit } from './elements'
 import { formatDuration } from './duration'
 import { shellCommandDescription } from './shell-command'
+import { agentCardTaskKindLabel, type AgentCardTaskKind } from './task-kind'
+import { boundedResultContent, compactTaskContent } from './task-content'
 
 export type { BgTaskStatus }
 
@@ -56,7 +58,7 @@ export interface BgTaskStep {
 
 /** 后台任务累积库 —— 双池结构,session 以此为单一可变状态。
  *  - active:已确认后台(workflow/monitor 白名单,或收到 is_backgrounded:true 提升),
- *    驱动共享委派卡的任务行。
+ *    驱动共享任务卡的任务行。
  *  - pending:观察池。尚未确认后台化的普通命令,
  *    不渲染;等 task_updated.is_backgrounded=true 提升到 active,或 task_settled 时丢弃。 */
 export interface BgStore {
@@ -419,6 +421,12 @@ const TYPE_LABEL: Record<BgTaskType, string> = {
   unknown: '任务',
 }
 
+/** Native children and background processes share a card, but keep distinct
+ * user-facing categories so a child Agent is never presented as a process. */
+export function backgroundTaskKind(t: BgTaskEntry): AgentCardTaskKind {
+  return t.type === 'subagent' ? 'subagent' : 'background'
+}
+
 const FOOTER_BUCKETS = [
   { limit: 30_000, label: '<30s' },
   { limit: 60_000, label: '<1m' },
@@ -491,15 +499,19 @@ function terminalElapsed(t: BgTaskEntry): number {
 }
 
 function renderDetailBody(t: BgTaskEntry): string {
+  const kindLabel = agentCardTaskKindLabel(backgroundTaskKind(t))
+  const typeLabel = TYPE_LABEL[t.type]
   const lines: string[] = [
-    `**${TYPE_LABEL[t.type]}**${ownerOf(t) !== TYPE_LABEL[t.type] ? ` · ${ownerOf(t)}` : ''}${isBgTerminal(t) ? ` · 用时 ${formatDuration(terminalElapsed(t) / 1000)}` : ''}`,
+    `**${kindLabel}${typeLabel !== kindLabel ? ` · ${typeLabel}` : ''}**${ownerOf(t) !== typeLabel ? ` · ${ownerOf(t)}` : ''}${isBgTerminal(t) ? ` · 用时 ${formatDuration(terminalElapsed(t) / 1000)}` : ''}`,
     t.description || '说明 MISS',
   ]
   if (t.error) lines.push(`⚠ ${t.error}`)
-  // 终态摘要(子 agent 最终答复 / Claude task summary)置顶:墓碑展开第一眼
-  // 是结果,不是过程。有界预览,steps 仍然完整跟在后面。
-  if (t.summary) lines.push('', `**${isBgTerminal(t) ? '结果' : '进度'}**`, preview(t.summary, 8000))
-  if (t.prompt) lines.push('', '**任务说明**', preview(t.prompt, 2000))
+  // 终态摘要(子 agent 最终答复 / Claude task summary)置顶并完整展示;
+  // 任务说明只保留短摘要,最近动作仍然跟在后面。
+  if (t.summary) lines.push('', `**${isBgTerminal(t) ? '结果' : '进度'}**`, isBgTerminal(t)
+    ? boundedResultContent(t.summary)
+    : compactTaskContent(t.summary))
+  if (t.prompt) lines.push('', '**任务说明**', compactTaskContent(t.prompt))
   if (t.steps.length) {
     lines.push('', '**最近动作**')
     for (const step of t.steps.slice(-3)) lines.push(`- ${step.brief}`)
@@ -509,14 +521,11 @@ function renderDetailBody(t: BgTaskEntry): string {
   return sanitizeMarkdownForCardKit(lines.join('\n'))
 }
 
-function preview(text: string, limit: number): string {
-  return text.length <= limit ? text : `${text.slice(0, limit)}\n_这里只显示预览。_`
-}
-
 export function backgroundTaskSummary(t: BgTaskEntry): string {
+  const kindLabel = agentCardTaskKindLabel(backgroundTaskKind(t))
   const status = {
-    running: '⏳ 正在执行', pending: '⏳ 等待执行', paused: '⏸️ 已暂停',
-    completed: '✅ 委派完成', failed: '❌ 委派失败', killed: '🛑 委派已终止',
+    running: `⏳ ${kindLabel}正在执行`, pending: `⏳ ${kindLabel}等待执行`, paused: `⏸️ ${kindLabel}已暂停`,
+    completed: `✅ ${kindLabel}完成`, failed: `❌ ${kindLabel}失败`, killed: `🛑 ${kindLabel}已终止`,
   }[t.status]
   const description = t.description.replace(/\s+/g, ' ').trim() || '说明 MISS'
   return `${status} · ${description.length <= 40 ? description : `${description.slice(0, 39)}…`}`

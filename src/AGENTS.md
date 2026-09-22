@@ -48,7 +48,7 @@
 - 提问进入 `needs_input`，answer 后恢复；非输入权限请求放行。委派任务不设整轮时长上限，不截断返回正文，结束由后端终态或用户取消决定；follow-up 复用 provider 原生 session。
 - 新委派可用 `--workdir` / `work_dir` 指定主 Agent 工作目录内的现有子目录；默认主目录，相对路径以主目录解析，绝对路径也须在范围内。按真实路径校验软链接，启动前再次校验；越界、缺失和非目录报错。快照 `sessionWorkDir` 保留所属主会话目录，`workDir` 记录实际执行目录；旧快照缺少 `sessionWorkDir` 时其 `workDir` 就是原主目录。
 - `run --session <session_id>` / `POST /agents/runs` 的 `session_id` 从本群同主工作目录的委派历史选择最新一轮，复用原身份及上一轮 effort，并保留原任务目录；显式 `work_dir` 必须解析到原目录。每轮新建 run，原生 session 不变。续跑必须等原任务终态和进程退出；同一 provider/session 在开卡、排队及执行期间禁止重叠续跑，不能把恢复失败转为新会话。
-- `run` / `follow-up` 必填单行 `description`（CLI `--description`，最多 60 字）。委派、原生子 Agent、后台任务共用 `agent-cards.ts` 的同一实例；一项一个默认收起的面板，标题仅状态与说明，详情保留类型、结果、错误及最近三步动作。子 Agent 启动即展示，普通前台命令仍先观察；原生启动工具与 SDK task id 回填复用同一项。按群尾实际消息复用委派卡，满卡或新消息后新任务开新卡，原任务留在原卡更新，不再迁移后台游标。共享卡的 streaming/dispose 统一结算，单项终态不得关闭同卡其他任务；停止进程先排空已接收写入，再结算所属任务。群内出站消息与委派追加通过 `chat-message-order.ts` 排序；读取群尾或写卡失败须报错，不能猜测位置。
+- `run` / `follow-up` 必填单行 `description`（CLI `--description`，最多 60 字）。委派、原生子 Agent、后台任务共用 `agent-cards.ts` 的同一实例；一项一个默认收起的面板，标题明确标出“委派任务 / 子 Agent / 后台进程”类别、状态与说明，详情中的任务说明只显示短摘要，结果在卡片安全上限内完整展示，超限明确截断，错误及最近三步动作仍保留。子 Agent 启动即展示，普通前台命令仍先观察；原生启动工具与 SDK task id 回填复用同一项。按群尾实际消息复用委派卡，满卡或新消息后新任务开新卡，原任务留在原卡更新，不再迁移后台游标。共享卡的 streaming/dispose 统一结算，单项终态不得关闭同卡其他任务；停止进程先排空已接收写入，再结算所属任务。群内出站消息与委派追加通过 `chat-message-order.ts` 排序；读取群尾或写卡失败须报错，不能猜测位置。
 - 每次状态转换原子落盘；大 prompt/输出单独存入私有 artifact，快照不重复内嵌。委派 session id 单独登记，从主会话 `rs`/`fk` 历史排除。
 - 委派历史索引和父子关系不能按缓存数量删除；仅淘汰已完成、已落盘且进程退出的旧正文缓存。`status` 按原 artifact 读取完整正文，读取失败报错；续接保留原生 session、最新一轮 effort 和群/目录边界。
 - 父 run 取消、Session stop/kill/restart 和 daemon shutdown 在首次 await 前关闭新建入口、吊销 capability，并递归回收后代进程。

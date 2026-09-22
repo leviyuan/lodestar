@@ -34,7 +34,7 @@ describe('delegated Agent cards', () => {
     expect(rendered.header).toBeUndefined()
     expect(rendered.body.elements).toHaveLength(1)
     expect(rendered.body.elements[0].expanded).toBe(false)
-    expect(rendered.body.elements[0].header.title.content).toBe('❓ 等待主 Agent 回复 · 检查接口')
+    expect(rendered.body.elements[0].header.title.content).toBe('❓ 委派任务等待主 Agent 回复 · 检查接口')
     expect(rendered.body.elements[0].header.title.content).not.toContain('do it')
     expect(card).not.toContain('depth')
     expect(card).not.toContain('private-session-id')
@@ -65,12 +65,44 @@ describe('delegated Agent cards', () => {
     run.workers[0]!.error = '连接失败'
     const failedCard = agentRunCard(run) as any
     expect(failedCard.body.elements[0].expanded).toBe(false)
-    expect(failedCard.body.elements[0].header.title.content).toContain('❌ 委派失败')
+    expect(failedCard.body.elements[0].header.title.content).toContain('❌ 委派任务失败')
     const failed = JSON.stringify(failedCard)
     expect(failed).toContain('失败原因')
     expect(failed).toContain('连接失败')
     expect(failed).toContain('已生成的内容')
     expect(failed).toContain('接口检查通过')
+  })
+
+  test('compacts the task prompt while keeping the complete result', () => {
+    const run: AgentRunSnapshot = {
+      runId: 'long-content', sessionName: 'project', chatId: 'chat', workDir: '/repo',
+      description: '长任务', prompt: `先完成核心检查 ${'任务细节 '.repeat(200)}任务末尾标记`,
+      depth: 0, status: 'completed', createdAt: '2026-09-06T00:00:00Z',
+      workers: [{
+        identityId: identity.id, identityName: identity.displayName, tokenSourceId: 'glm', provider: 'claude',
+        model: identity.model, effort: 'max', status: 'completed',
+        output: `${'完整结果 '.repeat(1000)}结果末尾标记`, steps: [],
+      }],
+    }
+    const content = (agentRunCard(run) as any).body.elements[0].elements[0].content
+    expect(content).toContain('任务内容已精简')
+    expect(content).not.toContain('任务末尾标记')
+    expect(content).toContain('结果末尾标记')
+  })
+
+  test('截断超出安全上限的结果并明确提示', () => {
+    const run: AgentRunSnapshot = {
+      runId: 'bounded-result', sessionName: 'project', chatId: 'chat', workDir: '/repo',
+      description: '超长结果', prompt: '检查', depth: 0, status: 'completed',
+      createdAt: '2026-09-06T00:00:00Z', workers: [{
+        identityId: identity.id, identityName: identity.displayName, tokenSourceId: 'glm', provider: 'claude',
+        model: identity.model, effort: 'max', status: 'completed',
+        output: `${'完整结果 '.repeat(2000)}结果截断标记`, steps: [],
+      }],
+    }
+    const content = (agentRunCard(run) as any).body.elements[0].elements[0].content
+    expect(content).toContain('结果超过卡片安全上限，已截断')
+    expect(content).not.toContain('结果截断标记')
   })
 
   test('keeps parallel workers in one row and namespaces repeated identities by run', () => {

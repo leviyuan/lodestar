@@ -4853,7 +4853,7 @@ describe('Session background tasks in shared delegation cards', () => {
       expect(session.backgroundTasks).toHaveLength(1)
       expect(session.backgroundTasks[0].status).toBe('failed')
       const rendered = calls.filter(call => call.method === 'PUT').map(call => String(call.body.element)).join('\n')
-      expect(rendered).toContain('委派失败')
+      expect(rendered).toContain('子 Agent失败')
       expect(rendered).toContain('无法启动子 Agent')
     } finally {
       session.stopFooterStatus(session.currentTurn)

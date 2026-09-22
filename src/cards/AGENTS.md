@@ -13,7 +13,7 @@
 - `hi` 的额度区用展开式浅蓝面板，全局所有账号各占一行、notation 字号、2px 行间距，无进度条和底部解释。Codex 按账号备注分行，只显示主额度及“重置 N”，排除 Spark/gpt-reserve；DeepSeek、GLM 的跨 Agent 入口合为一行；GLM 月工具只显示百分比。统一额度摘要与 footer 不附带重置次数。活跃项目行尾显示实际 Codex 进程的账号备注；账号未知时省略整个备注，不显示账号 MISS。账号列表每页附完整 Codex 账号命令说明，底部「Codex 命令」面板默认折叠。
 - Codex 的 `hi`、footer 和账号额度只显示主额度；保留主额度自身的短时窗口、周窗口，不展示 GPT-5.3-Codex-Spark 等模型的附加额度。
 - Claude 订阅 footer 同时保留 5 小时与周额度，周额度按该条回复的模型选择专属窗口或总窗口；已返回的专属窗口缺数据时显示 MISS。hi 仍列出全部额度窗口。
-- `background.ts` 累积 Claude `task_*`、Codex collab 和 DSH 子 Agent 事件；子 Agent 直接展示，普通前台命令留在 pending。任务行与委派共用 `agent-cards.ts`：默认折叠，标题仅状态与最多 40 字说明，类型、完整说明、结果、错误和最近三步动作放在详情；完成后显示实际耗时，运行中不放需要定时刷新的计时。禁止恢复独立后台卡和游标迁移。
+- `background.ts` 累积 Claude `task_*`、Codex collab 和 DSH 子 Agent 事件；子 Agent 直接展示，普通前台命令留在 pending。任务行与委派共用 `agent-cards.ts`：默认折叠，标题明确标出“委派任务 / 子 Agent / 后台进程”类别、状态与最多 40 字说明，详情只保留任务说明短摘要，结果在卡片安全上限内完整展示，超限明确截断，具体类型、错误和最近三步动作仍保留；完成后显示实际耗时，运行中不放需要定时刷新的计时。禁止恢复独立后台卡和游标迁移。
 - 临时会话选择卡只携带 `panel_id`、opaque `choice_id`。provider、cwd、source、owner、launch 保存在 Session 短期状态，不能信任回调传入的可执行 id、数组下标或路径。
 - 公式段使用固定 id 的单个顶层 `column_set`，按源码顺序替换内部 markdown/image。小图可用 `crop_center` 和精确 `size`；宽图用 `fit_horizontal`，不传 `size`，由容器缩放。
 - Card action 立即换卡返回 `{ card: { type: 'raw', data: card } }`。异步更新先返回 toast ACK，再调用 `feishu.updateCard()`；不用 callback-token 的 `/interactive/v1/card/update`，该端点会让 schema 2.0 卡片空白。`notify_callback` 在 Session 存在性检查前分流。
