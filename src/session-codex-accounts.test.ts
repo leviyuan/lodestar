@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events'
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { resetFeishuMock, sentCards, sentTexts } from './feishu-test-mock'
+import { resetFeishuMock, sentCards, sentRawTexts, sentTexts } from './feishu-test-mock'
 import { Session } from './session'
 import { bindProcessCodexAccount, codexAccounts, CodexAccounts, reserveCodexLogin } from './codex-accounts'
 import { codexLogins } from './codex-login'
@@ -17,6 +17,7 @@ import { peekUsage, peekSuccessfulUsage, refreshUsageFromConnection } from './us
 import * as usageModule from './usage'
 import { codexAccountScheduler } from './codex-account-scheduler'
 import { codexAccountCard } from './cards/codex-account'
+import * as logModule from './log'
 
 let root: string
 let quotaNow: number
@@ -98,6 +99,69 @@ afterEach(async () => {
 })
 
 describe('bare Codex account commands', () => {
+  test.each([
+    '周重置时间 MISS 或已过期',
+    'shared-model/high 不可用',
+    '模型目录 MISS',
+    '额度查询失败：HTTP 503',
+    'auth_failed',
+  ])('successful startup and account changes keep unused-account diagnostics in logs: %s', async reason => {
+    const account = store.ensure('replacement')
+    const s = session(); s.status = 'idle'
+    const proc = new Proc(); procs.push(proc); s.wireProc(proc)
+    const logged = spyOn(logModule, 'log').mockImplementation(() => {}); spies.push(logged)
+    const changes = [
+      { accountId: 'default', previousAccountId: null },
+      { accountId: account.id, previousAccountId: 'default' },
+      { accountId: account.id, previousAccountId: account.id },
+    ]
+    for (const change of changes) {
+      bindProcessCodexAccount(proc, change.accountId)
+      proc.emit('codex_account_changed', { ...change, diagnostics: [`备用账号：${reason}`] })
+      await Promise.resolve()
+      expect(s.codexAccountId()).toBe(change.accountId)
+      expect(s.status).toBe('idle'); expect(proc.isAlive()).toBe(true)
+      expect(sentCards).toHaveLength(0)
+      expect(sentTexts).toHaveLength(0)
+      expect(sentRawTexts).toHaveLength(0)
+    }
+    expect(logged.mock.calls.some(([line]) => line.includes(s.sessionName) && line.includes(reason))).toBe(true)
+  })
+
+  test('explicit account inspection still explains skipped accounts after a successful selection', async () => {
+    const account = store.ensure('备用账号')
+    const reason = '周重置时间 MISS 或已过期'
+    const usage: usageModule.UsageSnapshot = { state: 'ok', subscriptionType: 'pro',
+      fiveHour: null, weekly: { percent: 25, resetsAt: new Date(quotaNow + 3600_000) }, fetchedAt: quotaNow }
+    const ready = { account: store.get('default'), identity: 'default', usage,
+      state: 'ready' as const, score: 15, shares: 20, remaining: 15, hours: 1 }
+    const missing = { ...ready, account, identity: account.id, state: 'miss' as const, score: null, reason,
+      usage: { ...usage, weekly: { percent: 25, resetsAt: new Date(quotaNow - 3600_000) } } }
+    spies.push(spyOn(codexAccountScheduler, 'choose').mockResolvedValue({ selected: ready, candidates: [ready, missing] }))
+    const s = session()
+    await s.runCommand('codex-accounts', 'owner')
+    const view = cardViews.at(-1)!
+    expect(view.phase).toBe('accounts')
+    const card = JSON.stringify(codexAccountCard(view))
+    expect(card).toContain('可调度 1')
+    expect(card).toContain('未参与原因'); expect(card).toContain(reason)
+  })
+
+  test.each([
+    'Codex 账号检查失败，无法自动选账号（MISS）；默认：额度查询失败：HTTP 503',
+    '没有配置 Codex 账号',
+    '没有符合条件的 Codex 账号；默认：Ultra 自动选择不使用 Plus',
+  ])('blocking account selection failures remain visible: %s', async failure => {
+    const s = session()
+    Object.defineProperty(s, 'workDir', { value: root })
+    const proc = new Proc(); procs.push(proc)
+    proc.initializationPromise = async () => { throw new Error(failure) }
+    s.spawnAgent = () => proc
+    expect(await s.start()).toBe(false)
+    expect(s.status).toBe('stopped')
+    expect(sentTexts.some(text => text.includes('Codex 启动失败') && text.includes(failure))).toBe(true)
+  })
+
   test('account list shows a logged-in named account even when the default account has no model', async () => {
     const account = store.ensure('新登录账号')
     const native = getTokenSourceForAccount('codex-sub')!

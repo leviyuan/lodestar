@@ -17,7 +17,8 @@ async function scratch(): Promise<string> {
 }
 async function install(directory: string): Promise<void> {
   const manifest = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'))
-  for (const [name, version] of Object.entries(manifest.dependencies)) {
+  const family = Object.fromEntries(Object.entries(manifest.overrides ?? {}).filter(([name]) => name.startsWith('@deepseek-ai/dsh')))
+  for (const [name, version] of Object.entries({ ...family, ...manifest.dependencies })) {
     const target = join(directory, 'node_modules', name)
     await mkdir(target, { recursive: true })
     await writeFile(join(target, 'package.json'), JSON.stringify({ name, version }))
@@ -210,6 +211,24 @@ test('DSH discovers new dependency and peer packages from the latest release wit
   expect(packages['@deepseek-ai/dsh-new-peer']).toBe('9.0.0-rc.8')
   expect(calls.filter(call => call.endsWith('@latest'))).toEqual(['@deepseek-ai/dsh@latest'])
   expect(calls.some(call => call.startsWith('ordinary-library'))).toBe(false)
+})
+
+test('DSH preserves upstream peer placement while keeping the resolved plugin family on one release', async () => {
+  const root = await scratch()
+  const version = '9.0.0-rc.8'
+  const state = await updateAgentRuntime('dsh', { root, install, metadata: async name => ({ name, version,
+    ...(name === '@deepseek-ai/dsh' ? { dependencies: { '@deepseek-ai/dsh-cmdline': `^${version}`,
+      '@deepseek-ai/cordis': '4.0.2', '@deepseek-ai/cordis-plugin-loader': '1.0.3' } }
+      : name === '@deepseek-ai/dsh-cmdline' ? { peerDependencies: { '@deepseek-ai/cordis': '4.0.2',
+        '@deepseek-ai/cordis-plugin-loader': '1.0.3' } } : {}),
+  }) })
+  const manifest = JSON.parse(await readFile(join(state.directory!, 'package.json'), 'utf8'))
+  expect(manifest.dependencies).toEqual({ '@deepseek-ai/dsh': version,
+    '@deepseek-ai/dsh-llm-pi-ai': version, '@deepseek-ai/dsh-tool-ask-user': version })
+  expect(manifest.overrides['@deepseek-ai/dsh-cmdline']).toBe(version)
+  expect(manifest.overrides['@deepseek-ai/cordis']).toBeUndefined()
+  expect(state.versions?.['@deepseek-ai/dsh-cmdline']).toBe(version)
+  expect(JSON.parse(await readFile(join(state.directory!, 'node_modules/@deepseek-ai/dsh-cmdline/package.json'), 'utf8')).version).toBe(version)
 })
 
 test('successful installs activate immediately without compatibility gating and preserve the old process directory', async () => {

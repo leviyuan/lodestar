@@ -161,6 +161,7 @@ export type AgentProcessEventMap = {
   }
   turn_started: { turn_id?: string | null; thread_id?: string | null; retry?: boolean }
   turn_retry: AgentTurnRetry
+  /** Selection succeeded; diagnostics describe unused accounts and are for logs, not proactive alerts. */
   codex_account_changed: { accountId: string; previousAccountId: string | null; diagnostics: string[] }
   token_usage: TokenUsageUpdated
   turn_plan_updated: TurnPlanUpdated

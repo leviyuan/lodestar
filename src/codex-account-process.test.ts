@@ -1,10 +1,12 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
 import type { AgentProcess } from './agent-process'
 import { CodexAccountProcess } from './codex-account-process'
 import type { CodexAccountCandidate, CodexAccountDecision } from './codex-account-scheduler'
 import type { ConversationLaunch } from './conversation'
 import { bindProcessCodexAccount, codexAccountInUse, processCodexAccount } from './codex-accounts'
+import { invalidateCodexUsage } from './usage'
+import * as logModule from './log'
 
 const live: CodexAccountProcess[] = []
 afterEach(async () => { for (const proc of live.splice(0)) { (proc as any).inner && ((proc as any).inner.failKill = false); await proc.kill() } })
@@ -111,6 +113,26 @@ describe('Codex account process ownership and recovery', () => {
     expect(processCodexAccount(h.proc)).toBe('b'); expect(h.proc.sourceRevision()).toBe('b')
     h.children[1].success(); expect(h.results).toHaveLength(1); expect(h.proc.lastCompletedTurnId).toBe('done')
   })
+  test('quota refresh failure during recovery stays in logs while the original task continues', async () => {
+    const accountId = 'recovery-refresh-failure'
+    const h = harness([decision(accountId), decision('replacement')])
+    const notices: string[] = []
+    h.proc.on('turn_retry', event => notices.push(event.message))
+    const logged = spyOn(logModule, 'log').mockImplementation(() => {})
+    try {
+      await h.proc.initializationPromise()
+      Object.assign(h.children[0], { readRateLimits: async () => { throw new Error('quota probe unavailable') } })
+      h.children[0].quota(); await flush()
+      expect(h.children).toHaveLength(2)
+      expect(h.children[1].launch).toMatchObject({ kind: 'resume', source: { sessionId: 'native-thread' } })
+      expect(h.children[1].sent).toHaveLength(1)
+      expect(h.results).toEqual([])
+      expect(notices.some(message => message.includes('正在换号'))).toBe(true)
+      expect(notices.some(message => message.includes('继续原任务'))).toBe(true)
+      expect(notices.every(message => !message.includes('MISS') && !message.includes('quota probe unavailable'))).toBe(true)
+      expect(logged.mock.calls.some(([line]) => line.includes('quota probe unavailable'))).toBe(true)
+    } finally { logged.mockRestore(); invalidateCodexUsage(accountId) }
+  })
   test('unaccepted first input can be submitted once with its original file hints', async () => {
     const h = harness(); await h.proc.initializationPromise()
     h.children[0].resumable = false
@@ -168,6 +190,25 @@ describe('Codex account process ownership and recovery', () => {
     resume(); await h.proc.initializationPromise()
     expect(h.options.map(opts => opts.preferCachedUsage)).toEqual([true, false])
     expect(h.events).toEqual(['init']); expect(h.children[0].sent.map(s => s.text)).toEqual(['queued original'])
+  })
+  test('quota waiting shows recovery status without repeating other account diagnostics', async () => {
+    let resume!: () => void
+    const reason = '备用账号目录查询失败'
+    const rows: CodexAccountCandidate[] = [
+      { ...candidate('exhausted'), state: 'exhausted', score: null, reason: '额度耗尽' },
+      { ...candidate('unavailable'), state: 'miss', score: null, reason, usage: { state: 'network', reason } },
+    ]
+    const h = harness([{ selected: null, candidates: rows, retryAt: Date.now() + 10000 }, decision('recovered')],
+      () => new Promise<void>(resolve => { resume = resolve }))
+    const logged = spyOn(logModule, 'log').mockImplementation(() => {})
+    try {
+      h.proc.sendUserText('queued original'); await h.proc.quotaWaitPromise()
+      expect(h.proc.turnRetry?.message).toBe('暂无可用账号 · 自动等待恢复')
+      expect(h.children).toHaveLength(0)
+      expect(logged.mock.calls.some(([line]) => line.includes(reason))).toBe(true)
+      resume(); await h.proc.initializationPromise()
+      expect(h.children[0].sent.map(s => s.text)).toEqual(['queued original'])
+    } finally { logged.mockRestore() }
   })
   test('stop while all accounts are exhausted cancels the wait and never resumes later', async () => {
     let resume!: () => void

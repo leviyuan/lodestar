@@ -209,14 +209,17 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
     const versions = await resolveAgentPackages(agent, options.metadata ?? ((name, version) => metadata(name, version, options.signal)))
     options.signal?.throwIfAborted()
     const security = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')).overrides ?? {}
-    const fingerprint = createHash('sha256').update(JSON.stringify({ installFormat: 2, versions: Object.entries(versions).sort(), security,
+    const fingerprint = createHash('sha256').update(JSON.stringify({ installFormat: agent === 'dsh' ? 3 : 2, versions: Object.entries(versions).sort(), security,
       platform: process.platform, arch: process.arch })).digest('hex').slice(0, 20)
     const destination = join(directory, fingerprint)
     if (!existsSync(destination)) {
       staging = await mkdtemp(join(directory, '.install-'))
       // Resolved versions are an installation snapshot, never a compatibility whitelist.
+      // Keep internal DSH plugins transitive so npm can place their peers according
+      // to upstream dependencies; the overrides still keep its family on one release.
       await writeFile(join(staging, 'package.json'), JSON.stringify({ name: `lodestar-runtime-${agent}`, version: versions[PACKAGES[agent][0]], private: true, type: 'module',
-        dependencies: versions, overrides: { ...security, ...(agent === 'dsh' ? versions : {}) } }) + '\n', { mode: 0o600 })
+        dependencies: Object.fromEntries(PACKAGES[agent].map(name => [name, versions[name]])),
+        overrides: { ...security, ...(agent === 'dsh' ? versions : {}) } }) + '\n', { mode: 0o600 })
       await (options.install ?? installAgentPackages)(staging, options.signal)
       for (const [name, version] of Object.entries(versions)) {
         const installed = JSON.parse(await readFile(join(staging, 'node_modules', name, 'package.json'), 'utf8'))

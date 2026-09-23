@@ -114,9 +114,8 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
         throw new Error(`${summary}${detail ? `；${detail}` : ''}`)
       }
       const delay = Math.max(1000, Math.min(60_000, decision.retryAt - Date.now()))
-      const missing = decision.candidates.filter(c => c.state === 'miss' && !c.duplicateOf).length
       log(`codex account: waiting for quota: ${detail}`)
-      this.notice(`暂无可用账号 · 自动等待恢复${missing ? ` · ${missing} 个 MISS` : ''}`, delay)
+      this.notice('暂无可用账号 · 自动等待恢复', delay)
       this.resolveQuotaWait()
       await (this.opts.wait ?? waitForQuota)(delay, this.lifetime.signal)
     }
@@ -206,7 +205,7 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
       this.lifetime.signal.throwIfAborted()
       if (fresh?.state === 'ok') this.selected = { ...this.selected, usage: fresh,
         identity: fresh.accountFingerprint ?? this.selected.identity }
-      else this.notice('已确认额度耗尽 · 用量读取 MISS，正在换号')
+      else log(`codex account: ${this.selected.account.id} 用量读取 MISS，继续按已确认的耗尽状态换号`)
     }
     const failedAccountId = this.selected.usage === null ? this.selected.account.id : undefined
     if (this.selected.usage) this.scheduler().block(this.selected, this.lastModel ?? this.opts.model)

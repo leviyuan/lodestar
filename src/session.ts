@@ -3645,11 +3645,10 @@ export class Session {
       log(`session "${this.sessionName}": Codex account=${accountId}`)
       this.pendingAsks.clear()
       this.pendingPermissions.clear()
+      // Selection succeeded. Other accounts' diagnostics belong in logs and
+      // explicit account inspection; only blocking failures warrant a notice.
       if (diagnostics.length) {
-        void feishu.sendCard(this.chatId, codexAccountCard({ phase: 'warning', title: '部分账号 MISS',
-          message: `${diagnostics.length} 个账号未参与选择`, details: diagnostics.join('\n'), hint: '详情：codex-accounts' })).catch(error => {
-          log(`session "${this.sessionName}": 账号诊断卡失败: ${messageOf(error)}`)
-        })
+        log(`session "${this.sessionName}": Codex 未参与选号的账号: ${diagnostics.join('；')}`)
       }
     })
     on('turn_started', ({ retry }) => {
