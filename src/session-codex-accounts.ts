@@ -4,7 +4,7 @@ import * as feishu from './feishu'
 import { codexAccounts, codexAccountInUse, processCodexAccount } from './codex-accounts'
 import { codexLogins, requireDefaultCodexLogin } from './codex-login'
 import { getTokenSourceForAccount, waitForTokenSourceModelRefresh } from './token-source'
-import { aggregateCodexUsage, readAllCodexUsage } from './codex-account-usage'
+import { aggregateCodexUsage, readAllCodexUsage, readCodexAccountEmails } from './codex-account-usage'
 import { codexAccountScheduler } from './codex-account-scheduler'
 import { CodexAccountCard } from './codex-account-card'
 import { codexAccountCard, type CodexAccountCardView } from './cards/codex-account'
@@ -70,7 +70,7 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
   const namedLogin = command === 'login' && !!argument.trim() && !['default', '默认'].includes(argument.normalize('NFC').trim().toLowerCase())
   const card = await CodexAccountCard.open(s.chatId, { phase: command === 'login' ? 'connecting' : 'checking', name,
     ...(command === 'login' ? { flow: 'login' as const } : {}),
-    message: command === 'accounts' ? '正在读取各账号额度…' : namedLogin ? '正在检查默认账号登录状态…'
+    message: command === 'accounts' ? '正在读取各账号邮箱与额度…' : namedLogin ? '正在检查默认账号登录状态…'
       : command === 'login' ? '正在获取设备码…' : '正在核对账号…' })
   try {
     if (command === 'account-delete') {
@@ -114,7 +114,7 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
         return usage ? [{ account: c.account, usage, fingerprint: c.identity.startsWith('record:') ? null : c.identity }] : []
       })) : await readAllCodexUsage()
       if (catalogError) log(`codex-accounts: scheduling MISS: ${catalogError}`)
-      await card.finish({ phase: 'accounts', total, currentId: accountId,
+      await card.finish({ phase: 'accounts', total: await readCodexAccountEmails(total), currentId: accountId,
         ...(codexAccounts.preferred(s.sessionName) ? { selectedId: codexAccounts.selected(s.sessionName) } : {}), page,
         ...(decision ? { scheduling: { candidates: decision.candidates, ultra: effort === 'ultra' } }
           : { message: '⚠️ 调度顺序 MISS：尚未确定 Codex 模型', details: catalogError,

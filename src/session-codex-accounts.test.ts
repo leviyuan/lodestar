@@ -9,6 +9,7 @@ import { bindProcessCodexAccount, codexAccounts, CodexAccounts, reserveCodexLogi
 import { codexLogins } from './codex-login'
 import * as loginModule from './codex-login'
 import * as accountCommands from './session-codex-accounts'
+import * as accountUsageModule from './codex-account-usage'
 import { CodexAccountCard } from './codex-account-card'
 import type { CodexAccountCardView } from './cards/codex-account'
 import { getTokenSourceForAccount, listTokenSources, refreshAllTokenSourceModels, registerTokenSource, resetTokenSourceRegistry, type TokenSource } from './token-source'
@@ -61,6 +62,9 @@ beforeEach(() => {
   spies.push(spyOn(Date, 'now').mockImplementation(() => quotaNow))
   resetFeishuMock()
   cardViews.length = 0
+  spies.push(spyOn(accountUsageModule, 'readCodexAccountEmails').mockImplementation(async total => ({
+    ...total, entries: total.entries.map(entry => ({ ...entry, email: `actual-${entry.account.id}@example.test` })),
+  })))
   spies.push(spyOn(CodexAccountCard, 'open').mockImplementation(async (_chatId, view) => {
     cardViews.push(view)
     return { cardId: 'codex-card-test',
@@ -116,6 +120,7 @@ describe('bare Codex account commands', () => {
     expect(view.details).toContain('默认'); expect(view.details).toContain('未登录')
     const card = JSON.stringify(codexAccountCard(view))
     expect(card).toContain('新登录账号'); expect(card).toContain('5h · 7%')
+    expect(card).toContain(`实际邮箱：actual-${account.id}@example.test`)
     expect(card).toContain('调度顺序 MISS'); expect(card).not.toContain('可调度 0')
     expect(store.preferred(s.sessionName)).toBeNull(); expect(s.proc).toBeNull()
   })

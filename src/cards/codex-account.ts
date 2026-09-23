@@ -123,9 +123,12 @@ function accountRows(view: CodexAccountCardView): object[] {
     const usage = entry.usage
     const row: object[] = []
     elements.push({ tag: 'collapsible_panel', expanded: true,
-      header: { title: { tag: 'plain_text', content: `${entry.account.name}${badges.length ? ` · ${badges.join(' · ')}` : ''}` },
+      header: { title: { tag: 'plain_text', content: `备注：${entry.account.name}${badges.length ? ` · ${badges.join(' · ')}` : ''}` },
         background_color: entry.account.id === view.currentId ? 'blue-50' : 'grey-50' },
       border: { color: 'grey-100', corner_radius: '8px' }, padding: '8px', vertical_spacing: '4px', elements: row })
+    row.push(muted(`实际邮箱：${entry.email ?? 'MISS'}`))
+    if (entry.emailError) row.push({ tag: 'collapsible_panel', expanded: false,
+      header: { title: { tag: 'plain_text', content: '邮箱查询错误' } }, elements: [md(text(entry.emailError))] })
     if (entry.duplicateOf) { row.push(muted(`与「${entry.duplicateOf}」同一账号，合计只计一次`)); continue }
     const schedule = view.scheduling?.candidates.find(c => c.account.id === entry.account.id)
     if (schedule) {
