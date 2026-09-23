@@ -1,9 +1,11 @@
-import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { CodexAccountScheduler } from './codex-account-scheduler'
+import { checkCodexModelCompatibility, CodexAccountScheduler } from './codex-account-scheduler'
 import { isCodexQuotaError, rankCodexQuota } from './codex-quota'
+import type { AgentReasoningEffort } from './agent-process'
+import type { TokenSource, TokenSourceModel } from './token-source'
 import type { UsageSnapshot } from './usage'
 
 const NOW = 1_800_000_000_000
@@ -230,6 +232,172 @@ describe('weekly quota scheduling', () => {
     const replacement = await h.scheduler.choose({ model: 'model', failedAccountId: 'pro' })
     expect(replacement.selected?.account.id).toBe('plus')
     expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('plus')
+  })
+})
+
+describe('account model catalog checks', () => {
+  const model = (efforts: AgentReasoningEffort[] = ['high', 'max']): TokenSourceModel => ({
+    model: 'new-model', display: 'New model', efforts, defaultEffort: efforts[0],
+  })
+  function catalog(models: TokenSourceModel[]) {
+    const refresh = mock(async (): Promise<void> => { throw new Error('unexpected catalog query') })
+    const source: TokenSource = {
+      id: 'codex-sub', kind: 'codex-subscription', agent: 'codex', display: 'Codex', enabled: true,
+      models, defaultModel: 'new-model', modelCatalogState: { status: 'ready', updatedAt: NOW - 3600_000 },
+      refreshModels: refresh, spawnEnv: env => env, resolveSpawnModel: value => value,
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    }
+    return { source, refresh }
+  }
+
+  test('refreshing a named account restores its missing model before quota ranking', async () => {
+    const primary = catalog([model()])
+    const secondary = catalog([])
+    secondary.refresh.mockImplementation(async () => { secondary.source.models = [model()] })
+    const quotas = { primary: quota('plus'), secondary: quota('pro') }
+    const h = harness(quotas, quotas)
+    const reader = spyOn((h.scheduler as any).deps, 'usage')
+    spyOn((h.scheduler as any).deps, 'compatible').mockImplementation((id: string, requested: string, effort?: AgentReasoningEffort) =>
+      checkCodexModelCompatibility(id === 'primary' ? primary.source : secondary.source, requested, effort, NOW))
+    const choice = await h.scheduler.choose({ model: 'new-model', effort: 'max', preferCachedUsage: true })
+    expect(choice.selected?.account.id).toBe('secondary')
+    expect(choice.candidates.every(c => c.state === 'ready')).toBe(true)
+    expect(secondary.refresh).toHaveBeenCalledTimes(1)
+    expect(primary.refresh).not.toHaveBeenCalled()
+    expect(reader).not.toHaveBeenCalled()
+  })
+
+  test('an updated effort catalog makes the original requested effort eligible', async () => {
+    const { source, refresh } = catalog([model(['high'])])
+    refresh.mockImplementation(async () => { source.models = [model()] })
+    expect(await checkCodexModelCompatibility(source, 'new-model', 'max', NOW)).toBeNull()
+    expect(refresh).toHaveBeenCalledTimes(1)
+    expect(await checkCodexModelCompatibility(source, 'new-model', 'max', NOW)).toBeNull()
+    expect(refresh).toHaveBeenCalledTimes(1)
+  })
+
+  test('account rollout mismatches are cached for five minutes without extending on hits', async () => {
+    for (const [models, reason] of [
+      [[], '模型目录缺少 new-model'],
+      [[model(['high'])], 'new-model 缺少推理档位 max（目录档位：high）'],
+    ] as Array<[TokenSourceModel[], string]>) {
+      const { source, refresh } = catalog(models)
+      let now = NOW
+      refresh.mockImplementation(async () => { source.modelCatalogState = { status: 'ready', updatedAt: now } })
+      const quotas = { secondary: quota('pro') }
+      const h = harness(quotas, quotas)
+      spyOn((h.scheduler as any).deps, 'compatible').mockImplementation((_id: string, requested: string, effort?: AgentReasoningEffort) =>
+        checkCodexModelCompatibility(source, requested, effort, now))
+      const choice = await h.scheduler.choose({ model: 'new-model', effort: 'max', preferCachedUsage: true })
+      expect(choice.selected).toBeNull()
+      expect(choice.candidates[0]).toMatchObject({ state: 'miss', reason })
+      expect(refresh).toHaveBeenCalledTimes(1)
+      for (const elapsed of [1, 4 * 60_000, 5 * 60_000 - 1]) {
+        now = NOW + elapsed
+        const cached = await h.scheduler.choose({ model: 'new-model', effort: 'max', preferCachedUsage: true })
+        expect(cached.selected).toBeNull()
+        expect(cached.candidates[0]).toMatchObject({ state: 'miss', reason })
+        expect(refresh).toHaveBeenCalledTimes(1)
+      }
+      // A later account rollout becomes visible on the first selection at expiry.
+      refresh.mockImplementation(async () => {
+        source.models = [model()]
+        source.modelCatalogState = { status: 'ready', updatedAt: now }
+      })
+      now = NOW + 5 * 60_000
+      expect((await h.scheduler.choose({ model: 'new-model', effort: 'max' })).selected?.account.id).toBe('secondary')
+      expect(refresh).toHaveBeenCalledTimes(2)
+    }
+  })
+
+  test('fresh missing-model catalogs are reused per account and manual refresh takes effect immediately', async () => {
+    const fresh = catalog([])
+    const stale = catalog([])
+    fresh.source.modelCatalogState = { status: 'ready', updatedAt: NOW }
+    stale.refresh.mockImplementation(async () => {
+      stale.source.models = [model()]
+      stale.source.modelCatalogState = { status: 'ready', updatedAt: NOW }
+    })
+    expect(await checkCodexModelCompatibility(fresh.source, 'new-model', 'max', NOW)).toBe('模型目录缺少 new-model')
+    expect(await checkCodexModelCompatibility(stale.source, 'new-model', 'max', NOW)).toBeNull()
+    expect(fresh.refresh).not.toHaveBeenCalled()
+    expect(stale.refresh).toHaveBeenCalledTimes(1)
+    // md refreshes the source directly, even during the automatic check's cache window.
+    fresh.refresh.mockImplementation(async () => {
+      fresh.source.models = [model()]
+      fresh.source.modelCatalogState = { status: 'ready', updatedAt: NOW + 1 }
+    })
+    await fresh.source.refreshModels()
+    expect(await checkCodexModelCompatibility(fresh.source, 'new-model', 'max', NOW + 1)).toBeNull()
+    expect(fresh.refresh).toHaveBeenCalledTimes(1)
+  })
+
+  test('a query failure is not cached as an account rollout restriction', async () => {
+    const { source, refresh } = catalog([])
+    refresh.mockImplementationOnce(async () => {
+      source.modelCatalogState = { status: 'failed', updatedAt: NOW, error: 'model/list timed out' }
+    }).mockImplementation(async () => {
+      source.models = [model()]
+      source.modelCatalogState = { status: 'ready', updatedAt: NOW + 1 }
+    })
+    expect(await checkCodexModelCompatibility(source, 'new-model', 'max', NOW)).toBe('模型目录查询失败：model/list timed out')
+    expect(await checkCodexModelCompatibility(source, 'new-model', 'max', NOW + 1)).toBeNull()
+    expect(refresh).toHaveBeenCalledTimes(2)
+  })
+
+  test('a future catalog timestamp cannot indefinitely cache a missing model after a clock change', async () => {
+    const { source, refresh } = catalog([])
+    source.modelCatalogState = { status: 'ready', updatedAt: NOW + 60_000 }
+    refresh.mockImplementation(async () => { source.models = [model()] })
+    expect(await checkCodexModelCompatibility(source, 'new-model', 'max', NOW)).toBeNull()
+    expect(refresh).toHaveBeenCalledTimes(1)
+  })
+
+  test.each(['throw', 'failed', 'disabled'] as const)('catalog %s preserves the real query error', async failure => {
+    const { source, refresh } = catalog([])
+    refresh.mockImplementation(async () => {
+      source.models = [model()]
+      if (failure === 'throw') throw new Error('account/read timed out')
+      source.modelCatalogState = { status: failure, updatedAt: NOW, error: 'account/read timed out' }
+      source.enabled = failure !== 'disabled'
+    })
+    expect(await checkCodexModelCompatibility(source, 'new-model', 'max', NOW)).toBe('模型目录查询失败：account/read timed out')
+    expect(refresh).toHaveBeenCalledTimes(1)
+  })
+
+  test('concurrent checks share one refresh and cannot borrow a different account catalog', async () => {
+    const secondary = catalog([])
+    const primary = catalog([model()])
+    let finish!: () => void
+    const pending = new Promise<void>(resolve => { finish = resolve })
+    secondary.refresh.mockImplementation(async () => { await pending })
+    const checks = [checkCodexModelCompatibility(secondary.source, 'new-model', 'max', NOW),
+      checkCodexModelCompatibility(secondary.source, 'new-model', 'high', NOW)]
+    expect(await checkCodexModelCompatibility(primary.source, 'new-model', 'max', NOW)).toBeNull()
+    expect(secondary.refresh).toHaveBeenCalledTimes(1)
+    finish()
+    expect(await Promise.all(checks)).toEqual(['模型目录缺少 new-model', '模型目录缺少 new-model'])
+    expect(primary.refresh).not.toHaveBeenCalled()
+  })
+
+  test('a cold catalog is queried once and explicit model rejection keeps its reason', async () => {
+    const { source, refresh } = catalog([])
+    source.modelCatalogState = { status: 'idle', updatedAt: null }
+    refresh.mockImplementation(async () => {
+      source.models = [{ ...model(), unavailableReason: 'account restriction' }]
+      source.modelCatalogState = { status: 'ready', updatedAt: NOW }
+    })
+    expect(await checkCodexModelCompatibility(source, 'new-model', 'max', NOW)).toBe('new-model 不可用：account restriction')
+    expect(refresh).toHaveBeenCalledTimes(1)
+  })
+
+  test('hidden catalog entries and explicit custom models remain valid without a refresh', async () => {
+    for (const origin of ['upstream', 'custom'] as const) {
+      const { source, refresh } = catalog([])
+      source.modelSelection = { mode: 'catalog', modelIds: [], availableModels: [{ ...model(), origin }] }
+      expect(await checkCodexModelCompatibility(source, 'new-model', 'max', NOW)).toBeNull()
+      expect(refresh).not.toHaveBeenCalled()
+    }
   })
 })
 

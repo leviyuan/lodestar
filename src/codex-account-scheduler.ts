@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { codexAccounts, isCodexLoginPending, type CodexAccount } from './codex-accounts'
 import { peekSuccessfulUsage, readUsage, type UsageSnapshot } from './usage'
 import { codexModelQuota, codexQuotaMeter, rankCodexQuota, type CodexQuotaRank } from './codex-quota'
-import { getTokenSourceForAccount, tokenSourceRuntimeModel } from './token-source'
+import { getTokenSourceForAccount, tokenSourceRuntimeModel, type TokenSource } from './token-source'
 import type { AgentReasoningEffort } from './agent-process'
 import { CODEX_QUOTA_BLOCKS_FILE } from './paths'
 import { writeJsonStateAtomic } from './state-store'
@@ -84,14 +84,17 @@ export class CodexAccountScheduler {
       return { selected: { account, identity: `record:${account.id}`, usage: null, state: 'manual',
         score: null, shares: null, remaining: null, hours: null }, candidates: [] }
     }
+    // Cached and live quota passes belong to one decision. Recheck each account's catalog only once.
+    const checkedModels = new Map<string, Promise<string | null>>()
     if (opts.preferCachedUsage) {
-      const cached = await this.chooseAutomatic(accounts, opts, true)
+      const cached = await this.chooseAutomatic(accounts, opts, true, checkedModels)
       if (cached.selected) return cached
     }
-    return this.chooseAutomatic(accounts, opts, false)
+    return this.chooseAutomatic(accounts, opts, false, checkedModels)
   }
 
-  private async chooseAutomatic(accounts: CodexAccount[], opts: CodexSelectionOptions, cached: boolean): Promise<CodexAccountDecision> {
+  private async chooseAutomatic(accounts: CodexAccount[], opts: CodexSelectionOptions, cached: boolean,
+    checkedModels: Map<string, Promise<string | null>>): Promise<CodexAccountDecision> {
     opts.signal?.throwIfAborted()
     const rows = await Promise.all(accounts.map(async account => {
       let usage: UsageSnapshot | null
@@ -105,7 +108,14 @@ export class CodexAccountScheduler {
           const fingerprint = usage?.state === 'ok' ? usage.accountFingerprint ?? this.deps.identity(account.id) : null
           if (fingerprint) identity = fingerprint
           else if (usage?.state === 'ok') reason = '账号身份 MISS'
-          if (usage?.state === 'ok' && !reason) reason = await this.deps.compatible(account.id, opts.model, opts.effort)
+          if (usage?.state === 'ok' && !reason) {
+            let checked = checkedModels.get(account.id)
+            if (!checked) {
+              checked = this.deps.compatible(account.id, opts.model, opts.effort)
+              checkedModels.set(account.id, checked)
+            }
+            reason = await checked
+          }
         } catch (error) { usage = { state: 'network', reason: String(error) } }
       }
       return { account, usage, identity, reason }
@@ -152,6 +162,42 @@ export class CodexAccountScheduler {
   }
 }
 
+function modelCatalogMismatch(source: TokenSource, model: string, effort?: AgentReasoningEffort): string | null {
+  const entry = tokenSourceRuntimeModel(source, model)
+  if (!entry) return `模型目录缺少 ${model}`
+  if (entry.unavailableReason) return `${model} 不可用：${entry.unavailableReason}`
+  if (effort && !entry.efforts.includes(effort)) {
+    return `${model} 缺少推理档位 ${effort}（目录档位：${entry.efforts.join('、') || 'MISS'}）`
+  }
+  return null
+}
+
+const modelRefreshes = new WeakMap<TokenSource, Promise<void>>()
+const MODEL_MISMATCH_CACHE_MS = 5 * 60_000
+
+/** Account rollouts can differ. Recheck old mismatches, but reuse a recent successful catalog. */
+export async function checkCodexModelCompatibility(source: TokenSource, model: string,
+  effort?: AgentReasoningEffort, now = Date.now()): Promise<string | null> {
+  let refresh = modelRefreshes.get(source)
+  const catalog = source.modelCatalogState
+  if (!refresh && source.enabled && catalog?.status === 'ready') {
+    const mismatch = modelCatalogMismatch(source, model, effort)
+    const fresh = catalog.updatedAt !== null && now >= catalog.updatedAt
+      && now - catalog.updatedAt < MODEL_MISMATCH_CACHE_MS
+    if (!mismatch || fresh) return mismatch
+  }
+  if (!refresh) {
+    refresh = Promise.resolve().then(() => source.refreshModels()).finally(() => { modelRefreshes.delete(source) })
+    modelRefreshes.set(source, refresh)
+  }
+  try { await refresh }
+  catch (error) { return `模型目录查询失败：${error instanceof Error ? error.message : String(error)}` }
+  if (!source.enabled || source.modelCatalogState?.status !== 'ready') {
+    return `模型目录查询失败：${source.modelCatalogState?.error ?? (source.enabled ? '模型目录 MISS' : '订阅来源未启用')}`
+  }
+  return modelCatalogMismatch(source, model, effort)
+}
+
 export const codexAccountScheduler = new CodexAccountScheduler({
   accounts: () => codexAccounts.list(), usage: readUsage, cachedUsage: peekSuccessfulUsage,
   identity: id => codexAccounts.fingerprint(id), pendingLogin: isCodexLoginPending,
@@ -159,10 +205,6 @@ export const codexAccountScheduler = new CodexAccountScheduler({
   compatible: async (id, model, effort) => {
     const source = getTokenSourceForAccount('codex-sub', id)
     if (!source) return '订阅来源 MISS'
-    if (source.modelCatalogState?.status !== 'ready') await source.refreshModels()
-    if (!source.enabled || source.modelCatalogState?.status !== 'ready') return source.modelCatalogState?.error ?? '模型目录 MISS'
-    const entry = tokenSourceRuntimeModel(source, model)
-    return !entry || entry.unavailableReason || (effort && !entry.efforts.includes(effort))
-      ? `${model}/${effort ?? 'default'} 不可用` : null
+    return checkCodexModelCompatibility(source, model, effort)
   },
 })
