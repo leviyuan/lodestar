@@ -143,7 +143,8 @@ describe('bare Codex account commands', () => {
     const view = cardViews.at(-1)!
     expect(view.phase).toBe('accounts')
     const card = JSON.stringify(codexAccountCard(view))
-    expect(card).toContain('可调度 1')
+    expect(card).toContain('#1·默认「15.0/h」')
+    expect(card).not.toContain('可调度 1')
     expect(card).toContain('未参与原因'); expect(card).toContain(reason)
   })
 
@@ -183,8 +184,8 @@ describe('bare Codex account commands', () => {
     expect(view.message).toContain('调度顺序 MISS')
     expect(view.details).toContain('默认'); expect(view.details).toContain('未登录')
     const card = JSON.stringify(codexAccountCard(view))
-    expect(card).toContain('新登录账号'); expect(card).toContain('5h · 7%')
-    expect(card).toContain(`实际邮箱：actual-${account.id}@example.test`)
+    expect(card).toContain('新登录账号'); expect(card).toContain("5h　<font color='green'>▱▱▱▱▱▱</font>　7%")
+    expect(card).toContain(`邮箱：actual-${account.id}@example.test`)
     expect(card).toContain('调度顺序 MISS'); expect(card).not.toContain('可调度 0')
     expect(store.preferred(s.sessionName)).toBeNull(); expect(s.proc).toBeNull()
   })

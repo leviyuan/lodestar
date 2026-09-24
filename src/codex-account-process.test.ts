@@ -52,7 +52,8 @@ function harness(choices: Array<CodexAccountDecision | Promise<CodexAccountDecis
   const options: any[] = []
   const proc = new CodexAccountProcess({ model: 'model', effort: 'ultra', launch: { kind: 'fresh' }, workDir: '/repo', wait,
     scheduler: { choose: async opts => { options.push({ ...opts }); const d = choices.shift(); if (!d) throw new Error('no decision'); return d },
-      block: row => { order.push(`block:${row.account.id}`) } },
+      block: row => { order.push(`block:${row.account.id}`) },
+      recordUsage: (id, model) => { order.push(`usage:${id}:${model}`) } },
     create: (id, launch) => { order.push(`spawn:${id}`); const child = new Child(launch, order, id); children.push(child);
       bindProcessCodexAccount(child, id)
       return { process: child as unknown as AgentProcess, sourceRevision: id } },
@@ -63,6 +64,24 @@ function harness(choices: Array<CodexAccountDecision | Promise<CodexAccountDecis
 }
 
 describe('Codex account process ownership and recovery', () => {
+  test('only actual current-turn usage consumes an unused-account priority', async () => {
+    const h = harness()
+    await h.proc.initializationPromise()
+    const child = h.children[0]
+    const usage = { turnId: 'turn', threadId: child.sessionId, usage: { total_tokens: 1 } }
+    child.emit('token_usage', usage) // Native resume can replay history before a new turn.
+    h.proc.sendUserText('work')
+    child.emit('token_usage', { ...usage, turnId: 'older-turn' })
+    child.emit('token_usage', { ...usage, threadId: 'other-thread' })
+    child.emit('token_usage', { ...usage, usage: { total_tokens: 0 } })
+    expect(h.order).toEqual(['spawn:a'])
+    child.lastModel = 'spark'
+    child.emit('token_usage', usage)
+    expect(h.order).toEqual(['spawn:a', 'usage:a:spark'])
+    child.success()
+    child.emit('token_usage', usage)
+    expect(h.order).toEqual(['spawn:a', 'usage:a:spark'])
+  })
   test('failed account checks retain the upstream error instead of reporting no available account', async () => {
     const reason = 'Codex 额度查询失败（已尝试 3 次）：error sending request for url (https://chatgpt.com/backend-api/wham/usage)'
     const row: CodexAccountCandidate = { ...candidate('default'), state: 'miss', score: null,

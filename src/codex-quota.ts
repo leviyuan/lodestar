@@ -3,6 +3,8 @@ import type { AgentReasoningEffort } from './agent-process'
 
 export const PLUS_FIVE_HOUR_SHARES = 0.15
 export const ULTRA_MIN_WEEKLY_SHARES = 0.5
+const WEEK_MS = 7 * 24 * 3_600_000
+const WEEKLY_EARLY_FINISH_HOURS = 5
 
 /** User-defined subscription rule: successful Plus reads without a short window mean a full 5h budget.
  * This does not fabricate a reset timestamp, and never applies to failed reads or malformed windows. */
@@ -40,12 +42,43 @@ export type CodexQuotaRank = {
   shares: number | null
   remaining: number | null
   hours: number | null
-  weeklyScore?: number
+  /** Priority is independent of the hourly score; an expiring window has no positive scoring horizon. */
+  priority?: 'unused' | 'expiring'
+  weeklyScore?: number | null
   fiveHourRemaining?: number
   fiveHourHours?: number
   availableNow?: number
   reason?: string
   retryAt?: number
+}
+
+/** The native reset timestamp has second precision. Never infer a full week from rounded display text. */
+export function unusedCodexWeek(usage: Extract<UsageSnapshot, { state: 'ok' }>, model: string): boolean {
+  const weekly = codexModelQuota(usage, model).weekly
+  const start = usage.readStartedAt ?? usage.fetchedAt
+  const reset = weekly?.resetsAt?.getTime()
+  // Only the actual request interval and native second precision are allowed, never a display-rounded day.
+  return weekly?.percent === 0 && weekly.durationMins === 10080 && Number.isFinite(start)
+    && Number.isFinite(usage.fetchedAt) && start <= usage.fetchedAt && reset != null
+    && reset >= Math.floor(start / 1000) * 1000 + WEEK_MS
+    && reset <= Math.floor(usage.fetchedAt / 1000) * 1000 + WEEK_MS
+}
+
+/** A real request has activated any week whose nominal start is at or before that request. */
+export function codexWeekUsedSince(usage: Extract<UsageSnapshot, { state: 'ok' }>, model: string, usedAt: number): boolean {
+  const reset = codexModelQuota(usage, model).weekly?.resetsAt?.getTime()
+  return reset != null && reset - WEEK_MS <= usedAt
+}
+
+/** One ordering for scheduling and the account panel. Only ready candidates participate. */
+export function compareCodexQuota(
+  a: CodexQuotaRank & { account: { id: string } },
+  b: CodexQuotaRank & { account: { id: string } },
+): number {
+  const priority = (row: CodexQuotaRank) => row.priority === 'unused' ? 2 : row.priority === 'expiring' ? 1 : 0
+  return priority(b) - priority(a)
+    || (a.priority === 'expiring' ? a.hours! - b.hours! : b.score! - a.score!)
+    || (b.availableNow ?? 0) - (a.availableNow ?? 0) || a.account.id.localeCompare(b.account.id)
 }
 
 export function rankCodexQuota(usage: UsageSnapshot, model: string, now = Date.now(), effort?: AgentReasoningEffort): CodexQuotaRank {
@@ -74,20 +107,25 @@ export function rankCodexQuota(usage: UsageSnapshot, model: string, now = Date.n
   if (reset == null || !Number.isFinite(reset) || reset <= now) return { ...out, reason: '周重置时间 MISS 或已过期' }
   const remaining = shares * (100 - weekly.percent) / 100
   const hours = (reset - now) / 3_600_000
-  const weeklyScore = remaining / hours
+  const scoringHours = hours - WEEKLY_EARLY_FINISH_HOURS
+  const weeklyScore = scoringHours > 0 ? remaining / scoringHours : null
   if (effort === 'ultra' && remaining < ULTRA_MIN_WEEKLY_SHARES) {
     return { ...out, state: 'waiting', remaining, hours, weeklyScore,
       reason: `Ultra 至少需要 ${ULTRA_MIN_WEEKLY_SHARES} 份周余量`, retryAt: reset }
   }
+  // A formerly full cached window can now be near its recorded reset; it no longer describes a full week.
+  const priority = scoringHours <= 0 ? 'expiring' as const
+    : unusedCodexWeek(usage, model) ? 'unused' as const : undefined
   if (usage.subscriptionType === 'plus') {
     const short = quota.fiveHour!
     const fiveHourRemaining = PLUS_FIVE_HOUR_SHARES * (100 - short.percent!) / 100
     const fiveHourHours = short.unreportedFull ? 5 : ((short.resetsAt?.getTime() ?? NaN) - now) / 3_600_000
     if (!Number.isFinite(fiveHourHours) || fiveHourHours <= 0) return { ...out, reason: '5h 重置时间 MISS 或已过期' }
-    return { state: 'ready', shares, remaining, hours, weeklyScore, fiveHourRemaining, fiveHourHours,
-      availableNow: Math.min(remaining, fiveHourRemaining), score: Math.min(weeklyScore, fiveHourRemaining / fiveHourHours) }
+    return { state: 'ready', shares, remaining, hours, priority, weeklyScore, fiveHourRemaining, fiveHourHours,
+      availableNow: Math.min(remaining, fiveHourRemaining),
+      score: weeklyScore === null ? null : Math.min(weeklyScore, fiveHourRemaining / fiveHourHours) }
   }
-  return { state: 'ready', shares, remaining, hours, weeklyScore, availableNow: remaining, score: weeklyScore }
+  return { state: 'ready', shares, remaining, hours, priority, weeklyScore, availableNow: remaining, score: weeklyScore }
 }
 
 /** Only native quota terminal failures qualify. HTTP 429, capacity and transport failures do not. */

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
 import { snapshotFromReadResponse, observeRateLimitsNotification, refreshUsageFromConnection, readUsage, readUsageForDisplay, peekUsage, peekSuccessfulUsage, captureCodexUsageCache, invalidateCodexUsage, requestCodexControlWithRetry } from './usage'
+import { rankCodexQuota } from './codex-quota'
 
 let quotaNow: number
 let quotaClock: ReturnType<typeof spyOn>
@@ -12,6 +13,28 @@ beforeEach(() => {
 afterEach(() => { invalidateCodexUsage('default'); quotaClock.mockRestore() })
 
 describe('quota account isolation', () => {
+  test('a live read retains its actual observation interval for complete unused weeks', async () => {
+    const account = 'unused-week-read-interval'
+    const started = quotaNow
+    const snapshot = await refreshUsageFromConnection(async () => {
+      quotaNow += 5000
+      return { rateLimits: { planType: 'pro', primary: {
+        usedPercent: 0, windowDurationMins: 10080, resetsAt: Math.floor(started / 1000) + 7 * 86400,
+      } } }
+    }, account)
+    expect(snapshot).toMatchObject({ readStartedAt: started, fetchedAt: started + 5000 })
+    expect(rankCodexQuota(snapshot!, 'model', quotaNow).priority).toBe('unused')
+    invalidateCodexUsage(account)
+  })
+  test('invalid native percentages cannot become an apparently untouched week', () => {
+    for (const usedPercent of [-1, 101, NaN, Infinity]) {
+      const snapshot = snapshotFromReadResponse({ rateLimits: { planType: 'pro', primary: {
+        usedPercent, windowDurationMins: 10080, resetsAt: Math.floor(quotaNow / 1000) + 7 * 86400,
+      } } })
+      expect(snapshot.state === 'ok' && snapshot.weekly?.percent).toBeNull()
+      expect(rankCodexQuota(snapshot, 'model', quotaNow).state).toBe('miss')
+    }
+  })
   test('successful Plus reads without 5h consistently expose a full short window to footer and hi', () => {
     const input = { rateLimits: { limitId: 'codex', planType: 'plus', primary: {
       usedPercent: 20, windowDurationMins: 10080, resetsAt: 1_900_000_000 }, secondary: null } }

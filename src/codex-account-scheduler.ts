@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { codexAccounts, isCodexLoginPending, type CodexAccount } from './codex-accounts'
 import { peekSuccessfulUsage, readUsage, type UsageSnapshot } from './usage'
-import { codexModelQuota, codexQuotaMeter, rankCodexQuota, type CodexQuotaRank } from './codex-quota'
+import { codexModelQuota, codexQuotaMeter, codexWeekUsedSince, compareCodexQuota, rankCodexQuota, type CodexQuotaRank } from './codex-quota'
 import { getTokenSourceForAccount, tokenSourceRuntimeModel, type TokenSource } from './token-source'
 import type { AgentReasoningEffort } from './agent-process'
 import { CODEX_QUOTA_BLOCKS_FILE } from './paths'
@@ -38,6 +38,9 @@ export interface CodexSelectionOptions {
 
 /** Shared by main sessions and workers. Only hashes/limit observations enter the private block file. */
 export class CodexAccountScheduler {
+  // Like quota caches, these observations live only in this daemon. Restarting reads a new native snapshot.
+  private readonly lastUses = new Map<string, number>()
+
   constructor(private readonly deps: {
     accounts: () => CodexAccount[]
     usage: (id: string) => Promise<UsageSnapshot>
@@ -48,6 +51,16 @@ export class CodexAccountScheduler {
     now: () => number
     stateFile: string
   }) {}
+
+  /** Called only for a current turn's real token usage, never when viewing or merely selecting an account. */
+  recordUsage(accountId: string, model: string): void {
+    const usage = this.deps.cachedUsage(accountId)
+    // A manual launch may not have queried quota yet; its first read will observe the running window.
+    if (usage?.state !== 'ok') return
+    const identity = usage.accountFingerprint ?? this.deps.identity(accountId)
+    if (!identity) return
+    this.lastUses.set(JSON.stringify([identity, codexQuotaMeter(usage, model)]), this.deps.now())
+  }
 
   private blocks(): Block[] {
     if (!existsSync(this.deps.stateFile)) return []
@@ -136,6 +149,9 @@ export class CodexAccountScheduler {
       seen.set(identity, duplicateOf ?? account.name)
       if (duplicateOf) rank = { ...rank, state: 'miss', score: null, reason: `重复账号：${duplicateOf}` }
       const meter = usage?.state === 'ok' ? codexQuotaMeter(usage, opts.model) : null
+      const usedAt = this.lastUses.get(JSON.stringify([identity, meter]))
+      if (rank.priority === 'unused' && usage?.state === 'ok' && usedAt !== undefined
+        && codexWeekUsedSince(usage, opts.model, usedAt)) rank = { ...rank, priority: undefined }
       const block = blocks.find(b => (b.identity === identity || b.identity === `record:${account.id}`) && b.meter === meter)
       if (block && usage?.state === 'ok' && rank.state === 'ready') {
         const quota = codexModelQuota(usage, opts.model)
@@ -152,12 +168,11 @@ export class CodexAccountScheduler {
     })
     if (recovered.size) writeJsonStateAtomic(this.deps.stateFile, { version: 1, blocks: blocks.filter(b => !recovered.has(b.key)) })
     const ready = candidates.filter(c => c.state === 'ready')
-    ready.sort((a, b) => b.score! - a.score! || (b.availableNow ?? 0) - (a.availableNow ?? 0)
-      || a.account.id.localeCompare(b.account.id))
+    ready.sort(compareCodexQuota)
     const selected = ready[0] ?? null
     const exhausted = candidates.filter(c => c.state === 'exhausted' || c.state === 'waiting')
     const retryAt = exhausted.length ? Math.min(...exhausted.map(c => c.retryAt ?? now + 60_000)) : undefined
-    for (const c of candidates) log(`codex scheduler${cached ? ' [cache]' : ''}: ${c.account.name} ${c.state} score=${c.score ?? 'MISS'}${c.reason ? ` (${c.reason})` : ''}`)
+    for (const c of candidates) log(`codex scheduler${cached ? ' [cache]' : ''}: ${c.account.name} ${c.state} priority=${c.priority ?? 'score'} score=${c.score ?? (c.priority === 'expiring' ? 'N/A' : 'MISS')}${c.reason ? ` (${c.reason})` : ''}`)
     return { selected, candidates, ...(retryAt !== undefined ? { retryAt } : {}) }
   }
 }

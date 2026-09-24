@@ -61,6 +61,8 @@ export type UsageSnapshot =
       defaultLimitId?: string
       /** 账号可用的额度重置卡次数；null 表示接口没有返回有效数值。 */
       resetCredits?: number | null
+      /** Start of the successful native read attempt; together with fetchedAt bounds transport delay. */
+      readStartedAt?: number
       fetchedAt: number
     }
 
@@ -318,14 +320,14 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   })
 }
 
-function clampPct(v: unknown): number | null {
-  return typeof v === 'number' && isFinite(v) ? Math.max(0, Math.min(100, v)) : null
+function validPct(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 100 ? v : null
 }
 
 function windowFromRateLimit(w: any): UsageWindow | null {
   if (!w) return null
   return {
-    percent: clampPct(w.usedPercent),
+    percent: validPct(w.usedPercent),
     resetsAt: typeof w.resetsAt === 'number' ? new Date(w.resetsAt * 1000) : null,
     durationMins: typeof w.windowDurationMins === 'number' ? w.windowDurationMins : null,
   }
@@ -409,8 +411,12 @@ async function fetchUsage(accountId: string): Promise<UsageSnapshot> {
     if (!account) return { state: 'no_credentials' }
     if (account.type !== 'chatgpt') return { state: 'auth_failed' }
 
-    const limitsRes = await requestCodexQuotaWithRetry(() => app.request('account/rateLimits/read', {}))
-    return snapshotFromReadResponse(limitsRes, account.planType)
+    let readStartedAt: number | undefined
+    const limitsRes = await requestCodexQuotaWithRetry(() => {
+      readStartedAt = Date.now()
+      return app.request('account/rateLimits/read', {})
+    })
+    return snapshotFromReadResponse(limitsRes, account.planType, readStartedAt)
   } catch (e: any) {
     log(`usage: codex app-server usage failed: ${e?.message ?? e}`)
     if (isUsageAuthError(e)) return { state: 'auth_failed' }
@@ -423,7 +429,7 @@ async function fetchUsage(accountId: string): Promise<UsageSnapshot> {
 
 /** read 端点响应 → 权威快照。默认桶跟随服务端顶层 rateLimits 指针;
  * 桶 map 整体替换(OpenAI 加/删桶自动跟上)。 */
-export function snapshotFromReadResponse(limitsRes: any, planType?: string | null): UsageSnapshot {
+export function snapshotFromReadResponse(limitsRes: any, planType?: string | null, readStartedAt?: number): UsageSnapshot {
   const { buckets, defaultLimitId } = bucketsFromReadResponse(limitsRes)
   const def = buckets.find(b => b.limitId === defaultLimitId) ?? buckets[0]
   if (!def) return { state: 'network', reason: 'empty rate limit response' }
@@ -443,7 +449,7 @@ export function snapshotFromReadResponse(limitsRes: any, planType?: string | nul
     defaultLimitId: def.limitId,
     resetCredits: Number.isInteger(limitsRes?.rateLimitResetCredits?.availableCount) && limitsRes.rateLimitResetCredits.availableCount >= 0
       ? limitsRes.rateLimitResetCredits.availableCount : null,
-    fetchedAt: Date.now(),
+    ...(readStartedAt !== undefined ? { readStartedAt } : {}), fetchedAt: Date.now(),
   }
 }
 
@@ -503,7 +509,12 @@ export function refreshUsageFromConnection(request: (method: string, params: any
   const generation = usageGenerations.get(accountId) ?? 0
   return usageReads.read(accountId, async () => {
     try {
-      const snap = snapshotFromReadResponse(await requestCodexQuotaWithRetry(() => request('account/rateLimits/read', {})))
+      let readStartedAt: number | undefined
+      const response = await requestCodexQuotaWithRetry(() => {
+        readStartedAt = Date.now()
+        return request('account/rateLimits/read', {})
+      })
+      const snap = snapshotFromReadResponse(response, undefined, readStartedAt)
       if (snap.state !== 'ok') log(`usage: refresh from connection: ${snap.state === 'network' ? snap.reason : snap.state}`)
       return snap
     } catch (error) {

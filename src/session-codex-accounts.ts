@@ -125,14 +125,14 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
       if (argument) throw new Error('codex-auto 不需要备注')
       codexAccounts.selectAuto(s.sessionName)
       await card.finish({ phase: 'selected', name: '自动选择', current: codexAccounts.get(s.codexAccountId()).name,
-        selected: '自动 · 最高分优先', hint: 'Ultra：Pro 且周余量 ≥ 0.5 份' })
+        selected: '自动 · 未使用 / 临期 / 评分', hint: 'Ultra：Pro 且周余量 ≥ 0.5 份' })
       return
     }
     if (command === 'account') {
       if (!argument) {
         await card.finish({ phase: 'current', current: codexAccounts.get(s.codexAccountId()).name,
-          selected: codexAccounts.preferred(s.sessionName) === null ? '自动 · 最高分优先' : codexAccounts.get(codexAccounts.selected(s.sessionName)).name,
-          hint: '周剩余份额 ÷ 重置小时 · codex-auto' })
+          selected: codexAccounts.preferred(s.sessionName) === null ? '自动 · 未使用 / 临期 / 评分' : codexAccounts.get(codexAccounts.selected(s.sessionName)).name,
+          hint: '周剩余份额 ÷（重置小时 − 5）· codex-auto' })
         return
       }
       const account = codexAccounts.find(argument)

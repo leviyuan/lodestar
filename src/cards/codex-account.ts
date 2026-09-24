@@ -1,8 +1,9 @@
 import type { CodexUsageTotal } from '../codex-account-usage'
 import { ELEMENTS } from './elements'
-import { usageWindowElements } from './usage'
+import { fmtResetIn, usageWindowElements } from './usage'
+import { compareCodexQuota } from '../codex-quota'
 import type { CodexAccountCandidate } from '../codex-account-scheduler'
-import type { UsageSnapshot } from '../usage'
+import type { UsageSnapshot, UsageWindow } from '../usage'
 
 export type CodexAccountPhase = 'connecting' | 'waiting' | 'checking' | 'success' | 'selected' | 'current' | 'accounts' | 'deleted' | 'cancelled' | 'expired' | 'error' | 'warning'
 export interface CodexAccountCardView {
@@ -105,7 +106,18 @@ export function codexAccountPanel(view: CodexAccountCardView): object {
     header: { title: { tag: 'plain_text', content: '查看详情' } }, elements: [md(text(view.details))] })
   return { tag: 'collapsible_panel', element_id: ELEMENTS.codexAccountPanel, expanded: true,
     header: { title: { tag: 'plain_text', content: codexAccountSummary(view) }, background_color: `${color}-50` },
-    border: { color: `${color}-100`, corner_radius: '8px' }, padding: '12px', elements }
+    border: { color: `${color}-100`, corner_radius: '8px' }, padding: view.phase === 'accounts' ? '8px' : '12px',
+    ...(view.phase === 'accounts' ? { vertical_spacing: '8px' } : {}), elements }
+}
+
+function accountUsageWindow(window: UsageWindow | null, label: string): object {
+  const value = window?.percent
+  if (value == null || !Number.isFinite(value) || value < 0 || value > 100) return md(`${label}　MISS`)
+  const filled = Math.round(value / 100 * 6)
+  const color = value >= 100 ? 'red' : value >= 80 ? 'orange' : 'green'
+  const reset = window!.unreportedFull ? '满窗'
+    : window!.resetsAt && Number.isFinite(window!.resetsAt.getTime()) ? fmtResetIn(window!.resetsAt) : 'MISS'
+  return md(`${label}　<font color='${color}'>${'▰'.repeat(filled)}${'▱'.repeat(6 - filled)}</font>　${Math.round(value)}% <font color='grey'>「${reset}」</font>`)
 }
 
 function accountRows(view: CodexAccountCardView): object[] {
@@ -113,34 +125,31 @@ function accountRows(view: CodexAccountCardView): object[] {
   const pages = Math.max(1, Math.ceil(total.entries.length / CODEX_ACCOUNTS_PAGE_SIZE))
   const page = view.page ?? 1
   if (!Number.isInteger(page) || page < 1 || page > pages) throw new Error(`页码应为 1–${pages}`)
-  const elements: object[] = [muted(`${total.entries.length} 个记录 · 可用 ${total.available ?? 'MISS'} 个账号${total.complete ? '' : ' · 汇总不完整'}`)]
-  const ranked = view.scheduling?.candidates.filter(c => c.state === 'ready').sort((a, b) =>
-    b.score! - a.score! || (b.availableNow ?? 0) - (a.availableNow ?? 0) || a.account.id.localeCompare(b.account.id))
-  if (view.scheduling) elements.push(muted(`${view.scheduling.ultra ? 'Ultra · Pro ≥ 0.5 份' : '普通 · 周 / 5h 综合'} · 最高分优先 · 可调度 ${ranked!.length}`))
-  for (const entry of total.entries.slice((page - 1) * CODEX_ACCOUNTS_PAGE_SIZE, page * CODEX_ACCOUNTS_PAGE_SIZE)) {
-    const badges = [entry.account.id === view.currentId ? '使用中' : '',
-      entry.account.id === view.selectedId && view.selectedId !== view.currentId ? '下次启动' : ''].filter(Boolean)
+  const elements: object[] = []
+  const ranked = view.scheduling?.candidates.filter(c => c.state === 'ready').sort(compareCodexQuota) ?? []
+  const positions = new Map(ranked.map((candidate, index) => [candidate.account.id, index + 1]))
+  const entries = total.entries.slice().sort((a, b) =>
+    (positions.get(a.account.id) ?? Infinity) - (positions.get(b.account.id) ?? Infinity))
+  for (const entry of entries.slice((page - 1) * CODEX_ACCOUNTS_PAGE_SIZE, page * CODEX_ACCOUNTS_PAGE_SIZE)) {
     const usage = entry.usage
     const row: object[] = []
+    const schedule = view.scheduling?.candidates.find(c => c.account.id === entry.account.id)
+    const position = positions.get(entry.account.id)
+    const score = entry.duplicateOf ? '重复' : schedule?.state === 'ready'
+      ? schedule.priority === 'expiring' ? '临期优先' : `${schedule.score!.toPrecision(3)}/h`
+      : 'MISS'
     elements.push({ tag: 'collapsible_panel', expanded: true,
-      header: { title: { tag: 'plain_text', content: `备注：${entry.account.name}${badges.length ? ` · ${badges.join(' · ')}` : ''}` },
-        background_color: entry.account.id === view.currentId ? 'blue-50' : 'grey-50' },
-      border: { color: 'grey-100', corner_radius: '8px' }, padding: '8px', vertical_spacing: '4px', elements: row })
-    row.push(muted(`实际邮箱：${entry.email ?? 'MISS'}`))
+      header: { title: { tag: 'plain_text', content: `#${position ?? '—'}·${entry.account.name}「${score}」` }, background_color: 'grey-50' },
+      border: { color: 'grey-100', corner_radius: '8px' }, padding: '8px', vertical_spacing: '2px', elements: row })
+    row.push(muted(`邮箱：${entry.email ?? 'MISS'}`))
     if (entry.emailError) row.push({ tag: 'collapsible_panel', expanded: false,
       header: { title: { tag: 'plain_text', content: '邮箱查询错误' } }, elements: [md(text(entry.emailError))] })
     if (entry.duplicateOf) { row.push(muted(`与「${entry.duplicateOf}」同一账号，合计只计一次`)); continue }
-    const schedule = view.scheduling?.candidates.find(c => c.account.id === entry.account.id)
-    if (schedule) {
-      const position = ranked!.findIndex(c => c.account.id === entry.account.id)
-      row.push(schedule.state === 'ready'
-        ? md(`**#${position + 1} · ${schedule.score!.toPrecision(3)} 份/h**`)
-        : muted(schedule.state === 'exhausted' ? '⏳ 耗尽 · 暂不参与'
+    if (schedule && schedule.state !== 'ready') {
+      row.push(muted(schedule.state === 'exhausted' ? '⏳ 耗尽 · 暂不参与'
           : schedule.state === 'excluded' ? 'Ultra 自动排除 Plus'
           : schedule.state === 'waiting' ? `⏳ 周余量 ${schedule.remaining?.toPrecision(3)} 份 · 未达 0.5 份`
           : 'MISS · 无法排序'))
-      if (schedule.state === 'ready' && schedule.remaining != null) row.push(muted(
-        `周余量 ${schedule.remaining.toPrecision(3)} 份${schedule.fiveHourRemaining != null ? ` · 5h ${schedule.fiveHourRemaining.toPrecision(3)} 份` : ''}`))
       if (schedule.state === 'miss' && schedule.reason && usage.state === 'ok') row.push({ tag: 'collapsible_panel', expanded: false,
         header: { title: { tag: 'plain_text', content: '未参与原因' } }, elements: [md(text(schedule.reason))] })
     }
@@ -150,12 +159,8 @@ function accountRows(view: CodexAccountCardView): object[] {
         header: { title: { tag: 'plain_text', content: '查询错误' } }, elements: [md(text(usage.reason))] })
       continue
     }
-    const plan = usage.subscriptionType === 'pro' ? 'Pro 20×' : usage.subscriptionType === 'prolite' ? 'Pro 5×'
-      : usage.subscriptionType === 'plus' ? 'Plus 1×' : usage.subscriptionType ?? '套餐 MISS'
-    row.push(muted(`${plan} · 重置卡 ${usage.resetCredits ?? 'MISS'}`))
-    const windows = ([[usage.fiveHour, '5h'], [usage.weekly, '周']] as const)
-      .flatMap(([window, label]) => window ? [usageWindowElements(window, label)] : [])
-    if (windows.length) row.push(columns(windows))
+    row.push(accountUsageWindow(usage.weekly, '周'))
+    if (usage.fiveHour) row.push(accountUsageWindow(usage.fiveHour, '5h'))
   }
   if (pages > 1) elements.push(muted(`${page}/${pages} 页 · ${page < pages ? `下一页 codex-accounts ${page + 1}` : '首页 codex-accounts'}`))
   return elements

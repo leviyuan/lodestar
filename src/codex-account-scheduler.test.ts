@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { checkCodexModelCompatibility, CodexAccountScheduler } from './codex-account-scheduler'
-import { isCodexQuotaError, rankCodexQuota } from './codex-quota'
+import { compareCodexQuota, isCodexQuotaError, rankCodexQuota } from './codex-quota'
 import type { AgentReasoningEffort } from './agent-process'
 import type { TokenSource, TokenSourceModel } from './token-source'
 import type { UsageSnapshot } from './usage'
@@ -28,6 +28,90 @@ function harness(input: Record<string, UsageSnapshot>, cached: Record<string, Us
 }
 
 describe('weekly quota scheduling', () => {
+  test('an untouched complete week precedes expiring accounts, which precede numeric scores', async () => {
+    const h = harness({ high: quota('pro', 0, 5.01), expiring: quota('pro', 99, 4), unused: quota('prolite', 0, 168) })
+    const choice = await h.scheduler.choose({ model: 'model' })
+    expect(choice.selected?.account.id).toBe('unused')
+    expect(choice.candidates.slice().sort(compareCodexQuota).map(c => c.account.id)).toEqual(['unused', 'expiring', 'high'])
+    expect(choice.candidates[1]).toMatchObject({ state: 'ready', priority: 'expiring', score: null, weeklyScore: null, hours: 4 })
+    expect(choice.candidates[2]).toMatchObject({ priority: 'unused' })
+    expect(choice.candidates[2].score).toBeCloseTo(5 / 163)
+    expect(choice.candidates[0].score).toBeCloseTo(20 / 0.01)
+  })
+  test('unused priority requires an exact zero and a whole native week at observation time', () => {
+    const full = quota('pro', 0, 168)
+    full.fetchedAt += 999 // Native resetsAt only has second precision.
+    expect(rankCodexQuota(full, 'model', NOW + 1000).priority).toBe('unused')
+    for (const usage of [quota('pro', 0.001, 168), quota('pro', 0, 167.999), quota('pro', 0, 168.001)]) {
+      expect(rankCodexQuota(usage, 'model', NOW).priority).toBeUndefined()
+    }
+    full.weekly!.durationMins = null
+    expect(rankCodexQuota(full, 'model', NOW).priority).toBeUndefined()
+    full.weekly!.durationMins = 10080
+    full.fetchedAt = NaN
+    expect(rankCodexQuota(full, 'model', NOW).priority).toBeUndefined()
+    full.readStartedAt = NOW
+    full.fetchedAt = NOW + 5000
+    expect(rankCodexQuota(full, 'model', NOW + 5000).priority).toBe('unused')
+    full.readStartedAt = NOW + 1000
+    expect(rankCodexQuota(full, 'model', NOW + 5000).priority).toBeUndefined()
+  })
+  test('reading or choosing does not consume unused priority; actual use prevents stale-cache reuse', async () => {
+    const input = { unused: quota('prolite', 0, 168), urgent: quota('pro', 99, 2) }
+    const h = harness(input, input)
+    for (const preferCachedUsage of [false, true, false]) {
+      expect((await h.scheduler.choose({ model: 'model', preferCachedUsage })).selected?.account.id).toBe('unused')
+    }
+    h.scheduler.recordUsage('unused', 'model')
+    for (const preferCachedUsage of [true, false]) {
+      const choice = await h.scheduler.choose({ model: 'model', preferCachedUsage })
+      expect(choice.selected?.account.id).toBe('urgent')
+      expect(choice.candidates[0].priority).toBeUndefined()
+    }
+    // The same 0% window remains used on a later read; only a genuinely new complete week qualifies again.
+    input.unused.fetchedAt = NOW + 60_000
+    const clock = spyOn((h.scheduler as any).deps, 'now').mockReturnValue(NOW + 60_000)
+    expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('urgent')
+    input.unused.weekly!.resetsAt = new Date(NOW + 60_000 + 168 * 3_600_000)
+    expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('unused')
+    clock.mockRestore()
+  })
+  test('actual usage observations are shared by aliases but isolated by native quota meter and identity', async () => {
+    const full = quota('pro', 0, 168)
+    full.accountFingerprint = 'shared'
+    full.buckets = [{ limitId: 'spark', limitName: 'spark', fiveHour: null, weekly: full.weekly }]
+    const alias = { ...full }
+    const other = { ...full, accountFingerprint: 'different' }
+    const input = { original: full, alias, other }
+    const h = harness(input, input)
+    h.scheduler.recordUsage('original', 'model')
+    const main = await h.scheduler.choose({ model: 'model' })
+    expect(main.candidates[0].priority).toBeUndefined()
+    expect(main.candidates[1].priority).toBeUndefined()
+    expect(main.candidates[2].priority).toBe('unused')
+    expect((await h.scheduler.choose({ model: 'spark' })).candidates[0].priority).toBe('unused')
+  })
+  test('last five hours are explicit priority, including Plus, with earliest reset first and no infinite score', async () => {
+    const h = harness({ normal: quota('pro', 0, 5.001), five: quota('pro', 0, 5), two: quota('plus', 50, 2) })
+    const choice = await h.scheduler.choose({ model: 'model' })
+    expect(choice.selected?.account.id).toBe('two')
+    expect(choice.candidates.slice().sort(compareCodexQuota).map(c => c.account.id)).toEqual(['two', 'five', 'normal'])
+    expect(choice.candidates.slice(1).every(c => c.priority === 'expiring' && c.score === null)).toBe(true)
+    expect(rankCodexQuota(quota('pro', 0, 0), 'model', NOW)).toMatchObject({ state: 'miss', score: null })
+    const oldFullWeek = quota('pro', 0, 168)
+    expect(rankCodexQuota(oldFullWeek, 'model', NOW + 164 * 3_600_000)).toMatchObject({
+      state: 'ready', priority: 'expiring', score: null, hours: 4,
+    })
+  })
+  test('priority never bypasses Ultra eligibility, exhausted short windows or model compatibility', async () => {
+    const plus = quota('plus', 0, 168)
+    const small = quota('pro', 99, 1)
+    const blocked = quota('pro', 0, 168)
+    blocked.fiveHour = { percent: 100, resetsAt: new Date(NOW + 3600_000) }
+    const h = harness({ plus, small, blocked, incompatible: quota('pro', 0, 168), eligible: quota('pro', 50, 24) })
+    h.unavailable.set('incompatible', 'model not available')
+    expect((await h.scheduler.choose({ model: 'model', effort: 'ultra' })).selected?.account.id).toBe('eligible')
+  })
   test('startup ranks successful caches without querying quota or waiting for uncached accounts', async () => {
     const cached = { plus: quota('plus'), pro: { ...quota('pro'), fetchedAt: NOW - 12 * 3600_000 } }
     const h = harness({ plus: { state: 'network' }, pro: { state: 'network' }, cold: { state: 'network' } }, cached)
@@ -81,7 +165,7 @@ describe('weekly quota scheduling', () => {
     const { scheduler } = harness({ plus: quota('plus', 0, 10), five: quota('prolite', 50, 10), twenty: quota('pro', 75, 10) })
     const normal = await scheduler.choose({ model: 'gpt-6-astra', effort: 'max' })
     expect(normal.selected?.account.id).toBe('twenty')
-    expect(normal.candidates.map(c => c.score)).toEqual([0.03, 0.25, 0.5])
+    expect(normal.candidates.map(c => c.score)).toEqual([0.03, 0.5, 1])
     expect((await scheduler.choose({ model: 'gpt-6-astra', effort: 'ultra' })).selected?.account.id).toBe('twenty')
   })
   test('time to reset, not elapsed time or total plan size, determines ranking', async () => {
@@ -191,12 +275,12 @@ describe('weekly quota scheduling', () => {
     const plus = quota('plus', 20, 80)
     plus.fiveHour = { percent: 90, resetsAt: new Date(NOW + 3 * 3600_000), durationMins: 300 }
     const rank = rankCodexQuota(plus, 'model', NOW)
-    expect(rank.weeklyScore).toBeCloseTo(0.01)
+    expect(rank.weeklyScore).toBeCloseTo(0.8 / 75)
     expect(rank.fiveHourRemaining).toBeCloseTo(0.015)
     expect(rank.score).toBeCloseTo(0.005)
     expect(rank.availableNow).toBeCloseTo(0.015)
     plus.fiveHour.percent = 0
-    expect(rankCodexQuota(plus, 'model', NOW).score).toBeCloseTo(0.01)
+    expect(rankCodexQuota(plus, 'model', NOW).score).toBeCloseTo(0.8 / 75)
   })
   test('provided but malformed short-window data stays MISS, never a full allowance', () => {
     const plus = quota('plus')

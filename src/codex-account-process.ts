@@ -53,7 +53,7 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
     workDir: string
     create: (accountId: string, launch: ConversationLaunch, manual: boolean,
       model?: string, effort?: AgentReasoningEffort) => { process: AgentProcess; sourceRevision: string | null }
-    scheduler?: Pick<typeof codexAccountScheduler, 'choose' | 'block'>
+    scheduler?: Pick<typeof codexAccountScheduler, 'choose' | 'block' | 'recordUsage'>
     wait?: (ms: number, signal: AbortSignal) => Promise<void>
   }) {
     super()
@@ -155,8 +155,15 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
   }
 
   private wire(child: AgentProcess): void {
+    let activeTurnId: string | null = null
     for (const name of FORWARDED_EVENTS) child.on(name, (...args) => {
       if (this.inner === child && !this.closed) {
+        if (name === 'token_usage' && activeTurnId && args[0]?.turnId === activeTurnId
+          && args[0]?.threadId === child.sessionId && args[0]?.usage
+          && Object.values(args[0].usage).some(value => typeof value === 'number' && Number.isFinite(value) && value > 0)
+          && this.selected) {
+          this.scheduler().recordUsage(this.selected.account.id, this.lastModel || this.opts.model)
+        }
         if (name === 'bg_task_started') this.backgroundTasks.add(args[0].task_id)
         if (name === 'bg_task_settled') this.backgroundTasks.delete(args[0].task_id)
         this.emit(name, ...args)
@@ -165,6 +172,7 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
     child.on('turn_retry', event => { if (this.inner === child && !this.closed) this.emit('turn_retry', event) })
     child.on('turn_started', event => {
       if (this.inner !== child || this.closed) return
+      activeTurnId = event.turn_id
       this.result = null
       this.ownRetry = null
       const retry = this.retryTurn || event.retry
@@ -173,6 +181,7 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
     })
     child.on('result', (result: any) => {
       if (this.inner !== child || this.closed || this.lifetime.signal.aborted) return
+      activeTurnId = null
       if (result?.is_error && result.codexQuotaFailure && !this.recovery) {
         this.retryCount++
         // Defer the transaction one microtask so cancellation in a synchronous event listener wins.
