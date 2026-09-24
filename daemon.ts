@@ -32,6 +32,8 @@ import {
   get as getNotifyCallback,
   markResolved as markNotifyCallbackResolved,
   recordCallbackSuccess,
+  recordCallbackFailure,
+  beginCallbackDispatch,
   dispatchCallback,
   isDispatching,
   setDispatching,
@@ -1024,6 +1026,13 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
   // states via message.patch on the original card (Phase 1 processing →
   // push → Phase 2 final). The dispatching guard is set synchronously
   // here so a fast second click is blocked before the async work starts.
+  try {
+    beginCallbackDispatch(reg.notifyId, button.id, userId)
+  } catch (error) {
+    return withNotifyContext(reg, withBusinessOutcome({
+      toast: { type: 'error', content: `保存回调发送状态失败，未发送: ${error instanceof Error ? error.message : error}` },
+    }, false))
+  }
   setDispatching(reg.notifyId)
   const phase2 = trackCardActionWork(pushNotifyCallbackPhase2(reg, button, userId))
   void phase2.catch(e => {
@@ -1094,9 +1103,11 @@ async function pushNotifyCallbackPhase2(
         }
       }
     } else {
+      const recorded = recordCallbackFailure(reg.notifyId)
+      outcome = recorded.state
       resolution = {
-        status: 'failed', buttonId: button.id, text: button.text,
-        operatorOpenId: userId, detail: result.detail,
+        status: recorded.state === 'retry' ? 'failed' : 'unknown', buttonId: button.id, text: button.text,
+        operatorOpenId: userId, detail: recorded.state === 'retry' ? result.detail : `${result.detail}; ${recorded.detail}`,
       }
     }
 
@@ -1108,7 +1119,7 @@ async function pushNotifyCallbackPhase2(
       try {
         await sendActionReceipt(
           reg.chatId,
-          `⚠️ 通知反馈${outcome === 'retry' ? '失败且结果卡更新失败，可重新点击' : '已执行，但结果卡更新失败'}: ${e instanceof Error ? e.message : e}`,
+          `⚠️ 通知反馈${outcome === 'retry' ? '失败且结果卡更新失败，可重新点击' : outcome === 'unknown' ? '送达状态未知且结果卡更新失败，禁止自动重试' : '已执行，但结果卡更新失败'}: ${e instanceof Error ? e.message : e}`,
         )
       } catch (receiptError) {
         log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… final fallback receipt failed: ${receiptError instanceof Error ? receiptError.message : receiptError}`)

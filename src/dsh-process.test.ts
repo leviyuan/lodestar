@@ -237,7 +237,7 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(await readFile(join(f.dir, 'proof.txt'), 'utf8')).toBe('native-tool')
   }, 30_000)
 
-  test('answers a native user question and preserves the selected label', async () => {
+  for (const answerKey of ['Which colour?', 'colour']) test(`answers a native user question by ${answerKey} and preserves the selected label`, async () => {
     const f = await fixture((_body, count) => count === 1
       ? completion({ tool_calls: [{ index: 0, id: 'call-question', type: 'function', function: {
         name: 'ask_user_question', arguments: JSON.stringify({ questions: [{ id: 'colour', question: 'Which colour?', options: [{ label: 'Blue' }, { label: 'Red' }] }] }),
@@ -246,7 +246,7 @@ describe('DSH native runtime through Lodestar bridge', () => {
     let asked = 0
     proc.on('can_use_tool', request => {
       asked++
-      proc.sendPermissionResponse(request.request_id, 'allow', { updatedInput: { answers: { 'Which colour?': 'Blue' } } })
+      proc.sendPermissionResponse(request.request_id, 'allow', { updatedInput: { answers: { [answerKey]: 'Blue' } } })
     })
     await proc.initializationPromise()
     const result = nextResult(proc)

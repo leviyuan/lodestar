@@ -1688,6 +1688,7 @@ export class CodexProcess extends EventEmitter {
   async listModels(): Promise<CodexModel[]> {
     await this.ensureInitialized()
     const models: CodexModel[] = []
+    const seenCursors = new Set<string>()
     let cursor: string | null = null
     do {
       const res = await this.request('model/list', {
@@ -1713,7 +1714,15 @@ export class CodexProcess extends EventEmitter {
             : null,
         })
       }
-      cursor = typeof res?.nextCursor === 'string' && res.nextCursor ? res.nextCursor : null
+      const nextCursor = res?.nextCursor
+      if (nextCursor !== null && typeof nextCursor !== 'string') {
+        throw new Error('model/list returned an invalid nextCursor')
+      }
+      cursor = nextCursor || null
+      if (cursor) {
+        if (seenCursors.has(cursor)) throw new Error('model/list returned a repeated nextCursor')
+        seenCursors.add(cursor)
+      }
     } while (cursor)
     return models
   }

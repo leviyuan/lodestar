@@ -75,13 +75,15 @@ Body (JSON):
 
 Response: \`200 {ok, chat_id, message_id, notify_id?}\` (notify_id returned
 when buttons are present or allow_reply is true) / \`400\` bad params / \`404\` group not
-bound / \`502\` Feishu API rejected.
+bound / \`413\` JSON body exceeds 4 MiB / \`502\` Feishu API rejected.
 
 \`GET /notify/result/<notify_id>\` — pull the verdict with no callback
 server: \`{notify_id, project, message_id, resolved, unknown, button?,
 response?, reply?, resolved_at?, resolved_by?}\`. \`resolved:false\` while
 pending. \`unknown:true\` means delivery cannot be safely confirmed: do
-not retry automatically. \`404\` on unknown notify_id.
+not retry automatically. Interrupted button callbacks and text replies remain
+unknown after daemon restart; verify their outcome with the receiver.
+\`404\` on unknown notify_id.
 
 ## Usage — one-shot
 

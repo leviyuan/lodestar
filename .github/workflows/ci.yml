@@ -94,5 +94,5 @@ jobs:
           bun-version: 1.3.11
       - name: Install locked dependencies
         run: bun install --frozen-lockfile --ignore-scripts
-      - name: Test updates and native Windows system proxy discovery
-        run: bun test src/config.test.ts src/agent-install.test.ts src/agent-updates.test.ts src/network-proxy.test.ts
+      - name: Test updates, CLI process safety, and native Windows system proxy discovery
+        run: bun test src/config.test.ts src/agent-install.test.ts src/agent-updates.test.ts src/network-proxy.test.ts src/pid-guard.test.ts src/stop-cli.test.ts src/setup-spawn.test.ts

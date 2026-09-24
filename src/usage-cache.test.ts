@@ -81,6 +81,32 @@ describe('shared quota freshness and cooldown', () => {
     expect(cache.peekSuccessful('account')).toBeUndefined()
   })
 
+  test('thrown authentication loss clears successful data before a later transport failure', async () => {
+    let now = 0
+    const cache = new UsageReadCache<{ state: string }>(() => now)
+    await cache.readStale('account', async () => ({ state: 'ok' }))
+    now = 60_000
+    const error = new Error('token expired; connection timeout during reauthentication')
+    await expect(cache.readStale('account', async () => { throw error })).rejects.toBe(error)
+    expect(cache.peekSuccessful('account')).toBeUndefined()
+    now = 120_000
+    await expect(cache.readStale('account', async () => { throw new Error('timeout') })).rejects.toThrow('timeout')
+  })
+
+  test('thrown rate limits preserve a longer Retry-After and do not trigger another request early', async () => {
+    let now = 0, calls = 0
+    const cache = new UsageReadCache<{ state: string }>(() => now)
+    const error = Object.assign(new Error('HTTP 429'), { retryAfterMs: 600_000 })
+    const read = async () => { calls++; throw error }
+    await expect(cache.read('account', read)).rejects.toBe(error)
+    now = 599_999
+    await expect(cache.read('account', read)).rejects.toBe(error)
+    expect(calls).toBe(1)
+    now++
+    await expect(cache.read('account', read)).rejects.toBe(error)
+    expect(calls).toBe(2)
+  })
+
   test('rejected requests retain diagnostics and share the same cooldown', async () => {
     let now = 0, calls = 0
     const cache = new UsageReadCache<{ state: string }>(() => now)

@@ -1731,21 +1731,27 @@ export class Session {
     const announce = opts.announce ?? true
     const report = opts.onStatus
     this.daemonRestoreRequired = false
-    await this.cancelAgentRuns(reason)
-    if (!this.proc) {
+    const proc = this.proc
+    // Close admission before delegated cancellation can await network/process
+    // cleanup. The old main process must not create replacements during it.
+    if (proc) this.beginProcStop(proc)
+    let cancellationError: unknown = null
+    try { await this.cancelAgentRuns(reason) }
+    catch (error) { cancellationError = error }
+    if (!proc) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
+      if (cancellationError) throw cancellationError
       report?.('⚪ session 当前未运行')
       if (announce) await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
       return
     }
-    const proc = this.proc
     // Close the tiny materialization→stop window: Codex sets its durable flag
     // before emitting conversation_materialized, so an immediately following
     // stop can still persist the exact process-owned resume point.
     let stopResumeError = this.persistResumableSessionId(false, proc, false)
     let stopMaterializationError: string | null = null
-    report?.(`🛑 停止 ${this.backendLabel(this.proc.provider)}`)
+    report?.(`🛑 停止 ${this.backendLabel(proc.provider)}`)
     // Flip lifecycle state SYNCHRONOUSLY before awaiting kill — daemon's
     // SIGTERM cleanup snapshots `isRunning()` and if we're still mid-
     // `proc.kill()` await it'll see proc!=null and write us into the
@@ -1827,6 +1833,7 @@ export class Session {
       log(`session "${this.sessionName}": stop final lifecycle write failed: ${messageOf(e)}`)
     }
     const failures: unknown[] = [
+      ...(cancellationError ? [cancellationError] : []),
       ...(killError ? [killError] : []),
       ...(!confirmed && !killError ? [new Error(this.blockedProcReason ?? 'process stop unconfirmed')] : []),
       ...cleanupErrors,
@@ -1961,6 +1968,7 @@ export class Session {
     const turnClose = this.waitForTurnCloses()
       .catch(e => log(`session "${this.sessionName}": restart main-card close failed: ${messageOf(e)}`))
     let killError: unknown = null
+    let cancellationError: unknown = null
     let stoppedProc: AgentProcess | null = null
     if (this.proc) {
       const proc = this.proc
@@ -1969,7 +1977,10 @@ export class Session {
       // Seal the old owner before awaiting materialization. Otherwise a result
       // in this window can drain queued user input into the branch we are
       // about to kill, then restart clears that queue as if it never ran.
+      const previousCapability = this.agentCapability
       this.beginProcStop(proc)
+      try { await this.cancelAgentRuns('会话正在重启') }
+      catch (error) { cancellationError = error }
       const materializationBarrier = proc.conversationMaterializationBarrier?.()
       if (materializationBarrier) {
         try { await materializationBarrier }
@@ -1984,10 +1995,14 @@ export class Session {
         resume
         && !explicitLaunch
         && resumeRefreshError
+        && !cancellationError
         && !hadActiveConversationWork
         && proc.isAlive()
       ) {
-        if (this.stoppingProc === proc) this.stoppingProc = null
+        if (this.proc === proc && this.stoppingProc === proc) {
+          this.stoppingProc = null
+          this.agentCapability = previousCapability
+        }
         this.status = statusBeforeResumeValidation
         const finalStatus = `❌ ${this.backendLabel(proc.provider)} 恢复点尚未安全落盘，已保留当前进程: ${resumeRefreshError}`
         log(`session "${this.sessionName}": abort restart before kill: ${resumeRefreshError}`)
@@ -2004,6 +2019,11 @@ export class Session {
       }
       // Also close the beginStop→process-exit window (see stopUnlocked).
       refreshMaterializedCodexResume(proc)
+    } else {
+      // A prior stop can leave a delegated process whose exit was not yet
+      // confirmed. Do not launch a new owner until that cleanup succeeds.
+      try { await this.cancelAgentRuns('会话正在重启') }
+      catch (error) { cancellationError = error }
     }
     this.clearMultiMsgBuffer('restart')
     this.pendingUserMessageCount = 0
@@ -2029,6 +2049,7 @@ export class Session {
     }
     const stopConfirmed = stoppedProc ? this.finishProcStop(stoppedProc, killError) : true
     const stopFailures = [
+      ...(cancellationError ? [`agents=${messageOf(cancellationError)}`] : []),
       ...(killError ? [`kill=${messageOf(killError)}`] : []),
       ...(!stopConfirmed && !killError ? [`kill=${this.blockedProcReason ?? 'process stop unconfirmed'}`] : []),
       ...cleanupErrors.map(error => `cleanup=${messageOf(error)}`),

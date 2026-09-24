@@ -53,6 +53,15 @@ export function createNotifyReplyRuntime(deps: {
 
   return {
     async recover(reg: NotifyRegistration): Promise<void> {
+      if (reg.dispatchState && reg.unknownAt) {
+        const state = reg.dispatchState
+        const button = reg.buttons.find(button => button.id === state.buttonId)
+        await update(reg, reg.messageId, buildNotifyCardFromReg(reg, {
+          status: 'unknown', buttonId: state.buttonId, text: button?.text ?? state.buttonId,
+          operatorOpenId: state.openId, detail: reg.unknownReason,
+        }), '按钮回调送达状态未知')
+        return
+      }
       const state = reg.replyState
       if (!state || !reg.unknownAt) return
       const resolution: NotifyResolution = {

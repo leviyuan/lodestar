@@ -730,6 +730,35 @@ describe('AgentService', () => {
     expect(starts).toBe(0)
   })
 
+  test('shutdown closes admission and drains runs still opening their first card', async () => {
+    let cardEntered!: () => void
+    let releaseCard!: () => void
+    const entered = new Promise<void>(resolve => { cardEntered = resolve })
+    const released = new Promise<void>(resolve => { releaseCard = resolve })
+    let starts = 0
+    let shutdownComplete = false
+    const { service, root } = harness({
+      loadArtifacts: () => completedHistory(1),
+      sendCard: async () => { cardEntered(); await released; return 'message-shutdown-race' },
+      startWorker: () => { starts++; return resolvedHandle(result('unexpected')) },
+    })
+    const creating = service.startRun(root, { description: '关停期间开卡', identityIds: ['agent:a'], prompt: 'racing root' })
+    await entered
+    const stopping = service.shutdown('daemon shutdown').then(() => { shutdownComplete = true })
+    try {
+      await expect(service.startRun(root, { description: '关停后拒绝新建', identityIds: ['agent:a'], prompt: 'late root' }))
+        .rejects.toThrow('shutting down')
+      await expect(service.followUp(root, 'agent_history_0', { description: '关停后拒绝续跑', prompt: 'late follow-up' }))
+        .rejects.toThrow('shutting down')
+      expect(shutdownComplete).toBe(false)
+    } finally { releaseCard() }
+    const run = await creating
+    await stopping
+    expect(run.status).toBe('cancelled')
+    expect(starts).toBe(0)
+    expect(shutdownComplete).toBe(true)
+  })
+
   test('invalidates a main-Agent follow-up whose card was opening during Session cancellation', async () => {
     let cardEntered!: () => void
     let releaseCard!: () => void

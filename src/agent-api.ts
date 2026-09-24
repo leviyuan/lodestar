@@ -91,10 +91,14 @@ function bearerToken(header: string | undefined): string {
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   let raw = ''
+  let bytes = 0
+  req.setEncoding('utf8')
   for await (const chunk of req) {
-    raw += chunk.toString()
-    if (Buffer.byteLength(raw) > MAX_BODY_BYTES) throw new Error(`request body exceeds ${MAX_BODY_BYTES} bytes`)
+    bytes += Buffer.byteLength(chunk)
+    if (bytes <= MAX_BODY_BYTES) raw += chunk
+    else raw = ''
   }
+  if (bytes > MAX_BODY_BYTES) throw new Error(`request body exceeds ${MAX_BODY_BYTES} bytes`)
   try { return JSON.parse(raw || '{}') }
   catch { throw new Error('bad json') }
 }

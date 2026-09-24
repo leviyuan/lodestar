@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto'
 import { config } from './config'
 import { bindProcessCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
 import { plusFiveHourWindow } from './codex-quota'
-import { UsageReadCache, USAGE_FRESH_MS, isUsageRateLimitError } from './usage-cache'
+import { UsageReadCache, USAGE_FRESH_MS, isUsageAuthError, isUsageRateLimitError } from './usage-cache'
 import { observeCodexAccountEmail } from './codex-account-info'
 
 const API_TIMEOUT_MS = 10_000
@@ -547,11 +547,6 @@ export function invalidateCodexUsage(accountId: string): void {
   caches.delete(accountId)
   successfulCaches.delete(accountId)
   usageReads.invalidate(accountId)
-}
-
-function isUsageAuthError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-  return /\b(?:401|403)\b|unauthori[sz]ed|not authenticated|authentication (?:failed|required)|not logged in/i.test(message)
 }
 
 function requestCodexQuotaWithRetry<T>(request: () => Promise<T>): Promise<T> {

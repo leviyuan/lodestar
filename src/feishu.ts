@@ -1266,8 +1266,8 @@ export async function updateCard(messageId: string, card: object): Promise<void>
     path: { message_id: messageId },
     data: { content: JSON.stringify(neutralizeMarkdownImagesInCard(card)) },
   })
-  if (res?.code && res.code !== 0) {
-    throw new Error(`feishu message.patch failed code=${res.code} msg=${res.msg}`)
+  if (res?.code !== 0) {
+    throw new Error(`feishu message.patch failed code=${res?.code ?? 'MISS'} msg=${res?.msg ?? 'MISS'}`)
   }
 }
 
@@ -1399,8 +1399,11 @@ export async function downloadAttachment(
     const safeName = name
       ? name.replace(/[^a-zA-Z0-9._-]/g, '_')
       : `${key.replace(/[^a-zA-Z0-9_-]/g, '_')}.png`
-    const path = join(INBOX_DIR, `${Date.now()}-${safeName}`)
-    writeFileSync(path, buf)
+    // The inbox is shared by every chat. Timestamps and sanitized names can
+    // collide when simultaneous attachments arrive, so never overwrite a
+    // previous message's bytes (including a pre-existing symlink).
+    const path = join(INBOX_DIR, `${Date.now()}-${randomUUID()}-${safeName}`)
+    writeFileSync(path, buf, { flag: 'wx' })
     log(`feishu: downloaded ${type} ${path} (${buf.length}B)`)
     return path
   } catch (e) {

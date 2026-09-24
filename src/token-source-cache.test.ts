@@ -140,6 +140,43 @@ describe('Token Source cache boundary', () => {
     } finally { barrier.release(); disposeCachedTokenSource(original); if (edited) disposeCachedTokenSource(edited) }
   })
 
+  test.each(['token expired', 'Claude Code 当前认证不是第一方订阅'])('authentication loss invalidates model and usage caches: %s', async reason => {
+    const { create, state } = fixture()
+    const source = cachedTokenSource(create, {}, `auth-${reason}`, 'original')
+    try {
+      await source.refreshModels()
+      await refreshTokenSourceUsage(source)
+      state.usage = { state: 'network', windows: [], reason }
+      await expect(refreshTokenSourceUsage(source)).rejects.toThrow(reason)
+      expect((await source.readUsage()).state).not.toBe('ok')
+      state.error = reason
+      await expect(source.refreshModels()).rejects.toThrow(reason)
+      expect(source.models).toEqual([])
+      expect(source.modelCatalogState?.status).toBe('failed')
+      expect((await source.readUsage()).state).toBe('no_credentials')
+    } finally { disposeCachedTokenSource(source) }
+  })
+
+  test('a model loader that only throws an auth error clears cached usage and retains its diagnostic', async () => {
+    const { create } = fixture()
+    let failure: Error | undefined
+    const source = cachedTokenSource(() => {
+      const raw = create()
+      const refresh = raw.refreshModels
+      raw.refreshModels = async () => { if (failure) throw failure; await refresh() }
+      return raw
+    }, {}, 'throw-only-auth', 'same-settings')
+    try {
+      await source.refreshModels()
+      await refreshTokenSourceUsage(source)
+      failure = new Error('token expired')
+      await expect(source.refreshModels()).rejects.toBe(failure)
+      expect(source.models).toEqual([])
+      expect(source.modelCatalogState).toMatchObject({ status: 'failed', error: 'token expired' })
+      expect(await source.readUsage()).toMatchObject({ state: 'no_credentials', reason: 'token expired' })
+    } finally { disposeCachedTokenSource(source) }
+  })
+
   test('a retired credential refresh cannot populate its replacement', async () => {
     const { create, state } = fixture()
     const barrier = gate()

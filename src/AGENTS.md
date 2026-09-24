@@ -67,6 +67,7 @@
 - 已结束的共享任务卡补充正文时，Card Kit 可能重开 streaming，必须作废旧设置缓存并重新确认关闭。卡片设置更新失败须向调用方保留原始错误、code 和 log_id；委派告警显示具体错误及任务说明，完整错误仍保存在运行记录中，不能只报数量或抹去失败。
 
 - Lodestar 自有出站 HTTP 统一使用 `network.ts` 的 `networkFetch`；本机 capability 和通知回调用 `localFetch`。`network-proxy.ts` 按协议环境变量、`ALL_PROXY`、当前用户的手动系统代理解析，统一大小写和绕过规则；系统查询失败、非法代理、未支持的 SOCKS/PAC 不得转为直连。每次重定向重新判断路由，跨 origin 清除认证，本机请求不得跳出 loopback。Agent 与飞书 SDK 自身网络由各自应用/SDK 配置，不改其全局环境。网络改动需运行真实本地代理测试，不能仅依赖 mock fetch。
+- 本机通知和 Agent API 按连续 UTF-8 流读取正文，均限制为 4 MiB；通知路由不能让客户端 Host 的 URL 解析异常逃逸请求错误边界。按钮回调发送前由 `notify-callbacks.ts` 持久化 `dispatchState`，重启时将未结算发送标为 UNKNOWN 并冻结卡片；只有成功落盘的失败结算才允许重试。回调状态文件仅 ENOENT 视为首次启动，读取或 JSON 解析失败必须阻止启动，不能清空去重记录继续运行。
 
 - `hi` 的 Codex 重置卡次数来自额度接口 `rateLimitResetCredits.availableCount`，保留合法的零，缺失用 MISS；不推算剩余次数，也不显示在 footer。hi 的全部账号各占一行，重置卡简写为“重置”，GLM 月工具只显示百分比；footer 继续使用紧凑格式。`codex-reset [备注]` 经 `usage.ts` 的原生控制连接使用一次重置卡，同账号并发使用互斥，同消息与有限网络重试复用幂等标识；消费后失效旧额度查询并重新读取。四种原生结果必须区分，已确认消费后发生刷新或连接关闭失败仍保留消费结果并显示错误。
 - Codex 额度展示统一只用主额度的短时窗口和周窗口；`token-source-codex.ts` 不向统一展示导出 Spark（GPT-5.3）或其他模型的附加桶。全量桶继续供内部按模型调度，不能用附加桶替代缺失的主额度。

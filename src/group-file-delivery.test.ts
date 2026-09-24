@@ -242,6 +242,35 @@ describe('workspace file delivery preferences and per-group folders', () => {
     expect(f.created).toEqual([])
   })
 
+  test('rejects concurrent adoption of one folder by different chats before granting access to the second chat', async () => {
+    const f = fixture()
+    const existing = { token: 'shared', url: 'https://example.feishu.cn/drive/folder/shared', name: '项目群' }
+    f.remote.set(existing.token, existing)
+    const grants: string[] = []
+    f.deps.grantFolderAccess = async (_folder, chatId) => { grants.push(chatId) }
+    const results = await Promise.allSettled([
+      f.registry.bindExisting('chat-a', '/workspace/a', 'user', existing),
+      f.registry.bindExisting('chat-b', '/workspace/b', 'user', existing),
+    ])
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    const failure = results.find(result => result.status === 'rejected') as PromiseRejectedResult
+    expect(failure.reason.message).toContain('已绑定其他群')
+    expect(grants).toHaveLength(1)
+    expect(Object.values(f.stored().groups)).toHaveLength(1)
+  })
+
+  test('rejects persisted cross-chat folder aliases instead of continuing shared access', () => {
+    const f = fixture()
+    const folder = { token: 'shared', url: 'https://example.feishu.cn/drive/folder/shared', name: '项目群' }
+    for (const version of [1, 2]) {
+      f.setStored(JSON.stringify({ version, workspaces: {}, groups: {
+        'chat-a': { folder, ...(version === 1 ? { enabled: true } : {}) },
+        'chat-b': { folder, ...(version === 1 ? { enabled: true } : {}) },
+      } }))
+      expect(() => f.restart().mode('chat-a', '/workspace/a')).toThrow('重复绑定到多个群')
+    }
+  })
+
   test('corrupt persisted settings fail visibly instead of silently reverting the group to chat mode', () => {
     const f = fixture()
     f.setStored('{broken')

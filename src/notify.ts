@@ -51,7 +51,7 @@
  * need to seed the binding without leaving the keyboard.
  */
 
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { log } from './log'
 import * as feishu from './feishu'
@@ -78,6 +78,7 @@ const BUTTON_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
  * label is a caller mistake worth rejecting rather than rendering. */
 const BUTTON_TEXT_MAX = 64
 const MIXED_INTERACTION_ERROR = '"buttons" and "allow_reply":true are mutually exclusive; choose button selection or text reply'
+const MAX_BODY_BYTES = 4 * 1024 * 1024
 
 export interface ParsedButton {
   id: string
@@ -98,8 +99,8 @@ interface NotifyActionValue {
  *   - `processing` (push mode only): click received, push in flight
  *   - `delivered`: push acked 2xx → final success marker
  *   - `failed`: push rejected/timeout → inline failure reason
- *   - `unknown`: external callback succeeded but durable local confirmation
- *                failed — freeze and forbid automatic retry
+ *   - `unknown`: interrupted dispatch or failed durable local confirmation
+ *                leaves delivery uncertain — freeze and forbid automatic retry
  *   - `done`: pull / display-only mode — no push, freeze on the verdict
  * `operatorOpenId` is carried in the callback payload for the caller's
  * audit; the card itself shows only the choice + status. */
@@ -177,7 +178,7 @@ export function buildNotifyCard(opts: {
     } else if (r.status === 'delivered') {
       marker = `<font color='green'>✅ ${choice} · 反馈已送达 · ${hhmm}</font>`
     } else if (r.status === 'unknown') {
-      marker = `<font color='red'>⚠️ ${choice} · ${r.kind === 'text' ? '送达状态未知，禁止自动重试' : '外部回调已成功，但本地确认状态未知，禁止自动重试'} · ${hhmm}</font>`
+      marker = `<font color='red'>⚠️ ${choice} · 送达状态未知，禁止自动重试 · ${hhmm}</font>`
     } else {
       // 'done' — pull / display-only mode (no push to acknowledge).
       marker = `<font color='green'>✅ ${choice} · ${hhmm}</font>`
@@ -345,16 +346,24 @@ export interface NotifyOptions {
   extraHandler?: (req: IncomingMessage, res: ServerResponse, url: URL) => Promise<boolean>
 }
 
-export function startNotifyServer(opts: NotifyOptions): void {
+export function startNotifyServer(opts: NotifyOptions): Server | undefined {
   // node:http instead of Bun.serve so the same source runs on both
   // Bun (dev: `bun daemon.ts`) and Node (prod: `npm i -g @leviyuan/lodestar`).
   // Bun has full node:http compat so dev behavior is byte-for-byte preserved.
   try {
     const server = createServer((req, res) => {
-      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
-      const work = opts.extraHandler
-        ? opts.extraHandler(req, res, url).then(handled => handled ? undefined : handleNotifyRequest(req, res))
-        : handleNotifyRequest(req, res)
+      // Routing only needs the request target. Never let an untrusted Host
+      // header escape the async error boundary and crash the HTTP listener.
+      const work = Promise.resolve().then(async () => {
+        let url: URL
+        try { url = new URL(req.url ?? '/', 'http://localhost') }
+        catch {
+          res.statusCode = 400
+          res.end('bad request URL')
+          return
+        }
+        if (!await opts.extraHandler?.(req, res, url)) await handleNotifyRequest(req, res)
+      })
       work.catch((err: any) => {
         log(`notify: handler crash: ${err?.message ?? err}`)
         if (!res.headersSent) {
@@ -372,6 +381,7 @@ export function startNotifyServer(opts: NotifyOptions): void {
     server.listen(opts.port, opts.bind, () => {
       log(`notify: HTTP listening at http://${opts.bind}:${opts.port}/notify`)
     })
+    return server
   } catch (e) {
     log(`notify: server bind failed (${opts.bind}:${opts.port}): ${e}`)
   }
@@ -382,7 +392,7 @@ export async function handleNotifyRequest(
   res: ServerResponse,
   transport: Pick<typeof feishu, 'sanitizeSessionName' | 'chatIdForSession' | 'uploadImageKey' | 'sendCard'> = feishu,
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+  const url = new URL(req.url ?? '/', 'http://localhost')
 
   const sendText = (status: number, body: string): void => {
     res.statusCode = status
@@ -409,7 +419,9 @@ export async function handleNotifyRequest(
   // without running a callback server. Returns resolved:false while
   // pending; the chosen button + operator once a click froze the card.
   if (req.method === 'GET' && url.pathname.startsWith('/notify/result/')) {
-    const id = decodeURIComponent(url.pathname.slice('/notify/result/'.length)).trim()
+    let id: string
+    try { id = decodeURIComponent(url.pathname.slice('/notify/result/'.length)).trim() }
+    catch { return sendText(400, 'invalid notify_id encoding') }
     if (!id) return sendText(400, 'missing notify_id in path')
     const reg = getCallback(id)
     if (!reg) return sendJson(404, { error: 'unknown notify_id', notify_id: id })
@@ -420,7 +432,15 @@ export async function handleNotifyRequest(
   }
 
   let raw = ''
-  for await (const chunk of req) raw += chunk.toString()
+  let bytes = 0
+  // IncomingMessage's decoder preserves multibyte characters across chunks.
+  req.setEncoding('utf8')
+  for await (const chunk of req) {
+    bytes += Buffer.byteLength(chunk)
+    if (bytes <= MAX_BODY_BYTES) raw += chunk
+    else raw = ''
+  }
+  if (bytes > MAX_BODY_BYTES) return sendText(413, `request body exceeds ${MAX_BODY_BYTES} bytes`)
   let body: any = {}
   try { body = JSON.parse(raw) } catch { return sendText(400, 'bad json') }
   if (!body || typeof body !== 'object' || Array.isArray(body)) return sendText(400, 'body must be an object')

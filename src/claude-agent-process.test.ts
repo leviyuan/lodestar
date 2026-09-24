@@ -1,5 +1,5 @@
 import { homedir, tmpdir } from 'node:os'
-import { mkdtempSync, writeFileSync, unlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, unlinkSync } from 'node:fs'
 import { delimiter, join, win32 } from 'node:path'
 import { beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
@@ -1250,15 +1250,49 @@ describe('Claude project profile overrides', () => {
     expect(readProjectMcpServers(dir)).toBeUndefined()
   })
 
-  test('readProjectMcpServers returns undefined for malformed json', () => {
+  test('readProjectMcpServers rejects malformed json', () => {
     const dir = mkdtempSync(join(tmpdir(), 'lodestar-mcp-'))
     writeFileSync(join(dir, '.mcp.json'), '{ not json')
-    expect(readProjectMcpServers(dir)).toBeUndefined()
+    try { expect(() => readProjectMcpServers(dir)).toThrow('project .mcp.json parse failed') }
+    finally { rmSync(dir, { recursive: true, force: true }) }
   })
 
-  test('readProjectMcpServers returns undefined when mcpServers absent', () => {
+  test('readProjectMcpServers rejects missing and non-object mcpServers', () => {
     const dir = mkdtempSync(join(tmpdir(), 'lodestar-mcp-'))
-    writeFileSync(join(dir, '.mcp.json'), JSON.stringify({ foo: 'bar' }))
-    expect(readProjectMcpServers(dir)).toBeUndefined()
+    try {
+      for (const value of [{ foo: 'bar' }, { mcpServers: [] }, { mcpServers: null }, null]) {
+        writeFileSync(join(dir, '.mcp.json'), JSON.stringify(value))
+        expect(() => readProjectMcpServers(dir)).toThrow('no valid mcpServers object')
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  test('readProjectMcpServers exposes filesystem errors instead of omitting configured tools', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-mcp-'))
+    mkdirSync(join(dir, '.mcp.json'))
+    try { expect(() => readProjectMcpServers(dir)).toThrow('project .mcp.json not readable') }
+    finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  test('invalid project MCP configuration fails initialization before the SDK starts', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-mcp-'))
+    writeFileSync(join(dir, '.mcp.json'), '{ not json')
+    const sdk = spyOn(agentUpdates, 'loadClaudeSdk')
+    const proc = new ClaudeAgentProcess({ workDir: dir, effort: 'high' })
+    const errors: Error[] = []
+    const exits: unknown[] = []
+    proc.on('error', error => errors.push(error))
+    proc.on('exit', event => exits.push(event))
+    try {
+      await expect(proc.listModels()).rejects.toThrow('project .mcp.json parse failed')
+      expect(sdk).not.toHaveBeenCalled()
+      expect(errors).toHaveLength(1)
+      expect(exits).toEqual([{ code: 1, signal: null, expected: false }])
+      expect(proc.isAlive()).toBe(false)
+    } finally {
+      sdk.mockRestore()
+      await proc.kill()
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

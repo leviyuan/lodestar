@@ -30,6 +30,9 @@ const SHARED_FILES = ['config.toml', 'AGENTS.md', 'AGENTS.override.md', 'hooks.j
 
 /** Credentials never enter this registry. Constructing/reading it does not alter native Codex state. */
 export class CodexAccounts {
+  // Caches are process-local, so native login only needs a process-local epoch.
+  private defaultLoginRevision: string | undefined
+
   constructor(
     readonly defaultHome = resolve(process.env.CODEX_HOME || join(homedir(), '.codex')),
     readonly root = CODEX_ACCOUNTS_DIR,
@@ -67,7 +70,8 @@ export class CodexAccounts {
   }
 
   list(): CodexAccount[] {
-    return [{ id: DEFAULT_CODEX_ACCOUNT, name: '默认' }, ...this.read().accounts.map(a => ({ ...a }))]
+    return [{ id: DEFAULT_CODEX_ACCOUNT, name: '默认',
+      ...(this.defaultLoginRevision ? { revision: this.defaultLoginRevision } : {}) }, ...this.read().accounts.map(a => ({ ...a }))]
   }
   get(id: string): CodexAccount {
     const account = this.list().find(a => a.id === id)
@@ -145,12 +149,14 @@ export class CodexAccounts {
   }
   recordLogin(id: string, account: { email?: string | null; planType?: string }): void {
     const state = this.read()
-    if (id !== DEFAULT_CODEX_ACCOUNT) {
-      const row = state.accounts.find(a => a.id === id)
-      if (!row) throw new Error('登录完成时账号记录已不存在')
-      Object.assign(row, { email: account.email, planType: account.planType, revision: randomUUID() })
-      writeJsonStateAtomic(this.stateFile, state)
+    if (id === DEFAULT_CODEX_ACCOUNT) {
+      this.defaultLoginRevision = randomUUID()
+      return
     }
+    const row = state.accounts.find(a => a.id === id)
+    if (!row) throw new Error('登录完成时账号记录已不存在')
+    Object.assign(row, { email: account.email, planType: account.planType, revision: randomUUID() })
+    writeJsonStateAtomic(this.stateFile, state)
   }
   home(id = DEFAULT_CODEX_ACCOUNT): string {
     return id === DEFAULT_CODEX_ACCOUNT ? this.defaultHome : join(this.root, this.get(id).id)

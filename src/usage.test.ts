@@ -186,7 +186,7 @@ describe('quota transient failures', () => {
 
   test('authentication rejection clears successful quota so it cannot appear in cached footers', async () => {
     const account = 'footer-auth'
-    for (const message of ['HTTP 401 unauthorized', 'HTTP 403 forbidden', 'not authenticated']) {
+    for (const message of ['HTTP 401 unauthorized', 'HTTP 403 forbidden', 'not authenticated', 'token expired', 'invalid token']) {
       invalidateCodexUsage(account)
       await refreshUsageFromConnection(async () => ({ rateLimits: {
         primary: { usedPercent: 12, windowDurationMins: 300 },

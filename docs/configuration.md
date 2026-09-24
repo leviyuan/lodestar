@@ -30,6 +30,8 @@ lodestar-setup
 | `lodestar-version` | 查看 Lodestar、实际 Agent 版本及运行目录 |
 | `lodestar-agent` | 由主 Agent 调用已配置模型执行任务，也支持与自身相同的模型 |
 
+启动和停止命令会核对 PID 对应的实际入口，读取进程信息失败时明确报错。无法识别的运行时选项、macOS 无法区分边界的含空格入口、Windows 相对入口也会拒绝操作，请通过对应服务管理器处理。旧式单行 PID 文件缺少入口标识，`lodestar-stop` 会拒绝发送信号；请先核对该 PID 的完整命令行，再通过服务管理器或精确 PID 停止。停止命令以进程退出为准，删除 PID 文件不会被当作停止成功。
+
 daemon 启动时不检查 Agent 版本，也不安装或更新 Agent。自动更新默认关闭；首次安装缺少运行文件或需要更新时，运行 `lodestar-update --agents-only`。手动更新和显式开启的自动更新都选择上游 `latest`，独立于 Lodestar 发版，不设置兼容版本白名单。
 
 Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`、`claude`、`dsh` 开关，未设置的项均为 `false`。设为 `true` 的 Agent 在 daemon 运行满 6 小时后首次检查，之后每 6 小时独立检查，启动阶段仍不检查；一个 Agent 更新较慢或失败不阻塞其他 Agent。旧版布尔总开关按原值兼容映射为三项并提示迁移，不可与新配置表混用。
@@ -82,6 +84,8 @@ bin = "/abs/path/to/claude-wrapper"  # 可选的 Claude 可执行文件
 ```
 
 项目名用于定位工作目录；工具、MCP 等启动配置按实际目录匹配。同目录的 BTW/FK 与项目别名共享配置，别名配置冲突时明确报错。WT 的目录独立，不自动套用主目录的启动配置；需要配置某个 WT 时，可新增一个项目配置项，将 `cwd` 指向该 WT 的实际路径。工作目录内的 Agent 原生配置仍由相应后端读取。
+
+Claude 后端启用项目 MCP 时，缺少 `.mcp.json` 表示未配置；文件存在但无法读取、JSON 损坏或缺少有效的 `mcpServers` 对象会阻止会话启动，并显示具体错误。修正配置后再启动会话。
 
 账号配置、OpenRouter 默认模型和 DSH 接入见[模型与账号](models.md)。手动修改配置后需重启 daemon；群内设置自行保存。
 

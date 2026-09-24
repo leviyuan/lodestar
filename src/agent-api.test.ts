@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test'
-import { createServer, type Server } from 'node:http'
+import { createServer, request, type Server } from 'node:http'
 import { handleAgentRequest } from './agent-api'
 import { buildAgentIdentityCatalog } from './agent-identities'
 import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, type TokenSource, type UsageSnapshotUnified } from './token-source'
@@ -44,6 +44,23 @@ async function serve(onStart?: (request: any) => void) {
 }
 
 describe('delegated Agent HTTP API', () => {
+  test('preserves Chinese task input split inside a UTF-8 character', async () => {
+    const requests: any[] = []
+    const base = await serve(value => requests.push(value))
+    const body = Buffer.from(JSON.stringify({ description: '任务说明', identity_ids: ['agent:a'], prompt: '处理中文 🎉' }))
+    const boundary = body.indexOf(Buffer.from('任务')) + 1
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = request(`${base}/agents/runs`, { method: 'POST', headers: {
+        authorization: 'Bearer secret', 'content-type': 'application/json',
+      } }, res => { res.resume(); res.on('end', () => resolve(res.statusCode!)) })
+      req.on('error', reject)
+      req.write(body.subarray(0, boundary))
+      setTimeout(() => req.end(body.subarray(boundary)), 10)
+    })
+    expect(status).toBe(202)
+    expect(requests).toMatchObject([{ description: '任务说明', prompt: '处理中文 🎉' }])
+  })
+
   test('requires a live capability', async () => {
     const base = await serve()
     expect((await fetch(`${base}/agents/identities`)).status).toBe(401)

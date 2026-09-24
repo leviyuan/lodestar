@@ -136,6 +136,13 @@ export class GroupFileDelivery {
         ...(legacyEnabled === undefined ? {} : { legacyEnabled }),
       }
     }
+    const owners = new Map<string, string>()
+    for (const [chatId, group] of Object.entries(state.groups)) {
+      if (!group.folder) continue
+      const owner = owners.get(group.folder.token)
+      if (owner !== undefined) throw new Error(`云空间文件夹重复绑定到多个群：${owner} / ${chatId}`)
+      owners.set(group.folder.token, chatId)
+    }
     return this.state = state
   }
 
@@ -156,6 +163,11 @@ export class GroupFileDelivery {
   }
 
   private commitFolder(chatId: string, folder: GroupDeliveryFolder): void {
+    for (const [owner, group] of Object.entries(this.load().groups)) {
+      if (owner !== chatId && group.folder?.token === folder.token) {
+        throw new Error('云空间文件夹已绑定其他群，不能共用交付目录')
+      }
+    }
     const next = structuredClone(this.load())
     next.groups[chatId] = { ...next.groups[chatId], folder }
     this.commit(next)

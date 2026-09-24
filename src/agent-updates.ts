@@ -158,6 +158,15 @@ async function writeState(agentDirectory: string, state: AgentRuntimeState): Pro
   }
 }
 
+async function validateInstalledPackages(directory: string, versions: Record<string, string>): Promise<void> {
+  for (const [name, version] of Object.entries(versions)) {
+    const installed = JSON.parse(await readFile(join(directory, 'node_modules', name, 'package.json'), 'utf8'))
+    if (installed.name !== name || installed.version !== version) {
+      throw new Error(`Invalid Agent runtime at ${directory}: expected ${name}@${version}, found ${installed.name}@${installed.version}`)
+    }
+  }
+}
+
 /** Directory lock also serializes a manual CLI update with the daemon timer. */
 async function lock(directory: string, signal?: AbortSignal): Promise<() => Promise<void>> {
   const path = join(directory, 'update.lock')
@@ -221,14 +230,15 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
         dependencies: Object.fromEntries(PACKAGES[agent].map(name => [name, versions[name]])),
         overrides: { ...security, ...(agent === 'dsh' ? versions : {}) } }) + '\n', { mode: 0o600 })
       await (options.install ?? installAgentPackages)(staging, options.signal)
-      for (const [name, version] of Object.entries(versions)) {
-        const installed = JSON.parse(await readFile(join(staging, 'node_modules', name, 'package.json'), 'utf8'))
-        if (installed.version !== version) throw new Error(`npm installed ${name}@${installed.version}, expected ${version}`)
-      }
+      await validateInstalledPackages(staging, versions)
       options.signal?.throwIfAborted()
       const completedInstall = staging
       await retryAgentFileOperation(() => rename(completedInstall, destination))
       staging = undefined
+    } else {
+      // An existing fingerprint is not proof that its installation is intact.
+      // Never activate a damaged directory or overwrite files a process may use.
+      await validateInstalledPackages(destination, versions)
     }
     const state = { directory: destination, versions, checkedAt: Date.now() }
     const unchanged = previous?.directory === destination

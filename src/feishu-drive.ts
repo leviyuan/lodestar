@@ -196,8 +196,18 @@ export class FeishuDriveClient {
       const fileToken = requiredString(result?.file_token, '已上传文件')
       // Retain the identity before permission/URL checks so any failure remains manageable.
       const uploaded = { token: fileToken, url: '', name, bytes: initial.size }
-      onUploaded(uploaded)
-      await this.closeFileLinkSharing(fileToken, signal)
+      const completionErrors: unknown[] = []
+      try { onUploaded(uploaded) } catch (error) { completionErrors.push(error) }
+      // Uploads can initially be tenant-readable. Once Feishu has created the
+      // file, closing that access is mandatory cleanup even if cancellation or
+      // receipt persistence failed. Keep the bounded request deadlines/retries,
+      // and surface every failure before looking up or publishing its URL.
+      try { await this.closeFileLinkSharing(fileToken) } catch (error) { completionErrors.push(error) }
+      if (completionErrors.length === 1) throw completionErrors[0]
+      if (completionErrors.length > 1) {
+        throw new AggregateError(completionErrors, completionErrors.map(error => error instanceof Error ? error.message : String(error)).join('；'))
+      }
+      signal?.throwIfAborted()
       const meta = await this.request('读取交付文件链接', '/drive/v1/metas/batch_query', 'POST', () => ({
         request_docs: [{ doc_token: fileToken, doc_type: 'file' }], with_url: true,
       }), signal)

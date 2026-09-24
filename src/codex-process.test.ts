@@ -78,6 +78,24 @@ test('returning to a Codex subscription overrides a previous API provider on res
 
 type ProtocolCall = { method: string; params: any }
 
+test('model discovery rejects repeated or malformed pagination instead of looping or returning a partial catalog', async () => {
+  for (const nextCursor of ['repeated-page', 42, undefined]) {
+    let pages = 0
+    const { proc } = makeCodexProtocolHarness({}, async method => {
+      if (method === 'initialize') return {}
+      if (method === 'model/list') {
+        if (++pages > 2) throw new Error('test guard: pagination failed to terminate')
+        return { data: [], nextCursor }
+      }
+      throw new Error(`unexpected request ${method}`)
+    })
+    await expect(proc.listModels()).rejects.toThrow(
+      typeof nextCursor === 'string' ? 'model/list returned a repeated nextCursor' : 'model/list returned an invalid nextCursor',
+    )
+    expect(pages).toBe(typeof nextCursor === 'string' ? 2 : 1)
+  }
+})
+
 function makeCodexProtocolHarness(
   opts: Record<string, unknown> = {},
   respond?: (method: string, params: any) => any | Promise<any>,

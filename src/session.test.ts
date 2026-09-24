@@ -5597,6 +5597,7 @@ describe('Session lifecycle reliability', () => {
     proc.materializationBarrier = Promise.reject(new Error('thread/read materialization timeout'))
     session.proc = proc
     session.wireProc(proc)
+    session.agentCapability = 'retained-process-capability'
     let spawnCalls = 0
     session.spawnAgent = () => { spawnCalls++; return new FakeAgentProc('codex') }
     const statuses: string[] = []
@@ -5612,6 +5613,7 @@ describe('Session lifecycle reliability', () => {
     expect(session.proc).toBe(proc)
     expect(session.stoppingProc).toBeNull()
     expect(session.status).toBe('idle')
+    expect(session.acceptsAgentCapability('retained-process-capability')).toBe(true)
     expect(statuses.join('\n')).toContain('已保留当前进程')
     proc.materializationBarrier = null
     await session.stop('测试收尾', { announce: false })
@@ -6611,6 +6613,63 @@ describe('Session lifecycle reliability', () => {
     proc.emit('exit', { code: 0, signal: 'SIGKILL', expected: true })
     expect(session.proc).toBeNull()
     expect(session.blockedProc).toBeNull()
+  })
+
+  test.each(['stop', 'restart'] as const)('%s closes delegation admission before awaiting child cancellation', async action => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let entered!: () => void
+    const cancelling = new Promise<void>(resolve => { entered = resolve })
+    const session = new Session(`delegation-${action}`, 'chat_id', {
+      onCancelAgentRuns: async () => { entered(); await gate },
+    }) as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.agentCapability = 'old-capability'
+    let starts = 0
+    session.startUnlocked = async () => { starts++; return true }
+
+    expect(session.acceptsAgentCapability('old-capability')).toBe(true)
+    const operation = action === 'stop'
+      ? session.stop('cancel children', { announce: false })
+      : session.restart(false, { announce: false })
+    await cancelling
+    expect(session.acceptsAgentCapability('old-capability')).toBe(false)
+    expect(proc.killCalls).toBe(0)
+    expect(starts).toBe(0)
+    release()
+    await operation
+    expect(proc.killCalls).toBe(1)
+    expect(starts).toBe(action === 'restart' ? 1 : 0)
+  })
+
+  test.each(['stop', 'restart'] as const)('%s still stops its main process and exposes delegated cancellation failure', async action => {
+    const session = new Session(`delegation-failed-${action}`, 'chat_id', {
+      onCancelAgentRuns: async () => { throw new Error('delegated process exit unconfirmed') },
+    }) as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.agentCapability = 'old-capability'
+    let starts = 0
+    session.startUnlocked = async () => { starts++; return true }
+    const statuses: string[] = []
+
+    if (action === 'stop') {
+      await expect(session.stop('cancel children', { announce: false }))
+        .rejects.toThrow('delegated process exit unconfirmed')
+    } else {
+      expect(await session.restart(false, {
+        announce: false,
+        onStatus: (status: string) => statuses.push(status),
+      })).toBe(false)
+      expect(statuses.join('\n')).toContain('agents=delegated process exit unconfirmed')
+    }
+    expect(proc.killCalls).toBe(1)
+    expect(starts).toBe(0)
+    expect(session.proc).toBeNull()
+    expect(session.acceptsAgentCapability('old-capability')).toBe(false)
   })
 
   test('restart does not spawn after kill failure and still clears stale lifecycle state', async () => {

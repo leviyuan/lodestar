@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
   __setStoreFileForTest,
   buildNotifyResult,
+  beginCallbackDispatch,
   clearDispatching,
   dispatchCallback,
   get,
@@ -13,6 +14,7 @@ import {
   loadCallbacks,
   markResolved,
   recordCallbackSuccess,
+  recordCallbackFailure,
   prune,
   register,
   setDispatching,
@@ -114,12 +116,69 @@ describe('notify-callbacks store', () => {
     expect(get('nf_new')).toBeDefined()
   })
 
-  test('loadCallbacks silently ignores a corrupted file (no throw, empty map)', () => {
-    const { writeFileSync } = require('node:fs')
-    writeFileSync(tempFile, '{ not valid json')
+  test('only a missing store is treated as first boot; unreadable and malformed stores fail visibly', () => {
+    expect(loadCallbacks()).toEqual([])
+    for (const contents of ['{ not valid json', 'null', '[]']) {
+      writeFileSync(tempFile, contents)
+      __setStoreFileForTest(tempFile)
+      expect(() => loadCallbacks()).toThrow()
+      expect(readFileSync(tempFile, 'utf8')).toBe(contents)
+    }
+    __setStoreFileForTest(tempDir)
+    expect(() => loadCallbacks()).toThrow()
+  })
+
+  test('a button callback interrupted after durable dispatch becomes UNKNOWN on restart', () => {
+    register(sampleReg())
+    beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')
+    expect(() => beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')).toThrow()
     __setStoreFileForTest(tempFile)
-    expect(() => loadCallbacks()).not.toThrow()
-    expect(get('nf_anything')).toBeUndefined()
+    const recovered = loadCallbacks()
+    expect(recovered.map(reg => reg.notifyId)).toEqual(['nf_test1'])
+    expect(buildNotifyResult(get('nf_test1')!)).toMatchObject({
+      resolved: false, unknown: true, button: { id: 'approve' }, unknown_by: 'ou_operator',
+    })
+    expect(() => beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')).toThrow()
+    __setStoreFileForTest(tempFile)
+    loadCallbacks()
+    expect(get('nf_test1')?.unknownAt).toBeDefined()
+  })
+
+  test('dispatch cannot begin when its pending marker cannot be saved', () => {
+    register(sampleReg())
+    __setStoreFileForTest(join(tempFile, 'child.json'), false)
+    expect(() => beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')).toThrow()
+    expect(get('nf_test1')?.dispatchState).toBeUndefined()
+  })
+
+  test('confirmed success and failed dispatch clear the pending marker durably', () => {
+    register(sampleReg())
+    beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')
+    expect(recordCallbackFailure('nf_test1')).toEqual({ state: 'retry' })
+    __setStoreFileForTest(tempFile)
+    loadCallbacks()
+    expect(get('nf_test1')?.dispatchState).toBeUndefined()
+    expect(get('nf_test1')?.unknownAt).toBeUndefined()
+    beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')
+    expect(recordCallbackSuccess('nf_test1', 'approve', 'ou_operator')).toEqual({ state: 'complete' })
+    __setStoreFileForTest(tempFile)
+    loadCallbacks()
+    expect(get('nf_test1')?.dispatchState).toBeUndefined()
+    expect(get('nf_test1')?.resolvedAt).toBeDefined()
+  })
+
+  test.each(['success', 'failure'])('failed %s persistence keeps the original dispatch nonretryable after restart', outcome => {
+    register(sampleReg())
+    beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')
+    __setStoreFileForTest(join(tempFile, 'child.json'), false)
+    const recorded = outcome === 'success'
+      ? recordCallbackSuccess('nf_test1', 'approve', 'ou_operator') : recordCallbackFailure('nf_test1')
+    expect(recorded.state).toBe('unknown')
+    expect(get('nf_test1')?.unknownAt).toBeDefined()
+    __setStoreFileForTest(tempFile)
+    loadCallbacks()
+    expect(get('nf_test1')?.unknownAt).toBeDefined()
+    expect(get('nf_test1')?.unknownBy?.buttonId).toBe('approve')
   })
 
   test('callbackUrl may be empty (pull / display-only mode still registers)', () => {

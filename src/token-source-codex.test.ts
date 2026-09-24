@@ -82,3 +82,43 @@ test('native default auth works without auth.json while missing named credential
   })
   expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
 })
+
+test('native relogin retires the previous account catalog and cached email immediately', () => {
+  const script = `
+    import { mock } from 'bun:test'
+    import assert from 'node:assert/strict'
+    let model = 'old-account-model'
+    mock.module('./src/token-source-models', () => ({ fetchCodexModels: async () => [
+      { model, display: model, efforts: ['high'], defaultEffort: 'high' },
+    ] }))
+    const { codexAccounts } = await import('./src/codex-accounts')
+    const { tokenSourceFactories } = await import('./src/token-source')
+    const { observeCodexAccountEmail, peekCodexAccountEmail } = await import('./src/codex-account-info')
+    const { cachedTokenSource, disposeCachedTokenSource } = await import('./src/token-source-cache')
+    const { withModelVisibility } = await import('./src/token-source-visibility')
+    await import('./src/token-source-codex')
+    const factory = tokenSourceFactories().find(f => f.kind === 'codex-subscription')
+    const create = () => withModelVisibility(factory.build({}), {})
+    const original = cachedTokenSource(create, {}, 'codex', 'same-settings')
+    await original.refreshModels()
+    const oldRevision = codexAccounts.revision('default')
+    observeCodexAccountEmail('default', { type: 'chatgpt', email: 'old@example.test' }, oldRevision)
+    codexAccounts.recordLogin('default', { email: 'new@example.test' })
+    const replacement = cachedTokenSource(create, {}, 'codex', 'same-settings', original)
+    disposeCachedTokenSource(original)
+    assert.notEqual(replacement, original)
+    assert.deepEqual(replacement.models, [])
+    assert.equal(replacement.modelCatalogState.status, 'idle')
+    assert.equal(peekCodexAccountEmail('default'), undefined)
+    observeCodexAccountEmail('default', { type: 'chatgpt', email: 'late@example.test' }, oldRevision)
+    assert.equal(peekCodexAccountEmail('default'), undefined)
+    model = 'new-account-model'
+    await replacement.refreshModels()
+    assert.deepEqual(replacement.models.map(entry => entry.model), [model])
+    disposeCachedTokenSource(replacement)
+  `
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+    cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+  })
+  expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+})

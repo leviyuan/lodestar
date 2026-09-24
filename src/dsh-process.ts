@@ -147,7 +147,9 @@ export class DshProcess extends EventEmitter implements AgentProcess {
     if (!questions) throw new Error(`unknown DSH question: ${id}`)
     const values = payload?.updatedInput?.answers as Record<string, string> | undefined
     const answers = decision === 'allow' ? questions.map(q => {
-      const value = values?.[q.question]
+      // Session cards answer by displayed text; delegated workers expose the
+      // native question id. Both are explicit keys in the host protocol.
+      const value = values?.[q.question] ?? values?.[q.id]
       if (typeof value !== 'string') throw new Error(`missing answer to DSH question: ${q.question}`)
       const option = q.options?.find((entry: any) => entry.label === value)
       return { id: q.id, selected: option ? [value] : [], ...(option ? {} : { custom: value }) }

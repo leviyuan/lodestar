@@ -160,6 +160,50 @@ describe('Feishu Drive delivery transport', () => {
     })
   }
 
+  for (const interrupt of ['receipt write failure', 'cancellation after upload', 'cancellation during permission update']) {
+    test(`closes uploaded file sharing before surfacing ${interrupt}`, async () => {
+      const path = file(Buffer.from('private report'))
+      const controller = new AbortController()
+      const permissions: string[] = []
+      let linkQueries = 0
+      const client = new FeishuDriveClient(deps(async (url, init) => {
+        if (url.endsWith('/upload_all')) return Response.json({ code: 0, data: { file_token: 'saved' } })
+        if (new URL(url).pathname.endsWith('/public')) {
+          permissions.push(init.method!)
+          if (interrupt === 'cancellation during permission update' && init.method === 'PATCH') controller.abort(new DOMException('delivery cancelled', 'AbortError'))
+          expect(init.signal!.aborted).toBe(false)
+          return Response.json({ code: 0, data: { permission_public: { link_share_entity: 'closed' } } })
+        }
+        linkQueries++
+        throw new Error('must not publish a cancelled or unrecorded delivery')
+      }))
+      await expect(client.uploadFile(path, folder, () => {
+        if (interrupt === 'receipt write failure') throw new Error('receipt disk full')
+        if (interrupt === 'cancellation after upload') controller.abort(new DOMException('delivery cancelled', 'AbortError'))
+      }, controller.signal)).rejects.toThrow(interrupt === 'receipt write failure' ? 'receipt disk full' : 'delivery cancelled')
+      expect(permissions).toEqual(['PATCH', 'GET'])
+      expect(linkQueries).toBe(0)
+    })
+  }
+
+  test('preserves both receipt persistence and mandatory link-closing failures', async () => {
+    const path = file(Buffer.from('private report'))
+    let closes = 0
+    const client = new FeishuDriveClient(deps(async (url) => {
+      if (url.endsWith('/upload_all')) return Response.json({ code: 0, data: { file_token: 'saved' } })
+      closes++
+      return Response.json({ code: 1061004, msg: 'permission denied' }, { status: 403 })
+    }))
+    const result = await Promise.allSettled([client.uploadFile(path, folder, () => { throw new Error('receipt disk full') })])
+    expect(result[0].status).toBe('rejected')
+    const error = (result[0] as PromiseRejectedResult).reason
+    expect(error).toBeInstanceOf(AggregateError)
+    expect(error.message).toContain('receipt disk full')
+    expect(error.message).toContain('permission denied')
+    expect(error.errors).toHaveLength(2)
+    expect(closes).toBe(1)
+  })
+
   test('does not complete multipart upload if the source changes during transmission', async () => {
     const path = file(Buffer.alloc(21 * 1024 * 1024))
     let finishes = 0

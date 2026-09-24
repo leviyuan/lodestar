@@ -1,9 +1,67 @@
 import { describe, expect, test } from 'bun:test'
+import { request, type IncomingMessage, type ServerResponse } from 'node:http'
+import { once } from 'node:events'
+import { Readable } from 'node:stream'
 // Register the shared ./feishu mock so importing ./notify doesn't drag
 // in real config.toml / tenant-token code (keeps this test hermetic).
 import './feishu-test-mock'
 
-import { buildNotifyCard, parseButtons, parseCallbackUrl } from './notify'
+import { buildNotifyCard, handleNotifyRequest, parseButtons, parseCallbackUrl, startNotifyServer } from './notify'
+
+describe('notification HTTP input', () => {
+  async function invoke(chunks: Buffer[], path = '/notify') {
+    const req = Readable.from(chunks) as IncomingMessage
+    req.method = path === '/notify' ? 'POST' : 'GET'
+    req.url = path
+    req.headers = { host: '[' }
+    let body = ''
+    const sent: any[] = []
+    const res = { statusCode: 200, setHeader() {}, end(value: string) { body = value } } as unknown as ServerResponse
+    await handleNotifyRequest(req, res, {
+      sanitizeSessionName: name => name,
+      chatIdForSession: () => 'oc_test',
+      uploadImageKey: async () => 'img_test',
+      sendCard: async (_chatId, card) => { sent.push(card); return 'om_test' },
+    })
+    return { status: res.statusCode, body, sent }
+  }
+
+  test('preserves Chinese and emoji split across arbitrary request chunks', async () => {
+    const bytes = Buffer.from(JSON.stringify({ project: '通知', text: '构建完成 🎉' }))
+    const result = await invoke([...bytes].map(byte => Buffer.from([byte])))
+    expect(result.status).toBe(200)
+    expect(JSON.stringify(result.sent)).toContain('构建完成 🎉')
+    expect(JSON.stringify(result.sent)).not.toContain('\uFFFD')
+  })
+
+  test('rejects oversized input and malformed result IDs before sending cards', async () => {
+    const oversized = await invoke([Buffer.from(JSON.stringify({ project: 'ops', text: 'x'.repeat(4 * 1024 * 1024) }))])
+    expect(oversized.status).toBe(413)
+    expect(oversized.sent).toEqual([])
+    expect((await invoke([], '/notify/result/%ZZ')).status).toBe(400)
+  })
+
+  test('a malformed Host cannot escape the listener error boundary', async () => {
+    const server = startNotifyServer({ bind: '127.0.0.1', port: 0,
+      extraHandler: async (_req, res, url) => { res.end(url.pathname); return true },
+    })!
+    await once(server, 'listening')
+    const address = server.address() as import('node:net').AddressInfo
+    try {
+      const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const req = request({ host: '127.0.0.1', port: address.port, path: '/health', headers: { host: '[' } }, res => {
+          let body = ''
+          res.setEncoding('utf8')
+          res.on('data', chunk => { body += chunk })
+          res.on('end', () => resolve({ status: res.statusCode!, body }))
+        })
+        req.on('error', reject)
+        req.end()
+      })
+      expect(result).toEqual({ status: 200, body: '/health' })
+    } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
+  })
+})
 
 function cardBody(card: any): any[] {
   return (card as any).body.elements as any[]
@@ -121,7 +179,7 @@ describe('buildNotifyCard', () => {
       { status: 'processing' as const, want: /⏳/, color: 'blue' },
       { status: 'delivered' as const, want: /反馈已送达/, color: 'green' },
       { status: 'failed' as const, want: /回调失败:nope/, color: 'red', detail: 'nope' },
-      { status: 'unknown' as const, want: /确认状态未知，禁止自动重试/, color: 'red' },
+      { status: 'unknown' as const, want: /送达状态未知，禁止自动重试/, color: 'red' },
       { status: 'done' as const, want: /已选择/, color: 'green' },
     ]
     for (const s of states) {

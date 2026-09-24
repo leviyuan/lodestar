@@ -29,6 +29,21 @@ class FakeProcess extends EventEmitter {
 }
 
 describe('full delegated Agent runner', () => {
+  test('successful account selection keeps other-account diagnostics out of delegated progress', async () => {
+    const proc = new FakeProcess() as any
+    proc.provider = 'codex'
+    const progress: unknown[] = []
+    const accounts: string[] = []
+    const handle = collectAgentTurn(proc, 'do work', {
+      onProgress: step => progress.push(step), onCodexAccount: accountId => accounts.push(accountId),
+    }, () => {})
+    proc.emit('codex_account_changed', { accountId: 'available', diagnostics: ['other: catalog unavailable'] })
+    expect(accounts).toEqual(['available'])
+    expect(progress).toEqual([])
+    proc.emit('result', { is_error: false })
+    await handle.done
+  })
+
   test('capacity backoff reports progress without imposing a turn deadline or changing output', async () => {
     const timers = new Map<number, number>()
     let nextId = 100_000

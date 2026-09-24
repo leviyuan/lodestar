@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, test } from 'bun:test'
@@ -97,6 +97,53 @@ describe('project worktrees', () => {
     writeFileSync(join(result.worktreePath, 'scratch.txt'), 'dirty\n')
 
     expect(() => removeProjectWorktreeIfClean(repo, 'feishu', 'dirty-work')).toThrow(/uncommitted/)
+  })
+
+  test('refuses to remove work branches mounted outside the managed sibling path', () => {
+    const { root, repo } = initRepo()
+    const outside = join(root, 'manual-checkout')
+    git(repo, ['worktree', 'add', '-b', 'work/manual', outside, 'HEAD'])
+
+    expect(() => removeProjectWorktreeIfClean(repo, 'feishu', 'manual')).toThrow(/outside managed path/)
+    expect(existsSync(outside)).toBe(true)
+    expect(git(outside, ['branch', '--show-current']).trim()).toBe('work/manual')
+  })
+
+  test('rejects an unrelated repository at the managed path before remote disband can start', () => {
+    const { root, repo } = initRepo()
+    const unrelated = join(root, 'feishu[unrelated]')
+    mkdirSync(unrelated)
+    git(unrelated, ['init'])
+
+    expect(() => removeProjectWorktreeIfClean(repo, 'feishu', 'unrelated')).toThrow(/not a registered worktree/)
+    expect(existsSync(unrelated)).toBe(true)
+  })
+
+  test.skipIf(process.platform === 'win32')('preserves quoted and newline-containing paths in the Git worktree registry', () => {
+    const { root, repo } = initRepo()
+    const projectName = '项目\n"quoted"'
+    const first = ensureProjectWorktree(repo, projectName, 'path-test')
+
+    expect(listProjectWorktrees(repo, projectName)[0]?.worktreePath).toBe(join(root, `${projectName}[path-test]`))
+    expect(ensureProjectWorktree(repo, projectName, 'path-test').createdWorktree).toBe(false)
+    expect(removeProjectWorktreeIfClean(repo, projectName, 'path-test').removedWorktree).toBe(true)
+    expect(existsSync(first.worktreePath)).toBe(false)
+  })
+
+  test('recognizes managed worktrees and their instructions through a symlinked project root', () => {
+    const { root, repo } = initRepo()
+    const aliasRoot = `${root}-alias`
+    symlinkSync(root, aliasRoot, process.platform === 'win32' ? 'junction' : 'dir')
+    roots.push(aliasRoot)
+    const first = ensureProjectWorktree(repo, 'feishu', 'Prompt-work')
+    writeFileSync(join(first.worktreePath, 'AGENTS.PROMPT.md'), '# shared instructions\n')
+
+    const aliasRepo = join(aliasRoot, 'feishu')
+    expect(ensureProjectWorktree(aliasRepo, 'feishu', 'Prompt-work').createdWorktree).toBe(false)
+    expect(readWorktreeInstructionsForManagedBranch(first.worktreePath, aliasRepo, 'feishu')?.content)
+      .toBe('# shared instructions')
+    rmSync(join(first.worktreePath, 'AGENTS.PROMPT.md'))
+    expect(removeProjectWorktreeIfClean(aliasRepo, 'feishu', 'Prompt-work').removedWorktree).toBe(true)
   })
 
   test('removes clean worktree directory but keeps branch discoverable', () => {

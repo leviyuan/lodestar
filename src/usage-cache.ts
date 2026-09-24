@@ -43,7 +43,7 @@ export class UsageReadCache<T extends UsageResult> {
       if (this.entries.get(key) === current) {
         current.value = value
         if (value.state === 'ok') current.successfulValue = value
-        else if (value.state === 'no_credentials' || value.state === 'auth_failed' || isUsageAuthFailure(value)) current.successfulValue = undefined
+        else if (value.state === 'no_credentials' || value.state === 'auth_failed' || isUsageAuthError(value.reason)) current.successfulValue = undefined
         current.failed = false
         current.error = undefined
         finish(value.state === 'ok' || value.state === 'not_applicable', value.retryAfterMs)
@@ -52,9 +52,10 @@ export class UsageReadCache<T extends UsageResult> {
     }, error => {
       if (this.entries.get(key) === current) {
         current.value = undefined
+        if (isUsageAuthError(error)) current.successfulValue = undefined
         current.failed = true
         current.error = error
-        finish(false)
+        finish(false, Number((error as { retryAfterMs?: number })?.retryAfterMs))
       }
       throw error
     }).finally(() => { if (current.pending === pending) current.pending = undefined })
@@ -72,7 +73,7 @@ export class UsageReadCache<T extends UsageResult> {
     return this.read(key, load).then(value => {
       if (value.state === 'ok') return value
       const stale = this.peekSuccessful(key)
-      return stale && (value.state === 'network' || value.state === 'rate_limited') && !isUsageAuthFailure(value) ? stale : value
+      return stale && (value.state === 'network' || value.state === 'rate_limited') && !isUsageAuthError(value.reason) ? stale : value
     }).catch(error => {
       const stale = this.peekSuccessful(key)
       if (stale && isUsageTransientError(error)) return stale
@@ -104,8 +105,10 @@ function isUsageTransientError(error: unknown): boolean {
   return /abort|timed? ?out|timeout|fetch failed|network|ECONNRESET|ETIMEDOUT|EAI_AGAIN|connection (?:reset|closed)|\b(?:408|429|500|502|503|504)\b/i.test(message)
 }
 
-function isUsageAuthFailure(value: UsageResult): boolean {
-  return /\b(?:401|403)\b|unauthori[sz]ed|authentication (?:failed|required)|not authenticated|not (?:a )?first[- ]party|subscription (?:expired|missing)|(?:invalid|expired|revoked).*(?:key|token)|(?:key|token).*(?:invalid|expired|revoked)|认证(?:失败|失效|不是)|(?:不是|非).*(?:第一方|订阅)/i.test(value.reason ?? '')
+/** Authentication loss invalidates both model and quota snapshots, regardless of error shape. */
+export function isUsageAuthError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return /\b(?:401|403)\b|unauthori[sz]ed|authentication (?:failed|required)|not authenticated|not logged in|未登录|not (?:a )?first[- ]party|subscription (?:expired|missing)|(?:invalid|expired|revoked).*(?:key|token)|(?:key|token).*(?:invalid|expired|revoked)|认证(?:失败|失效|不是)|(?:不是|非).*(?:第一方|订阅)/i.test(message)
 }
 
 /** Only a credential hash becomes a cache key; protocol paths on the same service share quota. */

@@ -459,36 +459,30 @@ export function toolsFromProfile(
   return list.length ? list : { type: 'preset', preset: 'claude_code' }
 }
 
-/** Read `<workDir>/.mcp.json` and return its `mcpServers` map, or undefined
- * when missing / unreadable / malformed. Missing (ENOENT) is silent — it's
- * the common case (most projects ship no .mcp.json, and loadProjectMcp
- * defaults to true so every spawn probes once); other failures are logged
- * so the project knows its MCP didn't load. */
+/** Read `<workDir>/.mcp.json`, allowing an absent optional file. An existing
+ * configuration that cannot be loaded must fail startup instead of silently
+ * launching the Agent without the project's MCP tools. */
 export function readProjectMcpServers(workDir: string): Record<string, McpServerConfig> | undefined {
   const mcpPath = join(workDir, '.mcp.json')
   let raw: string
   try {
     raw = readFileSync(mcpPath, 'utf8')
   } catch (e) {
-    // ENOENT (no .mcp.json) is the common case — most projects ship none, and
-    // loadProjectMcp defaults to true so every spawn probes once. Stay silent
-    // to avoid log noise; only warn when the file exists but can't be read.
-    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log(`claude-agent-process: project .mcp.json not readable at ${mcpPath}: ${e}`)
-    }
-    return undefined
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw new Error(`project .mcp.json not readable at ${mcpPath}: ${e}`, { cause: e })
   }
+  let parsed: unknown
   try {
-    const parsed = JSON.parse(raw)
-    if (parsed && typeof parsed === 'object' && parsed.mcpServers && typeof parsed.mcpServers === 'object') {
-      return parsed.mcpServers as Record<string, McpServerConfig>
-    }
-    log(`claude-agent-process: project .mcp.json has no mcpServers object at ${mcpPath}`)
-    return undefined
+    parsed = JSON.parse(raw)
   } catch (e) {
-    log(`claude-agent-process: project .mcp.json parse failed at ${mcpPath}: ${e}`)
-    return undefined
+    throw new Error(`project .mcp.json parse failed at ${mcpPath}: ${e}`, { cause: e })
   }
+  const servers = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>).mcpServers : undefined
+  if (!servers || typeof servers !== 'object' || Array.isArray(servers)) {
+    throw new Error(`project .mcp.json has no valid mcpServers object at ${mcpPath}`)
+  }
+  return servers as Record<string, McpServerConfig>
 }
 
 function normalizeDialogQuestions(payload: Record<string, unknown>): Array<Record<string, unknown>> {

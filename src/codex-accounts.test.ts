@@ -17,6 +17,22 @@ function fixture() {
 }
 
 describe('Codex native and named accounts', () => {
+  test('each native login invalidates its cache revision without touching credentials or other accounts', () => {
+    const accounts = fixture()
+    const named = accounts.ensure('work')
+    const nativeRevision = accounts.revision('default')
+    const namedRevision = accounts.revision(named.id)
+    const saved = readFileSync(accounts.stateFile, 'utf8')
+    accounts.recordLogin('default', { email: 'first@example.test', planType: 'plus' })
+    const loggedIn = accounts.revision('default')
+    expect(loggedIn).not.toBe(nativeRevision)
+    expect(accounts.revision(named.id)).toBe(namedRevision)
+    accounts.recordLogin('default', { email: 'second@example.test', planType: 'pro' })
+    expect(accounts.revision('default')).not.toBe(loggedIn)
+    expect(readFileSync(accounts.stateFile, 'utf8')).toBe(saved)
+    expect(readFileSync(join(accounts.defaultHome, 'auth.json'), 'utf8')).toBe('{"native":"must-not-change"}')
+  })
+
   test('deleting a named account removes its credentials and selections while preserving shared data and other accounts', () => {
     const accounts = fixture()
     const removed = accounts.ensure('不要了')

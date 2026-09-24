@@ -145,6 +145,8 @@ curl -sS -X POST http://127.0.0.1:9876/notify \
 
 按钮点击结果可以 POST 到指定的本机 `callback`，或通过 `GET /notify/result/<notify_id>` 查询。需要文字回复时设置 `allow_reply: true`，卡片会提供“回复”按钮；文字回复模式与自定义按钮模式不能同时启用。字段和协议见 [feishu-notify Skill](../src/notify-skill.ts)。daemon 启动时会将该 Skill 同步到 Codex 和 Claude 的 Skill 目录。
 
+通知 JSON 正文上限为 4 MiB，超出返回 `413`；图片仍通过本地路径提供。按钮回调或文字回复发送期间若 daemon 中断，重启后会显示“送达状态未知”并禁止再次发送，请先向接收方核实处理结果。通知状态文件无法读取或 JSON 损坏会明确阻止启动，避免丢失去重记录后重复执行。
+
 ## 文件与生图
 
 Agent 用 `[[send: /abs/path]]` 交付本地文件。**默认沿用直接发送聊天附件的方式**，单文件不能超过 30 MB（30 × 1024 × 1024 字节）；超限需先压缩或分卷。原来的文件、图片消息通道保留。

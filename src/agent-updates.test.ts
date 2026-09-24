@@ -285,6 +285,27 @@ test('concurrent updater calls serialize and do not install the same release twi
   expect((await readdir(join(root, 'codex'))).includes('update.lock')).toBe(false)
 })
 
+test.each(['missing', 'version', 'name'])('a cached runtime with a %s package cannot replace the current installation', async damage => {
+  const root = await scratch()
+  let version = '1.0.0'
+  const options = { root, install, metadata: async (name: string) => ({ name, version }) }
+  const cached = await updateAgentRuntime('codex', options)
+  version = '2.0.0'
+  const current = await updateAgentRuntime('codex', options)
+  const manifest = join(cached.directory!, 'node_modules/@openai/codex/package.json')
+  if (damage === 'missing') await rm(manifest)
+  else await writeFile(manifest, JSON.stringify({ name: damage === 'name' ? 'wrong-package' : '@openai/codex', version: damage === 'version' ? '0.0.0' : '1.0.0' }))
+  version = '1.0.0'
+  const reports: string[] = []
+  await expect(updateAgentRuntime('codex', { ...options, report: message => reports.push(message) })).rejects.toThrow(
+    damage === 'missing' ? 'ENOENT' : 'Invalid Agent runtime',
+  )
+  expect(JSON.parse(await readFile(join(root, 'codex/current.json'), 'utf8'))).toEqual(current)
+  expect(reports.some(message => message.includes('已更新') || message.includes('已是 latest'))).toBe(false)
+  expect(existsSync(cached.directory!)).toBe(true)
+  expect(existsSync(join(root, 'codex/update.lock'))).toBe(false)
+})
+
 test.each(['checking', 'completed'])('a %s report failure preserves the last committed installation', async phase => {
   const root = await scratch()
   let version = '1.0.0'
@@ -395,6 +416,22 @@ test('lodestar-version displays only the selected installation, without update d
   expect(stdout).not.toContain('更新失败')
   expect(stdout).not.toContain('TLS disconnected')
   expect(stdout).not.toContain('codex: MISS')
+})
+
+test.each(['missing', 'mismatched'])('lodestar-version reports a %s installed package instead of a successful recorded version', async damage => {
+  const root = await scratch()
+  const selected = await updateAgentRuntime('codex', { root: join(root, 'agent-runtimes'), install, metadata: async name => ({ name, version: '1.0.0' }) })
+  const manifest = join(selected.directory!, 'node_modules/@openai/codex/package.json')
+  if (damage === 'missing') await rm(manifest)
+  else await writeFile(manifest, JSON.stringify({ name: '@openai/codex', version: '0.0.0' }))
+  const child = Bun.spawn([process.execPath, 'src/version-cli.ts'], {
+    cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'production', LODESTAR_DATA_DIR: root }, stdout: 'pipe', stderr: 'pipe',
+  })
+  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
+  expect(code).toBe(1)
+  expect(stdout).not.toContain('codex: @openai/codex@1.0.0')
+  expect(stderr).toContain('codex: MISS')
+  expect(stderr).toContain(damage === 'missing' ? 'ENOENT' : '安装包与记录不一致')
 })
 
 test('a failed scheduled update keeps the current install and succeeds on the next scheduled check', async () => {

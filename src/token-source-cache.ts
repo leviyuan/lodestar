@@ -5,6 +5,7 @@ import { customModelEfforts, modelList } from './token-source-visibility'
 import type { TokenSource, TokenSourceModel, UsageSnapshotUnified } from './token-source'
 import { invalidateCodexUsage, peekUsage } from './usage'
 import { codexUsageToUnified } from './token-source-codex'
+import { isUsageAuthError } from './usage-cache'
 
 export const MODEL_REFRESH_MS = 5 * 60_000
 const USAGE_REFRESH_MS = 60_000
@@ -21,10 +22,6 @@ interface CachedSource {
   children: Map<string, { revision: string; source: TokenSource }>
   active(): boolean
   dispose(): void
-}
-
-function authFailure(error: string): boolean {
-  return /\b(?:401|403)\b|unauthori[sz]ed|not authenticated|未登录|认证(?:失败|失效)|(?:invalid|expired|revoked).*(?:key|token)/i.test(error)
 }
 
 /** Reapply local visibility/custom choices to the same account's cached upstream catalog. */
@@ -115,14 +112,18 @@ export function cachedTokenSource(
       }
     }
     if (!active) return
+    if (failure !== undefined && !next.modelCatalogState?.error) {
+      next.modelCatalogState = { status: 'failed', updatedAt: Date.now(),
+        error: failure instanceof Error ? failure.message : String(failure) }
+    }
     const authError = next.modelCatalogState?.error
-    if (authError && authFailure(authError)) {
+    if (authError && isUsageAuthError(authError)) {
       usageSnapshot = { state: 'no_credentials', windows: [], reason: authError }
       if (source.kind === 'codex-subscription') invalidateCodexUsage(accountId ?? DEFAULT_CODEX_ACCOUNT)
     }
     if (next.modelCatalogState?.status === 'failed' || failure) {
       const error = next.modelCatalogState?.error ?? (failure instanceof Error ? failure.message : String(failure))
-      if (source.modelCatalogState?.status === 'ready' && !authFailure(error)) {
+      if (source.modelCatalogState?.status === 'ready' && !isUsageAuthError(error)) {
         source.modelCatalogState = { ...source.modelCatalogState, error }
       } else publish(next)
       throw failure ?? new Error(error)
@@ -134,14 +135,14 @@ export function cachedTokenSource(
     try { snapshot = await committed.readUsage() }
     catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
-      if (active && (usageSnapshot?.state !== 'ok' || authFailure(reason))) {
-        usageSnapshot = { state: authFailure(reason) ? 'no_credentials' : 'network', windows: [], reason }
+      if (active && (usageSnapshot?.state !== 'ok' || isUsageAuthError(reason))) {
+        usageSnapshot = { state: isUsageAuthError(reason) ? 'no_credentials' : 'network', windows: [], reason }
       }
       throw error
     }
     if (!active) return
     if (usageSnapshot?.state !== 'ok' || !['network', 'rate_limited'].includes(snapshot.state)
-      || authFailure(snapshot.reason ?? '')) usageSnapshot = snapshot
+      || isUsageAuthError(snapshot.reason)) usageSnapshot = snapshot
     if (snapshot.state !== 'ok' && snapshot.state !== 'not_applicable' && snapshot.state !== 'no_credentials') {
       throw Object.assign(new Error(snapshot.reason ?? snapshot.state), { retryAfterMs: snapshot.retryAfterMs })
     }

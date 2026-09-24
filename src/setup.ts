@@ -152,20 +152,24 @@ export async function writeClaudeGlmEnv(glmKey: string): Promise<{ path: string 
   }
 }
 
-// ── browser launcher (best-effort, never throws) ───────────────────
+// ── browser launcher ──────────────────────────────────────────────
 function openBrowser(url: string): void {
+  const report = (error: unknown) => console.error(`无法打开浏览器，请手动打开 ${url}: ${error instanceof Error ? error.message : String(error)}`)
   try {
+    let child
     if (process.platform === 'win32') {
-      spawn(process.env.ComSpec ?? 'cmd.exe', ['/c', 'start', '""', url], {
+      child = spawn(process.env.ComSpec ?? 'cmd.exe', ['/c', 'start', '""', url], {
         detached: true, stdio: 'ignore', windowsHide: true,
-      }).unref()
+      })
     } else if (process.platform === 'darwin') {
-      spawn('open', [url], { detached: true, stdio: 'ignore' }).unref()
+      child = spawn('open', [url], { detached: true, stdio: 'ignore' })
     } else {
-      spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref()
+      child = spawn('xdg-open', [url], { detached: true, stdio: 'ignore' })
     }
-  } catch {
-    // 终端环境 / 无浏览器, 静默, 用户照着控制台 URL 手动开就行
+    child.once('error', report)
+    child.unref()
+  } catch (error) {
+    report(error)
   }
 }
 
@@ -187,7 +191,7 @@ async function testFeishuCreds(appId: string, appSecret: string): Promise<{ ok: 
 }
 
 // ── daemon auto-start ──────────────────────────────────────────────
-function spawnDaemonDetached(): { pid?: number; error?: string } {
+export async function spawnDaemonDetached(): Promise<{ pid: number } | { error: string }> {
   // 入口是 dist/lodestar-setup.js, daemon 是同目录的 dist/lodestar.js。
   // 用 process.execPath (= 当前 node) 跑那个 bundle, 避开 Windows .cmd
   // shim 的 spawn 引号坑 —— 这样 detached + stdio:'ignore' 行为在
@@ -203,8 +207,13 @@ function spawnDaemonDetached(): { pid?: number; error?: string } {
       stdio: 'ignore',
       windowsHide: true,
     })
-    child.unref()
-    return { pid: child.pid }
+    return await new Promise(resolve => {
+      child.once('error', error => resolve({ error: error.message }))
+      child.once('spawn', () => {
+        child.unref()
+        resolve(child.pid ? { pid: child.pid } : { error: 'daemon 启动后未返回 PID' })
+      })
+    })
   } catch (e: any) {
     return { error: e?.message ?? String(e) }
   }
@@ -428,13 +437,13 @@ export async function runSetup(): Promise<void> {
 
   // ── Auto-start daemon ─────────────────────────────────────────
   console.log(`\n${C.bold}启动 daemon...${C.reset}`)
-  const r = spawnDaemonDetached()
+  const r = await spawnDaemonDetached()
   const sep = process.platform === 'win32' ? '\\' : '/'
   const logPath = process.platform === 'win32'
     ? `${process.env.LOCALAPPDATA ?? '%LOCALAPPDATA%'}\\Lodestar\\daemon-YYYY-MM-DD.log`
     : `${process.env.HOME ?? '~'}/.local/share/lodestar/daemon-YYYY-MM-DD.log`
 
-  if (r.pid) {
+  if ('pid' in r) {
     console.log(`${C.green}✓ daemon 已在后台启动${C.reset} (pid ${r.pid})`)
     console.log()
     console.log(`${C.bold}最后一步: 在 Feishu 验证${C.reset}`)

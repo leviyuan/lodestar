@@ -91,6 +91,8 @@ export class AgentService {
   private startingWorkers = 0
   private readonly startingRunsBySession = new Map<string, number>()
   private readonly startingNativeSessions = new Set<string>()
+  private readonly pendingRunCreations = new Set<Promise<AgentRunSnapshot>>()
+  private shuttingDown = false
 
   constructor(private readonly deps: AgentServiceDeps = DEFAULT_DEPS) {
     this.presentation = new AgentCards(deps)
@@ -106,6 +108,7 @@ export class AgentService {
   }
 
   async startRun(principal: AgentPrincipal, request: AgentRunRequest): Promise<AgentRunSnapshot> {
+    this.assertAcceptingRuns()
     if (principal.kind !== 'session') throw new Error(NESTED_DELEGATION_ERROR)
     requireAgentDescription(request.description)
     if (request.sessionId !== undefined) {
@@ -132,6 +135,7 @@ export class AgentService {
     runId: string,
     request: AgentFollowUpRequest,
   ): Promise<AgentRunSnapshot> {
+    this.assertAcceptingRuns()
     if (principal.kind !== 'session') throw new Error(NESTED_DELEGATION_ERROR)
     requireAgentDescription(request.description)
     const source = this.requireMutableDescendant(principal, runId)
@@ -221,13 +225,19 @@ export class AgentService {
   }
 
   async shutdown(reason: string): Promise<void> {
+    // Close admission before the first await, including runs still opening a
+    // card that have not entered the durable run registry yet.
+    this.shuttingDown = true
     const sessions = new Set([...this.runs.values()].map(run => `${run.snapshot.sessionName}\u0000${run.snapshot.chatId}`))
     for (const key of sessions) {
       const [sessionName, chatId] = key.split('\u0000')
       this.bumpCancellationEpoch(sessionName, chatId)
     }
     const roots = [...this.runs.values()].filter(run => !run.snapshot.parentRunId && this.treeHasActiveRun(run))
-    const results = await Promise.allSettled(roots.map(run => this.cancelTree(run, reason)))
+    const results = await Promise.allSettled([
+      ...roots.map(run => this.cancelTree(run, reason)),
+      ...[...this.pendingRunCreations].map(creation => creation.then(() => {})),
+    ])
     const remaining = [...this.runs.values()].flatMap(run => [...run.handles.values()])
     const remainingResults = results.some(result => result.status === 'rejected')
       ? [] : await Promise.allSettled(remaining.map(handle => handle.cancel(reason)))
@@ -237,7 +247,25 @@ export class AgentService {
     }
   }
 
-  private async createRun(
+  private assertAcceptingRuns(): void {
+    if (this.shuttingDown) throw new Error('Agent service is shutting down; cannot start new runs')
+  }
+
+  private createRun(
+    session: Session,
+    request: AgentRunRequest,
+    options: CreateRunOptions,
+  ): Promise<AgentRunSnapshot> {
+    const creation = this.createRunInternal(session, request, options)
+    this.pendingRunCreations.add(creation)
+    void creation.then(
+      () => this.pendingRunCreations.delete(creation),
+      () => this.pendingRunCreations.delete(creation),
+    )
+    return creation
+  }
+
+  private async createRunInternal(
     session: Session,
     request: AgentRunRequest,
     options: CreateRunOptions,
@@ -314,7 +342,7 @@ export class AgentService {
     }
     this.runs.set(runId, run)
     if (options.parentRunId) parent?.children.add(runId)
-    const invalidated = this.currentCancellationEpoch(session) !== options.cancellationEpoch
+    const invalidated = this.shuttingDown || this.currentCancellationEpoch(session) !== options.cancellationEpoch
     if (invalidated) {
       run.cancelled = true
       const reason = '任务已在启动前取消'

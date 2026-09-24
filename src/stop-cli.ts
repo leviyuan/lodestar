@@ -11,10 +11,10 @@
  * taskkill, 优雅 vs 强杀语义反正都没了, 让平台原生 API 接管就行。
  */
 
-import { execSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { PID_FILE } from './paths'
-import { isOurDaemon } from './pid-guard'
+import { isOurDaemon, parseDaemonPid } from './pid-guard'
 
 const C = {
   reset: '\x1b[0m',
@@ -30,20 +30,22 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  if (!existsSync(PID_FILE)) {
+  let contents: string
+  try {
+    contents = readFileSync(PID_FILE, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     console.log(`${C.yellow}Lodestar daemon 未运行${C.reset} ${C.dim}(${PID_FILE} 不存在)${C.reset}`)
     return
   }
 
-  const raw = readFileSync(PID_FILE, 'utf8').split('\n')
-  const pid = parseInt((raw[0] ?? '').trim(), 10)
+  const raw = contents.split('\n')
+  const pid = parseDaemonPid(raw[0] ?? '')
   const marker = (raw[1] ?? '').trim()
-  if (!Number.isFinite(pid) || pid <= 0) {
-    console.error(`${C.red}PID 文件格式坏:${C.reset} ${PID_FILE}`)
-    process.exit(1)
-  }
+  if (pid === null) throw new Error(`PID 文件格式坏: ${PID_FILE}`)
+  if (!marker) throw new Error(`旧 PID 文件没有 daemon 入口标识，拒绝发送停止信号。请核对 PID ${pid} 的完整命令行后手动停止: ${PID_FILE}`)
 
-  if (marker && !isOurDaemon(pid, marker)) {
+  if (!isOurDaemon(pid, marker)) {
     console.log(`${C.yellow}PID ${pid} 上没有 daemon (stale 文件)${C.reset}`)
     console.log(`${C.dim}手删 ${PID_FILE} 后再试${C.reset}`)
     return
@@ -52,7 +54,7 @@ async function main(): Promise<void> {
   console.log(`${C.bold}停止 daemon${C.reset} (pid ${pid})...`)
   try {
     if (process.platform === 'win32') {
-      execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' })
+      execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'pipe' })
     } else {
       process.kill(pid, 'SIGTERM')
     }
@@ -61,17 +63,16 @@ async function main(): Promise<void> {
     process.exit(1)
   }
 
-  // PID 文件由 daemon 自己 cleanup 删掉; 等它消失就代表优雅退出完成。
-  // 5s 超时, 超时不删 PID 文件由后续启动的 pid-guard 自己清理。
+  // 按原进程身份确认退出，不能把 PID 文件移除或替换当作已停止。
+  // Windows 强制结束不会清 PID 文件；下一次启动会识别并清理 stale 记录。
   for (let i = 0; i < 50; i++) {
-    if (!existsSync(PID_FILE)) {
+    if (!isOurDaemon(pid, marker)) {
       console.log(`${C.green}✓ daemon 已停${C.reset}`)
       return
     }
     await sleep(100)
   }
-  console.log(`${C.yellow}已发 SIGTERM, 但 5s 内 daemon 没清掉 ${PID_FILE}${C.reset}`)
-  console.log(`${C.dim}它可能还在收尾 (落盘 alive marker / 关 WS); 下次启动 pid-guard 会自动判别。${C.reset}`)
+  throw new Error(`已发送停止请求，但 5s 内 PID ${pid} 的 daemon 仍未退出，可能还在收尾；请检查日志`)
 }
 
 main().catch((e: any) => {

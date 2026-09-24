@@ -82,6 +82,9 @@ export interface NotifyRegistration {
   replyState?: NotifyReplyState
   /** Keep dedupe across explicit failed-attempt retries and different owners. */
   replyMessageIds?: string[]
+  /** Written before a button callback can run. An interrupted dispatch must
+   * not become retryable after restart because its external effect is unknown. */
+  dispatchState?: { buttonId: string; openId: string; startedAt: number }
   /** Unix-ms epoch. Used by {@link prune} (7-day TTL) and never
    * mutated after creation. */
   createdAt: number
@@ -91,9 +94,9 @@ export interface NotifyRegistration {
    * same card near-simultaneously. */
   resolvedAt?: number
   resolvedBy?: { buttonId?: string; openId: string }
-  /** External callback succeeded, but the durable resolved tombstone could
-   * not be confirmed. Never retry this state automatically: the external
-   * side effect may already have happened. */
+  /** Dispatch was interrupted or its durable completion could not be
+   * confirmed. Never retry automatically: the external side effect may
+   * already have happened. */
   unknownAt?: number
   unknownBy?: { buttonId?: string; openId: string }
   unknownReason?: string
@@ -114,13 +117,8 @@ const map = new Map<string, NotifyRegistration>()
 let lastRuntimePruneAt = Date.now()
 const RUNTIME_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000
 
-/** In-flight push dispatches (transient, in-memory only — deliberately
- * NOT persisted). Guards double-click during the live two-phase update:
- * set when Phase 1 ACK returns, cleared when Phase 2 finishes. A daemon
- * crash mid-push loses this, which is correct — the click becomes
- * retryable on next boot instead of wedging on a phantom in-flight
- * guard. Survives across the store file because it lives here, off the
- * persisted registration. */
+/** Fast in-memory double-click guard. dispatchState separately preserves
+ * uncertainty across a process interruption. */
 const dispatching = new Set<string>()
 export function isDispatching(notifyId: string): boolean { return dispatching.has(notifyId) }
 export function setDispatching(notifyId: string): void { dispatching.add(notifyId) }
@@ -142,19 +140,21 @@ function saveCallbacks(): void {
   }
 }
 
-/** Load + prune on daemon boot. Stale entries (older than 7 days) and
- * any shape-mismatched record are dropped so a corrupted/partial file
- * never wedges the store. */
+/** Load + prune on daemon boot. An unreadable or corrupt store is an error,
+ * since treating it as empty would lose callback deduplication records. */
 export function loadCallbacks(): NotifyRegistration[] {
-  const interruptedReplies: NotifyRegistration[] = []
+  const interruptedCallbacks: NotifyRegistration[] = []
   let raw: string
   try {
     raw = readFileSync(storeFile, 'utf8')
-  } catch {
-    return []  // first boot — file doesn't exist yet
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return []
+    log(`notify-callbacks: read failed (${storeFile}): ${error}`)
+    throw error
   }
   try {
     const obj = JSON.parse(raw) as Record<string, any>
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error('notify callback store must be an object')
     const cutoff = Date.now() - MAX_AGE_MS
     let dropped = 0
     let interrupted = 0
@@ -170,16 +170,23 @@ export function loadCallbacks(): NotifyRegistration[] {
         rec.unknownReason = '服务在文字回复回传期间中断，无法确认是否送达，禁止自动重试'
         interrupted++
       }
+      if (rec.dispatchState && !rec.resolvedAt && !rec.unknownAt) {
+        rec.unknownAt = Date.now()
+        rec.unknownBy = { buttonId: rec.dispatchState.buttonId, openId: rec.dispatchState.openId }
+        rec.unknownReason = '服务在按钮回调期间中断，无法确认是否送达，禁止自动重试'
+        interrupted++
+      }
       map.set(rec.notifyId, rec as NotifyRegistration)
-      if (rec.replyState?.status === 'sending' && rec.unknownAt) interruptedReplies.push(rec)
+      if ((rec.replyState?.status === 'sending' || rec.dispatchState) && rec.unknownAt) interruptedCallbacks.push(rec)
     }
     log(`notify-callbacks: loaded ${map.size} registration(s)${dropped ? `, dropped ${dropped} stale` : ''}`)
-    if (interrupted) log(`notify-callbacks: ${interrupted} interrupted text reply(s) marked UNKNOWN`)
+    if (interrupted) log(`notify-callbacks: ${interrupted} interrupted callback(s) marked UNKNOWN`)
     if (dropped > 0 || interrupted > 0) saveCallbacks()
   } catch (e) {
     log(`notify-callbacks: load failed (${storeFile}): ${e}`)
+    throw e
   }
-  return interruptedReplies
+  return interruptedCallbacks
 }
 
 export function register(reg: NotifyRegistration): void {
@@ -196,6 +203,35 @@ export function register(reg: NotifyRegistration): void {
 
 export function get(notifyId: string): NotifyRegistration | undefined {
   return map.get(notifyId)
+}
+
+/** Commit the uncertain interval before any external side effect is allowed. */
+export function beginCallbackDispatch(notifyId: string, buttonId: string, openId: string): void {
+  const rec = map.get(notifyId)
+  if (!rec) throw new Error(`notify registration not found: ${notifyId}`)
+  if (rec.resolvedAt || rec.unknownAt || rec.dispatchState) throw new Error('notify callback is already dispatched or finalized')
+  rec.dispatchState = { buttonId, openId, startedAt: Date.now() }
+  try { saveCallbacks() }
+  catch (error) { delete rec.dispatchState; throw error }
+}
+
+/** A failed POST becomes retryable only once removing its pending marker is
+ * durable. Retain UNKNOWN when that transition cannot be saved. */
+export function recordCallbackFailure(notifyId: string): { state: 'retry' } | { state: 'unknown'; detail: string } {
+  const rec = map.get(notifyId)
+  if (!rec?.dispatchState) throw new Error(`notify callback is not dispatching: ${notifyId}`)
+  const state = rec.dispatchState
+  delete rec.dispatchState
+  try { saveCallbacks(); return { state: 'retry' } }
+  catch (error) {
+    rec.dispatchState = state
+    const detail = `callback failure persistence failed: ${error instanceof Error ? error.message : error}`
+    try { markUnknown(notifyId, state.buttonId, state.openId, detail) }
+    catch (unknownError) {
+      rec.unknownReason = `${detail}; unknown tombstone persistence also failed: ${unknownError instanceof Error ? unknownError.message : unknownError}`
+    }
+    return { state: 'unknown', detail: rec.unknownReason ?? detail }
+  }
 }
 
 export function pendingRepliesForChat(chatId: string): NotifyRegistration[] {
@@ -243,12 +279,14 @@ export function markResolved(notifyId: string, buttonId: string | undefined, ope
     unknownAt: rec.unknownAt,
     unknownBy: rec.unknownBy,
     unknownReason: rec.unknownReason,
+    dispatchState: rec.dispatchState,
   }
   rec.resolvedAt = Date.now()
   rec.resolvedBy = { ...(buttonId !== undefined ? { buttonId } : {}), openId }
   delete rec.unknownAt
   delete rec.unknownBy
   delete rec.unknownReason
+  delete rec.dispatchState
   try {
     saveCallbacks()
   } catch (e) {
@@ -262,6 +300,7 @@ export function markResolved(notifyId: string, buttonId: string | undefined, ope
     else rec.unknownBy = previous.unknownBy
     if (previous.unknownReason === undefined) delete rec.unknownReason
     else rec.unknownReason = previous.unknownReason
+    if (previous.dispatchState !== undefined) rec.dispatchState = previous.dispatchState
     throw e
   }
 }

@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
-  __setStoreFileForTest, register, get, loadCallbacks, buildNotifyResult, findPendingReply, pendingRepliesForChat,
+  __setStoreFileForTest, register, get, loadCallbacks, buildNotifyResult, findPendingReply, pendingRepliesForChat, beginCallbackDispatch,
   type NotifyRegistration, type NotifyTextResponse, type DispatchResult,
 } from './notify-callbacks'
 import { handleNotifyRequest } from './notify'
@@ -515,6 +515,22 @@ describe('notification text reply workflow', () => {
     expect(buildNotifyResult(get('nf_reply')!)).toMatchObject({ resolved: false, unknown: true, response: { text: '明天十点' } })
     expect((await h.open()).ok).toBe(false)
     expect(h.delivered).toHaveLength(1)
+  })
+
+  test('recovery freezes an interrupted button callback without claiming delivery or dispatching again', async () => {
+    register(registration({ allowReply: false, buttons: [{ id: 'approve', text: '通过', type: 'primary' }] }))
+    beginCallbackDispatch('nf_reply', 'approve', 'ou_owner')
+    __setStoreFileForTest(file)
+    const interrupted = loadCallbacks()
+    const h = harness()
+    await h.runtime.recover(interrupted[0])
+    expect(h.updated).toHaveLength(1)
+    expect(h.updated[0].messageId).toBe('om_notification')
+    const card = JSON.stringify(h.updated[0].card)
+    expect(card).toContain('送达状态未知，禁止自动重试')
+    expect(card).not.toContain('已成功')
+    expect(card).not.toContain('notify_callback')
+    expect(h.delivered).toEqual([])
   })
 
   test('unsupported, wrong-chat and anonymous reply actions do not send waiting cards', async () => {

@@ -117,6 +117,48 @@ test('Drive explicit retryable errors use the shared bounded retry policy', asyn
   `)
 })
 
+test('interactive card replacement requires explicit API confirmation', async () => {
+  await runIsolated(`
+    const card = { schema: '2.0', body: { elements: [] } }
+    for (const response of [undefined, null, {}, { data: {} }, { code: '0' }, { code: 230001, msg: 'invalid card' }]) {
+      feishu.client.im.v1.message.patch = async () => response
+      await assert.rejects(feishu.updateCard('message', card), /feishu message.patch failed/)
+    }
+    feishu.client.im.v1.message.patch = async args => {
+      assert.equal(args.path.message_id, 'message')
+      assert.deepEqual(JSON.parse(args.data.content), card)
+      return { code: 0 }
+    }
+    await feishu.updateCard('message', card)
+  `)
+})
+
+test('simultaneous same-name attachments retain separate bytes in the shared inbox', async () => {
+  await runIsolated(`
+    const { readFileSync, rmSync } = await import('node:fs')
+    const originalNow = Date.now
+    const paths = []
+    try {
+      Date.now = () => 1800000000000
+      globalThis.fetch = async url => {
+        if (String(url).includes('/tenant_access_token/')) return Response.json({ code: 0, tenant_access_token: 'test-token' })
+        return new Response(String(url).includes('/message-a/') ? 'first private report' : 'second private report')
+      }
+      paths.push(...await Promise.all([
+        feishu.downloadAttachment('message-a', 'key-a', 'file', 'report.txt'),
+        feishu.downloadAttachment('message-b', 'key-b', 'file', 'report.txt'),
+      ]))
+      assert.ok(paths.every(path => typeof path === 'string'))
+      assert.notEqual(paths[0], paths[1], 'shared inbox paths must not collide across messages')
+      assert.equal(readFileSync(paths[0], 'utf8'), 'first private report')
+      assert.equal(readFileSync(paths[1], 'utf8'), 'second private report')
+    } finally {
+      Date.now = originalNow
+      for (const path of new Set(paths)) if (path) rmSync(path, { force: true })
+    }
+  `)
+})
+
 test('uploads retry token failures and rebuild multipart bodies; message retries reuse the uploaded key', async () => {
   await runIsolated(`
     const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs')

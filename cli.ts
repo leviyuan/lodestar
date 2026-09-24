@@ -51,8 +51,8 @@ async function main(): Promise<void> {
   // 干净, 旧的 `[info]: client ready` + "already running" 双行错乱也消失。
   // 旧版只调 `process.kill(pid, 0)` 问 OS 这 pid 上有没有进程, 在 Windows
   // 上 PID 回收快, 旧 daemon 死后那号被别的程序占了就会冤枉拦下新启动。
-  // 现在 isOurDaemon 验证 cmdline 包含 "lodestar" (Linux 读 /proc, mac
-  // 用 ps, Win 用 tasklist), 真冒名才认。
+  // isOurDaemon 核对实际入口 (Linux /proc、macOS ps、Windows CIM)，
+  // 查询失败显式报错，不能把无法确认身份当成允许启动。
   const guard = checkPidGuard(PID_FILE)
   if (guard.state === 'exit') {
     console.error(`${C.yellow}Lodestar: 已经有一个 daemon 在运行 (pid ${guard.pid})${C.reset}`)
@@ -67,7 +67,7 @@ async function main(): Promise<void> {
   // 如果 PID 文件存在但 isOurDaemon 判否 (stale + 回收), 顺手清掉, 后面
   // daemon 启动会写新的。
   if (existsSync(PID_FILE)) {
-    try { unlinkSync(PID_FILE) } catch {}
+    unlinkSync(PID_FILE)
   }
 
   await import('./daemon')
