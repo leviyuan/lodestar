@@ -33,7 +33,7 @@ export async function runClaudeSubscriptionCommand(s: Session, action: string): 
   const state = source?.modelCatalogState
   const lines = [`Claude Code 订阅：${enabled ? '已启用' : '已禁用'}（Lodestar 全局）`]
   if (enabled && (!source?.enabled || state?.status !== 'ready')) {
-    lines.push(`可用性 MISS：${state?.error ?? (state?.status === 'loading' || state?.status === 'idle' ? '模型目录尚未就绪，请发送 md 刷新' : '订阅来源不可用')}`)
+    lines.push(`可用性 MISS：${state?.error ?? (state?.status === 'loading' || state?.status === 'idle' ? '模型目录缓存尚未就绪，后台刷新中' : '订阅来源不可用')}`)
   }
   lines.push('所有群共用；保留本机登录态。')
   if (!enabled) lines.push('禁止新任务，已在执行的任务继续完成。')
@@ -64,7 +64,7 @@ export async function onTokenSourceEnable(s: Session, sourceId: string): Promise
   } else if (ts.kind === 'claude-subscription') {
     await feishu.sendText(s.chatId, config.token_sources['claude-sub']?.enabled === false
       ? 'Claude Code 订阅已在 Lodestar 中禁用。发送 `claude-sub on` 启用，所有群共用，本机登录态保持不变。'
-      : ts.modelCatalogState?.error ?? '请在运行 Lodestar 的本机执行 `claude auth login` 登录 Claude 订阅，完成后发送 `md` 刷新。')
+      : ts.modelCatalogState?.error ?? '请在运行 Lodestar 的本机执行 `claude auth login` 登录 Claude 订阅，完成后等待后台刷新，发送 `md` 查看状态。')
   } else if (ts.kind === 'claude-native') {
     // native 凭本机 Claude 配置自动启用/禁用,无独立「启用」操作(它就是默认通路)。
     await feishu.sendText(s.chatId, `${ts.display} 直接使用本机 Claude Code 配置,无需单独启用。`)
@@ -86,6 +86,7 @@ export async function runTokenSourceSetup(s: Session, sourceId: string, args: st
     await feishu.sendText(s.chatId, parsed.error)
     return
   }
+  await feishu.sendText(s.chatId, '正在后台校验账号配置，完成后会返回结果；其他操作可继续使用。')
   let saved = false
   try {
     await configureTokenSource(def, parsed.config, setup)
@@ -98,13 +99,13 @@ export async function runTokenSourceSetup(s: Session, sourceId: string, args: st
       await feishu.sendText(s.chatId, `✅ ${ts?.display ?? sourceId} 真实余额校验通过，配置已保存。发送 hi 查看；回复页脚使用同一账户余额。${diagnostic}`)
       return
     }
-    if (failed || related.some(source => !source)) {
+    if (failed?.modelCatalogState?.status === 'failed' || related.some(source => !source)) {
       const reason = tokenSourceErrorMessage(failed?.modelCatalogState?.error ?? '模型目录尚未就绪', [parsed.config.api_key, parsed.config.auth_token])
-      await feishu.sendText(s.chatId, `❌ ${ts?.display ?? sourceId} 凭据校验通过、配置已保存，但暂不可用：${reason}\n处理后发送 md 刷新。`)
+      await feishu.sendText(s.chatId, `❌ ${ts?.display ?? sourceId} 凭据校验通过、配置已保存，但暂不可用：${reason}\n处理后等待后台刷新，发送 md 查看状态。`)
       return
     }
     const agents = [...new Set(related.filter((source): source is NonNullable<typeof source> => !!source).map(source => agentProviderLabel(source.agent)))]
-    await feishu.sendText(s.chatId, `✅ ${ts!.display} 校验通过，配置已保存。${agents.length > 1 ? `${agents.join(' 和 ')} 共用该账号。` : ''}发送 md 选择模型。`)
+    await feishu.sendText(s.chatId, `✅ ${ts!.display} 校验通过，配置已保存。${agents.length > 1 ? `${agents.join(' 和 ')} 共用该账号。` : ''}目录与额度在后台刷新；发送 md 查看模型。`)
   } catch (e: any) {
     const state = saved || e instanceof TokenSourceSetupError && e.saved ? '配置已保存，但后续处理失败' : '配置失败，未保存，原配置保持不变'
     const reason = tokenSourceErrorMessage(e, [parsed.config.api_key, parsed.config.auth_token, parsed.config.management_token])

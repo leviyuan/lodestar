@@ -2231,40 +2231,44 @@ describe('Session provider switching', () => {
     } finally { session.dispose() }
   })
 
-  test('MD waits for the source refresh instead of sending a zero-model snapshot', async () => {
+  test('MD uses cached models immediately and never waits for catalog I/O', async () => {
     const previous = listTokenSources()
     resetTokenSourceRegistry()
     let release!: () => void
     const pending = new Promise<void>(resolve => { release = resolve })
+    let refreshes = 0
     const models = Array.from({ length: 9 }, (_, i) => ({ model: `vendor/model-${i}`, display: `Model ${i}`, efforts: ['high' as const], defaultEffort: 'high' as const }))
-    const source = { id: 'md-refresh', kind: 'test', agent: 'claude' as const, display: 'OpenRouter', enabled: true,
+    const source = { id: 'md-cache', kind: 'test', agent: 'codex' as const, display: 'Codex', enabled: true,
       models, defaultModel: models[0].model,
       modelCatalogState: { status: 'ready' as 'ready' | 'loading' | 'failed', updatedAt: 1, error: undefined as string | undefined },
-      async refreshModels() { source.models = []; source.modelCatalogState.status = 'loading'; await pending; source.models = models; source.modelCatalogState.status = 'ready' },
+      async refreshModels() { refreshes++; await pending },
       spawnEnv: (env: Record<string, string | undefined>) => env, resolveSpawnModel: (model: string) => model,
       readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
     }
     registerTokenSource(source)
-    const session = new Session('md-refresh-test', 'chat_id')
+    const session = new Session('md-cache-test', 'chat_id')
+    const background = refreshAllTokenSourceModels()
     try {
-      const opening = session.showModelPanel()
-      await Promise.resolve()
-      expect(sentCards).toHaveLength(0)
-      release()
-      await opening
+      expect(await session.runCommand('md')).toBe(true)
       expect(JSON.stringify(sentCards[0])).toContain('9 个模型')
-      expect(JSON.stringify(sentCards[0])).not.toContain('0 个模型')
+      expect(refreshes).toBe(1)
       const panelId = [...session.modelPanels.keys()][0]
       expect(session.modelPanels.get(panelId)?.messageId).toBe('om_status_1')
-      await session.onProviderSelect(source.id, panelId)
-      expect(session.modelPanels.get(panelId)?.messageId).toBe('om_status_1')
-      source.refreshModels = async () => { source.models = []; source.modelCatalogState.status = 'failed'; source.modelCatalogState.error = 'HTTP 503' }
+      expect((await session.onProviderSelect(source.id, panelId)).ok).toBe(true)
+      source.models = []
+      source.modelCatalogState.status = 'loading'
+      await session.showModelPanel()
+      expect(JSON.stringify(sentCards.at(-1))).toContain('模型目录加载中')
+      expect(JSON.stringify(sentCards.at(-1))).not.toContain('0 个模型')
+      const loadingId = [...session.modelPanels.keys()].at(-1)!
+      expect((await session.onProviderSelect(source.id, loadingId)).ok).toBe(false)
+      source.modelCatalogState.status = 'failed'; source.modelCatalogState.error = 'HTTP 503'
       await session.showModelPanel()
       expect(JSON.stringify(sentCards.at(-1))).toContain('模型目录 MISS')
       expect(JSON.stringify(sentCards.at(-1))).toContain('HTTP 503')
-      expect(JSON.stringify(sentCards.at(-1))).not.toContain('0 个模型')
+      expect(refreshes).toBe(1)
     } finally {
-      release(); session.dispose(); resetTokenSourceRegistry()
+      release(); await background; session.dispose(); resetTokenSourceRegistry()
       for (const entry of previous) registerTokenSource(entry)
     }
   })
@@ -2969,18 +2973,18 @@ describe('Session provider switching', () => {
 
 })
 
-describe('Session waits for its model catalog', () => {
+describe('Session starts from cached model catalogs', () => {
   for (const resume of [false, true]) {
-    test(`${resume ? 'resume' : 'fresh start'} waits for models and keeps the selected model and effort`, async () => {
+    test(`${resume ? 'resume' : 'fresh start'} uses cached models without waiting for unrelated refresh and keeps its selection`, async () => {
       const previousSources = listTokenSources()
       resetTokenSourceRegistry()
       let releaseModels!: () => void
       const modelsGate = new Promise<void>(resolve => { releaseModels = resolve })
       const source: import('./token-source').TokenSource = {
         id: 'catalog-test', kind: 'test', agent: 'codex', display: 'Test Codex', enabled: true,
-        models: [], defaultModel: '', modelCatalogState: { status: 'idle', updatedAt: null },
+        models: [{ model: 'gpt-6-astra', display: 'Astra', efforts: ['max', 'ultra'], defaultEffort: 'max' }],
+        defaultModel: 'gpt-6-astra', modelCatalogState: { status: 'ready', updatedAt: 1 },
         async refreshModels() {
-          source.modelCatalogState = { status: 'loading', updatedAt: null }
           await modelsGate
           source.models = [{ model: 'gpt-6-astra', display: 'Astra', efforts: ['max', 'ultra'], defaultEffort: 'max' }]
           source.defaultModel = 'gpt-6-astra'
@@ -3010,10 +3014,6 @@ describe('Session waits for its model catalog', () => {
       const opts = { announce: false, onStatus: () => {} }
       const starting = resume ? session.restart(true, opts) : session.start(opts)
       try {
-        await waitUntil(() => session.status === 'starting')
-        expect(spawns).toBe(0)
-        expect(session.proc).toBeNull()
-        releaseModels()
         expect(await starting).toBe(true)
         expect(spawns).toBe(1)
         expect(session.proc).toBe(proc)

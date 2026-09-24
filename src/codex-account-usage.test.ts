@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { aggregateCodexUsage, readCodexAccountEmails, type CodexAccountUsage } from './codex-account-usage'
+import { aggregateCodexUsage, refreshCodexAccountEmails, type CodexAccountUsage } from './codex-account-usage'
 import { codexAccountCard } from './cards/codex-account'
 
 function entry(id: string, short: number | null, weekly: number | null, fingerprint: string | null = id): CodexAccountUsage {
@@ -15,7 +15,7 @@ describe('Codex account usage aggregation', () => {
     rows[1].account.email = 'old-login@example.test'
     const total = aggregateCodexUsage(rows)
     const reads: string[] = [], closed: string[] = []
-    const inspected = await readCodexAccountEmails(total, id => ({
+    const inspected = await refreshCodexAccountEmails(total, id => ({
       initialize: async () => {},
       request: async (method, params) => {
         expect(method).toBe('account/read')
@@ -42,7 +42,7 @@ describe('Codex account usage aggregation', () => {
     const rows = ['missing', 'failed', 'close-failed'].map(id => entry(id, 10, 20))
     for (const row of rows) row.account.email = 'old-login@example.test'
     const closed: string[] = []
-    const total = await readCodexAccountEmails(aggregateCodexUsage(rows), id => ({
+    const total = await refreshCodexAccountEmails(aggregateCodexUsage(rows), id => ({
       initialize: async () => {},
       request: async () => {
         if (id === 'failed') throw new Error('HTTP 401 account access denied')

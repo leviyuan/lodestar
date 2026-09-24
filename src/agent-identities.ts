@@ -39,14 +39,6 @@ export interface AgentIdentityCatalog {
   sourceFailures: AgentSourceFailure[]
 }
 
-const SUBSCRIPTION_CHECK_TTL_MS = 30 * 60 * 1000
-interface SubscriptionCheck {
-  /** null 表示查询尚未完成；成功和失败都从完成时起保留 30 分钟。 */
-  expiresAt: number | null
-  result: Promise<string | null>
-}
-const subscriptionChecks = new WeakMap<TokenSource, SubscriptionCheck>()
-
 export function agentIdentityId(tokenSourceId: string, model: string): string {
   return `agent:${Buffer.from(`${tokenSourceId}\u0000${model}`, 'utf8').toString('base64url')}`
 }
@@ -81,17 +73,7 @@ export async function buildAgentSkillIdentityCatalog(sources: TokenSource[]): Pr
 }
 
 function subscriptionFailure(source: TokenSource): Promise<string | null> {
-  const cached = subscriptionChecks.get(source)
-  if (cached && (cached.expiresAt === null || Date.now() < cached.expiresAt)) return cached.result
-  // 只缓存校验结论；模型目录仍实时生成，配置重建后的 source 不沿用旧账号结论。
-  const check: SubscriptionCheck = {
-    expiresAt: null,
-    result: readSubscriptionFailure(source).finally(() => {
-      check.expiresAt = Date.now() + SUBSCRIPTION_CHECK_TTL_MS
-    }),
-  }
-  subscriptionChecks.set(source, check)
-  return check.result
+  return readSubscriptionFailure(source)
 }
 
 async function readSubscriptionFailure(source: TokenSource): Promise<string | null> {

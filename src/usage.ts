@@ -18,6 +18,7 @@ import { config } from './config'
 import { bindProcessCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
 import { plusFiveHourWindow } from './codex-quota'
 import { UsageReadCache, USAGE_FRESH_MS, isUsageRateLimitError } from './usage-cache'
+import { observeCodexAccountEmail } from './codex-account-info'
 
 const API_TIMEOUT_MS = 10_000
 
@@ -402,12 +403,14 @@ function windowsEqual(a: UsageWindow | null, b: UsageWindow | null): boolean {
 }
 
 async function fetchUsage(accountId: string): Promise<UsageSnapshot> {
+  const revision = codexAccounts.revision(accountId)
   const app = new AppServerOnce({ accountId })
   try {
     await app.initialize('lodestar-usage')
 
     const accountRes = await withTimeout(app.request('account/read', {}), API_TIMEOUT_MS)
     const account = accountRes?.account
+    observeCodexAccountEmail(accountId, account, revision)
     if (!account) return { state: 'no_credentials' }
     if (account.type !== 'chatgpt') return { state: 'auth_failed' }
 
@@ -496,11 +499,7 @@ export function readUsage(accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnaps
 
 /** Query for a user-visible panel while retaining the last successful quota on transient failure. */
 export async function readUsageForDisplay(accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot> {
-  const snapshot = await readUsage(accountId)
-  if ((snapshot.state === 'network' || snapshot.state === 'rate_limited')) {
-    return peekSuccessfulUsage(accountId) ?? snapshot
-  }
-  return snapshot
+  return peekUsage(accountId) ?? { state: 'network', reason: '额度缓存尚未就绪，后台刷新中' }
 }
 
 /** 用现有连接刷新额度；请求失败返回 null 并记录原始错误。

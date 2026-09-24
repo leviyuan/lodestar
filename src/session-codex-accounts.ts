@@ -3,7 +3,9 @@ import { createHash } from 'node:crypto'
 import * as feishu from './feishu'
 import { codexAccounts, codexAccountInUse, processCodexAccount } from './codex-accounts'
 import { codexLogins, requireDefaultCodexLogin } from './codex-login'
-import { getTokenSourceForAccount, waitForTokenSourceModelRefresh } from './token-source'
+import { getTokenSource, getTokenSourceForAccount } from './token-source'
+import { buildTokenSourcesFromConfig } from './token-source-builtins'
+import { removeCachedTokenSourceAccount } from './token-source-cache'
 import { aggregateCodexUsage, readAllCodexUsage, readCodexAccountEmails } from './codex-account-usage'
 import { codexAccountScheduler } from './codex-account-scheduler'
 import { CodexAccountCard } from './codex-account-card'
@@ -78,6 +80,7 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
       const account = codexAccounts.find(argument)
       if (loginReceipts.has(account.id)) throw new Error('账号登录或结果更新尚未结束；请先完成或取消登录后重试')
       const { clearedSelections } = codexAccounts.remove(account.id)
+      removeCachedTokenSourceAccount(getTokenSource('codex-sub'), account.id)
       invalidateCodexUsage(account.id)
       await card.finish({ phase: 'deleted', name: account.name,
         message: '已删除本地账号记录与独立凭据，共享会话历史保留。',
@@ -87,7 +90,6 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
     if (command === 'accounts') {
       if (argument && !/^[1-9]\d*$/.test(argument)) throw new Error('页码无效；使用 codex-accounts [页码]')
       const page = argument ? Number(argument) : 1
-      await waitForTokenSourceModelRefresh()
       const accountId = s.codexAccountId()
       const source = getTokenSourceForAccount('codex-sub', accountId)
       const modelLabel = () => s.currentProvider() === 'codex' ? s.currentModelLabel() : source?.defaultModel
@@ -96,7 +98,6 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
       if (!model) {
         try {
           if (!source) throw new Error('Codex 订阅来源尚未初始化')
-          await source.refreshModels()
           model = modelLabel()
           if (!model) throw new Error(source.modelCatalogState?.error ?? 'Codex 模型目录未提供可用的默认模型')
         } catch (error) { catalogError = `${codexAccounts.get(accountId).name}：${error instanceof Error ? error.message : String(error)}` }
@@ -170,18 +171,10 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
       let info
       try { info = await handle.done }
       catch (error) { await card.finish(errorView(error, account.name)); return }
-      await card.update({ phase: 'checking', flow: 'login', name: account.name, message: '授权完成，正在读取模型…' })
-      let catalogError: string | undefined
-      try {
-        await waitForTokenSourceModelRefresh()
-        const source = getTokenSourceForAccount('codex-sub', account.id)
-        if (!source) throw new Error('Codex 订阅来源尚未初始化')
-        await source.refreshModels()
-        if (source.modelCatalogState?.status !== 'ready') throw new Error(source.modelCatalogState?.error ?? '模型目录未就绪')
-      } catch (error) { catalogError = error instanceof Error ? error.message : String(error) }
-      await card.finish({ phase: catalogError ? 'warning' : 'success', flow: 'login', name: account.name, email: info.email, plan: info.planType,
-        ...(catalogError ? { title: '已登录 · 目录 MISS', details: catalogError } : {}),
-        hint: `已加入自动选择 · 优先使用：codex-account ${account.id === 'default' ? 'default' : account.name}` })
+      buildTokenSourcesFromConfig()
+      getTokenSourceForAccount('codex-sub', account.id)
+      await card.finish({ phase: 'success', flow: 'login', name: account.name, email: info.email, plan: info.planType,
+        hint: `目录与额度正在后台刷新 · 优先使用：codex-account ${account.id === 'default' ? 'default' : account.name}` })
     })()
     loginReceipts.set(account.id, receipt)
     const release = () => { if (loginReceipts.get(account.id) === receipt) loginReceipts.delete(account.id) }

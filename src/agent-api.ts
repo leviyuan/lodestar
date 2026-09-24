@@ -8,7 +8,6 @@ import {
   parseAgentRunRequest,
   type AgentRunSnapshot,
 } from './agent-run-types'
-import { pendingTokenSourceModelRefresh } from './token-source'
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024
 
@@ -36,7 +35,6 @@ export async function handleAgentRequest(
   if (!principal) return send(403, { error: 'invalid or stale agent capability' })
 
   if (req.method === 'GET' && url.pathname === '/agents/identities') {
-    await pendingTokenSourceModelRefresh()
     return send(200, serializeCatalog(await getAgentSkillIdentityCatalog(principal.session.codexAccountId())))
   }
   if (req.method === 'POST' && url.pathname === '/agents/runs') {

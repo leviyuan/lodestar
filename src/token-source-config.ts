@@ -1,10 +1,10 @@
-/** 群内账号启用和模型补录的配置写入；重建账号目录并等待模型刷新。 */
+/** Configuration edits reproject cached catalogs; network refreshes are owned by the background worker. */
 
 import { readFileSync } from 'node:fs'
 import { CONFIG_FILE } from './paths'
 import { config, loadConfig, reloadTokenSources, type TokenSourceConfig } from './config'
 import { buildTokenSourcesFromConfig } from './token-source-builtins'
-import { getTokenSourceForAccount, refreshAllTokenSourceModels, type TokenSourceFactoryDef, type TokenSourceSetup } from './token-source'
+import { getTokenSourceForAccount, type TokenSourceFactoryDef, type TokenSourceSetup } from './token-source'
 import { writeStateFileAtomic } from './state-store'
 import { modelList } from './token-source-visibility'
 import { sharedTokenSourceConfigs, tokenSourceConfigUpdates } from './token-source-accounts'
@@ -90,8 +90,6 @@ async function applyTokenSourceConfig(id: string, cfg: TokenSourceConfig, saved?
   saved?.()
   reloadTokenSources()
   buildTokenSourcesFromConfig()
-  // 重建会清空各账号的目录；所有调用方共用这次刷新。
-  await refreshAllTokenSourceModels()
 }
 
 export function addTokenSource(id: string, cfg: TokenSourceConfig): Promise<void> {
@@ -105,19 +103,25 @@ export class TokenSourceSetupError extends Error {
 }
 
 /** 群内补配先校验再保存；校验与写入共用队列，失败不会覆盖现有凭据或重建目录。 */
-export function configureTokenSource(def: TokenSourceFactoryDef, cfg: TokenSourceConfig, setup: TokenSourceSetup | undefined = def.setup): Promise<void> {
-  return serializeConfigUpdate(async () => {
-    let saved = false
-    try {
-      if (!def.configSectionId || !setup) throw new Error('此来源不支持配置命令')
+export async function configureTokenSource(def: TokenSourceFactoryDef, cfg: TokenSourceConfig, setup: TokenSourceSetup | undefined = def.setup): Promise<void> {
+  let saved = false
+  try {
+    if (!def.configSectionId || !setup) throw new Error('此来源不支持配置命令')
+    const id = def.configSectionId
+    const candidateFor = () => {
       const previous = loadConfig().token_sources
-      const candidate = { ...previous, ...tokenSourceConfigUpdates(previous, def.configSectionId, cfg) }
-      await setup.validate(sharedTokenSourceConfigs(candidate)[def.configSectionId])
-      await applyTokenSourceConfig(def.configSectionId, cfg, () => { saved = true })
-    } catch (error) {
-      throw new TokenSourceSetupError(error, saved)
+      return sharedTokenSourceConfigs({ ...previous, ...tokenSourceConfigUpdates(previous, id, cfg) })[id]
     }
-  })
+    const candidate = candidateFor()
+    // Validation may be slow. It must not hold the local settings queue.
+    await setup.validate(candidate)
+    await serializeConfigUpdate(async () => {
+      if (JSON.stringify(candidateFor()) !== JSON.stringify(candidate)) throw new Error('校验期间账号配置已变化，本次未保存，请重试')
+      await applyTokenSourceConfig(id, cfg, () => { saved = true })
+    })
+  } catch (error) {
+    throw new TokenSourceSetupError(error, saved)
+  }
 }
 
 /** 所有群共用同一账号的列表；在队列内部读取最新列表，避免并发增删互相覆盖。 */
@@ -159,10 +163,6 @@ export function registerCustomTokenSourceModel(id: string, raw: string, accountI
     const catalog = source.modelSelection?.availableModels ?? source.models
     if (catalog.some(entry => entry.model.toLowerCase() === model.toLowerCase())) throw new Error('模型已在目录或补录记录中；隐藏项请使用“显示”')
     if (source.modelCatalogState?.status !== 'ready') throw new Error(source.modelCatalogState?.error ?? '模型目录未就绪')
-    if (source.verifyModel) {
-      const verdict = await source.verifyModel(model)
-      if (verdict !== 'exists') throw new Error(verdict === 'not_found' ? '端点确认不存在' : '无法校验模型：端点无响应或凭据问题')
-    }
     const cfg = config.token_sources[id]
     await applyTokenSourceConfig(id, { custom_models: [...modelList(cfg?.custom_models), model].join(',') })
     const fresh = getTokenSourceForAccount(id, accountId)

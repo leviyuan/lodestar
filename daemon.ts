@@ -18,6 +18,9 @@
  */
 
 import * as lark from '@larksuiteoapi/node-sdk'
+import { startBackgroundRefresh, stopBackgroundRefresh } from './src/background-refresh'
+import { refreshTokenSourceUsage } from './src/token-source-cache'
+import { pendingSourceCommands } from './src/session-commands'
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { Session } from './src/session'
@@ -115,6 +118,7 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
   shutdownExitCode = Math.max(shutdownExitCode, exitCode)
   if (shutdownPromise) return shutdownPromise
   shutdownRequested = true
+  stopBackgroundRefresh()
   stopAgentAutoUpdates?.()
   // Seal both message and action admission synchronously before taking the
   // dynamic work snapshot. Already-admitted tails remain drainable.
@@ -140,6 +144,7 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
         await drainDynamicWork(() => [
           ...chatActor.pending(),
           ...inflightCardActions,
+          ...pendingSourceCommands(),
         ])
         sessionRecovery.freezeForShutdown()
         const agentResults = await Promise.allSettled([
@@ -1247,10 +1252,12 @@ async function boot(): Promise<void> {
   buildTokenSourcesFromConfig()
   // 先完成模型目录加载，再接受群消息和恢复会话。空的加载中目录不能用于
   // 判断已保存的模型是否存在；刷新失败由对应 source 保留明确错误。
-  const { refreshAllTokenSourceModels } = await import('./src/token-source')
+  const { refreshAllTokenSourceModels, listTokenSourceAccounts } = await import('./src/token-source')
   if (shutdownRequested) return
   await refreshAllTokenSourceModels()
+  await Promise.allSettled(listTokenSourceAccounts().map(refreshTokenSourceUsage))
   if (shutdownRequested) return
+  startBackgroundRefresh()
   feishu.loadTempSessionLeases()
   feishu.loadSessionChatMap()
   feishu.loadSessionResumeMap()

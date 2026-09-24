@@ -4,7 +4,6 @@ import { codexUsageToUnified } from './token-source-codex'
 import { listTokenSources, tokenSourceRegistryRevision, type UsageSnapshotUnified } from './token-source'
 import { sharedAccountId } from './token-source-accounts'
 import { codexUsageCacheRevision } from './usage'
-import { USAGE_FRESH_MS } from './usage-cache'
 import { log } from './log'
 
 export interface AccountUsage {
@@ -13,7 +12,6 @@ export interface AccountUsage {
   usage: UsageSnapshotUnified
 }
 
-let cached: { key: string; until: number; rows: AccountUsage[] } | undefined
 let pending: { key: string; promise: Promise<AccountUsage[]> } | undefined
 
 function cacheKey(): string {
@@ -22,14 +20,8 @@ function cacheKey(): string {
     codexAccounts.list().map(account => [account.id, account.name, account.revision])])
 }
 
-export function peekAllAccountUsage(): AccountUsage[] | undefined {
-  return cached && cached.key === cacheKey() && Date.now() < cached.until ? cached.rows : undefined
-}
-
 /** One row per billing account, independent of the Agent selected in this chat. */
 export function readAllAccountUsage(): Promise<AccountUsage[]> {
-  const fresh = peekAllAccountUsage()
-  if (fresh) return Promise.resolve(fresh)
   const key = cacheKey()
   if (pending?.key === key) return pending.promise
   const order = ['codex-sub', 'claude-sub', 'glm', 'dsh-glm', 'deepseek', 'deepseek-harness', 'openrouter', 'claude-native']
@@ -57,13 +49,8 @@ export function readAllAccountUsage(): Promise<AccountUsage[]> {
       return { state: 'network', windows: [], reason }
     }).then(usage => [{ id, label, usage }]))
   }
-  const promise = Promise.all(reads).then(groups => {
-    const rows = groups.flat()
-    const now = Date.now()
-    const until = Math.min(now + USAGE_FRESH_MS, ...rows.map(row => (row.usage.fetchedAt ?? now) + USAGE_FRESH_MS))
-    if (key === cacheKey()) cached = { key, rows, until }
-    return rows
-  }).finally(() => { if (pending?.promise === promise) pending = undefined })
+  const promise = Promise.all(reads).then(groups => groups.flat())
+    .finally(() => { if (pending?.promise === promise) pending = undefined })
   pending = { key, promise }
   return promise
 }

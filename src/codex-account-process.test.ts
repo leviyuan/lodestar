@@ -132,7 +132,7 @@ describe('Codex account process ownership and recovery', () => {
     expect(processCodexAccount(h.proc)).toBe('b'); expect(h.proc.sourceRevision()).toBe('b')
     h.children[1].success(); expect(h.results).toHaveLength(1); expect(h.proc.lastCompletedTurnId).toBe('done')
   })
-  test('quota refresh failure during recovery stays in logs while the original task continues', async () => {
+  test('recovery continues from cached quota without making an upstream usage query', async () => {
     const accountId = 'recovery-refresh-failure'
     const h = harness([decision(accountId), decision('replacement')])
     const notices: string[] = []
@@ -140,7 +140,8 @@ describe('Codex account process ownership and recovery', () => {
     const logged = spyOn(logModule, 'log').mockImplementation(() => {})
     try {
       await h.proc.initializationPromise()
-      Object.assign(h.children[0], { readRateLimits: async () => { throw new Error('quota probe unavailable') } })
+      let reads = 0
+      Object.assign(h.children[0], { readRateLimits: async () => { reads++; throw new Error('quota probe unavailable') } })
       h.children[0].quota(); await flush()
       expect(h.children).toHaveLength(2)
       expect(h.children[1].launch).toMatchObject({ kind: 'resume', source: { sessionId: 'native-thread' } })
@@ -149,7 +150,8 @@ describe('Codex account process ownership and recovery', () => {
       expect(notices.some(message => message.includes('正在换号'))).toBe(true)
       expect(notices.some(message => message.includes('继续原任务'))).toBe(true)
       expect(notices.every(message => !message.includes('MISS') && !message.includes('quota probe unavailable'))).toBe(true)
-      expect(logged.mock.calls.some(([line]) => line.includes('quota probe unavailable'))).toBe(true)
+      expect(reads).toBe(0)
+      expect(logged.mock.calls.some(([line]) => line.includes('quota probe unavailable'))).toBe(false)
     } finally { logged.mockRestore(); invalidateCodexUsage(accountId) }
   })
   test('unaccepted first input can be submitted once with its original file hints', async () => {

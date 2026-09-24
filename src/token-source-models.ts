@@ -13,6 +13,8 @@ import type { AgentReasoningEffort } from './agent-process'
 import { homedir } from 'node:os'
 import { log } from './log'
 import type { ClaudeSpawnOpts } from './claude-agent-process'
+import { observeCodexAccountEmail } from './codex-account-info'
+import { codexAccounts } from './codex-accounts'
 
 const TIMEOUT_MS = 10_000
 
@@ -50,10 +52,12 @@ export async function fetchNativeClaudeModels(options: Pick<ClaudeSpawnOpts,
 
 /** codex 订阅可用模型(app-server model/list),过滤 hidden,effort 用 per-model。 */
 export async function fetchCodexModels(accountId = 'default'): Promise<TokenSourceModel[]> {
+  const revision = codexAccounts.revision(accountId)
   const app = new AppServerOnce({ accountId })
   try {
     await app.initialize('lodestar-models')
     const account = await requestCodexControlWithRetry(() => app.request('account/read', { refreshToken: false }), '账号查询')
+    observeCodexAccountEmail(accountId, account?.account, revision)
     if (account?.account?.type !== 'chatgpt') throw Object.assign(new Error('Codex 订阅未登录；发送 codex-login 或 codex-login 备注完成授权'), { code: 'CODEX_AUTH_MISSING' })
     const res = await requestCodexControlWithRetry(() => app.request('model/list', {}), '模型查询')
     if (!Array.isArray(res?.data)) throw new Error('Codex model/list 缺少 data 数组')

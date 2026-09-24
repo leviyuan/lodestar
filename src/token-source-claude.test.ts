@@ -43,6 +43,7 @@ test('Claude subscription coexists with other accounts and refreshes authoritati
     assert.equal(source.defaultModel, 'sonnet')
     assert.deepEqual(source.models[0].efforts, ['high', 'low'])
     assert.equal(source.models[0].defaultEffort, 'high')
+    await (await import('./src/token-source-cache')).refreshTokenSourceUsage(source)
     assert.equal((await source.readUsage()).state, 'ok')
 
     account = {}
@@ -58,15 +59,15 @@ test('Claude subscription coexists with other accounts and refreshes authoritati
     assert.equal(source.enabled, true)
     assert.equal(source.modelCatalogState.status, 'ready')
     failure = new Error('catalog connection failed')
-    await source.refreshModels()
-    assert.equal(source.modelCatalogState.status, 'failed')
+    await assert.rejects(source.refreshModels(), /catalog connection failed/)
+    assert.equal(source.modelCatalogState.status, 'ready')
     assert.match(source.modelCatalogState.error, /catalog connection failed/)
-    assert.deepEqual(source.models, [])
-    assert.deepEqual(source.modelSelection.availableModels, [])
+    assert.ok(source.models.length > 0)
+    assert.ok(source.modelSelection.availableModels.length > 0)
     failure = null
     models = []
-    await source.refreshModels()
-    assert.equal(source.modelCatalogState.status, 'failed')
+    await assert.rejects(source.refreshModels(), /目录为空/)
+    assert.equal(source.modelCatalogState.status, 'ready')
     assert.match(source.modelCatalogState.error, /目录为空/)
 
     // Independent subscription detection must not disable the legacy local-config route.
@@ -124,6 +125,7 @@ test('disabled Claude subscription skips native queries and discovery until expl
     await enabled.refreshModels()
     assert.equal(enabled.enabled, true)
     assert.equal(enabled.modelCatalogState.status, 'ready')
+    await (await import('./src/token-source-cache')).refreshTokenSourceUsage(enabled)
     assert.equal((await buildAgentSkillIdentityCatalog([enabled])).identities.length, 2)
     assert.equal(modelQueries, 1)
     assert.equal(usageQueries, 1)

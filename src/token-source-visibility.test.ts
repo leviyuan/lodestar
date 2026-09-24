@@ -22,9 +22,13 @@ function run(work: string) {
     globalThis.fetch = async () => failed ? new Response('unavailable', { status: 503 })
       : Response.json({ data: ids.map(id => ({ id, display_name: id })) })
     const factory = registry.tokenSourceFactories().find(f => f.kind === 'glm-coding-plan')
+    const { cachedTokenSource } = await import(${path('token-source-cache.ts')})
     const rebuild = () => {
+      const cfg = config.token_sources.glm
+      const previous = registry.getTokenSource('glm')
+      const source = cachedTokenSource(() => withModelVisibility(factory.build(cfg), cfg), cfg, 'fixture-glm', JSON.stringify(cfg), previous)
       registry.resetTokenSourceRegistry()
-      registry.registerTokenSource(withModelVisibility(factory.build(config.token_sources.glm), config.token_sources.glm))
+      registry.registerTokenSource(source)
       return 1
     }
     mock.module(${path('token-source-builtins.ts')}, () => ({ buildTokenSourcesFromConfig: rebuild }))
@@ -61,7 +65,7 @@ test('hiding persists across refresh, new upstream models appear, and adding res
   `)
 })
 
-test('concurrent hides preserve an editable empty list and refresh failure never reuses its old catalog', () => {
+test('concurrent hides preserve an editable empty list while failed background refresh retains the cache', () => {
   run(`
     await Promise.all(ids.map(id => editTokenSourceModels('glm', id, 'remove')))
     assert.deepEqual(source().models, [])
@@ -70,10 +74,11 @@ test('concurrent hides preserve an editable empty list and refresh failure never
     rebuild(); await registry.refreshAllTokenSourceModels()
     assert.deepEqual(source().models, [])
     failed = true
-    await assert.rejects(editTokenSourceModels('glm', 'GLM-5.3', 'add'), /配置已保存.*刷新失败/)
-    assert.equal(source().modelCatalogState.status, 'failed')
-    assert.deepEqual(source().models, [])
-    assert.deepEqual(source().modelSelection.availableModels, [])
+    await editTokenSourceModels('glm', 'GLM-5.3', 'add')
+    await assert.rejects(source().refreshModels(), /503/)
+    assert.equal(source().modelCatalogState.status, 'ready')
+    assert.deepEqual(source().models.map(m => m.model), ['GLM-5.3'])
+    assert.equal(source().modelSelection.availableModels.length, 2)
     failed = false
     await source().refreshModels()
     assert.deepEqual(source().models.map(m => m.model), ['GLM-5.3'])

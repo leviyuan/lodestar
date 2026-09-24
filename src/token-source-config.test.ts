@@ -22,12 +22,12 @@ function runConfigUpdate(work: string): void {
     import { mock } from 'bun:test'
     import assert from 'node:assert/strict'
     import { readFileSync, rmSync } from 'node:fs'
-    let rebuilds = 0
+    let rebuilds = 0, rebuildError
     let refreshes = 0
     let releaseRefresh, rejectRefresh
     const refresh = new Promise((resolve, reject) => { releaseRefresh = resolve; rejectRefresh = reject })
     mock.module(${JSON.stringify(join(import.meta.dir, 'token-source-builtins.ts'))}, () => ({
-      buildTokenSourcesFromConfig: () => { rebuilds++ },
+      buildTokenSourcesFromConfig: () => { rebuilds++; if (rebuildError) throw rebuildError },
     }))
     mock.module(${JSON.stringify(join(import.meta.dir, 'token-source.ts'))}, () => ({
       refreshAllTokenSourceModels: () => { refreshes++; return refresh },
@@ -51,14 +51,14 @@ function runConfigUpdate(work: string): void {
   }
 }
 
-test('updates credentials without losing slots or adjacent sections and waits for one catalog refresh', () => {
+test('updates credentials without losing slots or adjacent sections without waiting for a catalog refresh', () => {
   runConfigUpdate(`
     let completed = false
     const pending = addTokenSource('glm', { auth_token: 'new-token' }).then(() => { completed = true })
-    await Promise.resolve()
-    assert.equal(completed, false)
+    await pending
+    assert.equal(completed, true)
     assert.equal(rebuilds, 1)
-    assert.equal(refreshes, 1)
+    assert.equal(refreshes, 0)
     const saved = readFileSync(configFile, 'utf8')
     assert.equal((saved.match(/\\[token_source\\.glm\\]/g) || []).length, 1)
     assert.ok(saved.includes('slots = "opus=GLM-5.3[1m],sonnet=GLM-5.3[1m]"'))
@@ -68,7 +68,7 @@ test('updates credentials without losing slots or adjacent sections and waits fo
     releaseRefresh()
     await pending
     assert.equal(completed, true)
-    assert.equal(refreshes, 1)
+    assert.equal(refreshes, 0)
   `)
 })
 
@@ -134,7 +134,7 @@ test('credential validation failure never writes, reloads or clears the active c
   `)
 })
 
-test('queued credential checks complete before writing and allow retry after rejection', () => {
+test('slow credential validation does not block another configuration update', () => {
   runConfigUpdate(`
     const before = readFileSync(configFile, 'utf8')
     const seen = []
@@ -148,8 +148,9 @@ test('queued credential checks complete before writing and allow retry after rej
     const rejected = assert.rejects(first, /invalid key/)
     const next = configureTokenSource(def, { auth_token: 'valid-token' })
     await Promise.resolve()
-    assert.deepEqual(seen, ['invalid-token'])
-    assert.equal(readFileSync(configFile, 'utf8'), before)
+    assert.deepEqual(seen, ['invalid-token', 'valid-token'])
+    await next
+    assert.notEqual(readFileSync(configFile, 'utf8'), before)
     rejectValidation(new Error('invalid key'))
     await rejected
     releaseRefresh()
@@ -157,21 +158,21 @@ test('queued credential checks complete before writing and allow retry after rej
     assert.deepEqual(seen, ['invalid-token', 'valid-token'])
     assert.equal(config.token_sources.glm.auth_token, 'valid-token')
     assert.equal(rebuilds, 1)
-    assert.equal(refreshes, 1)
+    assert.equal(refreshes, 0)
   `)
 })
 
 test('post-save reload failures keep the fact that credentials were already saved', () => {
   runConfigUpdate(`
     const def = { configSectionId: 'glm', setup: { validate: async () => {} } }
+    rebuildError = new Error('rebuild failed')
     const pending = configureTokenSource(def, { auth_token: 'valid-token' })
     const rejected = assert.rejects(pending, error => {
       assert.equal(error.saved, true)
-      return /refresh failed/.test(error.message)
+      return /rebuild failed/.test(error.message)
     })
     await Promise.resolve()
     await Promise.resolve()
-    rejectRefresh(new Error('refresh failed'))
     await rejected
     assert.equal(config.token_sources.glm.auth_token, 'valid-token')
     assert.ok(readFileSync(configFile, 'utf8').includes('valid-token'))
@@ -209,7 +210,7 @@ test('persists an OpenRouter account and reloads its catalog settings', () => {
     assert.deepEqual(config.token_sources.openrouter, { agent: 'claude', api_key: 'openrouter-test-key',
       model: 'anthropic/test-model', effort: 'medium', models: 'anthropic/test-model' })
     assert.equal(rebuilds, 1)
-    assert.equal(refreshes, 1)
+    assert.equal(refreshes, 0)
     assert.ok(readFileSync(configFile, 'utf8').includes('[token_source.glm]'))
   `)
 })

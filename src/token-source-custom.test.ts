@@ -52,13 +52,18 @@ api_key="test-key"
     for (const name of ['codex', 'glm', 'native', 'claude', 'deepseek', 'openrouter', 'dsh', 'dsh-glm']) {
       await import(${JSON.stringify(join(import.meta.dir, 'token-source-'))} + name + '.ts')
     }
+    const { cachedTokenSource } = await import(${modulePath('token-source-cache.ts')})
     const rebuild = () => {
+      const previous = new Map(registry.listTokenSources().map(source => [source.id, source]))
       registry.resetTokenSourceRegistry()
       const effective = sharedTokenSourceConfigs(config.token_sources)
       for (const factory of registry.tokenSourceFactories()) {
         const cfg = effective[factory.configSectionId] ?? {}
-        const source = withModelVisibility(factory.build(cfg), cfg)
-        source.enabled = true // 本测试隔离凭据发现，不依赖测试机上的本地登录态。
+        const source = cachedTokenSource(() => {
+          const raw = withModelVisibility(factory.build(cfg), cfg)
+          raw.enabled = true
+          return raw
+        }, cfg, factory.kind, JSON.stringify(cfg), previous.get(factory.configSectionId))
         registry.registerTokenSource(source)
       }
       return registry.listTokenSources().length

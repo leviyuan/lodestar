@@ -47,7 +47,7 @@ registerTokenSourceFactory({
     const source: TokenSource = {
       id: 'dsh-glm', kind: 'dsh-glm', agent: 'dsh', display: cfg.display?.trim() || 'GLM Coding Plan',
       enabled: !!key, models: [], defaultModel: cfg.model?.trim().toLowerCase() ?? '',
-      modelEnvironmentRevision() { return JSON.stringify([...(allowedModels ?? [])].sort()) },
+      modelEnvironmentRevision() { return JSON.stringify((source.modelSelection?.availableModels ?? source.models).map(model => model.model).sort()) },
       modelCatalogState: { status: key ? 'idle' : 'disabled', updatedAt: Date.now() },
       spawnEnv(baseEnv) {
         if (!key) throw new Error('DSH GLM Coding Plan API key is missing')
@@ -56,7 +56,8 @@ registerTokenSourceFactory({
         env.LODESTAR_DSH_GLM_API_KEY = key
         env.LODESTAR_DSH_BASE_URL = base
         env.LODESTAR_DSH_DEFAULT_MODEL = source.defaultModel
-        if (allowedModels) env.LODESTAR_DSH_MODELS = JSON.stringify(allowedModels)
+        const cachedModels = (source.modelSelection?.availableModels ?? source.models).map(model => model.model)
+        if (allowedModels || cachedModels.length) env.LODESTAR_DSH_MODELS = JSON.stringify(allowedModels ?? cachedModels)
         if (cfg.bin) env.LODESTAR_DSH_NODE = cfg.bin
         return env
       },

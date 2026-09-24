@@ -18,6 +18,13 @@ import * as usageModule from './usage'
 import { codexAccountScheduler } from './codex-account-scheduler'
 import { codexAccountCard } from './cards/codex-account'
 import * as logModule from './log'
+import { pendingSourceCommands } from './session-commands'
+
+async function runAndSettle(session: Session, ...args: Parameters<Session['runCommand']>) {
+  const result = await session.runCommand(...args)
+  await Promise.all(pendingSourceCommands())
+  return result
+}
 
 let root: string
 let quotaNow: number
@@ -139,7 +146,7 @@ describe('bare Codex account commands', () => {
       usage: { ...usage, weekly: { percent: 25, resetsAt: new Date(quotaNow - 3600_000) } } }
     spies.push(spyOn(codexAccountScheduler, 'choose').mockResolvedValue({ selected: ready, candidates: [ready, missing] }))
     const s = session()
-    await s.runCommand('codex-accounts', 'owner')
+    await runAndSettle(s, 'codex-accounts', 'owner')
     const view = cardViews.at(-1)!
     expect(view.phase).toBe('accounts')
     const card = JSON.stringify(codexAccountCard(view))
@@ -169,13 +176,13 @@ describe('bare Codex account commands', () => {
     native.enabled = false; native.models = []; native.defaultModel = ''
     native.modelCatalogState = { status: 'disabled', updatedAt: 1, error: 'Codex 订阅未登录' }
     const s = session(); s.selectedProvider = 'claude'; s.selectedTokenSourceId = 'glm'
-    const read = spyOn(usageModule, 'readUsage').mockImplementation(async id => id === account.id
+    const read = spyOn(usageModule, 'peekUsage').mockImplementation(id => id === account.id
       ? { state: 'ok', subscriptionType: 'plus', fiveHour: { percent: 7, resetsAt: null }, weekly: null,
         resetCredits: 0, fetchedAt: 1, accountFingerprint: 'named-identity' }
       : { state: 'no_credentials' })
     const choose = spyOn(codexAccountScheduler, 'choose').mockResolvedValue({ selected: null, candidates: [] })
     spies.push(read, choose)
-    await s.runCommand('codex-accounts', 'owner')
+    await runAndSettle(s, 'codex-accounts', 'owner')
     expect(read.mock.calls.map(([id]) => id)).toEqual(['default', account.id])
     expect(choose).not.toHaveBeenCalled()
     const view = cardViews.at(-1)!
@@ -197,37 +204,30 @@ describe('bare Codex account commands', () => {
     getTokenSourceForAccount('codex-sub', account.id)!.defaultModel = 'named-model'
     const choose = spyOn(codexAccountScheduler, 'choose').mockResolvedValue({ selected: null, candidates: [] })
     spies.push(choose)
-    await s.runCommand('codex-accounts', 'owner')
+    await runAndSettle(s, 'codex-accounts', 'owner')
     expect(choose).toHaveBeenCalledWith({ model: 'named-model', effort: undefined })
     expect(cardViews.at(-1)?.phase).toBe('accounts')
     expect(s.selectedProvider).toBe('claude')
   })
 
-  test('account list refreshes a missing model and reports persistent catalog errors alongside quota', async () => {
+  test('account list reports cached catalog errors immediately without querying any upstream', async () => {
     const s = session(); s.selectedModel = null
     const native = getTokenSourceForAccount('codex-sub')!
-    native.defaultModel = ''; native.models = []; native.modelCatalogState = { status: 'failed', updatedAt: 1, error: 'old timeout' }
-    const refresh = spyOn(native, 'refreshModels').mockImplementation(async () => {
-      native.defaultModel = 'recovered-model'; native.modelCatalogState = { status: 'ready', updatedAt: 2 }
-    })
+    native.defaultModel = ''; native.models = []
+    native.modelCatalogState = { status: 'failed', updatedAt: 1, error: 'catalog HTTP 503' }
+    const refresh = spyOn(native, 'refreshModels').mockImplementation(async () => { throw new Error('must not refresh') })
     const choose = spyOn(codexAccountScheduler, 'choose').mockResolvedValue({ selected: null, candidates: [] })
-    const read = spyOn(usageModule, 'readUsage').mockResolvedValue({ state: 'network', reason: 'quota HTTP 503' })
+    const read = spyOn(usageModule, 'readUsage').mockImplementation(async () => { throw new Error('must not fetch usage') })
     spies.push(refresh, choose, read)
-    await s.runCommand('codex-accounts', 'owner')
-    expect(refresh).toHaveBeenCalledTimes(1)
-    expect(choose).toHaveBeenCalledWith({ model: 'recovered-model', effort: 'high' })
+    await runAndSettle(s, 'codex-accounts', 'owner')
+    expect(refresh).not.toHaveBeenCalled()
     expect(read).not.toHaveBeenCalled()
-    native.defaultModel = ''
-    refresh.mockImplementation(async () => { throw new Error('catalog HTTP 503 after 3 attempts') })
-    await s.runCommand('codex-accounts', 'owner')
-    const view = cardViews.at(-1)!
-    expect(view.phase).toBe('accounts'); expect(view.details).toContain('catalog HTTP 503 after 3 attempts')
-    expect(view.message).toContain('调度顺序 MISS')
-    expect(JSON.stringify(codexAccountCard(view))).toContain('quota HTTP 503')
-    expect(choose).toHaveBeenCalledTimes(1)
+    expect(choose).not.toHaveBeenCalled()
+    expect(cardViews.at(-1)?.phase).toBe('accounts')
+    expect(cardViews.at(-1)?.details).toContain('catalog HTTP 503')
   })
 
-  test('account list waits for an existing catalog refresh before resolving its model', async () => {
+  test('account list responds before an existing catalog refresh and uses its result on the next read', async () => {
     const s = session(); s.selectedModel = null
     const native = getTokenSourceForAccount('codex-sub')!
     native.defaultModel = ''
@@ -244,8 +244,10 @@ describe('bare Codex account commands', () => {
     await new Promise(resolve => setTimeout(resolve, 0))
     const waiting = cardViews.at(-1)?.phase
     release(); await loading; await command
-    expect(waiting).toBe('checking')
+    expect(waiting).toBe('accounts')
     expect(refresh).toHaveBeenCalledTimes(1)
+    expect(choose).not.toHaveBeenCalled()
+    await runAndSettle(s, 'codex-accounts', 'owner')
     expect(choose).toHaveBeenCalledWith({ model: 'loaded-model', effort: 'high' })
   })
 
@@ -261,7 +263,7 @@ describe('bare Codex account commands', () => {
       return proc
     }
     const console = spyOn(s, 'showConsole').mockResolvedValue(undefined); spies.push(console)
-    expect(await s.runCommand('HI 强制 Plus', 'owner')).toBe(true)
+    expect(await runAndSettle(s, 'HI 强制 Plus', 'owner')).toBe(true)
     expect(override).toBe(account.id)
     expect(s.codexAccountId()).toBe(account.id)
     expect(store.preferred(s.sessionName)).toBeNull()
@@ -280,27 +282,27 @@ describe('bare Codex account commands', () => {
       return proc
     }
     spies.push(spyOn(s, 'showConsole').mockResolvedValue(undefined))
-    await s.runCommand('hi next', 'owner')
+    await runAndSettle(s, 'hi next', 'owner')
     expect(resumed.sessionId).toBe('shared-thread'); expect(old.killCalls).toBe(1)
     expect(s.codexAccountId()).toBe(account.id)
-    await s.runCommand('hi unknown', 'owner')
+    await runAndSettle(s, 'hi unknown', 'owner')
     expect(s.codexAccountId()).toBe(account.id); expect(cardViews.at(-1)?.phase).toBe('error')
     await s.stop('cleanup', { announce: false })
     s.spawnAgent = () => { throw new Error('native auth failed') }
-    await s.runCommand('hi next', 'owner')
+    await runAndSettle(s, 'hi next', 'owner')
     expect(cardViews.at(-1)?.message).toContain('native auth failed')
     expect(store.preferred(s.sessionName)).toBeNull(); expect(s.codexStartAccountOverride).toBeUndefined()
   })
   test('named hi with embedded newlines is not consumed as an account command', async () => {
     const s = session()
     const dispatch = spyOn(accountCommands, 'runCodexNamedHi').mockResolvedValue(undefined); spies.push(dispatch)
-    expect(await s.runCommand('hi remark\ncontinue task', 'owner')).toBe(false)
+    expect(await runAndSettle(s, 'hi remark\ncontinue task', 'owner')).toBe(false)
     expect(dispatch).not.toHaveBeenCalled()
   })
   test('auto clears manual preference and temporary sessions inherit auto without pinning the running account', async () => {
     const account = store.ensure('manual')
     const s = session(); store.select(s.sessionName, account.id)
-    await s.runCommand('codex-auto', 'owner')
+    await runAndSettle(s, 'codex-auto', 'owner')
     expect(store.preferred(s.sessionName)).toBeNull()
     expect(cardViews.at(-1)?.selected).toContain('自动')
     const proc = new Proc(); procs.push(proc); bindProcessCodexAccount(proc, account.id); s.proc = proc
@@ -325,9 +327,9 @@ describe('bare Codex account commands', () => {
     const replacements: string[] = []
     spies.push(spyOn(s, 'replaceStatusCardWithConsole').mockImplementation(async (_card: any, status: string) => { replacements.push(status) }))
     spies.push(spyOn(s, 'openStatusCard').mockResolvedValue(null))
-    await s.runCommand('hi', 'owner')
+    await runAndSettle(s, 'hi', 'owner')
     expect(replacements).toEqual([])
-    await s.runCommand('stop', 'owner')
+    await runAndSettle(s, 'stop', 'owner')
     expect(proc.isAlive()).toBe(false)
   })
 
@@ -343,9 +345,11 @@ describe('bare Codex account commands', () => {
       reads++
       return { rateLimits: { primary: { usedPercent: 11, windowDurationMins: 300 }, secondary: { usedPercent: 23, windowDurationMins: 10080 } } }
     }
+    await refreshUsageFromConnection(() => proc.readRateLimits(), 'default')
+    reads = 0
     const suffix = await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)
     expect(suffix).toBe('  |  11%·[23%]')
-    expect(reads).toBe(1)
+    expect(reads).toBe(0)
     expect(s.codexAccountId()).toBe('default')
     expect(suffix).not.toContain('账号')
     expect(suffix).not.toContain('份额')
@@ -371,6 +375,7 @@ describe('bare Codex account commands', () => {
       expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)).toBe('  |  11%·[23%]')
       expect(reads).toBe(0)
       quotaNow += 60_000
+      await refreshUsageFromConnection(() => proc.readRateLimits(), account.id)
       for (let attempt = 0; attempt < 2; attempt++) {
         const suffix = await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)
         expect(suffix).toBe('  |  11%·[23%]')
@@ -380,6 +385,7 @@ describe('bare Codex account commands', () => {
       expect(reads).toBe(1)
       proc.readRateLimits = async () => response(15)
       quotaNow += 60_000
+      await refreshUsageFromConnection(() => proc.readRateLimits(), account.id)
       expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null))
         .toBe('  |  15%·[23%]')
     } finally {
@@ -403,11 +409,13 @@ describe('bare Codex account commands', () => {
       } }), account.id)
       proc.readRateLimits = async () => { throw new Error('HTTP 401 unauthorized') }
       quotaNow += 60_000
+      await refreshUsageFromConnection(() => proc.readRateLimits(), account.id)
       expect(await read()).toBe('  |  额度 MISS')
       proc.readRateLimits = async () => ({ rateLimits: {
         primary: { usedPercent: null, windowDurationMins: 300 },
       } })
       quotaNow += 60_000
+      await refreshUsageFromConnection(() => proc.readRateLimits(), account.id)
       expect(await read()).toBe('  |  MISS')
     } finally { usageModule.invalidateCodexUsage(account.id) }
   })
@@ -435,7 +443,7 @@ describe('bare Codex account commands', () => {
     } finally { usageModule.invalidateCodexUsage(account.id) }
   })
 
-  test('a quota reset during a footer refresh invalidates its old cache and late response', async () => {
+  test('a quota reset invalidates the cache and late background response without delaying the footer', async () => {
     const account = store.ensure('footer-reset')
     const s = session()
     const proc = new Proc() as any; procs.push(proc)
@@ -445,15 +453,17 @@ describe('bare Codex account commands', () => {
     quotaNow += 60_000
     let release!: (value: any) => void
     proc.readRateLimits = () => new Promise(resolve => { release = resolve })
-    const pending = s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)
+    const pending = refreshUsageFromConnection(() => proc.readRateLimits(), account.id)
     await Promise.resolve()
+    expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)).toBe('  |  11%')
     try {
       usageModule.invalidateCodexUsage(account.id)
       await refreshUsageFromConnection(async () => ({ rateLimits: {
         primary: { usedPercent: 0, windowDurationMins: 300 },
       } }), account.id)
       release(response)
-      expect(await pending).toBe('  |  额度 MISS')
+      expect(await pending).toBeNull()
+      expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)).toBe('  |  0%')
       expect(peekSuccessfulUsage(account.id)?.fiveHour?.percent).toBe(0)
     } finally {
       release(response)
@@ -496,7 +506,7 @@ describe('bare Codex account commands', () => {
     for (const raw of ['login', 'login 工作', 'accounts', 'account', 'account default',
       'login-cancel', 'login-cancel 工作', 'codex-login\n工作', 'codex-login 工作\n继续解释',
       'account-delete 工作', 'codex-account-delete 工作\n继续解释', 'reset', 'codex-reset 工作\n继续解释']) {
-      expect(await s.runCommand(raw, 'owner')).toBe(false)
+      expect(await runAndSettle(s, raw, 'owner')).toBe(false)
     }
     expect(dispatch).not.toHaveBeenCalled()
     const commands = [
@@ -512,7 +522,7 @@ describe('bare Codex account commands', () => {
       [' CODEX-RESET\t工作 订阅 ', 'reset', '工作 订阅'],
     ]
     for (const [raw, command, argument] of commands) {
-      expect(await s.runCommand(raw, 'owner', 'message-123')).toBe(true)
+      expect(await runAndSettle(s, raw, 'owner', 'message-123')).toBe(true)
       expect(dispatch).toHaveBeenLastCalledWith(s, command, argument, 'owner', 'message-123')
     }
     expect(sentTexts).toHaveLength(0)
@@ -527,13 +537,13 @@ describe('bare Codex account commands', () => {
     const consume = spyOn(usageModule, 'consumeCodexResetCredit').mockResolvedValue({ outcome: 'reset',
       usage: { state: 'ok', fiveHour: null, weekly: { percent: 3, resetsAt: null }, resetCredits: 0, fetchedAt: 1 } })
     spies.push(consume)
-    expect(await s.runCommand('codex-reset', 'owner', 'same-message')).toBe(true)
+    expect(await runAndSettle(s, 'codex-reset', 'owner', 'same-message')).toBe(true)
     const key = consume.mock.calls[0][1]
     expect(consume).toHaveBeenLastCalledWith(active.id, key)
     expect(cardViews.at(-1)).toMatchObject({ phase: 'success', name: active.name, title: '额度已重置', resetUsage: { resetCredits: 0 } })
-    await s.runCommand('codex-reset', 'owner', 'same-message')
+    await runAndSettle(s, 'codex-reset', 'owner', 'same-message')
     expect(consume).toHaveBeenLastCalledWith(active.id, key)
-    await s.runCommand('codex-reset', 'owner', 'new-message')
+    await runAndSettle(s, 'codex-reset', 'owner', 'new-message')
     expect(consume.mock.calls[2][1]).not.toBe(key)
     expect(store.preferred(s.sessionName)).toBe(next.id)
     expect(proc.killCalls).toBe(0); expect(s.proc).toBe(proc)
@@ -547,11 +557,11 @@ describe('bare Codex account commands', () => {
       ['alreadyRedeemed', 'success', '本次重置已完成'], ['nothingToReset', 'current', '无需重置'], ['noCredit', 'warning', '没有可用重置卡'],
     ] as const) {
       consume.mockResolvedValue({ outcome, usage: { state: 'ok', fiveHour: null, weekly: null, resetCredits: 0, fetchedAt: 1 } })
-      await s.runCommand('codex-reset 工作 订阅', 'owner', outcome)
+      await runAndSettle(s, 'codex-reset 工作 订阅', 'owner', outcome)
       expect(consume.mock.calls.at(-1)?.[0]).toBe(account.id)
       expect(cardViews.at(-1)).toMatchObject({ phase, title, name: account.name })
     }
-    await s.runCommand('codex-reset default', 'owner', 'default-message')
+    await runAndSettle(s, 'codex-reset default', 'owner', 'default-message')
     expect(consume.mock.calls.at(-1)?.[0]).toBe('default')
     expect(s.proc).toBeNull(); expect(store.preferred(s.sessionName)).toBeNull()
   })
@@ -559,19 +569,19 @@ describe('bare Codex account commands', () => {
   test('reset refuses an unknown target, missing message ID, or unknown current account', async () => {
     const s = session()
     const consume = spyOn(usageModule, 'consumeCodexResetCredit'); spies.push(consume)
-    await s.runCommand('codex-reset', 'owner', 'not-running')
+    await runAndSettle(s, 'codex-reset', 'owner', 'not-running')
     expect(JSON.stringify(sentCards.at(-1))).toContain('没有正在使用')
-    await s.runCommand('codex-reset default', 'owner')
+    await runAndSettle(s, 'codex-reset default', 'owner')
     expect(JSON.stringify(sentCards.at(-1))).toContain('缺少消息 ID')
-    await s.runCommand('codex-reset missing', 'owner', 'unknown-name')
+    await runAndSettle(s, 'codex-reset missing', 'owner', 'unknown-name')
     expect(JSON.stringify(sentCards.at(-1))).toContain('不存在')
     const proc = new Proc() as any; procs.push(proc); s.proc = proc
     proc.provider = 'claude'
-    await s.runCommand('codex-reset', 'owner', 'wrong-provider')
+    await runAndSettle(s, 'codex-reset', 'owner', 'wrong-provider')
     proc.provider = 'codex'; proc.codexAccountSelectionMode = () => null
-    await s.runCommand('codex-reset', 'owner', 'selecting')
+    await runAndSettle(s, 'codex-reset', 'owner', 'selecting')
     proc.codexAccountSelectionMode = () => 'automatic'; proc.turnRetry = { reason: 'quota', phase: 'waiting' }
-    await s.runCommand('codex-reset', 'owner', 'quota-wait')
+    await runAndSettle(s, 'codex-reset', 'owner', 'quota-wait')
     expect(consume).not.toHaveBeenCalled()
   })
 
@@ -580,12 +590,12 @@ describe('bare Codex account commands', () => {
     const consume = spyOn(usageModule, 'consumeCodexResetCredit').mockResolvedValue({ outcome: 'reset',
       usage: { state: 'network', reason: 'quota offline' }, cleanupError: 'close rejected' })
     spies.push(consume)
-    await s.runCommand('codex-reset default', 'owner', 'confirmed')
+    await runAndSettle(s, 'codex-reset default', 'owner', 'confirmed')
     expect(cardViews.at(-1)).toMatchObject({ phase: 'warning', title: '额度已重置', message: '已使用 1 次重置卡。' })
     expect(cardViews.at(-1)?.details).toContain('quota offline')
     expect(cardViews.at(-1)?.details).toContain('close rejected')
     consume.mockRejectedValue(new Error('upstream rejected reset'))
-    await s.runCommand('codex-reset default', 'owner', 'failed')
+    await runAndSettle(s, 'codex-reset default', 'owner', 'failed')
     expect(cardViews.at(-1)).toMatchObject({ phase: 'error', message: 'upstream rejected reset' })
   })
 
@@ -597,7 +607,7 @@ describe('bare Codex account commands', () => {
     spies.push(spyOn(CodexAccountCard, 'open').mockResolvedValue({
       finish: async (view: CodexAccountCardView) => { attempts.push(view); throw new Error('receipt write rejected') },
     } as unknown as CodexAccountCard))
-    await expect(s.runCommand('codex-reset default', 'owner', 'receipt-failed')).rejects.toThrow('receipt write rejected')
+    await expect(runAndSettle(s, 'codex-reset default', 'owner', 'receipt-failed')).rejects.toThrow('receipt write rejected')
     expect(attempts).toHaveLength(1)
     expect(attempts[0]).toMatchObject({ phase: 'success', title: '额度已重置' })
   })
@@ -619,7 +629,7 @@ describe('bare Codex account commands', () => {
     const pending = refreshUsageFromConnection(() => new Promise(resolve => { release = resolve }), account.id)
     await Promise.resolve()
 
-    expect(await s.runCommand('codex-account-delete 工作 订阅', 'owner')).toBe(true)
+    expect(await runAndSettle(s, 'codex-account-delete 工作 订阅', 'owner')).toBe(true)
     expect(cardViews.at(-1)).toMatchObject({ phase: 'deleted', name: account.name })
     expect(cardViews.at(-1)?.hint).toContain('2 个群')
     expect(existsSync(home)).toBe(false)
@@ -644,13 +654,13 @@ describe('bare Codex account commands', () => {
       ['codex-account-delete 默认', '默认账号'],
       ['codex-account-delete missing', '不存在'],
     ]) {
-      await s.runCommand(raw, 'owner')
+      await runAndSettle(s, raw, 'owner')
       expect(cardViews.at(-1)?.phase).toBe('error')
       expect(cardViews.at(-1)?.message).toContain(message)
     }
     // A native child can belong to another group or a delegated task, without being this Session's proc.
     const proc = new Proc(); procs.push(proc); bindProcessCodexAccount(proc, account.id)
-    await s.runCommand('codex-account-delete 受保护', 'owner')
+    await runAndSettle(s, 'codex-account-delete 受保护', 'owner')
     expect(cardViews.at(-1)?.message).toBe('账号正在使用中')
     expect(proc.killCalls).toBe(0)
     expect(store.get(account.id)).toEqual(account)
@@ -659,17 +669,17 @@ describe('bare Codex account commands', () => {
     const waiting = new Proc(); procs.push(waiting); bindProcessCodexAccount(waiting, account.id, false)
     const releaseWaitingLogin = reserveCodexLogin(account.id)
     releaseWaitingLogin()
-    await s.runCommand('codex-account-delete 受保护', 'owner')
+    await runAndSettle(s, 'codex-account-delete 受保护', 'owner')
     expect(cardViews.at(-1)?.message).toBe('账号正在使用中')
     expect(waiting.killCalls).toBe(0)
     await waiting.kill()
     const release = reserveCodexLogin(account.id)
     try {
-      await s.runCommand('codex-account-delete 受保护', 'owner')
+      await runAndSettle(s, 'codex-account-delete 受保护', 'owner')
       expect(cardViews.at(-1)?.message).toBe('账号正在登录')
       expect(store.get(account.id)).toEqual(account)
     } finally { release() }
-    await s.runCommand('codex-account-delete 受保护', 'owner')
+    await runAndSettle(s, 'codex-account-delete 受保护', 'owner')
     expect(cardViews.at(-1)?.phase).toBe('deleted')
     expect(() => store.get(account.id)).toThrow('不存在')
   })
@@ -688,7 +698,7 @@ describe('bare Codex account commands', () => {
     const old = new Proc(); procs.push(old)
     bindProcessCodexAccount(old, 'default')
     s.proc = old; s.wireProc(old)
-    expect(await s.runCommand('codex-account 工作 订阅', 'owner')).toBe(true)
+    expect(await runAndSettle(s, 'codex-account 工作 订阅', 'owner')).toBe(true)
     expect(store.selected(s.sessionName)).toBe(account.id)
     expect(s.codexAccountId()).toBe('default')
     expect(old.killCalls).toBe(0)
@@ -708,7 +718,7 @@ describe('bare Codex account commands', () => {
     expect(old.killCalls).toBe(1)
     const other = session()
     expect(other.codexAccountId()).toBe('default')
-    expect(await s.runCommand('codex-account default', 'owner')).toBe(true)
+    expect(await runAndSettle(s, 'codex-account default', 'owner')).toBe(true)
     expect(s.codexAccountId()).toBe(account.id)
     expect(await s.restart(true, { announce: false })).toBe(true)
     expect(s.codexAccountId()).toBe('default')
@@ -718,12 +728,12 @@ describe('bare Codex account commands', () => {
 
   test('unknown account is rejected, but explicit selection does not require model availability', async () => {
     const s = session()
-    await s.runCommand('codex-account missing', 'owner')
+    await runAndSettle(s, 'codex-account missing', 'owner')
     expect(store.selected(s.sessionName)).toBe('default')
     expect(cardViews.at(-1)?.message).toContain('不存在')
     const a = store.ensure('limited')
     s.tokenSource('codex-sub').forAccount(a.id).models = []
-    await s.runCommand('codex-account limited', 'owner')
+    await runAndSettle(s, 'codex-account limited', 'owner')
     expect(store.selected(s.sessionName)).toBe(a.id)
     expect(cardViews.at(-1)?.phase).toBe('selected')
   })
@@ -740,7 +750,7 @@ describe('bare Codex account commands', () => {
       '默认账号登录检查失败：native account read rejected']) {
       check.mockRejectedValue(new Error(message))
       for (const name of ['新增账号', existing.name]) {
-        await s.runCommand(`codex-login ${name}`, 'owner')
+        await runAndSettle(s, `codex-login ${name}`, 'owner')
         expect(cardViews.at(-1)).toMatchObject({ phase: 'error', message })
         expect(store.list()).toEqual(before)
       }
@@ -764,7 +774,7 @@ describe('bare Codex account commands', () => {
       accountId: id, loginId: 'named-login', verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'TEST-CODE', done,
     }))
     spies.push(check, start)
-    const command = s.runCommand('codex-login 新账号', 'owner')
+    const command = runAndSettle(s, 'codex-login 新账号', 'owner')
     await new Promise(resolve => setTimeout(resolve, 0))
     const before = store.list()
     const startedEarly = start.mock.calls.length
@@ -786,7 +796,7 @@ describe('bare Codex account commands', () => {
     const start = spyOn(codexLogins, 'start').mockRejectedValue(new Error('device-code sentinel'))
     spies.push(check, start)
     for (const command of ['codex-login', 'codex-login default', 'codex-login DEFAULT', 'codex-login 默认']) {
-      await s.runCommand(command, 'owner')
+      await runAndSettle(s, command, 'owner')
       expect(cardViews.at(-1)?.message).toBe('device-code sentinel')
     }
     expect(check).not.toHaveBeenCalled()
@@ -804,10 +814,10 @@ describe('bare Codex account commands', () => {
       started.push(id)
       return { accountId: id, loginId: 'login-id', verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'TEST-CODE', done }
     }))
-    await s.runCommand('codex-login', 'owner')
-    await s.runCommand('codex-login 第二订阅', 'owner')
+    await runAndSettle(s, 'codex-login', 'owner')
+    await runAndSettle(s, 'codex-login 第二订阅', 'owner')
     expect(started).toEqual(['default', store.find('第二订阅').id])
-    await s.runCommand('codex-account-delete 第二订阅', 'owner')
+    await runAndSettle(s, 'codex-account-delete 第二订阅', 'owner')
     expect(cardViews.at(-1)?.phase).toBe('error')
     expect(cardViews.at(-1)?.message).toContain('尚未结束')
     expect(cardViews.filter(v => v.phase === 'waiting').map(v => v.verification?.code)).toEqual(['TEST-CODE', 'TEST-CODE'])
@@ -824,9 +834,9 @@ describe('bare Codex account commands', () => {
     const proc = new Proc(); procs.push(proc)
     bindProcessCodexAccount(proc, 'default')
     const start = spyOn(codexLogins, 'start'); spies.push(start)
-    await s.runCommand('codex-login', 'owner')
+    await runAndSettle(s, 'codex-login', 'owner')
     expect(start).not.toHaveBeenCalled()
     expect(cardViews.at(-1)?.message).toBe('账号正在使用中')
-    expect(await s.runCommand('codex-login 带备注\n继续解释', 'owner')).toBe(false)
+    expect(await runAndSettle(s, 'codex-login 带备注\n继续解释', 'owner')).toBe(false)
   })
 })

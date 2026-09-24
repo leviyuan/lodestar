@@ -112,25 +112,22 @@ auth_token = "test-token"
     rmSync(dir, { recursive: true, force: true })
   })
 
-  await import('./token-source-builtins')
+  const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
   const {
     getTokenSource,
     refreshAllTokenSourceModels,
     registerTokenSource,
     resetTokenSourceRegistry,
-    tokenSourceFactories,
   } = await import('./token-source')
   const { onModelCustomPrompt, consumeModelCustomMessage, onModelPanelCancel } = await import('./session-model')
   const cardkit = await import('./cardkit')
 
   test('isolated model custom card flow', async () => {
     resetTokenSourceRegistry()
-    const glmFactory = tokenSourceFactories().find(factory => factory.kind === 'glm-coding-plan')!
-    registerTokenSource(glmFactory.build({
-      base_url: 'https://open.bigmodel.cn/api/anthropic',
-      auth_token: 'test-token',
-      model: 'GLM-5.2',
-    }, null))
+    buildTokenSourcesFromConfig()
+    const initial = getTokenSource('glm')!
+    resetTokenSourceRegistry()
+    registerTokenSource(initial)
     await refreshAllTokenSourceModels()
     const glm = getTokenSource('glm')
     const fake: any = {
@@ -156,7 +153,7 @@ auth_token = "test-token"
 
     const fetchesBeforeUpdate = modelFetches
     await consumeModelCustomMessage(fake, 'GLM-5.3', 'u')
-    expect(modelFetches - fetchesBeforeUpdate).toBe(1)
+    expect(modelFetches - fetchesBeforeUpdate).toBe(0)
     const el = elementPatches.at(-1)
     expect(el).toBeTruthy()
     expect(el.header?.title?.content).toBe('选择 effort')
@@ -165,10 +162,10 @@ auth_token = "test-token"
     expect(fake.modelPanels.get('p1')?.models.some((m: any) => m.model === 'GLM-5.3')).toBe(true)
 
     fake.modelCustomPrompt = { sourceId: 'glm', panelId: 'p2', cardMessageId: 'om_card_2' }
-    await consumeModelCustomMessage(fake, 'glm-9.9', 'u')
+    await consumeModelCustomMessage(fake, 'bad model', 'u')
     const el2 = elementPatches.at(-1)
     expect(JSON.stringify(el2)).toContain('未加入')
-    expect(JSON.stringify(el2)).toContain('glm-9.9')
+    expect(JSON.stringify(el2)).toContain('模型 ID 无效')
     expect(glm!.models.some(m => m.model === 'glm-9.9')).toBe(false)
 
     fake.modelCustomPrompt = { sourceId: 'glm', panelId: 'p3', cardMessageId: 'om_card_3' }
@@ -206,9 +203,10 @@ auth_token = "test-token"
     convertedCardId = 'card_model_catalog_miss'
     fake.modelCustomPrompt = { sourceId: 'glm', panelId: 'p6', cardMessageId: 'om_card_6' }
     await consumeModelCustomMessage(fake, 'GLM-5.4', 'u')
-    expect(JSON.stringify(elementPatches.at(-1))).toContain('catalog unavailable')
-    expect(fake.modelPanels.has('p6')).toBe(false)
-    expect(getTokenSource('glm')?.models).toEqual([])
-    expect(getTokenSource('glm')?.modelCatalogState?.status).toBe('failed')
+    expect(JSON.stringify(elementPatches.at(-1))).toContain('GLM-5.4')
+    expect(fake.modelPanels.has('p6')).toBe(true)
+    expect(getTokenSource('glm')?.models.some(model => model.model === 'GLM-5.4')).toBe(true)
+    await expect(getTokenSource('glm')!.refreshModels()).rejects.toThrow('catalog unavailable')
+    expect(getTokenSource('glm')?.modelCatalogState).toMatchObject({ status: 'ready', error: 'catalog unavailable' })
   })
 }

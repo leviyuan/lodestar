@@ -548,7 +548,7 @@ function providerChoiceElement(p: ProviderChoice, panelId: string): object {
   }
   const catalog = p.catalogStatus === 'failed' ? `模型目录 MISS${p.catalogError ? `：${p.catalogError}` : ''}`
     : p.catalogStatus === 'loading' || p.catalogStatus === 'idle' ? '模型目录加载中'
-    : `${p.modelCount} 个模型`
+    : `${p.modelCount} 个模型${p.catalogError ? ` · 刷新 MISS：${p.catalogError}` : ''}`
   const flags = [p.selected ? '当前账号' : '', catalog].filter(Boolean).join(' · ')
   return {
     tag: 'column_set',

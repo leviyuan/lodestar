@@ -5,7 +5,7 @@ import type { ConversationLaunch } from './conversation'
 import { bindProcessCodexAccount } from './codex-accounts'
 import { codexAccountScheduler, type CodexAccountCandidate, type CodexAccountDecision, type CodexSelectionOptions } from './codex-account-scheduler'
 import type { CodexQuotaFailure } from './codex-quota'
-import { refreshUsageFromConnection } from './usage'
+import { peekUsage } from './usage'
 import { log } from './log'
 
 const CONTINUE_TASK = '上一轮因当前账号额度耗尽而中断，现已切换账号。请基于本会话已有记录继续完成用户尚未完成的任务，保留已完成的修改和工具结果。执行有副作用的操作前先确认现状，不要重复已完成的操作。'
@@ -209,13 +209,9 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
   private async recover(child: AgentProcess, failure: CodexQuotaFailure): Promise<void> {
     this.lifetime.signal.throwIfAborted()
     if (!this.selected) throw new Error('额度耗尽时未记录运行账号')
-    if (child.readRateLimits) {
-      const fresh = await refreshUsageFromConnection(() => child.readRateLimits!(), this.selected.account.id)
-      this.lifetime.signal.throwIfAborted()
-      if (fresh?.state === 'ok') this.selected = { ...this.selected, usage: fresh,
-        identity: fresh.accountFingerprint ?? this.selected.identity }
-      else log(`codex account: ${this.selected.account.id} 用量读取 MISS，继续按已确认的耗尽状态换号`)
-    }
+    const cached = peekUsage(this.selected.account.id)
+    if (cached?.state === 'ok') this.selected = { ...this.selected, usage: cached,
+      identity: cached.accountFingerprint ?? this.selected.identity }
     const failedAccountId = this.selected.usage === null ? this.selected.account.id : undefined
     if (this.selected.usage) this.scheduler().block(this.selected, this.lastModel ?? this.opts.model)
     const barrier = child.conversationMaterializationBarrier?.()

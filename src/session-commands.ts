@@ -15,6 +15,21 @@ const CONTROL_COMMAND_ALIASES = new Map<string, ControlCommand>([
   ['model', 'model'], ['md', 'model'],
 ])
 
+const sourceCommandWork = new Set<Promise<void>>()
+
+function backgroundSourceCommand(s: Session, work: Promise<void>): void {
+  const tracked = work.catch(async error => {
+    const message = `账号操作或结果呈现失败：${messageOf(error)}`
+    log(message)
+    await feishu.sendTextRaw(s.chatId, `❌ ${message}`)
+    throw error
+  })
+  sourceCommandWork.add(tracked)
+  void tracked.finally(() => sourceCommandWork.delete(tracked)).catch(error => log(`账号操作结果发送失败：${messageOf(error)}`))
+}
+
+export function pendingSourceCommands(): Promise<void>[] { return [...sourceCommandWork] }
+
 /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`, `files`)
  * plus their two-letter aliases where applicable.
  * Returns true if the command was consumed (don't forward to Codex).
@@ -38,7 +53,10 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
   const accountCommand = raw.trim().match(/^codex-(login-cancel|login|accounts|account-delete|account|auto|reset)(?:[ \t]+([^\r\n]+))?$/i)
   if (accountCommand) {
     const { runCodexAccountCommand } = await import('./session-codex-accounts')
-    await runCodexAccountCommand(s, accountCommand[1].toLowerCase(), (accountCommand[2] ?? '').trim(), userOpenId, messageId)
+    const command = accountCommand[1].toLowerCase()
+    const work = runCodexAccountCommand(s, command, (accountCommand[2] ?? '').trim(), userOpenId, messageId)
+    if (command === 'login' || command === 'reset') backgroundSourceCommand(s, work)
+    else await work
     return true
   }
   const subscription = raw.trim().match(/^claude-sub(?:[ \t]+([^\r\n]+))?$/i)
@@ -90,7 +108,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
   const tsSetup = raw.trim().match(/^([\w-]+)-setup(?:\s+([\s\S]+))?$/i)
   if (tsSetup) {
     const { runTokenSourceSetup } = await import('./token-source-setup')
-    await runTokenSourceSetup(s, tsSetup[1].trim().toLowerCase(), (tsSetup[2] ?? '').trim())
+    backgroundSourceCommand(s, runTokenSourceSetup(s, tsSetup[1].trim().toLowerCase(), (tsSetup[2] ?? '').trim()))
     return true
   }
   const command = CONTROL_COMMAND_ALIASES.get(raw.trim().toLowerCase())

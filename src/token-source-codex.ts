@@ -16,7 +16,7 @@ import {
   scrubAnthropicEnv,
   registerTokenSourceFactory,
 } from './token-source'
-import { readUsageForDisplay, type UsageSnapshot, type UsageWindow } from './usage'
+import { readUsage, type UsageSnapshot, type UsageWindow } from './usage'
 import { fetchCodexModels } from './token-source-models'
 import type { AgentReasoningEffort } from './agent-process'
 import { log } from './log'
@@ -110,7 +110,7 @@ registerTokenSourceFactory({
           return model
         },
         async readUsage(): Promise<UsageSnapshotUnified> {
-          return codexUsageToUnified(await readUsageForDisplay(accountId))
+          return codexUsageToUnified(await readUsage(accountId))
         },
       }
       return ts
@@ -124,12 +124,6 @@ registerTokenSourceFactory({
       const source = withModelVisibility(make(accountId), cfg)
       children.set(accountId, { revision, source })
       return source
-    }
-    const refreshDefault = root.refreshModels.bind(root)
-    root.refreshModels = async () => {
-      await Promise.all([refreshDefault(), ...codexAccounts.list()
-        .filter(account => account.id !== DEFAULT_CODEX_ACCOUNT)
-        .map(account => root.forAccount!(account.id).refreshModels())])
     }
     return root
   },

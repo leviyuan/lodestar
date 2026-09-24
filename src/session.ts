@@ -55,7 +55,7 @@ import { createAgentProcess } from './agent-launch'
 import { agentApiUrl } from './agent-runtime'
 import { createAgentCards } from './agent-cards-runtime'
 import type { AgentCards } from './agent-cards'
-import { getTokenSource, getTokenSourceForAccount, listEnabledTokenSourcesByAgent, waitForTokenSourceModelRefresh, tokenSourceProcessRevision, tokenSourceRuntimeModel, type TokenSource } from './token-source'
+import { getTokenSource, getTokenSourceForAccount, listEnabledTokenSourcesByAgent, tokenSourceProcessRevision, tokenSourceRuntimeModel, type TokenSource } from './token-source'
 import { codexAccounts, DEFAULT_CODEX_ACCOUNT, processCodexAccount } from './codex-accounts'
 import { codexAccountCard } from './cards/codex-account'
 import {
@@ -71,9 +71,9 @@ import * as feishu from './feishu'
 import { log } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { readSysInfo } from './sysinfo'
-import { refreshUsageFromConnection, observeRateLimitsNotification, captureCodexUsageCache, type UsageSnapshot } from './usage'
+import { observeRateLimitsNotification, captureCodexUsageCache, type UsageSnapshot } from './usage'
 import type { GlmUsageSnapshot } from './glm-usage'
-import { peekAllAccountUsage, readAllAccountUsage } from './account-usage'
+import { readAllAccountUsage } from './account-usage'
 import { claudeWeeklyUsageWindow } from './claude-usage'
 import {
   contextLimitFromAppServer,
@@ -1505,7 +1505,6 @@ export class Session {
     report?.(this.withModel(`🚀 启动 ${this.backendLabel()}`))
     let proc: AgentProcess
     try {
-      if (this.selectedProvider !== 'codex' || (!this.codexStartAccountOverride && codexAccounts.preferred(this.sessionName) === null)) await waitForTokenSourceModelRefresh()
       proc = this.spawnAgent()
     } catch (e) {
       const message = `${this.backendLabel()} 启动失败: ${messageOf(e)}`
@@ -2059,7 +2058,6 @@ export class Session {
       report?.(this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}`))
       let proc: AgentProcess
       try {
-        if (this.selectedProvider !== 'codex' || (!this.codexStartAccountOverride && codexAccounts.preferred(this.sessionName) === null)) await waitForTokenSourceModelRefresh()
         proc = this.spawnAgent(prevSessionRef ?? undefined)
       } catch (e) {
         const finalStatus = `❌ ${this.backendLabel()} 恢复失败: ${messageOf(e)}`
@@ -2652,7 +2650,7 @@ export class Session {
         })),
       usage,
       glmUsage,
-      accountUsages: peekAllAccountUsage(),
+      accountUsages: await readAllAccountUsage(),
       sysinfo,
     }
   }
@@ -2755,26 +2753,9 @@ export class Session {
   }
 
   async showConsole(): Promise<void> {
-    // Fresh cached accounts render immediately; only a missing/expired snapshot needs an async patch.
+    // The first card already contains the current cached account snapshots.
     const opts = await this.buildConsoleOpts(undefined)
-    const card = cards.consoleCard(opts)
-    const messageId = await feishu.sendCard(this.chatId, card)
-    if (!messageId) return
-    if (opts.accountUsages !== undefined) return
-    // Patch the usage element asynchronously so the rest of the panel
-    // stays responsive. We don't await; failures are logged and the
-    // placeholder stays visible (no fallback fabrication).
-    void (async () => {
-      let cardId = ''
-      try {
-        cardId = await cardkit.convertMessageToCard(messageId)
-        cardkit.recordCardCreated(cardId, 4)
-      } catch (e) {
-        log(`session "${this.sessionName}": console card conversion failed: ${messageOf(e)}`)
-        return
-      }
-      await this.mutateStaticCard(cardId, 'console usage', () => this.patchConsoleUsage(cardId))
-    })().catch(e => log(`session "${this.sessionName}": console async update rejected: ${messageOf(e)}`))
+    await feishu.sendCard(this.chatId, cards.consoleCard(opts))
   }
 
   interrupt(): void {
@@ -5543,15 +5524,7 @@ export class Session {
     if (provider === 'codex') {
       const cache = cachedCodexUsage ?? (proc?.provider === 'codex' ? captureCodexUsageCache(processCodexAccount(proc)) : null)
       if (!cache) return '  |  额度 MISS'
-      // Capture the account before any await: a closing card must not read a replacement account.
-      const codexProc = proc?.isAlive() && proc.provider === 'codex' && proc.readRateLimits
-        && processCodexAccount(proc) === cache.accountId
-        ? proc as CodexProcess : null
-      const fresh = codexProc ? await refreshUsageFromConnection(() => {
-        if (processCodexAccount(codexProc) !== cache.accountId) throw new Error('Codex 额度查询所属账号已切换')
-        return codexProc.readRateLimits!()
-      }, cache.accountId) : null
-      const u = fresh?.state === 'ok' ? fresh : cache.read()
+      const u = cache.read()
       if (!u) return '  |  额度 MISS'
       return this.fmtDualWindowSuffix(u.fiveHour, u.weekly)
     }

@@ -8,6 +8,7 @@ import type { TokenSourceConfig } from './config'
 import type { AccountInfo, Settings } from '@anthropic-ai/claude-agent-sdk'
 import type { CodexApiProvider } from './codex-process'
 import { log } from './log'
+import { codexAccounts } from './codex-accounts'
 
 export type TokenSourceAgent = AgentProvider
 
@@ -116,11 +117,10 @@ export interface TokenSource {
   models: TokenSourceModel[]
   /** availableModels 包含接口目录及补录记录，origin 区分隐藏/显示和补录/删除。 */
   modelSelection?: { mode?: 'allowlist' | 'catalog'; modelIds: string[]; availableModels: TokenSourceModel[] }
-  /** Last authoritative model-catalog refresh result. Real built-in sources
-   * populate this; test/custom sources may omit it and are reported as idle. */
+  /** Committed catalog state. A ready snapshot may include a background refresh error. */
   modelCatalogState?: TokenSourceModelCatalogState
   defaultModel: string
-  /** 启动/刷新时拉模型填 models。失败如实留空(MISS),绝不假数据。 */
+  /** Startup/background worker only. Interactive consumers must not call or await this. */
   refreshModels(): Promise<void>
   /** 面板手动补录模型名时的存在性校验(端点 200/1214 判别)。
    *  未声明时允许手动补录并选择 Agent 请求档位，实际请求错误由后端报告。 */
@@ -140,6 +140,7 @@ export interface TokenSource {
   validateClaudeAccount?(account: AccountInfo): void
   /** 同一真实计费账号的 Agent / 模型 Key 只占 hi 中一行。 */
   usageAccount?: { id: string; label: string }
+  /** Runtime facades return cached data only; private factory instances load it in the background. */
   readUsage(): Promise<UsageSnapshotUnified>
 }
 
@@ -252,16 +253,14 @@ export function resetTokenSourceRegistry(): void {
   registryGeneration++
 }
 
-/** 全量刷新所有 token source 的 models(boot 启动 / setup rebuild 后调)。
- *  rebuild(resetTokenSourceRegistry)丢弃旧实例、重建空实例,必须重新 refresh,
- *  否则非当前操作的 source 的 models 永远空(deepseek-setup 后 glm/codex 变空)。
- *  allSettled:单个失败不阻断其余;失败如实留空,绝不假数据。 */
+/** Initial daemon warmup only. Config edits preserve compatible snapshots and schedule
+ * their own background refresh; no interactive consumer waits for this barrier. */
 let refreshAllInFlight: { generation: number; promise: Promise<void> } | null = null
 
 export function refreshAllTokenSourceModels(): Promise<void> {
   const generation = registryGeneration
   if (refreshAllInFlight?.generation === generation) return refreshAllInFlight.promise
-  const promise = Promise.allSettled(listTokenSources().map(async ts => {
+  const promise = Promise.allSettled(listTokenSourceAccounts().map(async ts => {
     await ts.refreshModels()
     log(`token-source ${ts.id}: ${ts.models.length} models loaded`)
   }))
@@ -273,9 +272,13 @@ export function refreshAllTokenSourceModels(): Promise<void> {
   return promise
 }
 
-/** Await an already-running catalog refresh without starting a new network
- * refresh. Agent discovery uses this to avoid returning a transient
- * loading-only catalog immediately after boot/setup. */
+/** Account views have independent caches and refreshes; one slow login cannot block another. */
+export function listTokenSourceAccounts(): TokenSource[] {
+  return listTokenSources().flatMap(source => source.forAccount
+    ? codexAccounts.list().map(account => source.forAccount!(account.id)) : [source])
+}
+
+/** Startup/diagnostic barrier. Interactive discovery must read the committed cache instead. */
 export function pendingTokenSourceModelRefresh(): Promise<void> | null {
   return refreshAllInFlight?.promise ?? null
 }

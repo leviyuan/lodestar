@@ -72,7 +72,7 @@ describe('delegated Agent HTTP API', () => {
     expect(requests).toHaveLength(1)
   })
 
-  test('skill discovery lazily refreshes subscriptions after 30 minutes without changing the model catalog', async () => {
+  test('skill discovery reflects the latest cached subscription status without a separate TTL', async () => {
     const previousSources = listTokenSources()
     let checks = 0
     let usage: UsageSnapshotUnified = { state: 'network', windows: [], reason: 'Claude 原生额度接口未返回 rate_limits 数据' }
@@ -104,8 +104,8 @@ describe('delegated Agent HTTP API', () => {
       time.mockReturnValue(start + 30 * 60 * 1000 - 1)
       const cached = await fetch(`${base}/agents/identities`, { headers })
       expect(cached.status).toBe(200)
-      expect(await cached.json()).toEqual(failedCatalog)
-      expect(checks).toBe(1)
+      expect((await cached.json() as any).identities).toHaveLength(1)
+      expect(checks).toBe(2)
 
       time.mockReturnValue(start + 30 * 60 * 1000)
       const recovered = await fetch(`${base}/agents/identities`, { headers })
@@ -116,7 +116,7 @@ describe('delegated Agent HTTP API', () => {
       }])
       expect(readyCatalog.source_failures).toEqual([])
       expect(readyCatalog.catalog_generation).not.toBe(failedCatalog.catalog_generation)
-      expect(checks).toBe(2)
+      expect(checks).toBe(3)
     } finally {
       time.mockRestore()
       resetTokenSourceRegistry()

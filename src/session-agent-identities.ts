@@ -3,7 +3,6 @@ import type { Session } from './session'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { getAgentIdentityCatalog } from './agent-identities'
-import { pendingTokenSourceModelRefresh } from './token-source'
 import type { ModelActionResult } from './session-util'
 
 const PAGE_SIZE = 8
@@ -24,7 +23,6 @@ export async function showAgentIdentityPanel(s: Session, userOpenId: string): Pr
     return
   }
   prunePanels()
-  await pendingTokenSourceModelRefresh()
   const panelId = `agents_${randomUUID()}`
   panels.set(panelId, { ownerOpenId: userOpenId, codexAccountId: s.codexAccountId(), page: 0, createdAt: Date.now() })
   const messageId = await feishu.sendCard(s.chatId, listCard(panelId))

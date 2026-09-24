@@ -7,7 +7,7 @@ function isolated(script: string): void {
   expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
 }
 
-test('hi aggregates all accounts, merges Agent views and reuses its snapshot without extending freshness', () => {
+test('hi projects current cached account snapshots and merges Agent views', () => {
   isolated(`
     import assert from 'node:assert/strict'
     import { mock } from 'bun:test'
@@ -37,8 +37,7 @@ test('hi aggregates all accounts, merges Agent views and reuses its snapshot wit
     registry.resetTokenSourceRegistry()
     for (const item of [source('codex-sub', 'codex-subscription', false), source('glm'), source('dsh-glm'),
       source('deepseek'), source('deepseek-harness'), source('claude-sub', 'claude-subscription'), source('openrouter'), source('disabled', 'disabled', false)]) registry.registerTokenSource(item)
-    const { readAllAccountUsage, peekAllAccountUsage } = await import('./src/account-usage')
-    assert.equal(peekAllAccountUsage(), undefined)
+    const { readAllAccountUsage } = await import('./src/account-usage')
     const [first, simultaneous] = await Promise.all([readAllAccountUsage(), readAllAccountUsage()])
     assert.equal(first, simultaneous)
     assert.deepEqual(first.map(row => row.label), ['Codex·默认', 'Codex·工作', 'Claude 订阅', 'GLM Coding Plan', 'DeepSeek', 'openrouter'])
@@ -48,15 +47,13 @@ test('hi aggregates all accounts, merges Agent views and reuses its snapshot wit
     assert.equal(calls.disabled, undefined)
     assert.equal(codexReads, 1)
     now += 59_999
-    assert.equal(await readAllAccountUsage(), first)
-    assert.equal(peekAllAccountUsage(), first)
-    now++
-    assert.equal(peekAllAccountUsage(), undefined)
+    const next = await readAllAccountUsage()
+    assert.deepEqual(next.map(row => row.id), first.map(row => row.id))
+    now += 60_000
     assert.notEqual(await readAllAccountUsage(), first)
-    assert.equal(codexReads, 2)
+    assert.equal(codexReads, 3)
     const { invalidateCodexUsage } = await import('./src/usage')
     invalidateCodexUsage('default')
-    assert.equal(peekAllAccountUsage(), undefined)
   `)
 })
 
@@ -91,6 +88,8 @@ test('shared DeepSeek and GLM configuration makes both Agents read the same quot
       return Response.json({ balance_infos: [{ currency: 'CNY', total_balance: '12.34' }] })
     }
     const ids = ['glm', 'dsh-glm', 'deepseek', 'deepseek-harness']
+    const { refreshTokenSourceUsage } = await import('./src/token-source-cache')
+    await Promise.all(ids.map(id => refreshTokenSourceUsage(registry.getTokenSource(id))))
     const results = await Promise.all(ids.map(id => registry.getTokenSource(id).readUsage()))
     assert.ok(results.every(usage => usage.state === 'ok'))
     assert.equal(requests.length, 2)
@@ -101,6 +100,8 @@ test('shared DeepSeek and GLM configuration makes both Agents read the same quot
     assert.equal(requests.length, 2)
     config.token_sources.deepseek.api_key = 'new-shared-account'
     buildTokenSourcesFromConfig()
+    assert.equal((await registry.getTokenSource('deepseek').readUsage()).state, 'network')
+    await Promise.all(['deepseek', 'deepseek-harness'].map(id => refreshTokenSourceUsage(registry.getTokenSource(id))))
     await Promise.all(['deepseek', 'deepseek-harness'].map(id => registry.getTokenSource(id).readUsage()))
     assert.equal(requests.length, 3)
   `)

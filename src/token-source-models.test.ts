@@ -29,6 +29,8 @@ test('Codex model discovery retries transient requests on the same account and e
       async close() { this.closed++ }
     }
     mock.module('./src/usage', () => ({ AppServerOnce: FakeAppServer, requestCodexControlWithRetry }))
+    const { codexAccounts } = await import('./src/codex-accounts')
+    codexAccounts.revision = id => id
     const { fetchCodexModels } = await import('./src/token-source-models')
     const originalSetTimeout = globalThis.setTimeout
     globalThis.setTimeout = (fn, delay, ...args) => {

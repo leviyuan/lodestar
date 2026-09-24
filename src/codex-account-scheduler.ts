@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { codexAccounts, isCodexLoginPending, type CodexAccount } from './codex-accounts'
-import { peekSuccessfulUsage, readUsage, type UsageSnapshot } from './usage'
+import { peekSuccessfulUsage, peekUsage, type UsageSnapshot } from './usage'
 import { codexModelQuota, codexQuotaMeter, codexWeekUsedSince, compareCodexQuota, rankCodexQuota, type CodexQuotaRank } from './codex-quota'
 import { getTokenSourceForAccount, tokenSourceRuntimeModel, type TokenSource } from './token-source'
 import type { AgentReasoningEffort } from './agent-process'
@@ -23,6 +23,7 @@ interface Block {
   key: string
   identity: string
   meter: string
+  blockedAt?: number
   windows: Array<{ kind: 'fiveHour' | 'weekly'; percent: number | null; reset: number | null }>
 }
 export interface CodexSelectionOptions {
@@ -84,7 +85,7 @@ export class CodexAccountScheduler {
     const meter = codexQuotaMeter(candidate.usage, model)
     const key = JSON.stringify([candidate.identity, meter])
     const blocks = this.blocks().filter(b => b.key !== key)
-    blocks.push({ key, identity: candidate.identity, meter, windows })
+    blocks.push({ key, identity: candidate.identity, meter, windows, blockedAt: this.deps.now() })
     writeJsonStateAtomic(this.deps.stateFile, { version: 1, blocks })
   }
 
@@ -156,7 +157,7 @@ export class CodexAccountScheduler {
       if (block && usage?.state === 'ok' && rank.state === 'ready') {
         const quota = codexModelQuota(usage, opts.model)
         // Cached observations may predate the native failure; only a fresh read can clear it.
-        const resetObserved = !cached && block.windows.some(old => {
+        const resetObserved = (usage.readStartedAt ?? usage.fetchedAt) > (block.blockedAt ?? 0) && block.windows.some(old => {
           const w = quota[old.kind]
           return w && w.percent !== null && ((old.percent !== null && w.percent < old.percent)
             || (old.reset !== null && old.reset <= now && (w.resetsAt?.getTime() ?? 0) > old.reset))
@@ -187,26 +188,9 @@ function modelCatalogMismatch(source: TokenSource, model: string, effort?: Agent
   return null
 }
 
-const modelRefreshes = new WeakMap<TokenSource, Promise<void>>()
-const MODEL_MISMATCH_CACHE_MS = 5 * 60_000
-
-/** Account rollouts can differ. Recheck old mismatches, but reuse a recent successful catalog. */
+/** Automatic selection reads only the account's committed catalog, even during a refresh. */
 export async function checkCodexModelCompatibility(source: TokenSource, model: string,
-  effort?: AgentReasoningEffort, now = Date.now()): Promise<string | null> {
-  let refresh = modelRefreshes.get(source)
-  const catalog = source.modelCatalogState
-  if (!refresh && source.enabled && catalog?.status === 'ready') {
-    const mismatch = modelCatalogMismatch(source, model, effort)
-    const fresh = catalog.updatedAt !== null && now >= catalog.updatedAt
-      && now - catalog.updatedAt < MODEL_MISMATCH_CACHE_MS
-    if (!mismatch || fresh) return mismatch
-  }
-  if (!refresh) {
-    refresh = Promise.resolve().then(() => source.refreshModels()).finally(() => { modelRefreshes.delete(source) })
-    modelRefreshes.set(source, refresh)
-  }
-  try { await refresh }
-  catch (error) { return `模型目录查询失败：${error instanceof Error ? error.message : String(error)}` }
+  effort?: AgentReasoningEffort, _now = Date.now()): Promise<string | null> {
   if (!source.enabled || source.modelCatalogState?.status !== 'ready') {
     return `模型目录查询失败：${source.modelCatalogState?.error ?? (source.enabled ? '模型目录 MISS' : '订阅来源未启用')}`
   }
@@ -214,7 +198,8 @@ export async function checkCodexModelCompatibility(source: TokenSource, model: s
 }
 
 export const codexAccountScheduler = new CodexAccountScheduler({
-  accounts: () => codexAccounts.list(), usage: readUsage, cachedUsage: peekSuccessfulUsage,
+  accounts: () => codexAccounts.list(), usage: async id => peekUsage(id)
+    ?? { state: 'network', reason: '额度缓存尚未就绪，后台刷新中' }, cachedUsage: peekSuccessfulUsage,
   identity: id => codexAccounts.fingerprint(id), pendingLogin: isCodexLoginPending,
   now: Date.now, stateFile: CODEX_QUOTA_BLOCKS_FILE,
   compatible: async (id, model, effort) => {

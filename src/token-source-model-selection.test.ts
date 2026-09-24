@@ -18,9 +18,14 @@ function runSelectionTest(work: string): void {
     const { OPENROUTER_DEFAULT_MODELS } = await import(${modulePath('openrouter-defaults.ts')})
     const { config } = await import(${modulePath('config.ts')})
     const factory = registry.tokenSourceFactories().find(f => f.kind === 'openrouter')
+    const { cachedTokenSource } = await import(${modulePath('token-source-cache.ts')})
+    const { withModelVisibility } = await import(${modulePath('token-source-visibility.ts')})
     const rebuild = () => {
+      const cfg = config.token_sources.openrouter
+      const previous = registry.getTokenSource('openrouter')
+      const source = cachedTokenSource(() => withModelVisibility(factory.build(cfg), cfg), cfg, 'fixture-openrouter', JSON.stringify(cfg), previous)
       registry.resetTokenSourceRegistry()
-      registry.registerTokenSource(factory.build(config.token_sources.openrouter))
+      registry.registerTokenSource(source)
       return 1
     }
     mock.module(${modulePath('token-source-builtins.ts')}, () => ({ buildTokenSourcesFromConfig: rebuild }))
@@ -82,14 +87,15 @@ test('hiding the last model persists an empty list while keeping defaults and sl
   `)
 })
 
-test('a saved edit reports refresh failure and clears stale model capabilities', () => {
+test('a local edit uses cached models while background refresh errors remain visible', () => {
   runSelectionTest(`
     httpFailure = true
-    await assert.rejects(editTokenSourceModels('openrouter', 'qwen/extra-a', 'add'), /配置已保存.*目录刷新失败/)
+    await editTokenSourceModels('openrouter', 'qwen/extra-a', 'add')
+    await assert.rejects(source().refreshModels(), /catalog down/)
     assert.ok(config.token_sources.openrouter.models.includes('qwen/extra-a'))
-    assert.equal(source().modelCatalogState.status, 'failed')
-    assert.deepEqual(source().models, [])
-    assert.deepEqual(source().modelSelection.availableModels, [])
+    assert.equal(source().modelCatalogState.status, 'ready')
+    assert.ok(source().modelCatalogState.error.includes('catalog down'))
+    assert.equal(source().models.length, defaults.length + 1)
     httpFailure = false
     await source().refreshModels()
     assert.equal(source().models.length, defaults.length + 1)

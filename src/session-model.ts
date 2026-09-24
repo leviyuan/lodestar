@@ -2,7 +2,7 @@ import { isAgentProvider, isDshReasoningEffort, ModelSettingsUpdateError, type A
 import { randomUUID } from 'node:crypto'
 
 import { Session } from './session'
-import { listTokenSources, refreshAllTokenSourceModels, type TokenSource } from './token-source'
+import { listTokenSources, type TokenSource } from './token-source'
 import { editTokenSourceModels, registerCustomTokenSourceModel, removeCustomTokenSourceModel } from './token-source-config'
 import { isCodexReasoningEffort } from './codex-process'
 import {
@@ -170,9 +170,8 @@ function modelChoicesFor(s: Session, ts: TokenSource, entries = ts.models): card
   })
 }
 
-/** 刷新完成后生成账号面板；刷新会清空能力数据，不能把加载中的空数组显示成零模型。 */
+/** Interactive reads use the committed catalog; background I/O never gates this card. */
 export async function showModelPanel(s: Session): Promise<void> {
-  await refreshAllTokenSourceModels()
   const panelId = randomUUID()
   const providers = providerChoices(s)
   s.modelPanels.set(panelId, { models: [] })  // 第1级;第2级 onProviderSelect 填 models
@@ -205,6 +204,9 @@ export async function onProviderSelect(
   if (!s.modelPanels.has(panelId)) return { ok: false, message: '模型面板已失效，请重新发送 model' }
   if (ts.modelCatalogState?.status === 'failed') {
     return { ok: false, message: `模型目录 MISS：${ts.modelCatalogState.error ?? '刷新失败'}` }
+  }
+  if (ts.modelCatalogState?.status === 'idle' || ts.modelCatalogState?.status === 'loading') {
+    return { ok: false, message: '模型目录缓存尚未就绪，后台刷新中' }
   }
   const catalog = modelChoicesFor(s, ts)
   const messageId = s.modelPanels.get(panelId)?.messageId

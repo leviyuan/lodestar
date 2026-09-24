@@ -42,6 +42,7 @@ test('all API key setup commands validate before saving and report post-save run
       const old = registry.getTokenSource(id)
       const beforeRebuild = rebuilds
       assert.equal(await runCommand(session, id + '-setup private-invalid-key'), true)
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
       assert.equal(readFileSync(CONFIG_FILE, 'utf8'), before)
       assert.equal(registry.getTokenSource(id), old)
       assert.equal(rebuilds, beforeRebuild)
@@ -59,6 +60,7 @@ test('all API key setup commands validate before saving and report post-save run
       'glm-setup https://wrong.example/api private-key', 'glm-setup https://open.bigmodel.cn/api/coding/paas/v4 private-key',
       'glm-setup https://open.bigmodel.cn/api/anthropic key extra', 'deepseek-setup one two three']) {
       assert.equal(await runCommand(session, command), true)
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
     }
     assert.equal(requests.length, 0)
     assert.equal(readFileSync(CONFIG_FILE, 'utf8'), beforeBadArgs)
@@ -66,18 +68,22 @@ test('all API key setup commands validate before saving and report post-save run
     valid = true
     for (const id of sources) {
       assert.equal(await runCommand(session, id + '-setup private-valid-key'), true)
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
       assert.match(sentTexts.at(-1), /校验通过，配置已保存/)
       assert.equal(sharedTokenSourceConfigs(config.token_sources)[id][id === 'glm' ? 'auth_token' : 'api_key'], 'private-valid-key')
     }
     assert.equal(await runCommand(session, 'glm-setup https://api.z.ai/api/anthropic international-test-key'), true)
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
     assert.equal(config.token_sources.glm.base_url, 'https://api.z.ai/api/anthropic')
     assert.ok(requests.includes('https://api.z.ai/api/anthropic/v1/models'))
 
     unavailable = true
     await runCommand(session, 'dsh-glm-setup valid-without-runtime')
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
     assert.equal(config.token_sources.glm.auth_token, 'valid-without-runtime')
     assert.equal(config.token_sources['dsh-glm'].api_key, undefined)
-    assert.match(sentTexts.at(-1), /校验通过、配置已保存，但暂不可用.*runtime 未安装/)
+    assert.match(sentTexts.at(-1), /校验通过.*配置已保存.*后台刷新/)
+    await assert.rejects(registry.getTokenSource('dsh-glm').refreshModels(), /runtime 未安装/)
     assert.doesNotMatch(sentTexts.at(-1), /认证失败|未保存/)
     await onTokenSourceEnable(session, 'dsh-glm')
     assert.match(sentTexts.at(-1), /当前不可用.*runtime 未安装/)
@@ -128,14 +134,17 @@ test('Claude subscription commands persist a global switch and report auth and s
     const previousSettings = readFileSync(claudeSettings, 'utf8')
     const before = readFileSync(CONFIG_FILE, 'utf8')
     assert.equal(await runCommand(session, 'claude-sub'), true)
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
     assert.match(sentTexts.at(-1), /Lodestar 全局/)
     assert.equal(readFileSync(CONFIG_FILE, 'utf8'), before)
     assert.equal(modelQueries, 0)
     assert.equal(await runCommand(session, 'claude-sub maybe'), true)
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
     assert.match(sentTexts.at(-1), /用法/)
     assert.equal(readFileSync(CONFIG_FILE, 'utf8'), before)
 
     assert.equal(await runCommand(session, ' CLAUDE-SUB OFF '), true)
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
     assert.match(sentTexts.at(-1), /已禁用/)
     assert.equal(loadConfig().token_sources['claude-sub'].enabled, false)
     assert.equal(registry.getTokenSource('claude-sub').enabled, false)
@@ -145,12 +154,18 @@ test('Claude subscription commands persist a global switch and report auth and s
     assert.doesNotMatch(sentTexts.at(-1), /claude auth login/)
 
     assert.equal(await runCommand(session, 'claude-sub on'), true)
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
     assert.equal(loadConfig().token_sources['claude-sub'].enabled, true)
+    assert.equal(registry.getTokenSource('claude-sub').modelCatalogState.status, 'idle')
+    await registry.getTokenSource('claude-sub').refreshModels()
     assert.equal(registry.getTokenSource('claude-sub').modelCatalogState.status, 'ready')
+    await runCommand(session, 'claude-sub')
     assert.match(sentTexts.at(-1), /已启用/)
     assert.doesNotMatch(sentTexts.at(-1), /MISS/)
     account = {}
+    await registry.getTokenSource('claude-sub').refreshModels()
     await runCommand(session, 'claude-sub on')
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
     assert.match(sentTexts.at(-1), /MISS.*claude auth login/)
     assert.equal(loadConfig().token_sources['claude-sub'].enabled, true)
     assert.equal(registry.getTokenSource('claude-sub').enabled, false)
@@ -159,6 +174,7 @@ test('Claude subscription commands persist a global switch and report auth and s
     assert.equal(readFileSync(claudeSettings, 'utf8'), previousSettings)
     unlinkSync(CONFIG_FILE)
     await runCommand(session, 'claude-sub off')
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
     assert.match(sentTexts.at(-1), /更新失败.*ENOENT/)
     assert.equal(config.token_sources['claude-sub'].enabled, true)
   `
@@ -200,9 +216,11 @@ test('Packy balance setup validates fresh, keeps model keys, supports sharing an
       return Response.json({ success: true, data: { id: 123, quota: 50000000 } })
     }
     assert.equal(await runCommand(session, 'packy-balance-setup 123 ' + secret), true)
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
     assert.match(sentTexts.at(-1), /真实余额校验通过，配置已保存/)
     assert.equal(loadConfig().token_sources.packy.management_token, secret)
     await runCommand(session, 'packy-secondary-balance-setup share packy')
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
     assert.match(sentTexts.at(-1), /真实余额校验通过，配置已保存/)
     const saved = loadConfig().token_sources
     assert.equal(saved.packy.api_key, 'model-one')
@@ -214,11 +232,13 @@ test('Packy balance setup validates fresh, keeps model keys, supports sharing an
     valid = false
     const before = readFileSync(CONFIG_FILE, 'utf8')
     await runCommand(session, 'packy-balance-setup 123 ' + secret)
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
     assert.match(sentTexts.at(-1), /未保存.*403/)
     assert.ok(!sentTexts.at(-1).includes(secret))
     assert.equal(readFileSync(CONFIG_FILE, 'utf8'), before)
     assert.equal(reads, 3)
     await runCommand(session, 'packy-balance-setup share packy-secondary')
+    await Promise.all((await import('./src/session-commands')).pendingSourceCommands())
     assert.match(sentTexts.at(-1), /未保存.*循环/)
     assert.equal(readFileSync(CONFIG_FILE, 'utf8'), before)
     assert.equal(reads, 3)

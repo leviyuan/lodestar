@@ -17,7 +17,7 @@ function subscriptionSettings(): Settings {
 
 export function validateClaudeSubscriptionAccount(account: AccountInfo): void {
   if (!account.subscriptionType?.trim()) {
-    throw Object.assign(new Error('Claude Code 订阅未登录；请在本机运行 claude auth login，完成后发送 md 刷新'),
+    throw Object.assign(new Error('Claude Code 订阅未登录；请在本机运行 claude auth login，完成后等待后台刷新，发送 md 查看状态'),
       { code: 'CLAUDE_SUBSCRIPTION_AUTH_MISSING' })
   }
   if (account.apiProvider !== 'firstParty' || (account.apiKeySource && account.apiKeySource !== 'none')) {

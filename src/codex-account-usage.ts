@@ -1,6 +1,7 @@
 import { codexAccounts, type CodexAccount } from './codex-accounts'
 import { AppServerOnce, readUsageForDisplay, requestCodexControlWithRetry, type UsageSnapshot, type UsageWindow } from './usage'
 import { log } from './log'
+import { peekCodexAccountEmail } from './codex-account-info'
 
 export interface CodexAccountUsage {
   account: CodexAccount
@@ -44,7 +45,7 @@ export function aggregateCodexUsage(input: CodexAccountUsage[]): CodexUsageTotal
 }
 
 /** Explicit account inspection reads every login, even when quota identities have been merged. */
-export async function readCodexAccountEmails(
+export async function refreshCodexAccountEmails(
   total: CodexUsageTotal,
   createClient: (id: string) => Pick<AppServerOnce, 'initialize' | 'request' | 'close'> = id => new AppServerOnce({ accountId: id }),
 ): Promise<CodexUsageTotal> {
@@ -72,6 +73,15 @@ export async function readCodexAccountEmails(
     return { ...entry, email, emailError }
   }))
   return { ...total, entries }
+}
+
+/** Account inspection is a projection of the background cache, including a genuine MISS. */
+export async function readCodexAccountEmails(total: CodexUsageTotal): Promise<CodexUsageTotal> {
+  return { ...total, entries: total.entries.map(entry => {
+    const cached = peekCodexAccountEmail(entry.account.id)
+    return { ...entry, email: cached?.email ?? null, emailError: cached?.error
+      ?? (!cached ? '账号信息缓存尚未就绪，后台刷新中' : undefined) }
+  }) }
 }
 
 export async function readAllCodexUsage(current?: { id: string; usage: UsageSnapshot }): Promise<CodexUsageTotal> {

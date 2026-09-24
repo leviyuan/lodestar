@@ -1,6 +1,7 @@
-import { describe, expect, spyOn, test } from 'bun:test'
+import { describe, expect, test } from 'bun:test'
 import { agentIdentityId, buildAgentIdentityCatalog, buildAgentSkillIdentityCatalog } from './agent-identities'
 import type { TokenSource, UsageSnapshotUnified } from './token-source'
+import { cachedTokenSource, disposeCachedTokenSource, refreshTokenSourceUsage } from './token-source-cache'
 
 function source(overrides: Partial<TokenSource> = {}): TokenSource {
   return {
@@ -73,43 +74,16 @@ describe('Agent skill subscription availability', () => {
     expect(subscription.modelCatalogState?.status).toBe('ready')
   })
 
-  test('lazily refreshes successful and failed checks after 30 minutes and then restores recovered identities', async () => {
-    let checks = 0
-    let usage: UsageSnapshotUnified = { state: 'ok', windows: [
-      { kind: 'fiveHour', label: '5h 窗口', percent: 0, resetsAt: null },
-    ] }
-    const subscription = source({
-      id: 'claude-sub', kind: 'claude-subscription',
-      readUsage: async () => { checks++; return usage },
-    })
-    const start = Date.now()
-    const interval = 30 * 60 * 1000
-    const time = spyOn(Date, 'now').mockReturnValue(start)
-    try {
-      const ready = await buildAgentSkillIdentityCatalog([subscription])
-      expect(ready.identities).toHaveLength(2)
-      usage = { state: 'no_credentials', windows: [], reason: 'subscription expired' }
-      time.mockReturnValue(start + interval - 1)
-      expect(await buildAgentSkillIdentityCatalog([subscription])).toEqual(ready)
-      expect(checks).toBe(1)
-
-      time.mockReturnValue(start + interval)
-      const unavailable = await buildAgentSkillIdentityCatalog([subscription])
-      expect(unavailable.identities).toEqual([])
-      expect(unavailable.sourceFailures[0]?.reason).toBe('subscription expired')
-      expect(checks).toBe(2)
-      usage = { state: 'ok', windows: [{ kind: 'fiveHour', label: '5h 窗口', percent: 10, resetsAt: null }] }
-      time.mockReturnValue(start + 2 * interval - 1)
-      expect(await buildAgentSkillIdentityCatalog([subscription])).toEqual(unavailable)
-      expect(checks).toBe(2)
-
-      time.mockReturnValue(start + 2 * interval)
-      const recovered = await buildAgentSkillIdentityCatalog([subscription])
-      expect(recovered).toEqual(ready)
-      expect(checks).toBe(3)
-    } finally {
-      time.mockRestore()
-    }
+  test('availability follows the shared usage cache without a second thirty-minute cache', async () => {
+    let usage: UsageSnapshotUnified = { state: 'ok', windows: [] }
+    const subscription = source({ id: 'claude-sub', kind: 'claude-subscription', readUsage: async () => usage })
+    const ready = await buildAgentSkillIdentityCatalog([subscription])
+    usage = { state: 'no_credentials', windows: [], reason: 'subscription expired' }
+    const failed = await buildAgentSkillIdentityCatalog([subscription])
+    expect(failed.identities).toEqual([])
+    expect(failed.sourceFailures[0]?.reason).toBe('subscription expired')
+    usage = { state: 'ok', windows: [] }
+    expect(await buildAgentSkillIdentityCatalog([subscription])).toEqual(ready)
   })
 
   test('surfaces thrown availability errors without dropping other sources', async () => {
@@ -125,44 +99,27 @@ describe('Agent skill subscription availability', () => {
       tokenSourceId: 'claude-sub', status: 'failed', reason: 'subscription query timed out',
     }])
     expect(await buildAgentSkillIdentityCatalog(sources)).toEqual(catalog)
-    expect(checks).toBe(1)
+    expect(checks).toBe(2)
   })
 
-  test('concurrent discovery shares initial and expired checks and starts the interval after completion', async () => {
+  test('identity discovery responds from cache while subscription refresh is blocked', async () => {
     let checks = 0
-    let finish!: (usage: UsageSnapshotUnified) => void
-    const subscription = source({
-      id: 'claude-sub', kind: 'claude-subscription',
-      readUsage: () => { checks++; return new Promise(resolve => { finish = resolve }) },
-    })
-    const start = Date.now()
-    const interval = 30 * 60 * 1000
-    const time = spyOn(Date, 'now').mockReturnValue(start)
+    let finish!: () => void
+    let barrier = Promise.resolve()
+    const subscription = cachedTokenSource(() => source({ id: 'claude-sub', kind: 'claude-subscription',
+      readUsage: async () => { checks++; await barrier; return { state: 'ok', windows: [] } },
+    }), {}, 'identity-cache-test', 'identity-cache-test')
     try {
-      const first = buildAgentSkillIdentityCatalog([subscription])
-      const concurrent = buildAgentSkillIdentityCatalog([subscription])
-      expect(checks).toBe(1)
-      time.mockReturnValue(start + 10_000)
-      finish({ state: 'ok', windows: [{ kind: 'fiveHour', label: '5h 窗口', percent: 0, resetsAt: null }] })
-      const ready = await first
-      expect(await concurrent).toEqual(ready)
-
-      time.mockReturnValue(start + interval)
-      expect(await buildAgentSkillIdentityCatalog([subscription])).toEqual(ready)
-      expect(checks).toBe(1)
-      time.mockReturnValue(start + 10_000 + interval)
-      expect(checks).toBe(1)
-      const expired = buildAgentSkillIdentityCatalog([subscription])
-      const concurrentExpired = buildAgentSkillIdentityCatalog([subscription])
+      await refreshTokenSourceUsage(subscription)
+      barrier = new Promise(resolve => { finish = resolve })
+      const refreshing = refreshTokenSourceUsage(subscription)
+      const catalogs = await Promise.all([buildAgentSkillIdentityCatalog([subscription]), buildAgentSkillIdentityCatalog([subscription])])
+      expect(catalogs[0].identities).toHaveLength(2)
+      expect(catalogs[1]).toEqual(catalogs[0])
       expect(checks).toBe(2)
-      finish({ state: 'network', windows: [], reason: 'subscription check failed' })
-      const unavailable = await expired
-      expect(unavailable.identities).toEqual([])
-      expect(unavailable.sourceFailures[0]?.reason).toBe('subscription check failed')
-      expect(await concurrentExpired).toEqual(unavailable)
-    } finally {
-      time.mockRestore()
-    }
+      finish()
+      await refreshing
+    } finally { finish?.(); disposeCachedTokenSource(subscription) }
   })
 
   test('caches only availability and does not retain an old model list', async () => {
@@ -176,7 +133,7 @@ describe('Agent skill subscription availability', () => {
     const updated = await buildAgentSkillIdentityCatalog([subscription])
     expect(updated.identities).toEqual([first.identities[1]!])
     expect(updated.catalogGeneration).not.toBe(first.catalogGeneration)
-    expect(checks).toBe(1)
+    expect(checks).toBe(2)
   })
 
   test('rebuilt sources do not reuse an earlier subscription check with the same source id', async () => {
