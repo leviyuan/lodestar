@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { basename } from 'node:path'
 import type { DeliveredFile, DeliveryFolder, FileDeliveryContext, FileDeliveryEntry, FileDeliveryHandle, FileDeliverySnapshot } from './file-delivery-types'
+import { formatFeishuError } from './feishu-errors'
 
 export interface FileDeliveryDeps {
   resolveFolder(context: FileDeliveryContext, signal: AbortSignal): Promise<DeliveryFolder>
   uploadFile(path: string, folder: DeliveryFolder, onUploaded: (file: DeliveredFile) => void, signal: AbortSignal): Promise<DeliveredFile>
-  sendCard(snapshot: FileDeliverySnapshot): Promise<string | null>
+  sendCard(snapshot: FileDeliverySnapshot, onFailure?: (error: unknown) => void): Promise<string | null>
   persist(snapshot: FileDeliverySnapshot): void
   reportError(message: string): Promise<void>
 }
@@ -102,8 +103,9 @@ export class FileDeliveryBatch implements FileDeliveryHandle {
     }
     let messageId: string | null
     try {
-      messageId = await this.deps.sendCard(this.snapshot)
-      if (!messageId) throw new Error('飞书未返回交付卡消息 ID')
+      let sendFailure: unknown
+      messageId = await this.deps.sendCard(this.snapshot, error => { sendFailure = error })
+      if (!messageId) throw new Error(`飞书未返回交付卡消息 ID：${formatFeishuError(sendFailure)}`)
     } catch (error) {
       const message = `交付卡发送失败：${error instanceof Error ? error.message : String(error)}`
       this.snapshot.error = message

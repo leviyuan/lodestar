@@ -76,7 +76,7 @@ export interface NotifyRegistration {
   /** Uploaded image keys (already on Feishu's CDN — reuse, don't
    * re-upload, on the resolved rebuild). `key==''` marks an upload
    * failure rendered inline in red. */
-  imageKeys: Array<{ key: string; src: string }>
+  imageKeys: Array<{ key: string; src: string; error?: string }>
   buttons: NotifyButton[]
   allowReply?: boolean
   replyState?: NotifyReplyState

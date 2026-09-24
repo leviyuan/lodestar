@@ -75,6 +75,8 @@ export interface CardWriteFailure {
   httpStatus?: number
   logId?: string
   message: string
+  /** Original upstream message, before adding HTTP/request diagnostics. */
+  apiMessage?: string
   /** Attempted body content, including the rejected element, independent of
    * card IDs, element renumbering and footer timers. Capacity failures only. */
   capacityFingerprint?: string
@@ -89,6 +91,7 @@ interface CardKitRequestError extends Error {
   code?: number
   httpStatus?: number
   logId?: string
+  apiMessage?: string
 }
 
 /** 整卡容量包括组件数量（300305）和体积（200860）。300315 是通用插入
@@ -238,11 +241,7 @@ async function call(method: string, path: string, body?: object): Promise<any> {
       // node-fetch turns deadline expiry into AbortError, including body reads.
       // Restore the owned timeout reason; arbitrary cancellation is not retried.
       if (signal.aborted && signal.reason?.name === 'TimeoutError') throw signal.reason
-      if (res && error instanceof FeishuRequestError) {
-        const logId = res.headers.get('x-tt-logid') ?? res.headers.get('x-request-id') ?? res.headers.get('request-id') ?? undefined
-        Object.assign(error, { httpStatus: res.status, logId })
-        if (logId) error.message += ` log_id=${logId}`
-      }
+      if (res && error instanceof FeishuRequestError) Object.assign(error, { httpStatus: res.status })
       throw error
     }
   })
@@ -306,6 +305,7 @@ async function withReopenOnStreamingClosed(
       httpStatus: requestError?.httpStatus,
       logId: requestError?.logId,
       message: error instanceof Error ? error.message : String(error),
+      apiMessage: requestError?.apiMessage,
     }
     if (isCardCapacityFailure(failure.code, failure)) {
       failure.capacityFingerprint = attemptedContentFingerprint(
@@ -514,7 +514,7 @@ export async function replaceElementChecked(
   cardId: string,
   elementId: string,
   element: object,
-  opts: { notifyCardFailure?: boolean } = {},
+  opts: { notifyCardFailure?: boolean; onFailure?: (failure: CardWriteFailure) => void } = {},
 ): Promise<boolean> {
   if (isDisposed(cardId)) return false
   const s = state(cardId)
@@ -524,7 +524,7 @@ export async function replaceElementChecked(
     cardId,
     elementId,
     element,
-    () => { failed = true },
+    (_code, failure) => { failed = true; if (failure) opts.onFailure?.(failure) },
     opts.notifyCardFailure !== false,
   )
   return !failed && !s.deadElements.has(elementId)
@@ -543,9 +543,11 @@ export async function replaceElementResult(cardId: string, elementId: string, el
 export async function addElementChecked(
   cardId: string,
   element: object,
-  opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
+  opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string; onFailure?: (failure: CardWriteFailure) => void } = {},
 ): Promise<boolean> {
-  return (await addElementResult(cardId, element, opts)).landed
+  const result = await addElementResult(cardId, element, opts)
+  if (result.failure) opts.onFailure?.(result.failure)
+  return result.landed
 }
 
 export async function addElementResult(

@@ -2,6 +2,7 @@ import * as feishu from './feishu'
 import * as cardkit from './cardkit'
 import { ELEMENTS } from './cards/elements'
 import { codexAccountCard, codexAccountPanel, codexAccountSummary, type CodexAccountCardView } from './cards/codex-account'
+import { formatFeishuError } from './feishu-errors'
 
 export interface CodexAccountCardDeps {
   sendCard: typeof feishu.sendCard
@@ -21,8 +22,9 @@ export class CodexAccountCard {
   private terminal: Promise<void> | null = null
   private constructor(readonly cardId: string, private deps: CodexAccountCardDeps) {}
   static async open(chatId: string, view: CodexAccountCardView, deps = defaults): Promise<CodexAccountCard> {
-    const messageId = await deps.sendCard(chatId, codexAccountCard(view, true))
-    if (!messageId) throw new Error('Codex 账号卡片发送失败')
+    let failure: unknown
+    const messageId = await deps.sendCard(chatId, codexAccountCard(view, true), error => { failure = error })
+    if (!messageId) throw new Error(`Codex 账号卡片发送失败：${formatFeishuError(failure)}`)
     const cardId = await deps.convertMessageToCard(messageId)
     deps.recordCardCreated(cardId, 1)
     return new CodexAccountCard(cardId, deps)
@@ -45,11 +47,15 @@ export class CodexAccountCard {
     return result
   }
   private async write(view: CodexAccountCardView, panel: object, terminal: boolean): Promise<void> {
-    const replaced = await this.deps.replaceElementChecked(this.cardId, ELEMENTS.codexAccountPanel, panel, { notifyCardFailure: false })
+    let replaceFailure: unknown
+    let settingsFailure: unknown
+    const replaced = await this.deps.replaceElementChecked(this.cardId, ELEMENTS.codexAccountPanel, panel, {
+      notifyCardFailure: false, onFailure: failure => { replaceFailure = failure },
+    })
     const configured = await this.deps.patchSettingsChecked(this.cardId, { config: {
       streaming_mode: !terminal, summary: { content: codexAccountSummary(view) },
-    } })
-    if (!replaced || !configured) throw new Error(`Codex 账号卡片更新失败：内容 ${replaced ? 'OK' : 'MISS'}，状态 ${configured ? 'OK' : 'MISS'}`)
+    } }, failure => { settingsFailure = failure })
+    if (!replaced || !configured) throw new Error(`Codex 账号卡片更新失败：内容 ${replaced ? 'OK' : formatFeishuError(replaceFailure)}，状态 ${configured ? 'OK' : formatFeishuError(settingsFailure)}`)
     if (terminal) await this.deps.dispose(this.cardId)
   }
 }

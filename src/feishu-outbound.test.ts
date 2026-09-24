@@ -31,6 +31,92 @@ async function runIsolated(script: string): Promise<void> {
   expect(code, stdout + stderr).toBe(0)
 }
 
+test('SDK diagnostics preserve header request IDs, HTTP response messages and task permission scopes', async () => {
+  await runIsolated(`
+    const body = { code: 99991672, msg: 'missing application permission', error: {
+      permission_violations: [{ scope: 'task:tasklist:write' }],
+    } }
+    const response = await feishu.client.httpInstance.request({
+      url: 'https://example.invalid/diagnostics',
+      adapter: async config => {
+        assert.match(config.headers.get('User-Agent'), /lark|oapi/i)
+        return { config, data: body, status: 200, statusText: 'OK', headers: { 'x-tt-logid': 'sdk-business-log' } }
+      },
+    })
+    assert.equal(response.log_id, 'sdk-business-log')
+    assert.equal(response.msg, body.msg)
+    const envelope = await feishu.client.httpInstance.post('https://example.invalid/headers', { test: 'body' }, {
+      $return_headers: true,
+      adapter: async config => {
+        assert.equal(config.method, 'post')
+        assert.deepEqual(JSON.parse(config.data), { test: 'body' })
+        return { config, data: { code: 0, data: {} }, status: 200, statusText: 'OK', headers: { 'x-tt-logid': 'sdk-envelope-log' } }
+      },
+    })
+    assert.equal(envelope.data.code, 0)
+    assert.equal(envelope.headers['x-tt-logid'], 'sdk-envelope-log')
+    feishu.client.im.v1.message.patch = async () => response
+    await assert.rejects(feishu.updateCard('message', {}), error => {
+      assert.match(error.message, /code=99991672/)
+      assert.match(error.message, /message=missing application permission/)
+      assert.match(error.message, /log_id=sdk-business-log/)
+      return true
+    })
+
+    const failure = Object.assign(new Error('Request failed with status code 403'), {
+      response: { status: 403, data: { code: body.code, msg: body.msg, error: body.error }, headers: { 'x-tt-logid': 'sdk-http-log' } },
+    })
+    feishu.client.task.v2.tasklist.create = () => feishu.client.httpInstance.request({
+      url: 'https://example.invalid/diagnostics', adapter: async () => { throw failure },
+    })
+    await assert.rejects(feishu.createTasklistWithOwner('project', 'owner'), error => {
+      assert.match(error.message, /code=99991672/)
+      assert.match(error.message, /message=missing application permission/)
+      assert.match(error.message, /log_id=sdk-http-log/)
+      assert.match(error.message, /missing_scopes=task:tasklist:write/)
+      return true
+    })
+    assert.equal(failure.response.data.error.permission_violations[0].scope, 'task:tasklist:write')
+  `)
+})
+
+test('send and upload failure callbacks expose the final Feishu message and log ID', async () => {
+  await runIsolated(`
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const { tmpdir } = await import('node:os')
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-failure-details-'))
+    try {
+      const failures = []
+      feishu.client.im.message.create = async () => ({ code: 230001, msg: 'invalid receiver', error: { log_id: 'send-log' } })
+      assert.equal(await feishu.sendCard('chat', {}, error => failures.push(error)), null)
+      assert.equal(failures.length, 1)
+      assert.match(failures[0].message, /code=230001.*message=invalid receiver.*log_id=send-log/)
+
+      const png = join(root, 'picture.png')
+      writeFileSync(png, 'png')
+      globalThis.fetch = async url => String(url).includes('/tenant_access_token/')
+        ? Response.json({ code: 0, tenant_access_token: 'test-token' })
+        : Response.json({ code: 99991672, msg: 'image upload forbidden' }, { status: 403, headers: { 'x-tt-logid': 'upload-log' } })
+      assert.equal(await feishu.uploadImageKey(png, error => failures.push(error)), null)
+      assert.equal(failures.length, 2)
+      assert.match(failures[1].message, /code=99991672.*message=image upload forbidden.*log_id=upload-log/)
+
+      globalThis.fetch = async () => Response.json({ code: 0, data: { image_key: 'uploaded' } })
+      const notices = []
+      feishu.client.im.message.create = async args => {
+        if (args.data.msg_type === 'image') return { code: 230001, msg: 'delivery rejected', error: { log_id: 'delivery-log' } }
+        notices.push(JSON.parse(args.data.content).text)
+        return { code: 0, data: { message_id: 'notice' } }
+      }
+      assert.equal(await feishu.uploadAndSend('chat', png), false)
+      assert.equal(notices.length, 1)
+      assert.match(notices[0], /上传已完成/)
+      assert.match(notices[0], /code=230001.*message=delivery rejected.*log_id=delivery-log/)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  `)
+})
+
 test('all message types retry transient SDK failures with the same UUID and reject permanent or incomplete responses', async () => {
   await runIsolated(`
     for (const [type, send] of [
@@ -305,6 +391,7 @@ test('upload and send exhaustion produce visible errors; invalid files and perma
         assert.equal(sends.length, 0)
         assert.equal(notices.length, 1)
         assert.match(notices[0], /出站文件上传失败.*report.txt/)
+        assert.match(notices[0], /code=.*message=.*log_id=/)
         assert.equal(delays.length, expectedAttempts - 1)
       }
       globalThis.fetch = async () => { throw new Error('invalid file must not upload') }

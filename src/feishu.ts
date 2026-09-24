@@ -1,5 +1,6 @@
 import { networkFetch } from './network'
 import { FeishuRequestError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
+import { feishuErrorDetails, formatFeishuError } from './feishu-errors'
 import { withChatMessageOrder } from './chat-message-order'
 import { AGENT_PROVIDERS, isAgentProvider, isDshReasoningEffort } from './agent-process'
 /**
@@ -135,9 +136,49 @@ export function projectProfileForDirectory(workDir: string): ProjectProfile | un
   return profileForWorkspace(workDir, PROJECTS_ROOT, config.projects)
 }
 
+// Keep response headers until diagnostics have been extracted. The SDK's
+// default response interceptor otherwise discards header-only request IDs.
+type SdkHttp = NonNullable<ConstructorParameters<typeof lark.Client>[0]['httpInstance']>
+const sdkRequest: SdkHttp['request'] = async <T = any, R = T, D = any>(options: Parameters<SdkHttp['request']>[0] & { data?: D }): Promise<R> => {
+  try {
+    // Use the original transport so the SDK's default options and request
+    // interceptors (including its User-Agent) remain unchanged.
+    const response = await lark.defaultHttpInstance.request({ ...options, $return_headers: true } as any) as any
+    const details = feishuErrorDetails({ data: response.data, headers: response.headers })
+    if (details.logId && response.data && typeof response.data === 'object' && !Array.isArray(response.data)) {
+      response.data.log_id = details.logId
+    }
+    return ((options as any).$return_headers ? response : response.data) as R
+  } catch (error) {
+    // Preserve the SDK/Axios object, including permission scopes and retry data.
+    if (error instanceof Error) {
+      const details = feishuErrorDetails(error)
+      error.message = formatFeishuError(error)
+      Object.assign(error, { apiMessage: details.message, logId: details.logId })
+    }
+    throw error
+  }
+}
+const sdkHttp: SdkHttp = {
+  request: sdkRequest,
+  get: (url, options) => sdkRequest({ ...options, url, method: 'GET' }),
+  delete: (url, options) => sdkRequest({ ...options, url, method: 'DELETE' }),
+  head: (url, options) => sdkRequest({ ...options, url, method: 'HEAD' }),
+  options: (url, options) => sdkRequest({ ...options, url, method: 'OPTIONS' }),
+  post: (url, data, options) => sdkRequest({ ...options, url, data, method: 'POST' }),
+  put: (url, data, options) => sdkRequest({ ...options, url, data, method: 'PUT' }),
+  patch: (url, data, options) => sdkRequest({ ...options, url, data, method: 'PATCH' }),
+}
+
 export const client = new lark.Client({
   appId: APP_ID, appSecret: APP_SECRET, disableTokenCache: false,
+  httpInstance: sdkHttp,
 })
+
+function sdkApiError(label: string, raw: unknown): FeishuRequestError {
+  const details = feishuErrorDetails(raw)
+  return new FeishuRequestError(`${label} failed ${formatFeishuError(raw)}`, details.status, details.code, details.retryAfter, details.logId, details.message)
+}
 
 const RAW_FETCH_TIMEOUT_MS = 15_000
 
@@ -994,6 +1035,7 @@ export async function refreshChatList(): Promise<void> {
       const res = await client.im.chat.list({
         params: { page_size: 100, ...(pageToken ? { page_token: pageToken } : {}) },
       })
+      if (res.code && res.code !== 0) throw sdkApiError('feishu chat.list', res)
       for (const chat of res.data?.items ?? []) {
         if (chat.chat_id && chat.name) chatNameCache.set(chat.chat_id, chat.name)
       }
@@ -1010,7 +1052,7 @@ export async function listNormalChatIdsByName(): Promise<Map<string, string[]>> 
     const res = await client.im.chat.list({
       params: { page_size: 100, ...(pageToken ? { page_token: pageToken } : {}) },
     })
-    if (res.code && res.code !== 0) throw new Error(`feishu chat.list failed code=${res.code} msg=${res.msg}`)
+    if (res.code && res.code !== 0) throw sdkApiError('feishu chat.list', res)
     for (const chat of res.data?.items ?? []) {
       if (!chat.chat_id || !chat.name) continue
       if (chat.chat_status && chat.chat_status !== 'normal') continue
@@ -1059,7 +1101,7 @@ export async function ensureChatForSession(sessionName: string, userOpenId: stri
     },
   })
   if (res.code && res.code !== 0) {
-    throw new Error(`feishu chat.create failed code=${res.code} msg=${res.msg}`)
+    throw sdkApiError('feishu chat.create', res)
   }
   const chatId = res.data?.chat_id
   if (!chatId) throw new Error('feishu chat.create returned no chat_id')
@@ -1085,7 +1127,7 @@ export async function createTempChatForSession(
     },
   })
   if (res.code && res.code !== 0) {
-    throw new Error(`feishu chat.create failed code=${res.code} msg=${res.msg}`)
+    throw sdkApiError('feishu chat.create', res)
   }
   const chatId = res.data?.chat_id
   if (!chatId) throw new Error('feishu chat.create returned no chat_id')
@@ -1102,7 +1144,7 @@ export async function disbandChatForSession(sessionName: string): Promise<{ chat
   }
   const res = await client.im.chat.delete({ path: { chat_id: chatId } })
   if (res.code && res.code !== 0) {
-    throw new Error(`feishu chat.delete failed code=${res.code} msg=${res.msg}`)
+    throw sdkApiError('feishu chat.delete', res)
   }
   chatNameCache.delete(chatId)
   if (preferredChatForSession.get(sessionName) === chatId) unbindSessionChat(sessionName)
@@ -1124,7 +1166,7 @@ export async function disbandChatForSessionExact(
   }
   const res = await client.im.chat.delete({ path: { chat_id: chatId } })
   if (res.code && res.code !== 0) {
-    throw new Error(`feishu chat.delete failed code=${res.code} msg=${res.msg}`)
+    throw sdkApiError('feishu chat.delete', res)
   }
   chatNameCache.delete(chatId)
   return { chatId, disbanded: true }
@@ -1138,7 +1180,7 @@ async function ensureUserInChat(chatId: string, userOpenId: string): Promise<boo
       params: { member_id_type: 'open_id', page_size: 100, ...(pageToken ? { page_token: pageToken } : {}) },
     })
     if (res.code && res.code !== 0) {
-      throw new Error(`feishu chatMembers.get failed code=${res.code} msg=${res.msg}`)
+      throw sdkApiError('feishu chatMembers.get', res)
     }
     for (const item of res.data?.items ?? []) {
       if (item.member_id === userOpenId) return false
@@ -1152,7 +1194,7 @@ async function ensureUserInChat(chatId: string, userOpenId: string): Promise<boo
     data: { id_list: [userOpenId] },
   })
   if (add.code && add.code !== 0) {
-    throw new Error(`feishu chatMembers.create failed code=${add.code} msg=${add.msg}`)
+    throw sdkApiError('feishu chatMembers.create', add)
   }
   return true
 }
@@ -1173,11 +1215,7 @@ export async function fetchChatName(chatId: string): Promise<string | null> {
     const res = await rawFetch(`https://open.feishu.cn/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, {
       headers: { Authorization: `Bearer ${token}` },
     })
-    const json = await res.json() as any
-    if (json?.code !== 0) {
-      log(`feishu: fetchChatName ${chatId} code=${json?.code} msg=${json?.msg}`)
-      return null
-    }
+    const json = await readFeishuResponse(res, `fetchChatName ${chatId}`)
     const name = json.data?.name
     if (typeof name === 'string' && name) {
       chatNameCache.set(chatId, name)
@@ -1200,6 +1238,7 @@ async function sendViaSdkWithRetry(
   chatId: string,
   msgType: 'text' | 'interactive' | 'image' | 'file',
   content: string,
+  onFailure?: (error: unknown) => void,
 ): Promise<string | null> {
   // Same uuid across retries → Feishu dedupes on its side so a successful-
   // but-response-lost first attempt doesn't produce a duplicate message.
@@ -1211,19 +1250,22 @@ async function sendViaSdkWithRetry(
         data: { receive_id: chatId, msg_type: msgType, content, uuid },
       })
       if (res?.code !== 0) {
-        throw new FeishuRequestError(`send${what} code=${res?.code ?? 'MISS'} msg=${res?.msg ?? 'MISS'}`, undefined, res?.code)
+        throw sdkApiError(`send${what}`, res)
       }
       const messageId = res?.data?.message_id
       if (typeof messageId !== 'string' || !messageId.trim()) throw new Error(`send${what} message_id MISS`)
       return messageId
     })
-  } catch { return null } // withFeishuRetry logs the final failure; callers surface null.
+  } catch (error) {
+    onFailure?.(error)
+    return null
+  } // withFeishuRetry logs the final failure; callers surface null.
 }
 
 async function fetchChatStatus(chatId: string): Promise<{ name: string | null; status: string | null }> {
   const res = await client.im.chat.get({ path: { chat_id: chatId } })
   if (res.code && res.code !== 0) {
-    throw new Error(`feishu chat.get failed code=${res.code} msg=${res.msg}`)
+    throw sdkApiError('feishu chat.get', res)
   }
   return {
     name: res.data?.name ?? null,
@@ -1235,16 +1277,17 @@ function isNormalChatStatus(status: string | null): boolean {
   return status === null || status === 'normal'
 }
 
-export async function sendText(chatId: string, text: string): Promise<string | null> {
-  return withChatMessageOrder(chatId, () => sendViaSdkWithRetry('Text', chatId, 'text', JSON.stringify({ text })))
+export async function sendText(chatId: string, text: string, onFailure?: (error: unknown) => void): Promise<string | null> {
+  return withChatMessageOrder(chatId, () => sendViaSdkWithRetry('Text', chatId, 'text', JSON.stringify({ text }), onFailure))
 }
 
-export async function sendCard(chatId: string, card: object): Promise<string | null> {
+export async function sendCard(chatId: string, card: object, onFailure?: (error: unknown) => void): Promise<string | null> {
   return withChatMessageOrder(chatId, () => sendViaSdkWithRetry(
     'Card',
     chatId,
     'interactive',
     JSON.stringify(neutralizeMarkdownImagesInCard(card)),
+    onFailure,
   ))
 }
 
@@ -1253,7 +1296,7 @@ export async function getChatTailMessageId(chatId: string): Promise<string | nul
   const response = await client.im.message.list({ params: {
     container_id_type: 'chat', container_id: chatId, sort_type: 'ByCreateTimeDesc', page_size: 1,
   } })
-  if (response.code !== 0) throw new Error(`feishu message.list failed code=${response.code ?? 'MISS'} msg=${response.msg ?? 'MISS'}`)
+  if (response.code !== 0) throw sdkApiError('feishu message.list', response)
   if (!Array.isArray(response.data?.items)) throw new Error('feishu message.list items MISS')
   if (response.data.items.length === 0) return null
   const messageId = response.data.items[0]?.message_id
@@ -1267,7 +1310,7 @@ export async function updateCard(messageId: string, card: object): Promise<void>
     data: { content: JSON.stringify(neutralizeMarkdownImagesInCard(card)) },
   })
   if (res?.code !== 0) {
-    throw new Error(`feishu message.patch failed code=${res?.code ?? 'MISS'} msg=${res?.msg ?? 'MISS'}`)
+    throw sdkApiError('feishu message.patch', res)
   }
 }
 
@@ -1295,11 +1338,7 @@ async function sendTextRawOrdered(chatId: string, text: string): Promise<string 
         content: JSON.stringify({ text }),
       }),
     })
-    const json = await res.json() as any
-    if (json?.code !== 0) {
-      log(`feishu: sendTextRaw rejected chat=${chatId} code=${json?.code} msg=${json?.msg}`)
-      return null
-    }
+    const json = await readFeishuResponse(res, `sendTextRaw chat=${chatId}`)
     return json.data?.message_id ?? null
   } catch (e) {
     log(`feishu: sendTextRaw chat=${chatId} failed: ${e}`)
@@ -1319,6 +1358,7 @@ export async function addReaction(messageId: string, emojiType: string): Promise
       path: { message_id: messageId },
       data: { reaction_type: { emoji_type: emojiType } },
     })
+    if (res?.code && res.code !== 0) throw sdkApiError('feishu messageReaction.create', res)
     return res?.data?.reaction_id ?? null
   } catch (e) { log(`feishu: addReaction ${emojiType} on ${messageId} failed: ${e}`); return null }
 }
@@ -1332,9 +1372,10 @@ export async function addReaction(messageId: string, emojiType: string): Promise
 export async function deleteReaction(messageId: string, reactionId: string): Promise<void> {
   if (!messageId || !reactionId) return
   try {
-    await client.im.messageReaction.delete({
+    const res = await client.im.messageReaction.delete({
       path: { message_id: messageId, reaction_id: reactionId },
     })
+    if (res?.code && res.code !== 0) throw sdkApiError('feishu messageReaction.delete', res)
   } catch (e) { log(`feishu: deleteReaction ${reactionId} on ${messageId} failed: ${e}`) }
 }
 
@@ -1371,11 +1412,7 @@ export async function urgentApp(messageId: string, openIds: string[]): Promise<v
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ user_id_list: openIds }),
     })
-    const json = await res.json() as any
-    if (json?.code !== 0) {
-      log(`feishu: urgentApp ${messageId} code=${json?.code} msg=${json?.msg}`)
-      return
-    }
+    const json = await readFeishuResponse(res, `urgentApp ${messageId}`)
     const invalid = json.data?.invalid_user_id_list ?? []
     const delivered = openIds.length - invalid.length
     log(`feishu: urgentApp ${messageId} ok — delivered=${delivered}${invalid.length ? ` invalid=${invalid.length}` : ''}`)
@@ -1391,8 +1428,7 @@ export async function downloadAttachment(
     const url = `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/resources/${key}?type=${type}`
     const res = await rawFetch(url, { headers: { Authorization: `Bearer ${token}` } })
     if (!res.ok) {
-      log(`feishu: download ${type} HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
-      return undefined
+      await readFeishuResponse(res, `download ${type}`)
     }
     const buf = Buffer.from(await res.arrayBuffer())
     mkdirSync(INBOX_DIR, { recursive: true })
@@ -1456,31 +1492,37 @@ async function uploadMultipart(filePath: string, type: 'image' | 'file'): Promis
  * file, API rejection). Mirrors `uploadAndSend`'s validation but yields the
  * key so the caller can place an `{tag:'image'}` element instead of sending
  * a standalone image message. */
-export async function uploadImageKey(filePath: string): Promise<string | null> {
+export async function uploadImageKey(filePath: string, onFailure?: (error: unknown) => void): Promise<string | null> {
   try {
     const stats = statSync(filePath)
     if (!stats.isFile()) {
       log(`feishu: uploadImageKey not a file — ${filePath}`)
+      onFailure?.(new Error('路径不是普通文件'))
       return null
     }
     if (stats.size > MAX_UPLOAD_BYTES) {
       log(`feishu: uploadImageKey oversize — ${filePath} (${(stats.size / 1024 / 1024).toFixed(1)} MB)`)
+      onFailure?.(new Error(`${basename(filePath)} 超过 30 MB`))
       return null
     }
   } catch (e) {
     log(`feishu: uploadImageKey stat failed — ${filePath}: ${e}`)
+    onFailure?.(e)
     return null
   }
   try { return await uploadMultipart(filePath, 'image') }
-  catch { return null } // Final upload diagnostics are logged by withFeishuRetry.
+  catch (error) {
+    onFailure?.(error)
+    return null
+  } // Final upload diagnostics are logged by withFeishuRetry.
 }
 
-export async function sendImage(chatId: string, imageKey: string): Promise<string | null> {
-  return withChatMessageOrder(chatId, () => sendViaSdkWithRetry('Image', chatId, 'image', JSON.stringify({ image_key: imageKey })))
+export async function sendImage(chatId: string, imageKey: string, onFailure?: (error: unknown) => void): Promise<string | null> {
+  return withChatMessageOrder(chatId, () => sendViaSdkWithRetry('Image', chatId, 'image', JSON.stringify({ image_key: imageKey }), onFailure))
 }
 
-export async function sendFile(chatId: string, fileKey: string): Promise<string | null> {
-  return withChatMessageOrder(chatId, () => sendViaSdkWithRetry('File', chatId, 'file', JSON.stringify({ file_key: fileKey })))
+export async function sendFile(chatId: string, fileKey: string, onFailure?: (error: unknown) => void): Promise<string | null> {
+  return withChatMessageOrder(chatId, () => sendViaSdkWithRetry('File', chatId, 'file', JSON.stringify({ file_key: fileKey }), onFailure))
 }
 
 /** Upload a local file and post it as an image or file message in the
@@ -1510,17 +1552,19 @@ export async function uploadAndSend(chatId: string, filePath: string): Promise<b
   const label = type === 'image' ? '出站图片' : '出站文件'
   try {
     const key = await uploadMultipart(filePath, type)
-    const msgId = await (type === 'image' ? sendImage(chatId, key) : sendFile(chatId, key))
+    let sendError: unknown
+    const onFailure = (error: unknown) => { sendError = error }
+    const msgId = await (type === 'image' ? sendImage(chatId, key, onFailure) : sendFile(chatId, key, onFailure))
     if (!msgId) {
       log(`feishu: uploadAndSend ${filePath} send failed after upload`)
-      await sendText(chatId, `❌ ${label}发送失败: ${basename(filePath)}（上传已完成）`)
+      await sendText(chatId, `❌ ${label}发送失败: ${basename(filePath)}（上传已完成）\n${formatFeishuError(sendError)}`)
       return false
     }
     log(`feishu: uploadAndSend ${filePath} delivered msg=${msgId}`)
     return true
   } catch (e) {
     log(`feishu: uploadAndSend ${filePath} failed: ${e}`)
-    await sendText(chatId, `❌ ${label}上传失败: ${basename(filePath)} — ${e}`)
+    await sendText(chatId, `❌ ${label}上传失败: ${basename(filePath)} — ${formatFeishuError(e)}`)
     return false
   }
 }

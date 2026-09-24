@@ -1,6 +1,7 @@
 import type { Session } from './session'
 import { createHash } from 'node:crypto'
 import * as feishu from './feishu'
+import { formatFeishuError } from './feishu-errors'
 import { codexAccounts, codexAccountInUse, processCodexAccount } from './codex-accounts'
 import { codexLogins, requireDefaultCodexLogin } from './codex-login'
 import { getTokenSource, getTokenSourceForAccount } from './token-source'
@@ -26,7 +27,10 @@ function errorView(error: unknown, name?: string): CodexAccountCardView {
 }
 
 async function sendErrorCard(s: Session, error: unknown): Promise<void> {
-  if (!await feishu.sendCard(s.chatId, codexAccountCard(errorView(error)))) throw new Error('Codex 错误卡片发送失败')
+  let failure: unknown
+  if (!await feishu.sendCard(s.chatId, codexAccountCard(errorView(error)), error => { failure = error })) {
+    throw new Error(`Codex 错误卡片发送失败\n${formatFeishuError(failure)}`)
+  }
 }
 
 /** Explicit account selection bypasses quota/model catalog gates; uses the regular Session lifecycle. */

@@ -5,11 +5,23 @@ function harness() {
   const calls: Array<{ operation: string; value?: any }> = []
   const control = { replace: true, settings: true, send: true }
   const deps: CodexAccountCardDeps = {
-    sendCard: async (_chat, card) => { calls.push({ operation: 'send', value: card }); return control.send ? 'message' : null },
+    sendCard: async (_chat, card, onFailure) => {
+      calls.push({ operation: 'send', value: card })
+      if (!control.send) onFailure?.({ code: 230001, msg: 'card send rejected', error: { log_id: 'send-log' } })
+      return control.send ? 'message' : null
+    },
     convertMessageToCard: async () => 'card',
     recordCardCreated: (_id, count) => { calls.push({ operation: 'register', value: count }) },
-    replaceElementChecked: async (_id, _element, value) => { calls.push({ operation: 'replace', value }); return control.replace },
-    patchSettingsChecked: async (_id, value) => { calls.push({ operation: 'settings', value }); return control.settings },
+    replaceElementChecked: async (_id, _element, value, opts) => {
+      calls.push({ operation: 'replace', value })
+      if (!control.replace) opts?.onFailure?.({ cardId: _id, operation: 'replaceElement', code: 300121, message: 'panel rejected', logId: 'replace-log' })
+      return control.replace
+    },
+    patchSettingsChecked: async (_id, value, onFailure) => {
+      calls.push({ operation: 'settings', value })
+      if (!control.settings) onFailure?.({ cardId: _id, operation: 'patchSettings', code: 300121, message: 'settings rejected', logId: 'settings-log' })
+      return control.settings
+    },
     dispose: async () => { calls.push({ operation: 'dispose' }) },
   }
   return { calls, deps, control }
@@ -35,14 +47,17 @@ describe('Codex account card lifecycle', () => {
       const { calls, deps, control } = harness()
       const card = await CodexAccountCard.open('chat', { phase: 'connecting' }, deps)
       control[failure] = false
-      await expect(card.finish({ phase: 'success' })).rejects.toThrow('更新失败')
+      const finish = card.finish({ phase: 'success' })
+      await expect(finish).rejects.toThrow('更新失败')
+      await expect(finish).rejects.toThrow(`log_id=${failure}-log`)
+      await expect(finish).rejects.toThrow(`message=${failure === 'replace' ? 'panel' : 'settings'} rejected`)
       expect(calls.some(c => c.operation === 'dispose')).toBe(false)
     }
   })
   test('failed card creation starts no bookkeeping, and invalid final content can still render an error', async () => {
     const { deps, calls, control } = harness()
     control.send = false
-    await expect(CodexAccountCard.open('chat', { phase: 'connecting' }, deps)).rejects.toThrow('发送失败')
+    await expect(CodexAccountCard.open('chat', { phase: 'connecting' }, deps)).rejects.toThrow('code=230001 message=card send rejected log_id=send-log')
     expect(calls.some(c => c.operation === 'register')).toBe(false)
     control.send = true
     const card = await CodexAccountCard.open('chat', { phase: 'checking' }, deps)

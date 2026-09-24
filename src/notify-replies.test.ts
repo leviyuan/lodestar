@@ -48,13 +48,15 @@ function harness() {
   const delivered: Array<{ notifyId: string; response: NotifyTextResponse; openId: string }> = []
   const controls = {
     send: async (): Promise<boolean> => true,
+    sendFailure: undefined as unknown,
+    textFailure: undefined as unknown,
     update: async (_messageId: string): Promise<void> => {},
     dispatch: async (): Promise<DispatchResult> => ({ ok: true, detail: '200', reply: '已安排部署' }),
     waitingChanged: (_chatId: string): void => {},
   }
   const io = {
-    sendCard: async (chatId: string, card: object) => {
-      if (!await controls.send()) return null
+    sendCard: async (chatId: string, card: object, onFailure?: (error: unknown) => void) => {
+      if (!await controls.send()) { onFailure?.(controls.sendFailure); return null }
       const messageId = `om_card_${sent.length + 1}`
       sent.push({ chatId, messageId, card })
       return messageId
@@ -63,7 +65,11 @@ function harness() {
       updated.push({ messageId, card })
       await controls.update(messageId)
     },
-    sendText: async (_chatId: string, text: string) => { notices.push(text); return 'om_error' },
+    sendText: async (_chatId: string, text: string, onFailure?: (error: unknown) => void) => {
+      notices.push(text)
+      if (controls.textFailure !== undefined) { onFailure?.(controls.textFailure); return null }
+      return 'om_error'
+    },
     dispatch: async (reg: NotifyRegistration, response: NotifyTextResponse, openId: string) => {
       delivered.push({ notifyId: reg.notifyId, response, openId })
       return controls.dispatch()
@@ -424,6 +430,18 @@ describe('notification text reply workflow', () => {
     expect(await h.runtime.consume(incoming())).toBe(false)
   })
 
+  test('waiting-card rejection includes Feishu message and log ID without reserving input', async () => {
+    register(registration())
+    const h = harness()
+    h.controls.send = async () => false
+    h.controls.sendFailure = { response: { data: { code: 230001, msg: 'invalid card content', error: { log_id: 'reply-open-log' } } } }
+    const result = await h.open()
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('code=230001 message=invalid card content log_id=reply-open-log')
+    expect(findPendingReply('oc_group', 'ou_owner')).toBeUndefined()
+    expect(await h.runtime.consume(incoming())).toBe(false)
+  })
+
   test('failure to persist a new prompt marks its visible card as failed without capturing input', async () => {
     register(registration())
     const h = harness()
@@ -477,6 +495,29 @@ describe('notification text reply workflow', () => {
     expect(h.delivered).toHaveLength(0)
     expect(h.notices.join('\n')).toContain('Feishu unavailable')
     expect(get('nf_reply')!.replyState!.status).toBe('failed')
+  })
+
+  test('receipt failure preserves raw API diagnostics in both state and existing error notices', async () => {
+    register(registration())
+    const h = harness()
+    await h.open()
+    h.controls.update = async () => { throw { response: { data: { code: 300121, msg: 'Failed to replace element' }, headers: { 'x-tt-logid': 'receipt-log' } } } }
+    expect(await h.runtime.consume(incoming())).toBe(true)
+    expect(h.delivered).toHaveLength(0)
+    const diagnostic = 'code=300121 message=Failed to replace element log_id=receipt-log'
+    expect(get('nf_reply')!.replyState!.error).toBe(diagnostic)
+    expect(h.notices.every(text => text.includes(diagnostic))).toBe(true)
+  })
+
+  test('failure to send an error notice reports its diagnostics and retains the original failure', async () => {
+    register(registration())
+    const h = harness()
+    await h.open()
+    h.controls.update = async () => { throw { code: 300121, msg: 'replace rejected', log_id: 'original-log' } }
+    h.controls.textFailure = { code: 230002, msg: 'send rejected', log_id: 'notice-log' }
+    await expect(h.runtime.consume(incoming())).rejects.toThrow('code=230002 message=send rejected log_id=notice-log')
+    expect(h.notices[0]).toContain('code=300121 message=replace rejected log_id=original-log')
+    expect(h.delivered).toHaveLength(0)
   })
 
   test('presentation failure after callback success stays resolved, reports error and never resends', async () => {

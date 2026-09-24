@@ -55,3 +55,19 @@ test('failed enabling shows the actual unchanged mode and missing permission', a
   expect(JSON.stringify(rendered)).toContain('drive:drive not granted')
   expect(JSON.stringify(rendered)).toContain('聊天附件（默认）')
 })
+
+test('files receipt rejection reports the API message and log id', async () => {
+  const errors: string[] = []
+  await runFileDeliveryCommand('chat', '群名', 'user', '', {
+    get: () => ({ enabled: false }),
+    enable: async () => { throw new Error('unexpected') },
+    disable: async () => { throw new Error('unexpected') },
+    sendCard: async (_card, onFailure) => {
+      onFailure?.({ code: 230001, msg: 'settings card rejected', error: { log_id: 'settings-card-log' } })
+      return null
+    },
+    reportError: async message => { errors.push(message) },
+  }, '/workspace/project')
+  expect(errors).toHaveLength(1)
+  expect(errors[0]).toContain('code=230001 message=settings card rejected log_id=settings-card-log')
+})

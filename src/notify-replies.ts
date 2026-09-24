@@ -7,6 +7,7 @@ import {
   type NotifyRegistration, type NotifyReplyState, type NotifyTextResponse, type DispatchResult,
 } from './notify-callbacks'
 import { buildNotifyCardFromReg, buildNotifyReplyCard, type NotifyResolution } from './notify'
+import { formatFeishuError } from './feishu-errors'
 
 interface ReplyActionResult {
   ok: boolean
@@ -24,9 +25,9 @@ export interface NotifyReplyMessage {
 }
 
 export function createNotifyReplyRuntime(deps: {
-  sendCard(chatId: string, card: object): Promise<string | null>
+  sendCard(chatId: string, card: object, onFailure?: (error: unknown) => void): Promise<string | null>
   updateCard(messageId: string, card: object): Promise<void>
-  sendText(chatId: string, text: string): Promise<string | null>
+  sendText(chatId: string, text: string, onFailure?: (error: unknown) => void): Promise<string | null>
   dispatch(reg: NotifyRegistration, response: NotifyTextResponse, openId: string): Promise<DispatchResult>
   onWaitingChanged(chatId: string): void
   log(text: string): void
@@ -44,11 +45,14 @@ export function createNotifyReplyRuntime(deps: {
   }
   const report = async (chatId: string, message: string) => {
     deps.log(`notify-reply: ${message}`)
-    if (!await deps.sendText(chatId, `❌ ${message}`)) throw new Error(`通知回复错误提示发送失败: ${message}`)
+    let failure: unknown
+    if (!await deps.sendText(chatId, `❌ ${message}`, error => { failure = error })) {
+      throw new Error(`通知回复错误提示发送失败: ${formatFeishuError(failure)}；原错误：${message}`)
+    }
   }
   const update = async (reg: NotifyRegistration, messageId: string, card: object, context: string) => {
     try { await deps.updateCard(messageId, card) }
-    catch (error) { await report(reg.chatId, `${context}，卡片更新失败：${detailOf(error)}`) }
+    catch (error) { await report(reg.chatId, `${context}，卡片更新失败：${formatFeishuError(error)}`) }
   }
 
   return {
@@ -96,8 +100,9 @@ export function createNotifyReplyRuntime(deps: {
         const state: NotifyReplyState = {
           id: randomUUID(), openId, promptMessageId: '', openedAt: Date.now(), status: 'waiting',
         }
-        const messageId = await deps.sendCard(reg.chatId, buildNotifyReplyCard(reg, state))
-        if (!messageId) return { ok: false, message: '等待输入卡片发送失败，未开始接收回复，请重新点击「回复」' }
+        let failure: unknown
+        const messageId = await deps.sendCard(reg.chatId, buildNotifyReplyCard(reg, state), error => { failure = error })
+        if (!messageId) return { ok: false, message: `等待输入卡片发送失败，未开始接收回复，请重新点击「回复」\n${formatFeishuError(failure)}` }
         state.promptMessageId = messageId
         try { setReplyState(notifyId, state) }
         catch (error) {
@@ -158,7 +163,8 @@ export function createNotifyReplyRuntime(deps: {
         try {
           // Do not POST until both the durable input and its visible receipt
           // exist. A presentation failure here is still safely retryable.
-          await deps.updateCard(state.promptMessageId, buildNotifyReplyCard(reg, sending))
+          try { await deps.updateCard(state.promptMessageId, buildNotifyReplyCard(reg, sending)) }
+          catch (error) { throw new Error(formatFeishuError(error)) }
           if (reg.callbackUrl) result = await deps.dispatch(reg, response, openId)
           else {
             markResolved(reg.notifyId, undefined, openId)

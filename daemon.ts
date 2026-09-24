@@ -25,6 +25,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSy
 import { dirname } from 'node:path'
 import { Session } from './src/session'
 import * as feishu from './src/feishu'
+import { formatFeishuError } from './src/feishu-errors'
 import * as cards from './src/cards'
 import { actionCardResponse } from './src/card-action'
 import { debugModelActionEvent, debugModelState } from './src/debug-model'
@@ -1196,7 +1197,7 @@ function startDebugSocket(): void {
             const panel = session.modelPanels.get(panelId)
             if (!panel?.messageId || panel.messageId !== body.message_id) throw new Error('stale or mismatched model panel')
             const response = await feishu.client.im.v1.message.get({ path: { message_id: body.message_id } })
-            if (response.code !== 0) throw new Error(`message.get failed: ${response.code} ${response.msg}`)
+            if (response.code !== 0) throw new Error(`message.get failed: ${formatFeishuError(response)}`)
             const event = debugModelActionEvent(body, ctx, response.data?.items?.[0], config.feishu.app_id, panel.messageId)
             log(`debug: model action ${body.value.kind} chat=${ctx.chat_id.slice(0, 8)}…`)
             const admission = acceptCardAction(event)

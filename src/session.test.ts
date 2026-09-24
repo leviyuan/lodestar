@@ -610,7 +610,7 @@ describe('generated image delivery', () => {
     const normalFetch = globalThis.fetch
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       if (init?.method === 'PUT' && String(init.body).includes('img_generated')) {
-        return Response.json({ code: 200570, msg: 'inline image rejected' })
+        return Response.json({ code: 200570, msg: 'inline image rejected', error: { log_id: 'inline-image-log' } })
       }
       return normalFetch(input, init)
     }) as typeof fetch
@@ -623,6 +623,7 @@ describe('generated image delivery', () => {
       expect(sentLocalFiles).toEqual([])
       const update = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/elements/tool_0')).at(-1)!
       expect(JSON.parse(update.body.element).elements[0].content).toContain('图片已单独发送')
+      expect(JSON.parse(update.body.element).elements[0].content).toContain('code=200570 message=inline image rejected log_id=inline-image-log')
     } finally { globalThis.fetch = normalFetch; session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
   })
 
@@ -650,6 +651,50 @@ describe('generated image delivery', () => {
       expect(calls.some(call => call.method === 'PUT' && String(call.body?.element).includes('img_delayed'))).toBe(true)
       expect(sentImages).toEqual([])
     } finally { release?.('img_delayed'); await sessionTools.waitForImageDeliveries(turn); session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+
+  test('reports rejected image and note writes together when neither can appear on the card', async () => {
+    const session = new Session('image-note-failure', 'chat_id') as any
+    const turn = turnState('card_image_note_failure')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const normalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'PUT' && String(input).endsWith('/elements/tool_0')) {
+        const isImage = String(init.body).includes('img_generated')
+        return Response.json({ code: 300121, msg: isImage ? 'image rejected' : 'note rejected',
+          error: { log_id: isImage ? 'image-rejection-log' : 'note-rejection-log' } })
+      }
+      return normalFetch(input, init)
+    }) as typeof fetch
+    try {
+      sessionTools.addTool(session, 'image-call', 'ImageGeneration', { revisedPrompt: 'Prompt' })
+      sessionTools.completeTool(session, 'image-call', '/tmp/generated.png', false)
+      await sessionTools.waitForImageDeliveries(turn)
+      expect(sentImages).toEqual([['chat_id', 'img_generated']])
+      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts[0]).toContain('code=300121 message=image rejected log_id=image-rejection-log')
+      expect(sentRawTexts[0]).toContain('code=300121 message=note rejected log_id=note-rejection-log')
+    } finally { globalThis.fetch = normalFetch; session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+
+  test('retains an upload rejection returned through the failure callback', async () => {
+    const session = new Session('image-upload-failure', 'chat_id') as any
+    const turn = turnState('card_image_upload_failure')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const upload = spyOn(feishu, 'uploadImageKey').mockImplementation(async (_path, onFailure) => {
+      onFailure?.({ code: 230001, msg: 'upload rejected', error: { log_id: 'upload-log' } })
+      return null
+    })
+    try {
+      sessionTools.addTool(session, 'image-call', 'ImageGeneration', { revisedPrompt: 'Prompt' })
+      sessionTools.completeTool(session, 'image-call', '/tmp/generated.png', false)
+      await sessionTools.waitForImageDeliveries(turn)
+      expect(sentLocalFiles).toEqual([['chat_id', '/tmp/generated.png']])
+      const update = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/elements/tool_0')).at(-1)!
+      expect(JSON.parse(update.body.element).elements[0].content).toContain('code=230001 message=upload rejected log_id=upload-log')
+    } finally { upload.mockRestore(); session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
   })
 })
 
@@ -1578,6 +1623,8 @@ describe('Session automatic context compaction events', () => {
         expect(turn.cardRotationFailed).toBe(false)
         expect(sentRawTexts).toHaveLength(1)
         expect(sentRawTexts[0]).toContain('换卡后仍超出飞书容量，写入失败')
+        expect(sentRawTexts[0]).toContain('message=card over max size')
+        expect(sentRawTexts[0]).toContain('log_id=MISS')
         expect(await cardkit.addElementChecked(turn.cardId, {
           tag: 'markdown', element_id: 'later_output', content: '后续回复仍可写入',
         })).toBe(true)
@@ -3987,6 +4034,43 @@ describe('Session card pagination', () => {
     }
   }
 
+  for (const diagnostic of [
+    { headers: { 'x-tt-logid': 'replace-header-id' }, error: undefined, logId: 'replace-header-id' },
+    { headers: {}, error: { log_id: 'replace-body-id' }, logId: 'replace-body-id' },
+    { headers: {}, error: undefined, logId: 'MISS' },
+  ]) {
+    test(`tool replacement warning includes upstream message and log_id=${diagnostic.logId}`, async () => {
+      const session = new Session('replace-diagnostics', 'chat_id') as any
+      const turn = turnState('card_replace_diagnostics')
+      session.currentTurn = turn
+      cardkit.recordCardCreated(turn.cardId, 2, (code, failure) => {
+        session.onCardWriteFailure(turn, turn.cardId, code, failure)
+      })
+      let attempts = 0
+      globalThis.fetch = (async () => {
+        attempts++
+        return Response.json({ code: 300121, msg: 'Failed to replace element: invalid nested component', error: diagnostic.error }, {
+          status: 400, headers: diagnostic.headers as Record<string, string>,
+        })
+      }) as unknown as typeof fetch
+      try {
+        expect(await cardkit.replaceElementChecked(turn.cardId, 'tool_28', {
+          tag: 'markdown', element_id: 'tool_28', content: 'tool output',
+        })).toBe(false)
+        expect(attempts).toBe(1)
+        expect(turn.rotating).toBeNull()
+        expect(sentRawTexts).toHaveLength(1)
+        expect(sentRawTexts[0]).toContain('replaceElement tool_28')
+        expect(sentRawTexts[0]).toContain('code=300121')
+        expect(sentRawTexts[0]).toContain('message=Failed to replace element: invalid nested component')
+        expect(sentRawTexts[0]).toContain(`log_id=${diagnostic.logId}`)
+        expect(sentRawTexts[0]?.match(/log_id=/g)).toHaveLength(1)
+      } finally {
+        await cardkit.dispose(turn.cardId)
+      }
+    })
+  }
+
   test('distinct validation/content failures stay on the current card and are each reported', async () => {
     const session = new Session('validation-no-rotate', 'chat_id') as any
     const turn = turnState('card_validation')
@@ -5899,7 +5983,7 @@ describe('Session lifecycle reliability', () => {
       if (method === 'PUT' && path === `/cards/${turn.cardId}/elements/footer`) {
         calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
         return new Response(JSON.stringify({ code: 300308, msg: 'footer rejected' }), {
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'x-tt-logid': 'terminal-footer-id' },
         })
       }
       return baseFetch(input, init)
@@ -5910,6 +5994,8 @@ describe('Session lifecycle reliability', () => {
 
       expect(sentRawTexts.join('\n')).toContain('终态写入失败')
       expect(sentRawTexts.join('\n')).toContain('footer=MISS')
+      expect(sentRawTexts.join('\n')).toContain('message=footer rejected')
+      expect(sentRawTexts.join('\n')).toContain('log_id=terminal-footer-id')
       // A disposed card returns false immediately. A successful repair PATCH
       // proves closeTurnCard deliberately retained the state after the miss.
       expect(await cardkit.patchSettingsChecked(turn.cardId, { config: { streaming_mode: false } })).toBe(true)

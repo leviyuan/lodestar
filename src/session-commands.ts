@@ -1,5 +1,6 @@
 import type { Session } from './session'
 import * as feishu from './feishu'
+import { formatFeishuError } from './feishu-errors'
 import { log } from './log'
 import { diagnosticIdLabel, messageOf } from './session-util'
 
@@ -146,8 +147,9 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
           if (statusCard) await s.closeStatusCard(statusCard, waiting)
           else {
             const { codexAccountCard } = await import('./cards/codex-account')
-            if (!await feishu.sendCard(s.chatId, codexAccountCard({ phase: 'checking', title: '等待额度', message: waiting }))) {
-              throw new Error('额度等待卡片发送失败')
+            let failure: unknown
+            if (!await feishu.sendCard(s.chatId, codexAccountCard({ phase: 'checking', title: '等待额度', message: waiting }), error => { failure = error })) {
+              throw new Error(`额度等待卡片发送失败\n${formatFeishuError(failure)}`)
             }
           }
           return true

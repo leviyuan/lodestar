@@ -96,11 +96,15 @@ describe('cloud file delivery receipts', () => {
   })
 
   test('a rejected card reports the failure and the accessible folder without claiming successful delivery', async () => {
-    const f = fixture({ sendCard: async () => null })
+    const f = fixture({ sendCard: async (_snapshot, onFailure) => {
+      onFailure?.({ code: 230001, msg: 'delivery card rejected', error: { log_id: 'delivery-log' } })
+      return null
+    } })
     f.batch.add('/tmp/report.pdf')
     expect(await f.batch.finish()).toEqual([])
     expect(f.errors).toHaveLength(1)
     expect(f.errors[0]).toContain('交付卡发送失败')
+    expect(f.errors[0]).toContain('code=230001 message=delivery card rejected log_id=delivery-log')
     expect(f.errors[0]).toContain(folder.url)
     expect(f.saved.at(-1)?.files[0].status).toBe('ready')
     expect(f.saved.at(-1)?.messageId).toBeUndefined()

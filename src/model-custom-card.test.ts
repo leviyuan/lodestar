@@ -76,7 +76,7 @@ auth_token = "test-token"
     }
     if (path === '/cards/id_convert') {
       if (rejectIdConvert) {
-        return new Response(JSON.stringify({ code: 300308, msg: 'id convert rejected' }), {
+        return new Response(JSON.stringify({ code: 300308, msg: 'id convert rejected', error: { log_id: 'convert-log' } }), {
           headers: { 'Content-Type': 'application/json' },
         })
       }
@@ -88,7 +88,7 @@ auth_token = "test-token"
       const body = init.body ? JSON.parse(String(init.body)) : {}
       elementPatches.push(typeof body.element === 'string' ? JSON.parse(body.element) : body)
       if (rejectElementPatch) {
-        return new Response(JSON.stringify({ code: 300308, msg: 'model panel rejected' }), {
+        return new Response(JSON.stringify({ code: 300308, msg: 'model panel rejected', error: { log_id: 'model-panel-log' } }), {
           headers: { 'Content-Type': 'application/json' },
         })
       }
@@ -183,6 +183,7 @@ auth_token = "test-token"
     rejectElementPatch = false
     expect(rawFallbacks.at(-1)).toContain('模型 GLM-5.2 已在列表中')
     expect(rawFallbacks.at(-1)).toContain('重新发送 model')
+    expect(rawFallbacks.at(-1)).toContain('code=300308 message=model panel rejected log_id=model-panel-log')
 
     // The element mutation missed but streaming-off landed. The one-shot
     // model-card transaction must retain CardKit state for diagnosis/repair
@@ -198,6 +199,7 @@ auth_token = "test-token"
     rejectIdConvert = false
     expect(rawFallbacks.at(-1)).toContain('模型 GLM-5.2 已在列表中')
     expect(rawFallbacks.at(-1)).toContain('重新发送 model')
+    expect(rawFallbacks.at(-1)).toContain('code=300308 message=id convert rejected log_id=convert-log')
 
     rejectCatalog = true
     convertedCardId = 'card_model_catalog_miss'

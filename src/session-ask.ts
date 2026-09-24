@@ -10,6 +10,7 @@ import type { Session } from './session'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
+import { formatFeishuError } from './feishu-errors'
 import { log } from './log'
 import { findPendingReply } from './notify-callbacks'
 
@@ -101,7 +102,10 @@ export async function onAskMessageAnswer(s: Session, text: string, user: string,
   const blocked = askBlockReason(s, toolUseId)
   if (blocked) {
     const notice = `${blocked}。这条文字未提交，请稍后重新发送。`
-    if (!await feishu.sendText(s.chatId, notice)) throw new Error(`提问等待提示发送失败: ${notice}`)
+    let failure: unknown
+    if (!await feishu.sendText(s.chatId, notice, error => { failure = error })) {
+      throw new Error(`提问等待提示发送失败: ${notice}\n${formatFeishuError(failure)}`)
+    }
     return
   }
   const consumed = await onAskCustomAnswer(s, toolUseId, pending.currentIdx!, text, user)

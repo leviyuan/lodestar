@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from 'bun:test'
+import { beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import type { ConversationLaunch, ConversationRouting, ConversationSummary } from './conversation'
 import type { TurnAnchor } from './feishu'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -11,9 +11,11 @@ import {
   resetFeishuMock,
   seededTurnAnchors,
   sentCards,
+  sentRawTexts,
   sentTexts,
   turnAnchorsBySession,
 } from './feishu-test-mock'
+import * as feishu from './feishu'
 
 // feishu-test-mock 必须先注册，session-temp 才会拿到共享的 Feishu 替身。
 const {
@@ -132,6 +134,50 @@ beforeEach(() => {
 })
 
 describe('session-temp Codex btw/fork', () => {
+  test('failed fork, back and resume pickers expose diagnostics and discard their choices', async () => {
+    const h = makeHarness('send-diagnostics')
+    turnAnchorsBySession.set(h.session.sessionName, [codexAnchor('first-input', 'root-thread', 'turn-1')])
+    branchBaseBySession.set(h.session.sessionName, { kind: 'fresh' })
+    h.state.history = [{ provider: 'codex', sessionId: 'old-thread', cwd: h.session.workDir, preview: 'old-input', ts: Date.now() }]
+    const cards: any[] = []
+    const send = spyOn(feishu, 'sendCard').mockImplementation(async (_chatId, card, onFailure) => {
+      cards.push(card)
+      onFailure?.({ code: 230001, msg: 'invalid card content', log_id: 'temp-send-log' })
+      return null
+    })
+    try {
+      await showForkList(h.session, 'ou_owner')
+      await showBackList(h.session, 'ou_owner')
+      await showResumeList(h.session, 'ou_owner')
+      expect(sentRawTexts).toHaveLength(3)
+      expect(sentRawTexts.every(text => text.includes('code=230001 message=invalid card content log_id=temp-send-log'))).toBe(true)
+      const value = pickerValue(cards[0], 'first-input')
+      expect((await onForkSelect(h.session, value.panelId, value.choiceId, 'ou_owner')).ok).toBe(false)
+      expect(h.createCalls).toHaveLength(0)
+      expect(h.rollbackCalls).toHaveLength(0)
+    } finally { send.mockRestore() }
+  })
+
+  test('a rejected write-log card reports diagnostics while preserving the requested rollback', async () => {
+    const h = makeHarness('back-send-diagnostics')
+    turnAnchorsBySession.set(h.session.sessionName, [
+      codexAnchor('first-input', 'root-thread', 'turn-1'),
+      codexAnchor('second-input', 'current-thread', 'turn-2'),
+    ])
+    await showBackList(h.session, 'ou_owner')
+    const value = pickerValue(sentCards[0], 'second-input')
+    const send = spyOn(feishu, 'sendCard').mockImplementation(async (_chatId, _card, onFailure) => {
+      onFailure?.({ code: 230001, msg: 'invalid card content', log_id: 'write-log-send' })
+      return null
+    })
+    try {
+      const result = await onBackSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+      expect(result.ok).toBe(true)
+      expect(result.message).toContain('code=230001 message=invalid card content log_id=write-log-send')
+      expect(h.rollbackCalls).toHaveLength(1)
+    } finally { send.mockRestore() }
+  })
+
   test('btw 以 Codex routing 和原 workDir 创建 fresh 会话', async () => {
     const h = makeHarness()
 

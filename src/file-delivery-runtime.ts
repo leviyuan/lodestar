@@ -36,7 +36,7 @@ export function createFileDelivery(context: FileDeliveryContext): FileDeliveryHa
   return new FileDeliveryBatch(context, {
     resolveFolder: (context, signal) => groupFileDelivery.resolveFolder(context, signal),
     uploadFile: (path, folder, onUploaded, signal) => feishuDrive.uploadFile(path, folder, onUploaded, signal),
-    sendCard: snapshot => feishu.sendCard(context.chatId, fileDeliveryCard(snapshot)),
+    sendCard: (snapshot, onFailure) => feishu.sendCard(context.chatId, fileDeliveryCard(snapshot), onFailure),
     persist: snapshot => writeJsonStateAtomic(join(FILE_DELIVERIES_DIR, `${snapshot.id}.json`), snapshot),
     reportError: async message => {
       log(`file delivery ${context.projectName}: ${message}`)

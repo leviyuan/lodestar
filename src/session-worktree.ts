@@ -4,6 +4,7 @@ import { channelInstructions } from './instructions'
 import type { FileDeliveryMode } from './file-delivery-types'
 import * as cards from './cards'
 import * as feishu from './feishu'
+import { formatFeishuError } from './feishu-errors'
 import { log } from './log'
 import * as worktree from './worktree'
 import { messageOf, type WorktreeActionResult } from './session-util'
@@ -91,19 +92,21 @@ export async function runWorktreeCommand(s: Session, arg: string, userOpenId: st
       try {
         const chat = await feishu.ensureChatForSession(ensured.chatName, userOpenId)
         const action = chat.created ? '已创建' : (chat.joined ? '已加入' : '已在群内')
+        let parentFailure: unknown
         const parentMsg = await feishu.sendCard(s.chatId, cards.worktreeNoticeCard({
           slug,
           branch: ensured.branch,
           status: action,
-        }))
-        if (!parentMsg) await feishu.sendTextRaw(s.chatId, `❌ wt 卡片失败: ${slug}`)
+        }), error => { parentFailure = error })
+        if (!parentMsg) await feishu.sendTextRaw(s.chatId, `❌ wt 卡片失败: ${slug}\n${formatFeishuError(parentFailure)}`)
+        let childFailure: unknown
         const childMsg = await feishu.sendCard(chat.chatId, cards.worktreeNoticeCard({
           slug,
           branch: ensured.branch,
           status: '就绪',
           body: '开始吧。',
-        }))
-        if (!childMsg) await feishu.sendTextRaw(chat.chatId, `❌ wt 卡片失败: ${slug}`)
+        }), error => { childFailure = error })
+        if (!childMsg) await feishu.sendTextRaw(chat.chatId, `❌ wt 卡片失败: ${slug}\n${formatFeishuError(childFailure)}`)
       } catch (e) {
         await feishu.sendText(s.chatId, `❌ wt 已建，拉群失败: ${messageOf(e)}`)
       }
@@ -165,8 +168,9 @@ async function buildWorktreeListCardUnlocked(
 export async function showWorktrees(s: Session): Promise<void> {
   try {
     const card = await buildWorktreeListCard(s)
-    const messageId = await feishu.sendCard(s.chatId, card)
-    if (!messageId) await feishu.sendTextRaw(s.chatId, '❌ wt 列表失败')
+    let failure: unknown
+    const messageId = await feishu.sendCard(s.chatId, card, error => { failure = error })
+    if (!messageId) await feishu.sendTextRaw(s.chatId, `❌ wt 列表失败\n${formatFeishuError(failure)}`)
   } catch (e) {
     await feishu.sendText(s.chatId, `❌ wt 列表失败: ${messageOf(e)}`)
   }

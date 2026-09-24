@@ -1,11 +1,12 @@
 import type { GroupFileDeliverySettings } from './file-delivery-types'
 import { fileDeliverySettingsCard } from './cards/files'
+import { formatFeishuError } from './feishu-errors'
 
 export interface FileDeliveryCommandDeps {
   get(chatId: string): GroupFileDeliverySettings
   enable(chatId: string, managerOpenId: string): Promise<GroupFileDeliverySettings>
   disable(chatId: string): Promise<GroupFileDeliverySettings>
-  sendCard(card: object): Promise<string | null>
+  sendCard(card: object, onFailure?: (error: unknown) => void): Promise<string | null>
   reportError(message: string): Promise<void>
 }
 
@@ -34,5 +35,8 @@ export async function runFileDeliveryCommand(
     try { settings = deps.get(chatId) } catch { settings = undefined }
   }
   const card = fileDeliverySettingsCard({ groupName, workDir, settings, notice, error })
-  if (!await deps.sendCard(card)) await deps.reportError(`❌ 文件交付设置卡发送失败${error ? `：${error}` : ''}`)
+  let sendFailure: unknown
+  if (!await deps.sendCard(card, failure => { sendFailure = failure })) {
+    await deps.reportError(`❌ 文件交付设置卡发送失败：${formatFeishuError(sendFailure)}${error ? `\n设置失败：${error}` : ''}`)
+  }
 }

@@ -102,7 +102,7 @@ export class FeishuDriveClient {
       await this.request('同步群文件夹名称', `/drive/v1/files/${encodeURIComponent(folder.token)}?type=folder`, 'PATCH', () => ({ new_title: name }), signal)
     } catch (error) {
       if (error instanceof FeishuRequestError && error.code === 99991672) {
-        throw new FeishuRequestError('同步群文件夹名称需要应用身份权限 drive:file:upload（飞书错误码 99991672）', error.status, error.code)
+        error.message = `同步群文件夹名称需要应用身份权限 drive:file:upload；${error.message}`
       }
       throw error
     }

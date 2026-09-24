@@ -4,10 +4,11 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import * as cardkit from './cardkit'
+import * as feishu from './feishu'
 import { ELEMENTS } from './cards'
 import { addTool } from './session-tools'
 import { renderPermission } from './session-permission'
-import { onAskAnswer, refreshPendingAsks } from './session-ask'
+import { onAskAnswer, onAskMessageAnswer, refreshPendingAsks } from './session-ask'
 import { __setStoreFileForTest, get, register, setReplyState } from './notify-callbacks'
 import type { Session } from './session'
 
@@ -75,6 +76,21 @@ function endReply() {
 const flushAnnouncements = () => new Promise<void>(resolve => setImmediate(resolve))
 
 describe('question presentation and backend handshakes', () => {
+  test('a blocked-answer notice failure retains Feishu diagnostics without submitting the answer', async () => {
+    const h = harness('codex')
+    startReply()
+    h.add('first', '先选择区域')
+    const send = spyOn(feishu, 'sendText').mockImplementation(async (_chatId, _text, onFailure) => {
+      onFailure?.({ code: 230002, msg: 'message rejected', log_id: 'ask-notice-log' })
+      return null
+    })
+    restore.push(() => send.mockRestore())
+    await expect(onAskMessageAnswer(h.s, '回答', 'ou_owner', 'om_answer'))
+      .rejects.toThrow('code=230002 message=message rejected log_id=ask-notice-log')
+    expect(h.answers).toHaveLength(0)
+    expect(h.s.pendingAsks.get('first')!.currentIdx).toBe(0)
+  })
+
   for (const provider of ['codex', 'claude', 'dsh'] as const) {
     test(`${provider}: notification input defers question controls and alerts; completion activates one question at a time`, async () => {
       const h = harness(provider)

@@ -55,6 +55,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { randomUUID } from 'node:crypto'
 import { log } from './log'
 import * as feishu from './feishu'
+import { formatFeishuError } from './feishu-errors'
+import { FeishuRequestError } from './feishu-retry'
 import { downgradeExternalImagesForCardKit, sanitizeMarkdownForCardKit } from './cards/elements'
 import {
   buildNotifyResult,
@@ -126,7 +128,7 @@ export function buildNotifyCard(opts: {
   level: Level
   /** Uploaded images, in insertion order. `key==''` marks an upload
    * failure — rendered as an inline red error so the caller sees it. */
-  images?: Array<{ key: string; src: string }>
+  images?: Array<{ key: string; src: string; error?: string }>
   /** Interactive buttons. Rendered as an equal-weight column_set row.
    * Requires `notifyId` so each button's `value` carries the routing
    * payload back to the click handler. */
@@ -156,7 +158,8 @@ export function buildNotifyCard(opts: {
     } else {
       // No silent fallback: surface the failed upload inline so the caller
       // knows which local image never made it onto the card.
-      elements.push({ tag: 'markdown', content: `<font color='red'>📷 图片上传失败: ${img.src}</font>` })
+      const detail = img.error ? `\n${sanitizeMarkdownForCardKit(img.error)}` : ''
+      elements.push({ tag: 'markdown', content: `<font color='red'>📷 图片上传失败: ${img.src}${detail}</font>` })
     }
   }
   // opts.text 用只降图片、不转义 HTML 的变体:notify 调用方会主动用 <font color='...'>
@@ -369,7 +372,7 @@ export function startNotifyServer(opts: NotifyOptions): Server | undefined {
         if (!res.headersSent) {
           res.statusCode = 500
           res.setHeader('content-type', 'text/plain; charset=utf-8')
-          res.end('internal error')
+          res.end(err instanceof FeishuRequestError ? formatFeishuError(err) : 'internal error')
         } else {
           try { res.end() } catch {}
         }
@@ -481,12 +484,13 @@ export async function handleNotifyRequest(
   }
 
   const imageInputs = Array.isArray(body.images) ? body.images : []
-  const images: Array<{ key: string; src: string }> = []
+  const images: Array<{ key: string; src: string; error?: string }> = []
   for (const entry of imageInputs) {
     const src = String(entry ?? '').trim()
     if (!src) continue
-    const key = await transport.uploadImageKey(src)
-    images.push({ key: key ?? '', src })
+    let failure: unknown
+    const key = await transport.uploadImageKey(src, error => { failure = error })
+    images.push({ key: key ?? '', src, ...(failure === undefined ? {} : { error: formatFeishuError(failure) }) })
   }
 
   // notify_id is generated up-front so it can be baked into every
@@ -494,10 +498,11 @@ export async function handleNotifyRequest(
   // needs message_id) is filled in after the card is accepted.
   const notifyId = interactive ? `nf_${randomUUID()}` : ''
   const card = buildNotifyCard({ title, text, level, images, buttons, allowReply, notifyId })
-  const messageId = await transport.sendCard(chatId, card)
+  let sendFailure: unknown
+  const messageId = await transport.sendCard(chatId, card, error => { sendFailure = error })
   if (!messageId) {
     log(`notify: sendCard failed → 502 (project="${project}" chat=${chatId.slice(0, 8)}…)`)
-    return sendText(502, 'feishu sendCard failed (see daemon log)')
+    return sendText(502, `feishu sendCard failed: ${formatFeishuError(sendFailure)}`)
   }
 
   if (interactive && notifyId) {

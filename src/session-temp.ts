@@ -7,6 +7,7 @@
 
 import type { Session } from './session'
 import * as feishu from './feishu'
+import { formatFeishuError } from './feishu-errors'
 import * as cards from './cards'
 import { log } from './log'
 import { claudeTranscriptDir } from './claude-agent-process'
@@ -319,13 +320,14 @@ async function showTurnList(s: Session, mode: 'fork' | 'back', userOpenId: strin
     entries,
   })
   let messageId: string | null
-  try { messageId = await feishu.sendCard(s.chatId, card) } catch (error) {
+  let failure: unknown
+  try { messageId = await feishu.sendCard(s.chatId, card, error => { failure = error }) } catch (error) {
     panelMap(s).delete(panel.id)
     throw error
   }
   if (!messageId) {
     panelMap(s).delete(panel.id)
-    await feishu.sendTextRaw(s.chatId, `❌ ${mode === 'fork' ? 'fk' : 'bk'} 列表发送失败`)
+    await feishu.sendTextRaw(s.chatId, `❌ ${mode === 'fork' ? 'fk' : 'bk'} 列表发送失败\n${formatFeishuError(failure)}`)
   }
 }
 
@@ -366,13 +368,14 @@ export async function showResumeList(s: Session, userOpenId: string): Promise<vo
   const panel = createPanel(s, 'resume', userOpenId, choices)
   const card = cards.resumeListCard({ projectName: baseSessionName(s), panelId: panel.id, entries })
   let messageId: string | null
-  try { messageId = await feishu.sendCard(s.chatId, card) } catch (error) {
+  let failure: unknown
+  try { messageId = await feishu.sendCard(s.chatId, card, error => { failure = error }) } catch (error) {
     panelMap(s).delete(panel.id)
     throw error
   }
   if (!messageId) {
     panelMap(s).delete(panel.id)
-    await feishu.sendTextRaw(s.chatId, '❌ rs 历史列表发送失败')
+    await feishu.sendTextRaw(s.chatId, `❌ rs 历史列表发送失败\n${formatFeishuError(failure)}`)
   }
 }
 
@@ -458,10 +461,11 @@ export async function onBackSelect(s: Session, panelId: string, choiceId: string
     if (choice.kind !== 'back') return { ok: false, message: '选择项类型不匹配' }
     let writeLogWarning = ''
     try {
-      const messageId = await feishu.sendCard(s.chatId, cards.writeLogCard({ projectName: panel.baseName, entries: choice.writes }))
-      if (!messageId) writeLogWarning = '；文件变更记录卡发送失败'
+      let failure: unknown
+      const messageId = await feishu.sendCard(s.chatId, cards.writeLogCard({ projectName: panel.baseName, entries: choice.writes }), error => { failure = error })
+      if (!messageId) writeLogWarning = `；文件变更记录卡发送失败: ${formatFeishuError(failure)}`
     } catch (error) {
-      writeLogWarning = `；文件变更记录卡发送失败: ${error instanceof Error ? error.message : error}`
+      writeLogWarning = `；文件变更记录卡发送失败: ${formatFeishuError(error)}`
     }
     log(`session-temp: back ${s.sessionName} (${choice.launch.kind}, writes=${choice.writes.length})`)
     const ok = await s.rollbackTo(choice.launch, {

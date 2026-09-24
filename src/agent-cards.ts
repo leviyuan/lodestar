@@ -1,5 +1,6 @@
 import * as cards from './cards'
 import { isCardCapacityFailure, type CardWriteFailure, type CardWriteResult } from './cardkit'
+import { formatFeishuError } from './feishu-errors'
 import type { AgentRunSnapshot } from './agent-run-types'
 import type { BgTaskEntry } from './cards/background'
 import type { AgentCardTaskKind } from './cards/task-kind'
@@ -10,7 +11,7 @@ import { withChatMessageOrder } from './chat-message-order'
 const CARD_ROW_SOFT_LIMIT = 50
 
 export interface AgentCardsDeps {
-  sendCard(chatId: string, card: object): Promise<string | null>
+  sendCard(chatId: string, card: object, onFailure?: (error: unknown) => void): Promise<string | null>
   getChatTailMessageId(chatId: string): Promise<string | null>
   convertMessageToCard(messageId: string): Promise<string>
   recordCardCreated(cardId: string, elementCount: number, onFailure?: (code?: number) => void): void
@@ -192,12 +193,13 @@ export class AgentCards {
   }
 
   private async create(row: TaskRow): Promise<CardGroup> {
+    let sendFailure: unknown
     const messageId = await this.deps.sendCard(row.chatId, {
       schema: '2.0',
       config: { update_multi: true, streaming_mode: !row.terminal, summary: { content: row.summary } },
       body: { elements: [row.element] },
-    })
-    if (!messageId) throw new Error('agent card creation failed')
+    }, error => { sendFailure = error })
+    if (!messageId) throw new Error(`agent card creation failed: ${formatFeishuError(sendFailure)}`)
     const cardId = await this.deps.convertMessageToCard(messageId)
     this.deps.recordCardCreated(cardId, 1)
     const group: CardGroup = {
@@ -254,5 +256,5 @@ function isCapacity(result: CardWriteResult): boolean {
 }
 
 function writeError(action: string, result: CardWriteResult): Error {
-  return new Error(`${action} MISS${result.failure ? `: ${result.failure.message} (code=${result.failure.code ?? 'MISS'}${result.failure.logId ? `, log_id=${result.failure.logId}` : ''})` : ''}`)
+  return new Error(`${action} MISS: ${formatFeishuError(result.failure)}`)
 }

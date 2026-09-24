@@ -21,8 +21,17 @@ const folder = { token: 'folder', url: 'https://example.feishu.cn/drive/folder/f
 
 describe('Feishu Drive delivery transport', () => {
   test('reports the additional upload scope required by the folder rename endpoint', async () => {
-    const client = new FeishuDriveClient(deps(async () => Response.json({ code: 99991672, msg: 'missing scope' }, { status: 400 })))
-    await expect(client.renameFolder(folder, '群名称')).rejects.toThrow('drive:file:upload')
+    const client = new FeishuDriveClient(deps(async () => Response.json({ code: 99991672, msg: 'missing scope: original detail' }, {
+      status: 400, headers: { 'x-tt-logid': 'rename-log-id' },
+    })))
+    const [result] = await Promise.allSettled([client.renameFolder(folder, '群名称')])
+    expect(result.status).toBe('rejected')
+    const error = (result as PromiseRejectedResult).reason
+    expect(error.message).toContain('drive:file:upload')
+    expect(error.message).toContain('code=99991672')
+    expect(error.message).toContain('message=missing scope: original detail')
+    expect(error.message).toContain('log_id=rename-log-id')
+    expect(error).toMatchObject({ status: 400, code: 99991672, logId: 'rename-log-id' })
   })
 
   test('reads the live group name and updates the same folder title through the native API', async () => {

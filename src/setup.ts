@@ -1,4 +1,6 @@
 import { networkFetch } from './network'
+import { formatFeishuError } from './feishu-errors'
+import { readFeishuResponse } from './feishu-retry'
 import { fetchGlmAnthropicModelIds, GLM_ANTHROPIC_BASE_URL } from './glm-models'
 /**
  * lodestar-setup 交互向导；cli.ts 首次启动且配置缺失时也可调用。
@@ -174,7 +176,7 @@ function openBrowser(url: string): void {
 }
 
 // ── Feishu credential check ────────────────────────────────────────
-async function testFeishuCreds(appId: string, appSecret: string): Promise<{ ok: true } | { ok: false; error: string }> {
+export async function testFeishuCreds(appId: string, appSecret: string): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
     const res = await networkFetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
       method: 'POST',
@@ -182,11 +184,11 @@ async function testFeishuCreds(appId: string, appSecret: string): Promise<{ ok: 
       body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
       signal: AbortSignal.timeout(15_000),
     })
-    const data = await res.json() as { code?: number; msg?: string; tenant_access_token?: string }
+    const data = await readFeishuResponse(res, '飞书凭据校验')
     if (data.tenant_access_token) return { ok: true }
-    return { ok: false, error: `飞书拒绝: code=${data.code} msg=${data.msg ?? '(no msg)'}` }
+    return { ok: false, error: `飞书凭据校验缺少 tenant_access_token：${formatFeishuError(data)}` }
   } catch (e: any) {
-    return { ok: false, error: `网络错误: ${e?.message ?? String(e)}` }
+    return { ok: false, error: `飞书凭据校验失败：${formatFeishuError(e)}` }
   }
 }
 

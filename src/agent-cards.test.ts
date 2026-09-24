@@ -84,7 +84,7 @@ describe('shared delegation card lifecycle', () => {
       return false
     }
     terminal(a)
-    await expect(h.cards.update(a, true)).rejects.toThrow('sequence number compare failed (code=300317, log_id=settings-request-id)')
+    await expect(h.cards.update(a, true)).rejects.toThrow('code=300317 message=sequence number compare failed log_id=settings-request-id')
     expect(h.disposed.size).toBe(0)
   })
 
@@ -368,7 +368,7 @@ describe('shared delegation card lifecycle', () => {
       return false
     }
     terminal(a)
-    await expect(h.cards.update(a, true)).rejects.toThrow('deletion MISS: field validation failed (code=99992402, log_id=delete-request-id); the previous card may still show its earlier state')
+    await expect(h.cards.update(a, true)).rejects.toThrow('deletion MISS: code=99992402 message=field validation failed log_id=delete-request-id; the previous card may still show its earlier state')
     expect(h.settings.get('message-2').config.streaming_mode).toBe(false)
     terminal(b)
     await h.cards.update(b, true)

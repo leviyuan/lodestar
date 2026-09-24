@@ -68,6 +68,7 @@ import {
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
+import { formatFeishuError } from './feishu-errors'
 import { log } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { readSysInfo } from './sysinfo'
@@ -229,6 +230,12 @@ function liveElapsedMode(): LiveElapsedMode {
  *  见 startFooterTimer / startFooterStatus。*/
 function timedStatus(status: string, startedAt: number): string {
   return `${status} (${liveElapsed(Date.now() - startedAt, liveElapsedMode()).label})`
+}
+
+function cardFailureDetails(failures: cardkit.CardWriteFailure[]): string {
+  return failures.length
+    ? failures.map(failure => `${failure.operation}: ${formatFeishuError(failure)}`).join('\n')
+    : formatFeishuError(undefined)
 }
 
 export class Session {
@@ -1162,17 +1169,18 @@ export class Session {
       status: timedStatus(initialStatus, startedAt),
       template,
     })
-    const messageId = await feishu.sendCard(this.chatId, card)
+    let sendFailure: unknown
+    const messageId = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
     if (!messageId) {
       log(`session "${this.sessionName}": status card send failed title=${title}`)
-      await feishu.sendTextRaw(this.chatId, `❌ 创建状态卡片失败: ${title}`)
+      await feishu.sendTextRaw(this.chatId, `❌ 创建状态卡片失败: ${title}\n${formatFeishuError(sendFailure)}`)
       return null
     }
     let cardId: string
     try { cardId = await cardkit.convertMessageToCard(messageId) }
     catch (e) {
       log(`session "${this.sessionName}": status card id_convert failed title=${title}: ${e}`)
-      await feishu.sendTextRaw(this.chatId, `❌ 状态卡片初始化失败: ${title}`)
+      await feishu.sendTextRaw(this.chatId, `❌ 状态卡片初始化失败: ${title}\n${formatFeishuError(e)}`)
       return null
     }
     cardkit.recordCardCreated(cardId, 1)
@@ -1197,22 +1205,25 @@ export class Session {
     const elapsed = handle.timer.elapsedSec()
     const content = cards.statusCardContent(handle.title, `${finalStatus} (${cards.formatDuration(elapsed)})`)
     await cardkit.flush(handle.cardId)
+    const failures: cardkit.CardWriteFailure[] = []
+    const onFailure = (failure: cardkit.CardWriteFailure) => { failures.push(failure) }
     const footerLanded = await cardkit.replaceElementChecked(
       handle.cardId,
       cards.ELEMENTS.footer,
       this.footerElement(content),
+      { onFailure },
     )
     cardkit.cancelSummary(handle.cardId)
     const settingsLanded = await cardkit.patchSettingsChecked(handle.cardId, cards.streamingOffSettings({
       durationSec: elapsed,
       suffix: finalStatus,
-    }))
+    }), onFailure)
     if (footerLanded && settingsLanded) {
       await cardkit.dispose(handle.cardId)
     } else {
       const detail = `footer=${footerLanded ? 'ok' : 'MISS'}, settings=${settingsLanded ? 'ok' : 'MISS'}`
       log(`session "${this.sessionName}": status card terminal transaction incomplete card=${handle.cardId.slice(0, 12)} ${detail}`)
-      await feishu.sendTextRaw(this.chatId, `⚠️ 状态卡片终态写入失败 (${detail})：${finalStatus}`)
+      await feishu.sendTextRaw(this.chatId, `⚠️ 状态卡片终态写入失败 (${detail})：${finalStatus}\n${cardFailureDetails(failures)}`)
     }
   }
 
@@ -1479,9 +1490,10 @@ export class Session {
       this.opts.onLifecycleChange?.()
       report?.('❌ Codex 未登录 ChatGPT 账号')
       if (announce) {
+        let failure: unknown
         const sent = await feishu.sendCard(this.chatId, codexAccountCard({ phase: 'warning', title: '需要登录',
-          hint: '默认：codex-login · 额外：codex-login 备注' }))
-        if (!sent) throw new Error('Codex 登录引导卡片发送失败')
+          hint: '默认：codex-login · 额外：codex-login 备注' }), error => { failure = error })
+        if (!sent) throw new Error(`Codex 登录引导卡片发送失败：${formatFeishuError(failure)}`)
       }
       return false
     }
@@ -2638,7 +2650,7 @@ export class Session {
       get: chatId => groupFileDelivery.get(chatId, this.workDir),
       enable: (chatId, managerOpenId) => groupFileDelivery.enable(chatId, this.workDir, managerOpenId),
       disable: chatId => groupFileDelivery.disable(chatId, this.workDir),
-      sendCard: card => feishu.sendCard(this.chatId, card),
+      sendCard: (card, onFailure) => feishu.sendCard(this.chatId, card, onFailure),
       reportError: async message => {
         log(`session "${this.sessionName}": ${message}`)
         if (!await feishu.sendText(this.chatId, message)) throw new Error(message)
@@ -2688,13 +2700,14 @@ export class Session {
       log(`console usage MISS: ${reason}`)
       opts.accountUsages = [{ id: 'error', label: '额度', usage: { state: 'network', windows: [], reason } }]
     }
+    let failure: cardkit.CardWriteFailure | undefined
     const landed = await cardkit.replaceElementChecked(
       cardId,
       cards.ELEMENTS.consoleUsage,
       cards.consoleUsageElement(opts),
-      { notifyCardFailure: false },
+      { notifyCardFailure: false, onFailure: detail => { failure = detail } },
     )
-    if (!landed) throw new Error('console usage element replace rejected')
+    if (!landed) throw new Error(`console usage element replace rejected: ${formatFeishuError(failure)}`)
   }
 
   /** Run a one-shot mutation on a static card, then close any streaming mode
@@ -2707,20 +2720,26 @@ export class Session {
     mutation: () => Promise<void>,
   ): Promise<boolean> {
     let mutationLanded = true
+    const failures: string[] = []
     try {
       await mutation()
     } catch (e) {
       mutationLanded = false
+      failures.push(messageOf(e))
       log(`session "${this.sessionName}": ${label} mutation failed: ${messageOf(e)}`)
     }
     let closed = false
     try {
-      closed = await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })
+      closed = await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } }, failure => {
+        failures.push(formatFeishuError(failure))
+      })
     } catch (e) {
+      failures.push(formatFeishuError(e))
       log(`session "${this.sessionName}": ${label} streaming-off failed: ${messageOf(e)}`)
     }
     if (!mutationLanded || !closed) {
       log(`session "${this.sessionName}": ${label} state retained after checked MISS mutation=${mutationLanded} streamingOff=${closed} card=${cardId.slice(0, 12)}`)
+      await feishu.sendTextRaw(this.chatId, `⚠️ 卡片更新失败 (${label})。\n${failures.join('\n') || formatFeishuError(undefined)}`)
       return false
     }
     try { await cardkit.dispose(cardId) }
@@ -2740,36 +2759,40 @@ export class Session {
     const elapsed = handle.timer.elapsedSec()
     const consoleOpts = await this.buildConsoleOpts(undefined)
     await cardkit.flush(handle.cardId)
+    const failures: cardkit.CardWriteFailure[] = []
+    const onFailure = (failure: cardkit.CardWriteFailure) => { failures.push(failure) }
     const currentModelLanded = await cardkit.replaceElementChecked(
       handle.cardId,
       cards.ELEMENTS.footer,
       cards.consoleCurrentModelElement(consoleOpts, cards.ELEMENTS.footer),
+      { onFailure },
     )
     const mainLanded = await cardkit.addElementChecked(
       handle.cardId,
       cards.consoleMainElement(consoleOpts),
-      { type: 'insert_after', targetElementId: cards.ELEMENTS.footer },
+      { type: 'insert_after', targetElementId: cards.ELEMENTS.footer, onFailure },
     )
     const hostLanded = await cardkit.addElementChecked(
       handle.cardId,
       cards.consoleHostElement(consoleOpts.sysinfo),
-      { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleProjects },
+      { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleProjects, onFailure },
     )
     const usageLanded = await cardkit.addElementChecked(
       handle.cardId,
       cards.consoleUsageElement(consoleOpts),
-      { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleHost },
+      { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleHost, onFailure },
     )
     if (!currentModelLanded || !mainLanded || !hostLanded || !usageLanded) {
-      await feishu.sendTextRaw(this.chatId, '⚠️ 控制台卡片结构写入失败，请重新发送 hi。')
+      await feishu.sendTextRaw(this.chatId, `⚠️ 控制台卡片结构写入失败，请重新发送 hi。\n${cardFailureDetails(failures)}`)
       await this.mutateStaticCard(handle.cardId, 'console structure', async () => {})
       return
     }
     cardkit.cancelSummary(handle.cardId)
-    await cardkit.patchSettingsChecked(handle.cardId, cards.streamingOffSettings({
+    const closed = await cardkit.patchSettingsChecked(handle.cardId, cards.streamingOffSettings({
       durationSec: elapsed,
       suffix: finalStatus,
-    }))
+    }), onFailure)
+    if (!closed) await feishu.sendTextRaw(this.chatId, `⚠️ 控制台卡片状态写入失败。\n${cardFailureDetails(failures)}`)
     this.patchConsoleUsageLater(handle.cardId)
   }
 
@@ -4194,13 +4217,16 @@ export class Session {
     status: string,
     hasFooter: boolean,
   ): Promise<void> {
+    const failures: cardkit.CardWriteFailure[] = []
+    const onFailure = (failure: cardkit.CardWriteFailure) => { failures.push(failure) }
     const footerLanded = hasFooter
-      ? await cardkit.replaceElementChecked(cardId, cards.ELEMENTS.footer, this.footerElement(status))
+      ? await cardkit.replaceElementChecked(cardId, cards.ELEMENTS.footer, this.footerElement(status), { onFailure })
       : true
     cardkit.cancelSummary(cardId)
     const settingsLanded = await cardkit.patchSettingsChecked(
       cardId,
       cards.streamingOffSettings({ suffix: status }),
+      onFailure,
     )
     if (footerLanded && settingsLanded) {
       await cardkit.dispose(cardId)
@@ -4208,7 +4234,7 @@ export class Session {
     }
     const detail = `footer=${footerLanded ? 'ok' : 'MISS'}, settings=${settingsLanded ? 'ok' : 'MISS'}`
     log(`session "${this.sessionName}": superseded card terminal transaction incomplete card=${cardId.slice(0, 12)} ${detail}`)
-    await feishu.sendTextRaw(this.chatId, `⚠️ 已作废卡片未能正常关闭 (${detail})。`)
+    await feishu.sendTextRaw(this.chatId, `⚠️ 已作废卡片未能正常关闭 (${detail})。\n${cardFailureDetails(failures)}`)
   }
 
   private async openTurnCard(
@@ -4242,13 +4268,13 @@ export class Session {
       initialFooter,
       directStart: opts.directStart,
     })
-    const messageId = await feishu.sendCard(this.chatId, card)
+    let sendFailure: unknown
+    const messageId = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
     if (!messageId) {
       if (!this.ownsTurnOpen(owner)) return null
-      log(`session "${this.sessionName}": openTurnCard sendCard EXHAUSTED retries — surfacing via raw text`)
-      // sendCard already retried 3× through the SDK. If it still came back
-      // null we're either on a sustained SDK-axios outage or a Feishu
-      // business reject. Either way the user just sent us a message and
+      log(`session "${this.sessionName}": openTurnCard sendCard failed — surfacing via raw text`)
+      // Transient failures have exhausted their retry budget; permanent
+      // API rejections fail immediately. The user just sent us a message and
       // it's gone into a black hole — surface that explicitly so they
       // know to resend instead of waiting for a reply that won't come.
       // Use raw fetch (not sendText) because if the SDK is the broken
@@ -4258,7 +4284,7 @@ export class Session {
       if (trigger === 'user_message') {
         await feishu.sendTextRaw(
           this.chatId,
-          `❌ 创建对话卡片失败 (Feishu SDK 重试 3 次后仍连不上)。你这条消息尚未送给 ${this.backendLabel()},请稍后重发。`,
+          `❌ 创建对话卡片失败。你这条消息尚未送给 ${this.backendLabel()},请稍后重发。\n${formatFeishuError(sendFailure)}`,
         )
       }
       // currentTurn left null as the failure signal. Caller decides
@@ -4274,7 +4300,7 @@ export class Session {
       if (trigger === 'user_message' && this.ownsTurnOpen(owner)) {
         await feishu.sendTextRaw(
           this.chatId,
-          `❌ 对话卡片初始化失败。你这条消息尚未送给 ${this.backendLabel()},请稍后重发。`,
+          `❌ 对话卡片初始化失败。你这条消息尚未送给 ${this.backendLabel()},请稍后重发。\n${formatFeishuError(e)}`,
         )
       }
       return null
@@ -4410,7 +4436,7 @@ export class Session {
         turn.cardWriteFailureNotices.add(noticeKey)
         void feishu.sendTextRaw(
           this.chatId,
-          `⚠️ 对话卡片有一项写入失败(code=${code ?? 'MISS'}, ${operation}${element})。未识别为卡片容量超限，未自动换卡；其余输出继续处理。`,
+          `⚠️ 对话卡片有一项写入失败(${operation}${element})。未识别为卡片容量超限，未自动换卡；其余输出继续处理。\n${formatFeishuError({ ...failure, code })}`,
         )
       }
       return
@@ -4424,7 +4450,7 @@ export class Session {
           turn.cardCapacityFailures.set(fingerprint, true)
           void feishu.sendTextRaw(
             this.chatId,
-            `⚠️ 有一项内容换卡后仍超出飞书容量，写入失败(code=${code ?? 'MISS'}, ${failure.operation}, element=${failure.elementId ?? 'MISS'})；其余输出继续处理。`,
+            `⚠️ 有一项内容换卡后仍超出飞书容量，写入失败(${failure.operation}, element=${failure.elementId ?? 'MISS'})；其余输出继续处理。\n${formatFeishuError({ ...failure, code })}`,
           )
         }
         return
@@ -4485,7 +4511,8 @@ export class Session {
           kind: 'card_full',
           userInputs: [],
         })
-        const newMessageId = await feishu.sendCard(this.chatId, card)
+        let sendFailure: unknown
+        const newMessageId = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
         if (!newMessageId) {
           log(`session "${this.sessionName}": mid-turn rotate sendCard failed — retry on the next content event`)
           if (this.currentTurn === turn) {
@@ -4494,7 +4521,7 @@ export class Session {
           }
           await feishu.sendTextRaw(
             this.chatId,
-            '⚠️ 续卡发送失败，后续内容到达时会再次尝试。',
+            `⚠️ 续卡发送失败，后续内容到达时会再次尝试。\n${formatFeishuError(sendFailure)}`,
           )
           return
         }
@@ -4507,7 +4534,7 @@ export class Session {
             this.stopFooterStatus(turn)
             await feishu.sendTextRaw(
               this.chatId,
-              '⚠️ 续卡已发送，但 Card Kit 初始化失败；后续内容到达时会再次尝试。',
+              `⚠️ 续卡已发送，但 Card Kit 初始化失败；后续内容到达时会再次尝试。\n${formatFeishuError(e)}`,
             )
           }
           return
@@ -4674,20 +4701,22 @@ export class Session {
           const compactNote = turn.contextCompactCount > 0
             ? ` · 🚨 压缩×${turn.contextCompactCount}`
             : ''
+          const failures: cardkit.CardWriteFailure[] = []
+          const onFailure = (failure: cardkit.CardWriteFailure) => { failures.push(failure) }
           const footerLanded = await cardkit.replaceElementChecked(
             oldCardId,
             cards.ELEMENTS.footer,
             this.footerElement(this.withModel(`📨 已续至下一张卡 ↓${compactNote}`)),
-            { notifyCardFailure: false },
+            { notifyCardFailure: false, onFailure },
           )
           cardkit.cancelSummary(oldCardId)
-          const settingsLanded = await cardkit.patchSettingsChecked(oldCardId, cards.streamingOffSettings({ suffix: '📨 转下一张' }))
+          const settingsLanded = await cardkit.patchSettingsChecked(oldCardId, cards.streamingOffSettings({ suffix: '📨 转下一张' }), onFailure)
           if (footerLanded && settingsLanded) await cardkit.dispose(oldCardId)
           else {
             log(`session "${this.sessionName}": rotate old-card terminal MISS footer=${footerLanded} settings=${settingsLanded}`)
             await feishu.sendTextRaw(
               this.chatId,
-              `⚠️ 上一张对话卡未能正常关闭 (footer=${footerLanded ? 'ok' : 'MISS'}, settings=${settingsLanded ? 'ok' : 'MISS'})，本轮输出已续到新卡。`,
+              `⚠️ 上一张对话卡未能正常关闭 (footer=${footerLanded ? 'ok' : 'MISS'}, settings=${settingsLanded ? 'ok' : 'MISS'})，本轮输出已续到新卡。\n${cardFailureDetails(failures)}`,
             )
           }
         } catch (e) {
@@ -5765,10 +5794,13 @@ export class Session {
           ))
       : ''
     const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1
+    const failures: cardkit.CardWriteFailure[] = []
+    const onFailure = (failure: cardkit.CardWriteFailure) => { failures.push(failure) }
     const footerLanded = await cardkit.replaceElementChecked(
       cardId,
       cards.ELEMENTS.footer,
       this.footerElement(footer),
+      { onFailure },
     )
     // Final chat-list preview: clean finish shows "⏱ duration · NK tokens";
     // interrupted shows the suffix instead (no usage event landed).
@@ -5779,7 +5811,7 @@ export class Session {
       durationSec: elapsed,
       outputTokens: opts.hasFreshResult ? snapshot.lastTurnUsage?.output_tokens : undefined,
       suffix,
-    }))
+    }), onFailure)
     if (footerLanded && settingsLanded) {
       await cardkit.dispose(cardId)
     } else {
@@ -5790,7 +5822,7 @@ export class Session {
       log(`session "${this.sessionName}": terminal card transaction incomplete card=${cardId.slice(0, 12)} ${detail}`)
       await feishu.sendTextRaw(
         this.chatId,
-        `⚠️ 对话卡片终态写入失败 (${detail})。本轮已结束: ${stateMark}`,
+        `⚠️ 对话卡片终态写入失败 (${detail})。本轮已结束: ${stateMark}\n${cardFailureDetails(failures)}`,
       )
     }
 

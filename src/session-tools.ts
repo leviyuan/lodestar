@@ -14,6 +14,7 @@ import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
 import { announceAsk, askRenderState } from './session-ask'
+import { formatFeishuError } from './feishu-errors'
 
 /** 过程元素(tool/assistant/plan/goal/context_compact)的插入锚点:实时任务总览区
  * 建立后,新元素 insert_before 它(让实时区永远压在 footer 正前,过程记录堆在它
@@ -272,17 +273,26 @@ function deliverGeneratedImage(s: Session, turn: TurnState, meta: TurnState['too
   const byCard = turn.imageDeliveryInflight ??= new Map()
   const tasks = byCard.get(cardId) ?? new Set<Promise<void>>()
   byCard.set(cardId, tasks)
+  const failures: string[] = []
   const task = (async () => {
     let imageKey: string | null = null
-    try { imageKey = await feishu.uploadImageKey(path) }
-    catch (error) { log(`generated image upload failed: ${error}`) }
+    try {
+      imageKey = await feishu.uploadImageKey(path, error => { failures.push(`图片上传：${formatFeishuError(error)}`) })
+    }
+    catch (error) {
+      failures.push(`图片上传：${formatFeishuError(error)}`)
+      log(`generated image upload failed: ${error}`)
+    }
     if (imageKey) {
       let landed = false
       try {
         landed = await cardkit.replaceElementChecked(cardId, elementId,
           cards.toolCallElement(meta.i, meta.name, meta.input, meta.output ?? null, '✅', meta.resolvedNote, imageKey),
-          { notifyCardFailure: false })
-      } catch (error) { log(`generated image embed failed: ${error}`) }
+          { notifyCardFailure: false, onFailure: failure => { failures.push(`图片嵌入：${formatFeishuError(failure)}`) } })
+      } catch (error) {
+        failures.push(`图片嵌入：${formatFeishuError(error)}`)
+        log(`generated image embed failed: ${error}`)
+      }
       if (landed) {
         meta.imageKey = imageKey
         turn.outboundSentPaths.add(path)
@@ -291,17 +301,26 @@ function deliverGeneratedImage(s: Session, turn: TurnState, meta: TurnState['too
       log(`generated image could not be embedded in card ${cardId}; sending it as a separate message`)
     }
     // The user explicitly prefers a separate image when embedding is unavailable.
-    const sent = imageKey ? await feishu.sendImage(s.chatId, imageKey) !== null : await feishu.uploadAndSend(s.chatId, path)
+    let sendFailure: unknown
+    const sent = imageKey
+      ? await feishu.sendImage(s.chatId, imageKey, error => { sendFailure = error }) !== null
+      : await feishu.uploadAndSend(s.chatId, path)
     if (sent) turn.outboundSentPaths.add(path)
     else log(`generated image delivery failed: ${path}`)
-    meta.resolvedNote = sent ? '图片已单独发送。' : '图片发送失败。'
-    await cardkit.replaceElementChecked(cardId, elementId,
+    if (!sent && imageKey) failures.push(`图片发送：${formatFeishuError(sendFailure)}`)
+    meta.resolvedNote = [sent ? '图片已单独发送。' : '图片发送失败。', ...failures].join('\n')
+    let noteFailure: unknown
+    const noteLanded = await cardkit.replaceElementChecked(cardId, elementId,
       cards.toolCallElement(meta.i, meta.name, meta.input, meta.output ?? null, sent ? '✅' : '❌', meta.resolvedNote),
-      { notifyCardFailure: false })
-    if (!sent && imageKey) await feishu.sendText(s.chatId, '❌ 生成图片发送失败，请稍后重试。')
+      { notifyCardFailure: false, onFailure: failure => { noteFailure = failure } })
+    if (!noteLanded) {
+      await feishu.sendTextRaw(s.chatId, `⚠️ 图片状态写入失败：${formatFeishuError(noteFailure)}\n${meta.resolvedNote}`)
+    } else if (!sent && imageKey) {
+      await feishu.sendText(s.chatId, `❌ 生成图片发送失败：${failures.join('\n')}`)
+    }
   })().catch(async error => {
     log(`generated image delivery failed: ${error}`)
-    await feishu.sendText(s.chatId, `❌ 生成图片发送失败：${error instanceof Error ? error.message : String(error)}`)
+    await feishu.sendText(s.chatId, `❌ 生成图片发送失败：${[...new Set([...failures, formatFeishuError(error)])].join('\n')}`)
   })
   tasks.add(task)
   void task.finally(() => {

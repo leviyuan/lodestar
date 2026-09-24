@@ -17,6 +17,7 @@ import * as cardkit from './cardkit'
 import * as feishu from './feishu'
 import { log } from './log'
 import { messageOf, type ModelActionResult } from './session-util'
+import { formatFeishuError } from './feishu-errors'
 
 export interface ModelPanelState {
   models: cards.ModelChoice[]
@@ -175,15 +176,16 @@ export async function showModelPanel(s: Session): Promise<void> {
   const panelId = randomUUID()
   const providers = providerChoices(s)
   s.modelPanels.set(panelId, { models: [] })  // 第1级;第2级 onProviderSelect 填 models
+  let sendFailure: unknown
   const messageId = await feishu.sendCard(s.chatId, cards.providerSelectionCard({
     sessionName: s.sessionName,
     panelId,
     currentDisplay: s.currentTokenSource()?.display ?? s.currentModelLabel(),
     providers,
-  }))
+  }), failure => { sendFailure = failure })
   if (!messageId) {
     s.modelPanels.delete(panelId)
-    await feishu.sendTextRaw(s.chatId, '❌ 模型面板发送失败')
+    await feishu.sendTextRaw(s.chatId, `❌ 模型面板发送失败：${formatFeishuError(sendFailure)}`)
   } else {
     const panel = s.modelPanels.get(panelId)
     if (panel) panel.messageId = messageId
@@ -327,6 +329,7 @@ export async function consumeModelCustomMessage(
   s.modelCustomPrompt = null  // 一次性:无论成败,应答态结束
   const model = text.trim()
   const ts = s.tokenSource(pending.sourceId)
+  const cardFailures: string[] = []
   // 更新补录卡的 panel(失败提示/成功转 effort);id_convert 失败如实 log,
   // 状态机照常走(卡片更新是呈现,不是数据路径)。
   const updateCard = async (panel: object): Promise<boolean> => {
@@ -341,25 +344,34 @@ export async function consumeModelCustomMessage(
       // not inherit an older disposed tombstone, and so finally can always
       // release the bookkeeping deterministically.
       cardkit.recordCardCreated(cardId, 1)
+      let replaceFailure: unknown
       replaced = await cardkit.replaceElementChecked(
         cardId,
         cards.ELEMENTS.modelPanel,
         panel,
-        { notifyCardFailure: false },
+        { notifyCardFailure: false, onFailure: failure => { replaceFailure = failure } },
       )
-      if (!replaced) throw new Error('model panel replace rejected')
-      closed = await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })
-      if (!closed) throw new Error('model panel streaming-off rejected')
+      if (!replaced) throw new Error(`model panel replace rejected: ${formatFeishuError(replaceFailure)}`)
+      let settingsFailure: unknown
+      closed = await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } }, failure => { settingsFailure = failure })
+      if (!closed) throw new Error(`model panel streaming-off rejected: ${formatFeishuError(settingsFailure)}`)
     } catch (e: any) {
       log(`model-custom: card update MISS (${e?.message ?? e})`)
+      cardFailures.push(messageOf(e))
     } finally {
       if (cardId) {
         // A failed replace can happen after CardKit reopened an expired static
         // card. Always make one checked close attempt, but only tombstone the
         // local state after streaming-off is confirmed.
         if (!closed) {
-          try { closed = await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } }) }
-          catch (e: any) { log(`model-custom: streaming-off retry MISS (${e?.message ?? e})`) }
+          try {
+            let settingsFailure: unknown
+            closed = await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } }, failure => { settingsFailure = failure })
+            if (!closed) cardFailures.push(`model panel streaming-off rejected: ${formatFeishuError(settingsFailure)}`)
+          } catch (e: any) {
+            log(`model-custom: streaming-off retry MISS (${e?.message ?? e})`)
+            cardFailures.push(formatFeishuError(e))
+          }
         }
         if (replaced && closed) {
           try { await cardkit.dispose(cardId) }
@@ -374,7 +386,8 @@ export async function consumeModelCustomMessage(
   const updateCardOrFallback = async (panel: object, result: string): Promise<boolean> => {
     const landed = await updateCard(panel)
     if (landed) return true
-    const fallback = `⚠️ 模型补录结果未能写回原卡。${result}\n请重新发送 model 打开面板。`
+    const details = [...new Set(cardFailures)].join('\n')
+    const fallback = `⚠️ 模型补录结果未能写回原卡。${result}${details ? `\n${details}` : ''}\n请重新发送 model 打开面板。`
     const sent = await feishu.sendTextRaw(s.chatId, fallback)
     if (!sent) log(`model-custom: visible fallback send MISS (${result})`)
     return false

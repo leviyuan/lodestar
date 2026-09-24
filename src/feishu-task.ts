@@ -1,4 +1,5 @@
 import { client } from './feishu'
+import { formatFeishuError } from './feishu-errors'
 
 export async function fetchChatOwnerOpenId(chatId: string): Promise<string> {
   const res = await callFeishuApi('feishu chat.get', () => client.im.chat.get({
@@ -52,15 +53,13 @@ export function formatFeishuApiError(api: string, raw: unknown): string {
     : data.data && typeof data.data === 'object'
       ? data.data as Record<string, any>
       : data
-  const code = responseData.code ?? data.code
-  const msg = responseData.msg ?? responseData.message ?? data.msg ?? data.message ?? 'unknown error'
   const violations = responseData.error?.permission_violations
     ?? responseData.permission_violations
     ?? data.error?.permission_violations
   const scopes = Array.isArray(violations)
     ? violations.map((v: any) => v?.scope ?? v?.subject ?? v?.name ?? v).filter(Boolean).join(', ')
     : ''
-  return `${api} failed code=${code ?? 'unknown'} msg=${msg}${scopes ? ` missing_scopes=${scopes}` : ''}`
+  return `${api} failed ${formatFeishuError(raw)}${scopes ? ` missing_scopes=${scopes}` : ''}`
 }
 
 async function callFeishuApi<T>(api: string, fn: () => Promise<T>): Promise<T> {

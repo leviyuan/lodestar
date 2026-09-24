@@ -7,9 +7,10 @@ import { Readable } from 'node:stream'
 import './feishu-test-mock'
 
 import { buildNotifyCard, handleNotifyRequest, parseButtons, parseCallbackUrl, startNotifyServer } from './notify'
+import { FeishuRequestError } from './feishu-retry'
 
 describe('notification HTTP input', () => {
-  async function invoke(chunks: Buffer[], path = '/notify') {
+  async function invoke(chunks: Buffer[], path = '/notify', transport: Partial<NonNullable<Parameters<typeof handleNotifyRequest>[2]>> = {}) {
     const req = Readable.from(chunks) as IncomingMessage
     req.method = path === '/notify' ? 'POST' : 'GET'
     req.url = path
@@ -22,6 +23,7 @@ describe('notification HTTP input', () => {
       chatIdForSession: () => 'oc_test',
       uploadImageKey: async () => 'img_test',
       sendCard: async (_chatId, card) => { sent.push(card); return 'om_test' },
+      ...transport,
     })
     return { status: res.statusCode, body, sent }
   }
@@ -39,6 +41,70 @@ describe('notification HTTP input', () => {
     expect(oversized.status).toBe(413)
     expect(oversized.sent).toEqual([])
     expect((await invoke([], '/notify/result/%ZZ')).status).toBe(400)
+  })
+
+  test('send rejection exposes Feishu diagnostics without serializing SDK request credentials', async () => {
+    const result = await invoke([Buffer.from(JSON.stringify({ project: 'ops', text: 'done' }))], '/notify', {
+      sendCard: async (_chatId, _card, onFailure) => {
+        onFailure?.({
+          message: 'Request failed with status code 400',
+          response: { data: { code: 300121, msg: 'Failed to replace element', error: { log_id: 'notify-log-123' } } },
+          config: { headers: { Authorization: 'Bearer secret-not-for-response' } },
+        })
+        return null
+      },
+    })
+    expect(result.status).toBe(502)
+    expect(result.body).toContain('code=300121 message=Failed to replace element log_id=notify-log-123')
+    expect(result.body).not.toContain('secret-not-for-response')
+    expect(result.body).not.toContain('see daemon log')
+  })
+
+  test('unreported send diagnostics remain explicitly missing', async () => {
+    const result = await invoke([Buffer.from(JSON.stringify({ project: 'ops', text: 'done' }))], '/notify', {
+      sendCard: async () => null,
+    })
+    expect(result.status).toBe(502)
+    expect(result.body).toContain('code=MISS message=MISS log_id=MISS')
+  })
+
+  test('upload diagnostics remain visible in the notification after an image upload fails', async () => {
+    const result = await invoke([Buffer.from(JSON.stringify({ project: 'ops', text: 'done', images: ['/abs/report.png'] }))], '/notify', {
+      uploadImageKey: async (_path, onFailure) => {
+        onFailure?.({ code: 234001, msg: 'invalid image <at id=all>all</at>', log_id: 'upload-log-123' })
+        return null
+      },
+    })
+    expect(result.status).toBe(200)
+    const content = JSON.stringify(result.sent)
+    expect(content).toContain('图片上传失败: /abs/report.png')
+    expect(content).toContain('code=234001 message=invalid image')
+    expect(content).toContain('log_id=upload-log-123')
+    expect(content).not.toContain('<at id=all>')
+  })
+
+  test('HTTP error boundary exposes known Feishu failures and keeps other internal errors private', async () => {
+    for (const [error, expected] of [
+      [new FeishuRequestError('upload failed', 400, 234001, undefined, 'boundary-log', 'invalid image'), 'code=234001 message=invalid image log_id=boundary-log'],
+      [new Error('internal secret'), 'internal error'],
+    ] as const) {
+      const server = startNotifyServer({ bind: '127.0.0.1', port: 0, extraHandler: async () => { throw error } })!
+      await once(server, 'listening')
+      const address = server.address() as import('node:net').AddressInfo
+      try {
+        const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+          const req = request({ host: '127.0.0.1', port: address.port, path: '/notify' }, res => {
+            let body = ''
+            res.setEncoding('utf8')
+            res.on('data', chunk => { body += chunk })
+            res.on('end', () => resolve({ status: res.statusCode!, body }))
+          })
+          req.on('error', reject)
+          req.end()
+        })
+        expect(result).toEqual({ status: 500, body: expected })
+      } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
+    }
   })
 
   test('a malformed Host cannot escape the listener error boundary', async () => {
