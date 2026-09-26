@@ -581,48 +581,65 @@ describe('checked card writes', () => {
 })
 
 describe('summary write coalescing', () => {
+  const signal = () => {
+    let resolve!: () => void
+    const promise = new Promise<void>(done => { resolve = done })
+    return { promise, resolve }
+  }
+
   test('slow settings writes retain only the latest preview and cancellation prevents a late successor', async () => {
     const id = 'card_summary_inflight'
     const timers: Array<() => void> = []
     const responses: Array<(response: Response) => void> = []
+    const requestsStarted = [signal(), signal()]
+    const successorScheduled = signal()
+    let cleaningUp = false
     const setTimeoutOriginal = globalThis.setTimeout
     globalThis.setTimeout = ((callback: (...args: any[]) => void, delay?: number, ...args: any[]) => {
       if (delay !== 1500) return setTimeoutOriginal(callback, delay, ...args)
       timers.push(() => callback(...args))
+      if (timers.length === 2) successorScheduled.resolve()
       return setTimeoutOriginal(() => {}, 0)
     }) as typeof setTimeout
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ method: String(init?.method), path: new URL(String(input)).pathname,
         body: JSON.parse(String(init?.body)) })
-      return new Promise<Response>(resolve => { responses.push(resolve) })
+      // Proxy discovery may finish after an assertion has entered finally.
+      // Such a late request must not strand dispose behind an unresolved mock.
+      if (cleaningUp) return Response.json({ code: 0 })
+      return new Promise<Response>(resolve => {
+        responses.push(resolve)
+        requestsStarted[responses.length - 1]?.resolve()
+      })
     }) as typeof fetch
-    const tick = () => new Promise<void>(resolve => setTimeoutOriginal(resolve, 0))
+    const drainCallbacks = () => new Promise<void>(resolve => setTimeoutOriginal(resolve, 0))
     cardkit.recordCardCreated(id, 1)
     try {
       cardkit.patchSummaryThrottled(id, 'first')
       timers[0]!()
-      await tick()
+      await requestsStarted[0]!.promise
       expect(calls).toHaveLength(1)
       cardkit.patchSummaryThrottled(id, 'second')
       cardkit.patchSummaryThrottled(id, 'latest')
-      await tick()
       expect(timers).toHaveLength(1)
       expect(calls).toHaveLength(1)
       responses[0]!(Response.json({ code: 0 }))
       await cardkit.flush(id)
-      await tick()
+      await successorScheduled.promise
       expect(timers).toHaveLength(2)
       timers[1]!()
-      await tick()
+      await requestsStarted[1]!.promise
       expect(JSON.parse(calls[1]!.body.settings).config.summary.content).toBe('latest')
       cardkit.patchSummaryThrottled(id, 'cancelled successor')
       cardkit.cancelSummary(id)
       responses[1]!(Response.json({ code: 0 }))
       await cardkit.flush(id)
-      await tick()
+      // The request has settled; now allow its cancellation callback to run.
+      await drainCallbacks()
       expect(timers).toHaveLength(2)
       expect(calls).toHaveLength(2)
     } finally {
+      cleaningUp = true
       globalThis.setTimeout = setTimeoutOriginal
       for (const resolve of responses) resolve(Response.json({ code: 0 }))
       await cardkit.dispose(id)
@@ -632,6 +649,7 @@ describe('summary write coalescing', () => {
   test('an unchanged failed preview does not retry itself, and disposed previews cannot resume', async () => {
     const id = 'card_summary_failed'
     const timers: Array<() => void> = []
+    const requestStarted = signal()
     const setTimeoutOriginal = globalThis.setTimeout
     globalThis.setTimeout = ((callback: (...args: any[]) => void, delay?: number, ...args: any[]) => {
       if (delay !== 1500) return setTimeoutOriginal(callback, delay, ...args)
@@ -641,15 +659,17 @@ describe('summary write coalescing', () => {
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ method: String(init?.method), path: new URL(String(input)).pathname,
         body: JSON.parse(String(init?.body)) })
+      requestStarted.resolve()
       return Response.json({ code: 300121, msg: 'summary rejected' })
     }) as typeof fetch
-    const tick = () => new Promise<void>(resolve => setTimeoutOriginal(resolve, 0))
+    const drainCallbacks = () => new Promise<void>(resolve => setTimeoutOriginal(resolve, 0))
     cardkit.recordCardCreated(id, 1)
     try {
       cardkit.patchSummaryThrottled(id, 'same preview')
       timers[0]!()
+      await requestStarted.promise
       await cardkit.flush(id)
-      await tick()
+      await drainCallbacks()
       cardkit.patchSummaryThrottled(id, 'same preview')
       expect(timers).toHaveLength(1)
       expect(calls).toHaveLength(1)
@@ -657,7 +677,7 @@ describe('summary write coalescing', () => {
       expect(timers).toHaveLength(2)
       await cardkit.dispose(id)
       timers[1]!()
-      await tick()
+      await drainCallbacks()
       expect(calls).toHaveLength(1)
     } finally {
       globalThis.setTimeout = setTimeoutOriginal
