@@ -238,6 +238,19 @@ function cardFailureDetails(failures: cardkit.CardWriteFailure[]): string {
     : formatFeishuError(undefined)
 }
 
+/** One upstream outage can reject every tool on a card. Item IDs, request
+ * paths and log IDs identify attempts, not distinct causes; keep them in the
+ * full diagnostics while grouping notices by the upstream rejection. */
+function cardFailureNoticeKey(code?: number, failure?: cardkit.CardWriteFailure): string {
+  let message = failure?.apiMessage ?? failure?.message ?? 'MISS'
+  for (const id of [failure?.cardId, failure?.elementId, failure?.targetElementId]) {
+    if (id) message = message.split(id).join('<id>')
+  }
+  message = message.replace(/^cardkit\s+\S+\s+\S+\s+HTTP\s+\d+:\s*/i, '')
+    .replace(/\s+log_id=\S+/gi, '').replace(/\s+/g, ' ').trim()
+  return `${code ?? 'MISS'}:${failure?.httpStatus ?? 'MISS'}:${message}`
+}
+
 export class Session {
   /** Process-wide registry of every Session ever constructed in this daemon.
    * Used by the `hi` console panel to enumerate sibling sessions across
@@ -848,17 +861,17 @@ export class Session {
     return text.includes(label) ? text : `${text} · ${label}`
   }
 
-  private replaceFooterContent(cardId: string, content: string): Promise<void> {
-    // 活跃 footer 是可丢的实时状态：second 模式下一秒就会再次刷新，单次
-    // replace MISS 不影响正文或 turn 状态。保留 Card Kit 日志，但不要触发
-    // Session 的群内写入失败告警；终态 footer 仍走 checked 事务并显式报错。
-    return cardkit.replaceElement(
+  private async replaceFooterContent(cardId: string, content: string): Promise<cardkit.CardWriteResult> {
+    // Let the timer pause after bounded transport retries fail. Do not mark
+    // the stable footer missing or rotate a card because its clock failed.
+    let failure: cardkit.CardWriteFailure | undefined
+    const landed = await cardkit.replaceElementChecked(
       cardId,
       cards.ELEMENTS.footer,
       this.footerElement(content),
-      undefined,
-      false,
+      { notifyCardFailure: false, onFailure: detail => { failure = detail } },
     )
+    return { landed, failure }
   }
 
   private footerElement(content: string): object {
@@ -1127,16 +1140,41 @@ export class Session {
     const startedAt = Date.now()
     let status = initialStatus
     let stopped = false
+    let pending = false
+    let paused = false
+    let dirty = false
+    const failureNotices = new Set<string>()
+    let timer: ReturnType<typeof setTimeout> | null = null
     const render = (): void => {
       if (stopped) return
-      void this.replaceFooterContent(cardId, renderContent(timedStatus(status, startedAt)))
+      if (pending) { dirty = true; return }
+      pending = true
+      dirty = false
+      const writtenStatus = status
+      void this.replaceFooterContent(cardId, renderContent(timedStatus(status, startedAt))).then(result => {
+        pending = false
+        if (stopped) return
+        if (result.landed) {
+          if (dirty) render()
+          return
+        }
+        paused = true
+        if (timer) clearTimeout(timer)
+        timer = null
+        const noticeKey = cardFailureNoticeKey(result.failure?.code, result.failure)
+        if (result.failure && !failureNotices.has(noticeKey)) {
+          failureNotices.add(noticeKey)
+          void feishu.sendTextRaw(this.chatId,
+            `⚠️ 状态卡片计时更新失败，已暂停自动刷新；操作仍继续，实际状态变化和最终状态仍会写入。同类错误合并提示，完整诊断保留在日志。\n${formatFeishuError(result.failure)}`)
+        }
+        if (dirty && status !== writtenStatus) render()
+      })
     }
     // footer 显示「状态词 + 耗时」(见 timedStatus)。bucket 只在档位边界 push;
     // second 前 10m 固定 1s,之后按 5m 档位。setStatus 切换状态也立即 push。
     // elapsedSec 仍基于 startedAt,供 closeStatusCard 结束时显示总耗时。
-    let timer: ReturnType<typeof setTimeout> | null = null
     const scheduleNext = (): void => {
-      if (stopped) return
+      if (stopped || paused) return
       const { nextDelayMs } = liveElapsed(Date.now() - startedAt, liveElapsedMode())
       timer = setTimeout(() => { render(); scheduleNext() }, Math.max(1, Math.ceil(nextDelayMs)))
     }
@@ -1144,6 +1182,7 @@ export class Session {
     scheduleNext()
     return {
       setStatus(next: string): void {
+        if (next === status) return
         status = next
         render()
       },
@@ -4404,6 +4443,21 @@ export class Session {
     this.startMidTurnRotate(turn)
   }
 
+  private reportCardWriteFailure(
+    turn: TurnState,
+    code: number | undefined,
+    failure: cardkit.CardWriteFailure | undefined,
+    handling: string,
+  ): void {
+    const noticeKey = cardFailureNoticeKey(code, failure)
+    if (turn.cardWriteFailureNotices.has(noticeKey)) return
+    turn.cardWriteFailureNotices.add(noticeKey)
+    const operation = failure?.operation ?? 'unknown operation'
+    const element = failure?.elementId ? ` element=${failure.elementId}` : ''
+    void feishu.sendTextRaw(this.chatId,
+      `⚠️ 对话卡片写入失败(${operation}${element})。${handling}同类错误本轮合并提示，完整诊断保留在日志。\n${formatFeishuError({ ...failure, code })}`)
+  }
+
   /** Reactive rotation is reserved for a confirmed card size or component ceiling.
    * `300315` is only a generic add wrapper and also carries duplicate-ID or
    * invalid-schema failures. Those require corrected content; temporary
@@ -4431,14 +4485,8 @@ export class Session {
       const operation = failure?.operation ?? 'unknown operation'
       const element = failure?.elementId ? ` element=${failure.elementId}` : ''
       log(`session "${this.sessionName}": non-capacity card write failure card=${sourceCardId.slice(0, 12)} operation=${operation}${element} code=${code ?? 'n/a'} — not rotating`)
-      const noticeKey = `${sourceCardId}:${operation}:${failure?.elementId ?? ''}:${code ?? 'MISS'}`
-      if (!turn.cardWriteFailureNotices.has(noticeKey)) {
-        turn.cardWriteFailureNotices.add(noticeKey)
-        void feishu.sendTextRaw(
-          this.chatId,
-          `⚠️ 对话卡片有一项写入失败(${operation}${element})。未识别为卡片容量超限，未自动换卡；其余输出继续处理。\n${formatFeishuError({ ...failure, code })}`,
-        )
-      }
+      this.reportCardWriteFailure(turn, code, failure,
+        '未识别为卡片容量超限，未自动换卡；其余输出继续处理。')
       return
     }
     const fingerprint = failure?.capacityFingerprint
@@ -5505,7 +5553,7 @@ export class Session {
         ? `⏳ 模型满载 · ${retry.delayMs / 1000}s 后重试 #${retry.attempt}`
         : `⏳ 模型满载 · 正在重试 #${retry.attempt}`
     }
-    if (turn.footerStatusHandle && turn.footerStatusLabel === status) return
+    if (turn.footerStatusLabel === status) return
     this.stopFooterStatus(turn)
     turn.footerStatusLabel = status
     turn.footerStatusStartedAt = Date.now()
@@ -5513,13 +5561,41 @@ export class Session {
     // bucket 只在档位边界 push;second 固定 1s。
     const render = (): void => {
       if (turn.footerStatusLabel !== status) return
+      const cardId = turn.cardId
+      // Slow requests/retries must not build a queue of obsolete clock ticks.
+      // Phase changes share this gate; terminal writes bypass it and stay checked.
+      if (turn.footerStatusWriteCardId === cardId) {
+        turn.footerStatusPendingRender = render
+        return
+      }
+      turn.footerStatusPendingRender = undefined
       const { label } = liveElapsed(Date.now() - turn.footerStatusStartedAt, liveElapsedMode())
       const thinking = status === FOOTER_THINKING_PREFIX ? this.proc?.lastThinkingTokens : null
       const progress = typeof thinking === 'number' ? ` · 约 ${thinking} tokens` : ''
-      void this.replaceFooterContent(turn.cardId, this.withModel(`${status}${progress} (${label})`))
+      turn.footerStatusWriteCardId = cardId
+      void this.replaceFooterContent(cardId, this.withModel(`${status}${progress} (${label})`)).then(result => {
+        if (turn.footerStatusWriteCardId === cardId) turn.footerStatusWriteCardId = undefined
+        if (turn.cardId !== cardId || turn.footerStatusLabel === null) return
+        if (result.landed) {
+          const latest = turn.footerStatusPendingRender
+          turn.footerStatusPendingRender = undefined
+          latest?.()
+          return
+        }
+        turn.footerStatusFailedCardId = cardId
+        if (turn.footerStatusHandle) clearTimeout(turn.footerStatusHandle)
+        turn.footerStatusHandle = null
+        const latest = turn.footerStatusPendingRender
+        turn.footerStatusPendingRender = undefined
+        if (result.failure && this.currentTurn === turn) {
+          this.reportCardWriteFailure(turn, result.failure.code, result.failure,
+            '计时自动刷新已暂停；实际状态变化、正文和最终状态仍会写入。')
+        }
+        if (turn.footerStatusLabel !== status) latest?.()
+      })
     }
     const scheduleNext = (): void => {
-      if (turn.footerStatusLabel !== status) return
+      if (turn.footerStatusLabel !== status || turn.footerStatusFailedCardId === turn.cardId) return
       const { nextDelayMs } = liveElapsed(Date.now() - turn.footerStatusStartedAt, liveElapsedMode())
       turn.footerStatusHandle = setTimeout(() => { render(); scheduleNext() }, Math.max(1, Math.ceil(nextDelayMs)))
     }
@@ -5545,6 +5621,7 @@ export class Session {
     turn.footerStatusHandle = null
     turn.footerStatusStartedAt = 0
     turn.footerStatusLabel = null
+    turn.footerStatusPendingRender = undefined
   }
 
   /** 页脚只显示当前来源额度；Codex 刷新失败时按原格式展示同账号缓存。 */

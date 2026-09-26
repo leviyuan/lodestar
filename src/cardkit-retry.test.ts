@@ -107,6 +107,9 @@ test('card mutations retry known transport, gateway and rate-limit failures but 
       ...[408, 429, 500, 502, 503, 504].map(status => [new Response('gateway unavailable', { status }), 1000]),
       [Response.json({ code: 99991400, msg: 'rate limited' }, { status: 400, headers: { 'retry-after': '2' } }), 2000],
       [Response.json({ code: 230020, msg: 'rate limited' }, { headers: { 'x-ogw-ratelimit-reset': '2' } }), 2000],
+      [Response.json({ code: 300308, msg: 'Server Internal Error' }), 1000],
+      [Response.json({ code: '300308', msg: 'Server Internal Error' }), 1000],
+      [Response.json({ code: 300308, msg: 'Server Internal Error' }, { status: 400 }), 1000],
     ]) {
       calls.length = 0; delays.length = 0
       respond = async () => {
@@ -146,15 +149,16 @@ test('card mutations retry known transport, gateway and rate-limit failures but 
 
 test('exhausted card retries report one failure and allow a later result to rebuild the missing tool', async () => {
   await runIsolated(`
-    for (const transportFailure of [true, false]) {
+    for (const failureKind of ['transport', 'gateway', 'internal']) {
+      const transportFailure = failureKind === 'transport'
       const failures = []
       cardkit.recordCardCreated('card', 1, (_code, failure) => failures.push(failure))
       calls.length = 0; delays.length = 0
       respond = async () => {
         assert.equal(failures.length, 0, 'do not notify before retries finish')
         if (transportFailure) throw reset()
-        return Response.json({ code: 300308, msg: 'gateway unavailable' }, {
-          status: 503, headers: { 'x-tt-logid': 'last-attempt-' + calls.length },
+        return Response.json({ code: 300308, msg: 'Server Internal Error' }, {
+          status: failureKind === 'gateway' ? 503 : 200, headers: { 'x-tt-logid': 'last-attempt-' + calls.length },
         })
       }
       const result = await cardkit.addElementResult('card', element(), {
@@ -172,7 +176,7 @@ test('exhausted card retries report one failure and allow a later result to rebu
       assert.equal(result.failure.code, transportFailure ? 'ECONNRESET' : 300308)
       assert.equal(cardkit.isCardCapacityFailure(result.failure.code, result.failure), false)
       if (!transportFailure) {
-        assert.equal(result.failure.httpStatus, 503)
+        assert.equal(result.failure.httpStatus, failureKind === 'gateway' ? 503 : 200)
         assert.equal(result.failure.logId, 'last-attempt-3')
         assert.match(result.failure.message, /log_id=last-attempt-3/)
       }

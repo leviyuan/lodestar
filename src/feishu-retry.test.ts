@@ -41,6 +41,71 @@ test('malformed success response exposes missing diagnostics; actual success is 
     .toEqual({ code: 0, data: { file_key: 'key' } })
 })
 
+test('Card Kit internal failures retry only their known code and message within the bounded budget', async () => {
+  const child = Bun.spawn([process.execPath, '--eval', `
+    import assert from 'node:assert/strict'
+    import { FeishuRequestError, readFeishuResponse, withFeishuRetry } from './src/feishu-retry'
+    const delays = []
+    const originalSetTimeout = globalThis.setTimeout
+    globalThis.setTimeout = (fn, ms, ...args) => {
+      delays.push(ms)
+      return originalSetTimeout(fn, 0, ...args)
+    }
+    const cardkit = { api: 'cardkit' }
+    for (const code of [300308, '300308']) {
+      delays.length = 0
+      let attempts = 0
+      const result = await withFeishuRetry('cardkit PUT', async () => {
+        attempts++
+        return readFeishuResponse(Response.json(attempts < 3
+          ? { code, msg: 'Server Internal Error', error: { log_id: 'attempt-' + attempts } }
+          : { code: 0, data: { delivered: true } }), 'cardkit PUT')
+      }, cardkit)
+      assert.equal(attempts, 3)
+      assert.deepEqual(delays, [1000, 4000])
+      assert.deepEqual(result, { code: 0, data: { delivered: true } })
+    }
+    delays.length = 0
+    let attempts = 0, lastFailure
+    const failure = await withFeishuRetry('cardkit PATCH', async () => {
+      attempts++
+      lastFailure = await readFeishuResponse(Response.json({
+        code: 300308, msg: 'Server Internal Error', error: { log_id: 'final-' + attempts },
+      }), 'cardkit PATCH').catch(error => error)
+      throw lastFailure
+    }, cardkit).catch(error => error)
+    assert.equal(attempts, 3)
+    assert.deepEqual(delays, [1000, 4000])
+    assert.equal(failure, lastFailure)
+    assert.ok(failure instanceof FeishuRequestError)
+    assert.equal(failure.status, 200)
+    assert.equal(failure.code, 300308)
+    assert.equal(failure.logId, 'final-3')
+    assert.equal(failure.apiMessage, 'Server Internal Error')
+    for (const [code, msg, options, retryAfter] of [
+      [300308, 'Server Internal Error', undefined, undefined],
+      [300308, 'unclassified API rejection', cardkit, undefined],
+      [300308, 'Server Internal Error', cardkit, '61'],
+      ...[300121, 300301, 300305, 300311, 300315, 300317].map(code => [code, 'Server Internal Error', cardkit, undefined]),
+    ]) {
+      delays.length = 0
+      attempts = 0
+      const source = new FeishuRequestError('rejected', 200, code, retryAfter, 'permanent', msg)
+      const error = await withFeishuRetry('request', async () => { attempts++; throw source }, options).catch(error => error)
+      assert.equal(error, source)
+      assert.equal(attempts, 1)
+      assert.deepEqual(delays, [])
+    }
+  `], {
+    cwd: fileURLToPath(new URL('..', import.meta.url)),
+    env: { ...process.env, NODE_ENV: 'test' }, stdout: 'pipe', stderr: 'pipe',
+  })
+  const [status, stdout, stderr] = await Promise.all([
+    child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+  ])
+  expect(status, stdout + stderr).toBe(0)
+})
+
 test('SDK rejection normalization preserves bounded retries, Retry-After and final diagnostics', async () => {
   const child = Bun.spawn([process.execPath, '--eval', `
     import assert from 'node:assert/strict'

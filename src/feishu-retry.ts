@@ -23,17 +23,27 @@ export class FeishuRequestError extends Error {
   }
 }
 
-function isTransient(error: any): boolean {
+export interface FeishuRetryOptions {
+  api?: 'cardkit'
+}
+
+export function isTransientFeishuError(error: unknown, options: FeishuRetryOptions = {}): boolean {
   if (!error || typeof error !== 'object') return false
-  const { status, code } = feishuErrorDetails(error)
+  const { status, code, message } = feishuErrorDetails(error)
+  // Card Kit can return HTTP 200 for its internal server failure. Keep this
+  // observed code/message pair scoped to Card Kit; other 300xxx rejections
+  // (parameters, permissions, layout and sequence) remain permanent.
+  if (options.api === 'cardkit' && (code === 300308 || code === '300308')
+    && /^server internal error[.!]?$/i.test(message.trim())) return true
   // Drive explicitly marks 1061045 as retryable; rate limits may also use HTTP 400.
   if (code === 99991400 || code === 230020 || code === 1061045
     || (status !== undefined && TRANSIENT_HTTP_STATUS.has(status))) return true
   if (typeof status === 'number' && status >= 400) return false
-  if ((typeof code === 'string' && TRANSIENT_NETWORK_CODES.has(code)) || error.name === 'TimeoutError') return true
+  if ((typeof code === 'string' && TRANSIENT_NETWORK_CODES.has(code))
+    || ('name' in error && error.name === 'TimeoutError')) return true
   // Native fetch wraps socket errors in cause; do not retry arbitrary TypeErrors,
   // caller cancellation, certificate failures, local I/O or configuration errors.
-  return error.cause !== error && isTransient(error.cause)
+  return 'cause' in error && error.cause !== error && isTransientFeishuError(error.cause, options)
 }
 
 function retryAfterMs(error: any): number {
@@ -46,12 +56,14 @@ function retryAfterMs(error: any): number {
 
 /** Retry the same operation, at most three attempts. Callers must make message
  * creation idempotent and recreate consumed upload bodies on each attempt. */
-export async function withFeishuRetry<T>(label: string, operation: () => Promise<T>): Promise<T> {
+export async function withFeishuRetry<T>(
+  label: string, operation: () => Promise<T>, options: FeishuRetryOptions = {},
+): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try { return await operation() }
     catch (error) {
       const delay = Math.max(RETRY_DELAYS_MS[attempt] ?? 0, retryAfterMs(error))
-      const retry = isTransient(error) && attempt < RETRY_DELAYS_MS.length && delay <= 60_000
+      const retry = isTransientFeishuError(error, options) && attempt < RETRY_DELAYS_MS.length && delay <= 60_000
       log(`feishu: ${label} attempt ${attempt + 1}/${RETRY_DELAYS_MS.length + 1} failed: ${formatFeishuError(error)}; ${retry ? `retry in ${delay}ms` : 'FINAL'}`)
       if (!retry) {
         // SDK HTTP exceptions often expose only "Request failed with status ..."

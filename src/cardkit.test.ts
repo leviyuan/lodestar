@@ -248,6 +248,112 @@ describe('cardkit card operations', () => {
 })
 
 describe('checked card writes', () => {
+  test('a lost add acknowledgement followed by a duplicate reconciles once with a new PUT identity', async () => {
+    const id = 'card_uncertain_add'
+    const failures: import('./cardkit').CardWriteFailure[] = []
+    cardkit.recordCardCreated(id, 1, (_code, failure) => { if (failure) failures.push(failure) })
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ method: String(init?.method), path: new URL(String(input)).pathname,
+        body: JSON.parse(String(init?.body)) })
+      if (calls.length === 1) return Response.json({ code: 300308, msg: 'Server Internal Error' })
+      if (calls.length === 2) return Response.json({ code: 300315, msg: 'Duplicate ID; code: 300301' })
+      return Response.json({ code: 0 })
+    }) as typeof fetch
+    try {
+      const element = { tag: 'markdown', element_id: 'tool_0', content: 'working' }
+      expect(await cardkit.addElementResult(id, element)).toEqual({ landed: true })
+      expect(calls.map(call => call.method)).toEqual(['POST', 'POST', 'PUT'])
+      expect(calls.map(call => call.body.sequence)).toEqual([1, 1, 2])
+      expect(calls[0]!.body).toEqual(calls[1]!.body)
+      expect(calls[2]!.body.uuid).not.toBe(calls[0]!.body.uuid)
+      expect(JSON.parse(calls[2]!.body.element)).toEqual(element)
+      expect(cardkit.getElementCount(id)).toBe(2)
+      expect(cardkit.isDeadElement(id, 'tool_0')).toBe(false)
+      expect(failures).toEqual([])
+      expect(await cardkit.replaceElementChecked(id, 'tool_0', { ...element, content: 'complete' })).toBe(true)
+      expect(cardkit.getElementCount(id)).toBe(2)
+    } finally { await cardkit.dispose(id) }
+  })
+
+  test('a later result reconciles an uncertain add; a rejected PUT preserves diagnostics and dead state', async () => {
+    const id = 'card_uncertain_result'
+    cardkit.recordCardCreated(id, 1)
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ method: String(init?.method), path: new URL(String(input)).pathname,
+        body: JSON.parse(String(init?.body)) })
+      if (calls.length === 1) return Response.json({ code: 300308, msg: 'Server Internal Error' },
+        { headers: { 'retry-after': '61' } })
+      if (init?.method === 'POST') return Response.json({ code: 300315, msg: 'Duplicate ID; code: 300301' })
+      if (calls.length === 3) return Response.json({ code: 300121, msg: 'replacement rejected' },
+        { headers: { 'x-tt-logid': 'reconcile-failure' } })
+      return Response.json({ code: 0 })
+    }) as typeof fetch
+    try {
+      const element = { tag: 'markdown', element_id: 'tool_0', content: 'working' }
+      expect((await cardkit.addElementResult(id, element,
+        { type: 'insert_before', targetElementId: 'footer' })).landed).toBe(false)
+      const failed = await cardkit.replaceElementResult(id, 'tool_0', { ...element, content: 'complete' })
+      expect(failed.landed).toBe(false)
+      expect(failed.failure).toMatchObject({ code: 300121, logId: 'reconcile-failure', apiMessage: 'replacement rejected' })
+      expect(cardkit.getElementCount(id)).toBe(1)
+      expect(cardkit.isDeadElement(id, 'tool_0')).toBe(true)
+      expect(calls[1]!.body.target_element_id).toBe('footer')
+      expect(await cardkit.replaceElementResult(id, 'tool_0', { ...element, content: 'latest result' })).toEqual({ landed: true })
+      expect(calls.map(call => call.method)).toEqual(['POST', 'POST', 'PUT', 'POST', 'PUT'])
+      expect(calls.map(call => call.body.sequence)).toEqual([1, 2, 3, 4, 5])
+      expect(new Set(calls.map(call => call.body.uuid)).size).toBe(5)
+      expect(JSON.parse(calls.at(-1)!.body.element).content).toBe('latest result')
+      expect(cardkit.getElementCount(id)).toBe(2)
+      expect(cardkit.isDeadElement(id, 'tool_0')).toBe(false)
+    } finally { await cardkit.dispose(id) }
+  })
+
+  test('a duplicate does not authorize overwriting an unknown ID or a definitively rejected add', async () => {
+    for (const prior of [undefined, 300121, 230020]) {
+      const id = `card_unknown_duplicate_${prior ?? 'first'}`
+      cardkit.recordCardCreated(id, 1)
+      calls = []
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({ method: String(init?.method), path: new URL(String(input)).pathname,
+          body: JSON.parse(String(init?.body)) })
+        if (prior !== undefined && calls.length === 1) return Response.json({ code: prior, msg: 'rejected' },
+          { headers: { 'retry-after': '61' } })
+        return Response.json({ code: 300315, msg: 'Duplicate ID; code: 300301' })
+      }) as typeof fetch
+      try {
+        const element = { tag: 'markdown', element_id: 'tool_0', content: 'ours' }
+        if (prior !== undefined) expect((await cardkit.addElementResult(id, element)).landed).toBe(false)
+        const result = await cardkit.addElementResult(id, element)
+        expect(result.failure?.code).toBe(300315)
+        expect(calls.every(call => call.method === 'POST')).toBe(true)
+        expect(cardkit.getElementCount(id)).toBe(1)
+        expect(cardkit.isDeadElement(id, 'tool_0')).toBe(true)
+      } finally { await cardkit.dispose(id) }
+    }
+  })
+
+  test('reconciliation does not double-count a previously confirmed ID', async () => {
+    const id = 'card_confirmed_add_count'
+    cardkit.recordCardCreated(id, 1)
+    let attempt = 0
+    globalThis.fetch = (async () => {
+      attempt++
+      if (attempt === 2) return new Response('truncated success acknowledgement')
+      if (attempt === 3) return Response.json({ code: 300315, msg: 'Duplicate ID; code: 300301' })
+      return Response.json({ code: 0 })
+    }) as unknown as typeof fetch
+    try {
+      const element = { tag: 'markdown', element_id: 'tool_0', content: 'first' }
+      expect(await cardkit.addElementChecked(id, element)).toBe(true)
+      expect(await cardkit.addElementChecked(id, { ...element, content: 'second' })).toBe(false)
+      expect(await cardkit.replaceElementChecked(id, 'tool_0', { ...element, content: 'final' })).toBe(true)
+      expect(attempt).toBe(4)
+      expect(cardkit.getElementCount(id)).toBe(2)
+      expect(await cardkit.deleteElementChecked(id, 'tool_0')).toBe(true)
+      expect(cardkit.getElementCount(id)).toBe(1)
+    } finally { await cardkit.dispose(id) }
+  })
+
   test('a queued tool result recreates a failed placeholder with its latest content and original placement', async () => {
     const id = 'card_retry_missing_add'
     cardkit.recordCardCreated(id, 1)
@@ -471,6 +577,92 @@ describe('checked card writes', () => {
       tag: 'markdown', element_id: 'second', content: 'second',
     })).toBe(true)
     await cardkit.dispose(cardId)
+  })
+})
+
+describe('summary write coalescing', () => {
+  test('slow settings writes retain only the latest preview and cancellation prevents a late successor', async () => {
+    const id = 'card_summary_inflight'
+    const timers: Array<() => void> = []
+    const responses: Array<(response: Response) => void> = []
+    const setTimeoutOriginal = globalThis.setTimeout
+    globalThis.setTimeout = ((callback: (...args: any[]) => void, delay?: number, ...args: any[]) => {
+      if (delay !== 1500) return setTimeoutOriginal(callback, delay, ...args)
+      timers.push(() => callback(...args))
+      return setTimeoutOriginal(() => {}, 0)
+    }) as typeof setTimeout
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ method: String(init?.method), path: new URL(String(input)).pathname,
+        body: JSON.parse(String(init?.body)) })
+      return new Promise<Response>(resolve => { responses.push(resolve) })
+    }) as typeof fetch
+    const tick = () => new Promise<void>(resolve => setTimeoutOriginal(resolve, 0))
+    cardkit.recordCardCreated(id, 1)
+    try {
+      cardkit.patchSummaryThrottled(id, 'first')
+      timers[0]!()
+      await tick()
+      expect(calls).toHaveLength(1)
+      cardkit.patchSummaryThrottled(id, 'second')
+      cardkit.patchSummaryThrottled(id, 'latest')
+      await tick()
+      expect(timers).toHaveLength(1)
+      expect(calls).toHaveLength(1)
+      responses[0]!(Response.json({ code: 0 }))
+      await cardkit.flush(id)
+      await tick()
+      expect(timers).toHaveLength(2)
+      timers[1]!()
+      await tick()
+      expect(JSON.parse(calls[1]!.body.settings).config.summary.content).toBe('latest')
+      cardkit.patchSummaryThrottled(id, 'cancelled successor')
+      cardkit.cancelSummary(id)
+      responses[1]!(Response.json({ code: 0 }))
+      await cardkit.flush(id)
+      await tick()
+      expect(timers).toHaveLength(2)
+      expect(calls).toHaveLength(2)
+    } finally {
+      globalThis.setTimeout = setTimeoutOriginal
+      for (const resolve of responses) resolve(Response.json({ code: 0 }))
+      await cardkit.dispose(id)
+    }
+  })
+
+  test('an unchanged failed preview does not retry itself, and disposed previews cannot resume', async () => {
+    const id = 'card_summary_failed'
+    const timers: Array<() => void> = []
+    const setTimeoutOriginal = globalThis.setTimeout
+    globalThis.setTimeout = ((callback: (...args: any[]) => void, delay?: number, ...args: any[]) => {
+      if (delay !== 1500) return setTimeoutOriginal(callback, delay, ...args)
+      timers.push(() => callback(...args))
+      return setTimeoutOriginal(() => {}, 0)
+    }) as typeof setTimeout
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ method: String(init?.method), path: new URL(String(input)).pathname,
+        body: JSON.parse(String(init?.body)) })
+      return Response.json({ code: 300121, msg: 'summary rejected' })
+    }) as typeof fetch
+    const tick = () => new Promise<void>(resolve => setTimeoutOriginal(resolve, 0))
+    cardkit.recordCardCreated(id, 1)
+    try {
+      cardkit.patchSummaryThrottled(id, 'same preview')
+      timers[0]!()
+      await cardkit.flush(id)
+      await tick()
+      cardkit.patchSummaryThrottled(id, 'same preview')
+      expect(timers).toHaveLength(1)
+      expect(calls).toHaveLength(1)
+      cardkit.patchSummaryThrottled(id, 'new preview')
+      expect(timers).toHaveLength(2)
+      await cardkit.dispose(id)
+      timers[1]!()
+      await tick()
+      expect(calls).toHaveLength(1)
+    } finally {
+      globalThis.setTimeout = setTimeoutOriginal
+      await cardkit.dispose(id)
+    }
   })
 })
 

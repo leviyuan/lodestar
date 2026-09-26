@@ -142,6 +142,13 @@ export interface TurnState {
   footerStatusHandle: ReturnType<typeof setInterval> | null
   footerStatusStartedAt: number
   footerStatusLabel: string | null
+  /** Coalesce clock ticks across phase changes while a write is pending. */
+  footerStatusWriteCardId?: string
+  /** Latest phase/clock snapshot to render when the current write finishes. */
+  footerStatusPendingRender?: () => void
+  /** Stop clock-only retries after their bounded request budget is exhausted.
+   * Real phase changes, content and terminal transactions remain writable. */
+  footerStatusFailedCardId?: string
   /** Mid-turn card-rotation lock. Set when we've fire-and-forget kicked
    * off `startMidTurnRotate` to open a fresh card — either proactively
    * (element count crossed CARD_ELEMENT_SOFT_LIMIT) or reactively (an
@@ -160,8 +167,8 @@ export interface TurnState {
   /** Rejected content in the current migration chain; value records whether
    * its repeated failure was reported. Cleared when pagination makes progress. */
   cardCapacityFailures: Map<string, boolean>
-  /** Dedupe repeated notices for the same card/item/operation/error. An
-   * earlier unrelated failure must not hide later failures in this turn. */
+  /** Group notices by upstream cause across elements/operations/pages. Full
+   * per-request diagnostics stay in the log; distinct errors remain visible. */
   cardWriteFailureNotices: Set<string>
   /** Replacement open failed. Pause footer refreshes; later content or turn
    * completion retries opening a card without disabling writes to the old one. */

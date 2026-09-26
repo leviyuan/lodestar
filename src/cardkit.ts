@@ -16,7 +16,7 @@ import { networkFetch } from './network'
 
 import { createHash, randomUUID } from 'node:crypto'
 import { getTenantToken } from './feishu'
-import { FeishuRequestError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
+import { FeishuRequestError, isTransientFeishuError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
 import { log } from './log'
 import { ELEMENTS, neutralizeMarkdownImagesInCard } from './cards/elements'
 
@@ -55,6 +55,12 @@ interface CardState {
    * update can create the latest element. Failed PUTs still have a remote
    * element and may be retried; deleted elements must remain unwritable. */
   failedAdds: Map<string, ElementPlacement>
+  /** POSTs whose outcome is unknown after a transport/server error. Only
+   * these IDs may reconcile a duplicate response with an authoritative PUT. */
+  uncertainAdds: Set<string>
+  /** Successfully accounted POSTs, so reconciliation cannot double-count an
+   * element that was already confirmed before a later ambiguous add. */
+  confirmedAdds: Set<string>
   failedReplacements: Set<string>
   /** Synchronous enqueue gate set by dispose before draining the queue. */
   closing?: boolean
@@ -121,6 +127,7 @@ interface SummaryState {
   latest: string
   lastSent: string
   timer: ReturnType<typeof setTimeout> | null
+  inFlight: boolean
 }
 const summaryStates = new Map<string, SummaryState>()
 const SUMMARY_FLUSH_MS = 1500
@@ -156,6 +163,8 @@ export function recordCardCreated(
     contentFingerprints: new Map(),
     deadElements: new Set(),
     failedAdds: new Map(),
+    uncertainAdds: new Set(),
+    confirmedAdds: new Set(),
     failedReplacements: new Set(),
     onFailure,
     closing: false,
@@ -215,7 +224,7 @@ function attemptedContentFingerprint(s: CardState, elementId?: string, fingerpri
   return createHash('sha256').update(contents.sort().join('\n')).digest('hex')
 }
 
-async function call(method: string, path: string, body?: object): Promise<any> {
+async function call(method: string, path: string, body?: object, onAttemptFailure?: (error: unknown) => void): Promise<any> {
   // Mutations carry a sequence; id_convert is a lookup and has no UUID field.
   // Freeze the whole mutation before retrying: a lost acknowledgement must
   // resend the same UUID, sequence and content for Feishu's idempotency check.
@@ -240,11 +249,53 @@ async function call(method: string, path: string, body?: object): Promise<any> {
     } catch (error) {
       // node-fetch turns deadline expiry into AbortError, including body reads.
       // Restore the owned timeout reason; arbitrary cancellation is not retried.
-      if (signal.aborted && signal.reason?.name === 'TimeoutError') throw signal.reason
+      if (signal.aborted && signal.reason?.name === 'TimeoutError') error = signal.reason
       if (res && error instanceof FeishuRequestError) Object.assign(error, { httpStatus: res.status })
+      onAttemptFailure?.(error)
       throw error
     }
-  })
+  }, { api: 'cardkit' })
+}
+
+function isAmbiguousAddFailure(error: unknown): boolean {
+  if (error instanceof FeishuRequestError) {
+    // An explicit rate-limit rejection did not commit this mutation. A
+    // malformed 2xx acknowledgement, however, cannot prove it was rejected.
+    if (error.status === 429 || error.code === 99991400 || error.code === 230020) return false
+    if (error.status !== undefined && error.status >= 200 && error.status < 300 && error.code === undefined) return true
+  }
+  return isTransientFeishuError(error, { api: 'cardkit' })
+}
+
+/** A failed POST may already exist remotely. Retry keeps its UUID; only an
+ * observed ambiguous attempt followed by Duplicate ID authorizes this PUT.
+ * An unsolicited duplicate remains a real validation failure. */
+async function addElementMutation(cardId: string, s: CardState, element: object, opts: ElementPlacement): Promise<void> {
+  const elementId = (element as { element_id?: string }).element_id
+  try {
+    await call('POST', `/cards/${cardId}/elements`, {
+      type: opts.type ?? 'append',
+      ...(opts.targetElementId ? { target_element_id: opts.targetElementId } : {}),
+      elements: JSON.stringify([element]),
+      sequence: nextSeq(cardId),
+    }, error => {
+      if (elementId && isAmbiguousAddFailure(error)) s.uncertainAdds.add(elementId)
+    })
+  } catch (error) {
+    const failure = error as CardKitRequestError
+    if (!elementId || !s.uncertainAdds.has(elementId)
+      || !isDuplicateElementFailure(failure?.code, failure)) throw error
+    log(`cardkit reconcile uncertain add ${cardId} element=${elementId}: duplicate confirmed; replacing latest content`)
+    await call('PUT', `/cards/${cardId}/elements/${elementId}`, {
+      element: JSON.stringify(element),
+      sequence: nextSeq(cardId),
+    })
+  }
+  if (!elementId || !s.confirmedAdds.has(elementId)) s.elementCount++
+  if (elementId) {
+    s.confirmedAdds.add(elementId)
+    s.uncertainAdds.delete(elementId)
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -420,18 +471,10 @@ export function addElement(
     cardId,
     `addElement`,
     async () => {
-      const seq = nextSeq(cardId)
-      await call('POST', `/cards/${cardId}/elements`, {
-        type: opts.type ?? 'append',
-        ...(opts.targetElementId ? { target_element_id: opts.targetElementId } : {}),
-        elements: JSON.stringify([safeElement]),
-        sequence: seq,
-      })
-      // Only bump after the API returns 0 — any rejected add will
-      // bypass this line, so the count tracks "elements Feishu actually
-      // accepted" not "elements we tried to push".
-      s.elementCount += 1
-      if (elementId !== ELEMENTS.footer) s.contentFingerprints.set(elementId ?? `#${seq}`, fingerprint)
+      await addElementMutation(cardId, s, safeElement, opts)
+      // The mutation confirms the POST or reconciliation before recording
+      // either the element count or its latest content.
+      if (elementId !== ELEMENTS.footer) s.contentFingerprints.set(elementId ?? `#${s.sequence}`, fingerprint)
       if (elementId) {
         s.deadElements.delete(elementId)
         s.failedAdds.delete(elementId)
@@ -473,23 +516,17 @@ export function replaceElement(
     async () => {
       const missing = s.failedAdds.get(elementId)
       if (s.deadElements.has(elementId) && !missing && !s.failedReplacements.has(elementId)) return
-      const seq = nextSeq(cardId)
       if (missing) {
-        await call('POST', `/cards/${cardId}/elements`, {
-          type: missing.type ?? 'append',
-          ...(missing.targetElementId ? { target_element_id: missing.targetElementId } : {}),
-          elements: JSON.stringify([safeElement]),
-          sequence: seq,
-        })
-        s.elementCount++
+        await addElementMutation(cardId, s, safeElement, missing)
       } else {
         await call('PUT', `/cards/${cardId}/elements/${elementId}`, {
           element: JSON.stringify(safeElement),
-          sequence: seq,
+          sequence: nextSeq(cardId),
         })
       }
       s.deadElements.delete(elementId)
       s.failedAdds.delete(elementId)
+      s.uncertainAdds.delete(elementId)
       s.failedReplacements.delete(elementId)
       if (elementId !== ELEMENTS.footer) s.contentFingerprints.set(elementId, fingerprint)
     },
@@ -591,6 +628,8 @@ export function deleteElement(
       s.elementCount = Math.max(0, s.elementCount - 1)
       s.contentFingerprints.delete(elementId)
       s.failedAdds.delete(elementId)
+      s.uncertainAdds.delete(elementId)
+      s.confirmedAdds.delete(elementId)
       s.failedReplacements.delete(elementId)
       markElementDead(s, elementId)
     },
@@ -629,23 +668,33 @@ export function patchSummaryThrottled(cardId: string, content: string): void {
   if (!trimmed) return
   let s = summaryStates.get(cardId)
   if (!s) {
-    s = { latest: trimmed, lastSent: '', timer: null }
+    s = { latest: trimmed, lastSent: '', timer: null, inFlight: false }
     summaryStates.set(cardId, s)
   } else {
+    if (s.latest === trimmed) return
     s.latest = trimmed
   }
-  if (s.timer) return
+  scheduleSummary(cardId, s)
+}
+
+/** Keep one summary request in flight. New deltas replace its pending
+ * successor; completion alone must never retry an unchanged failed preview. */
+function scheduleSummary(cardId: string, s: SummaryState): void {
+  if (s.timer || s.inFlight || s.latest === s.lastSent) return
   s.timer = setTimeout(() => {
-    const st = summaryStates.get(cardId)
-    if (!st) return
-    if (isDisposed(cardId)) { summaryStates.delete(cardId); return }
-    st.timer = null
-    if (st.latest === st.lastSent) return
-    const toSend = st.latest
+    if (summaryStates.get(cardId) !== s) return
+    s.timer = null
+    if (isDisposed(cardId) || cards.get(cardId)?.closing) { summaryStates.delete(cardId); return }
+    if (s.latest === s.lastSent) return
+    const toSend = s.latest
+    s.inFlight = true
     void patchSettingsChecked(cardId, { config: { summary: { content: toSend } } })
       .then(landed => {
         const current = summaryStates.get(cardId)
-        if (landed && current === st) current.lastSent = toSend
+        if (current !== s) return
+        s.inFlight = false
+        if (landed) s.lastSent = toSend
+        if (s.latest !== toSend && !isDisposed(cardId) && !cards.get(cardId)?.closing) scheduleSummary(cardId, s)
       })
   }, SUMMARY_FLUSH_MS)
 }
