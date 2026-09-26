@@ -139,7 +139,7 @@ function accountRows(view: CodexAccountCardView): object[] {
       ? schedule.priority === 'expiring' ? '临期优先' : `${schedule.score!.toPrecision(3)}/h`
       : 'MISS'
     elements.push({ tag: 'collapsible_panel', expanded: true,
-      header: { title: { tag: 'plain_text', content: `#${position ?? '—'}·${entry.account.name}「${score}」` }, background_color: 'grey-50' },
+      header: { title: { tag: 'plain_text', content: `#${position ?? '—'}·${entry.account.name}「${score}」 · 重置 ${usage.state === 'ok' ? usage.resetCredits ?? 'MISS' : 'MISS'}` }, background_color: 'grey-50' },
       border: { color: 'grey-100', corner_radius: '8px' }, padding: '8px', vertical_spacing: '2px', elements: row })
     row.push(muted(`邮箱：${entry.email ?? 'MISS'}`))
     if (entry.emailError) row.push({ tag: 'collapsible_panel', expanded: false,

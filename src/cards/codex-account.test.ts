@@ -55,7 +55,7 @@ describe('compact Codex account cards', () => {
     expect(displayed.map((row: any) => row.header.title.content.split('「')[0])).toEqual([
       '#1·账号 1', '#2·账号 2', '#3·账号 4', '#4·账号 3',
     ])
-    expect(displayed[1].header.title.content).toBe('#2·账号 2「临期优先」')
+    expect(displayed[1].header.title.content).toBe('#2·账号 2「临期优先」 · 重置 0')
     expect(displayed[0].elements).toHaveLength(3)
     expect(displayed[0].elements[0].content).toBe("<font color='grey'>邮箱：account-1@example.test</font>")
     expect(displayed[0].elements[1].content).toBe("周　<font color='green'>▱▱▱▱▱▱</font>　0% <font color='grey'>「7.0d」</font>")
@@ -95,7 +95,15 @@ describe('compact Codex account cards', () => {
   test('accounts retain zero and MISS distinctly and use bounded pages', () => {
     const entries = Array.from({ length: CODEX_ACCOUNTS_PAGE_SIZE + 1 }, (_, i) => entry(i))
     entries[1].usage = { state: 'network', reason: 'upstream offline' }
+    if (entries[2].usage.state !== 'ok' || entries[3].usage.state !== 'ok') throw new Error('fixture')
+    entries[2].usage.resetCredits = null
+    entries[3].usage.resetCredits = 3
     const total = aggregateCodexUsage(entries)
+    const panel = codexAccountPanel({ phase: 'accounts', total }) as any
+    expect(panel.elements.slice(0, 4).map((row: any) => row.header.title.content)).toEqual([
+      '#—·账号 0「MISS」 · 重置 0', '#—·账号 1「MISS」 · 重置 MISS',
+      '#—·账号 2「MISS」 · 重置 MISS', '#—·账号 3「MISS」 · 重置 3',
+    ])
     const first = JSON.stringify(codexAccountCard({ phase: 'accounts', total, currentId: '0', selectedId: '1' }))
     expect(first).not.toContain('实际邮箱')
     expect(first).toContain('邮箱：MISS')
