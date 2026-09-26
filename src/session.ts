@@ -862,8 +862,9 @@ export class Session {
   }
 
   private async replaceFooterContent(cardId: string, content: string): Promise<cardkit.CardWriteResult> {
-    // Let the timer pause after bounded transport retries fail. Do not mark
-    // the stable footer missing or rotate a card because its clock failed.
+    // Live timing is optional: Card Kit logs failures, and the timer pauses
+    // without a user notice. Never mark the footer missing or rotate its card.
+    // Terminal footer writes use their own checked transaction and still report.
     let failure: cardkit.CardWriteFailure | undefined
     const landed = await cardkit.replaceElementChecked(
       cardId,
@@ -1143,7 +1144,6 @@ export class Session {
     let pending = false
     let paused = false
     let dirty = false
-    const failureNotices = new Set<string>()
     let timer: ReturnType<typeof setTimeout> | null = null
     const render = (): void => {
       if (stopped) return
@@ -1161,12 +1161,6 @@ export class Session {
         paused = true
         if (timer) clearTimeout(timer)
         timer = null
-        const noticeKey = cardFailureNoticeKey(result.failure?.code, result.failure)
-        if (result.failure && !failureNotices.has(noticeKey)) {
-          failureNotices.add(noticeKey)
-          void feishu.sendTextRaw(this.chatId,
-            `⚠️ 状态卡片计时更新失败，已暂停自动刷新；操作仍继续，实际状态变化和最终状态仍会写入。同类错误合并提示，完整诊断保留在日志。\n${formatFeishuError(result.failure)}`)
-        }
         if (dirty && status !== writtenStatus) render()
       })
     }
@@ -5220,7 +5214,10 @@ export class Session {
           type: 'insert_before', targetElementId: target,
         })
       } else {
-        void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.planLive, cards.planLiveElement(turn.planSteps, turn.planExplanation, cards.ELEMENTS.planLive))
+        // The following timeline snapshot carries the plan; this is its live mirror.
+        void cardkit.replaceElementChecked(turn.cardId, cards.ELEMENTS.planLive,
+          cards.planLiveElement(turn.planSteps, turn.planExplanation, cards.ELEMENTS.planLive),
+          { notifyCardFailure: false })
       }
     }
     this.addPlanSnapshotOnCurrentTurn()
@@ -5587,10 +5584,6 @@ export class Session {
         turn.footerStatusHandle = null
         const latest = turn.footerStatusPendingRender
         turn.footerStatusPendingRender = undefined
-        if (result.failure && this.currentTurn === turn) {
-          this.reportCardWriteFailure(turn, result.failure.code, result.failure,
-            '计时自动刷新已暂停；实际状态变化、正文和最终状态仍会写入。')
-        }
         if (turn.footerStatusLabel !== status) latest?.()
       })
     }

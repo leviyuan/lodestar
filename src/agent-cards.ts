@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import * as cards from './cards'
 import { isCardCapacityFailure, type CardWriteFailure, type CardWriteResult } from './cardkit'
 import { formatFeishuError } from './feishu-errors'
@@ -5,6 +6,7 @@ import type { AgentRunSnapshot } from './agent-run-types'
 import type { BgTaskEntry } from './cards/background'
 import type { AgentCardTaskKind } from './cards/task-kind'
 import { withChatMessageOrder } from './chat-message-order'
+import { log } from './log'
 
 // Each row has one panel and one Markdown body. Leave room below the
 // component ceiling, and also honor actual byte-capacity errors from Card Kit.
@@ -32,6 +34,7 @@ interface CardGroup {
   settled: Set<string>
   sealed: boolean
   settingsJson?: string
+  pendingSettings?: boolean
 }
 
 interface TaskRow {
@@ -43,6 +46,7 @@ interface TaskRow {
   kind: AgentCardTaskKind
   status: string
   terminal: boolean
+  progressState?: string
   attach?: (messageId: string) => void
 }
 
@@ -58,8 +62,8 @@ export class AgentCards {
     return this.addRow(runRow(run))
   }
 
-  update(run: AgentRunSnapshot, terminal = false): Promise<void> {
-    return this.updateRow(runRow(run), terminal)
+  async update(run: AgentRunSnapshot, terminal = false, progressOnly = false): Promise<void> {
+    await this.updateRow(runRow(run), terminal, false, progressOnly)
   }
 
   /** Snapshots are immutable. Unchanged entries do not produce Card Kit writes.
@@ -84,7 +88,10 @@ export class AgentCards {
         }
         try {
           if (!previous || restarted) await this.addRow(row)
-          else await this.updateRow(row, row.terminal, true)
+          else {
+            const progressOnly = !previous.pendingSettings && isBackgroundProgress(previous.task, task)
+            if (!await this.updateRow(row, row.terminal, true, progressOnly)) continue
+          }
           entries.set(id, { task, version })
         } catch (error) {
           // The row may have landed even when settings failed. Preserve that
@@ -131,15 +138,15 @@ export class AgentCards {
     })
   }
 
-  private updateRow(row: TaskRow, terminal = false, allowTerminalCorrection = false): Promise<void> {
+  private updateRow(row: TaskRow, terminal = false, allowTerminalCorrection = false, progressOnly = false): Promise<boolean> {
     return withChatMessageOrder(row.chatId, async () => {
       let group = this.byTask.get(row.key)
-      if (!group) return // Durable history / a disposed, settled card.
+      if (!group) return true // Durable history / a disposed, settled card.
       if (group.settled.has(row.key) && !allowTerminalCorrection) {
         // A progress callback admitted before finalization must not reopen a
         // completed card; failed terminal settings may still be retried.
         if (terminal) await this.settings(group)
-        return
+        return true
       }
       // 完成后的正文更新可能由 Card Kit 自动重开 streaming。旧的设置缓存
       // 此时不能证明远端仍已关闭，即便补充结果没有改变标题和摘要。
@@ -147,6 +154,13 @@ export class AgentCards {
       const errors: string[] = []
       const result = await this.deps.replaceElementResult(group.cardId, row.elementId, row.element)
       if (!result.landed) {
+        const previous = group.rows.get(row.key)
+        if (progressOnly && !terminal && !row.terminal && !group.pendingSettings && !isCapacity(result)
+          && previous?.status === 'running' && row.status === previous.status
+          && row.kind === previous.kind && row.summary === previous.summary && row.progressState === previous.progressState) {
+          log(`agent: task progress refresh failed task=${row.key}: ${writeError('agent task row update', result).message}`)
+          return false
+        }
         if (!isCapacity(result) || group.rows.size === 1) throw writeError('agent task row update', result)
         // A later result can exhaust the shared card's byte capacity. Move only
         // this row, keeping every other running task attached to its own card.
@@ -175,6 +189,7 @@ export class AgentCards {
       try { await this.settings(group) }
       catch (error) { errors.push(String(error)) }
       if (errors.length) throw new Error(errors.join('; '))
+      return true
     })
   }
 
@@ -228,10 +243,12 @@ export class AgentCards {
     const settingsJson = JSON.stringify(settings)
     if (settingsJson !== group.settingsJson) {
       let failure: CardWriteFailure | undefined
+      group.pendingSettings = true
       if (!await this.deps.patchSettingsChecked(group.cardId, settings, detail => { failure = detail })) {
         throw writeError('agent card settings update', { landed: false, failure })
       }
       group.settingsJson = settingsJson
+      group.pendingSettings = false
     }
     if (complete && group.sealed && allowDisposal) {
       await this.deps.dispose(group.cardId)
@@ -243,16 +260,29 @@ export class AgentCards {
 }
 
 function runRow(run: AgentRunSnapshot): TaskRow {
+  const { cardMessageId: _cardMessageId, presentationErrors: _presentationErrors, promptArtifact: _promptArtifact, ...state } = run
   return {
     key: `run:${run.runId}`, chatId: run.chatId, elementId: cards.agentRunElementId(run.runId),
     element: cards.agentRunElement(run), summary: cards.agentRunSummary(run), kind: 'delegated', status: run.status,
     terminal: run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled',
+    // Steps may arrive alongside a result or input request from another worker.
+    // Only omit live progress fields from the confirmed-content comparison.
+    progressState: createHash('sha256').update(JSON.stringify({
+      ...state,
+      workers: state.workers.map(({ steps: _steps, usage: _usage, durationMs: _durationMs, outputArtifact: _outputArtifact, ...worker }) => worker),
+    })).digest('hex'),
     attach: messageId => { run.cardMessageId = messageId },
   }
 }
 
 function isCapacity(result: CardWriteResult): boolean {
   return isCardCapacityFailure(result.failure?.code, result.failure)
+}
+
+function isBackgroundProgress(previous: BgTaskEntry, task: BgTaskEntry): boolean {
+  return previous.status === 'running' && task.status === 'running'
+    && Object.keys({ ...previous, ...task }).every(key => key === 'steps' || key === 'usage' || key === 'lastToolName'
+      || previous[key as keyof BgTaskEntry] === task[key as keyof BgTaskEntry])
 }
 
 function writeError(action: string, result: CardWriteResult): Error {

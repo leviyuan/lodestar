@@ -116,7 +116,9 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
         type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
       })
     } else {
-      void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.taskBoardLive, cards.taskBoardLiveElement(s.taskBoard))
+      // The timeline retains the task result; this existing overview is only a mirror.
+      void cardkit.replaceElementChecked(turn.cardId, cards.ELEMENTS.taskBoardLive,
+        cards.taskBoardLiveElement(s.taskBoard), { notifyCardFailure: false })
     }
     // 连续同类合并:TaskCreate→创建面板,TaskUpdate/List/Get→进度快照面板。
     // 切到另一类则前一类面板定稿(不再更新);board 始终累积。timeline 效果:
@@ -155,7 +157,7 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
       : cards.editBatchElement(i, items)
     void cardkit.addElement(s.currentTurn.cardId, el, {
       type: 'insert_before', targetElementId: taskLiveAnchor(s.currentTurn),
-    })
+    }, undefined, 'capacity')
     toolSummaryToPreview(s.currentTurn, name, input)
     return
   }
@@ -186,10 +188,12 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
     return
   }
   const el = cards.toolCallElement(i, name, input, null, '⏳')
+  // A running placeholder is optional. Keep failed-add bookkeeping so the
+  // actual tool result can recreate it and report any delivery failure.
   void cardkit.addElement(s.currentTurn.cardId, el, {
     type: 'insert_before',
     targetElementId: taskLiveAnchor(s.currentTurn),
-  })
+  }, undefined, 'capacity')
   // Chat-list preview: 工具运行阶段正文不出字,预览会冻结在旧文字尾部 ——
   // 同步当前工具面板同款标题(🔧 工具名: 摘要),列表里能看到 agent 在干嘛。
   toolSummaryToPreview(s.currentTurn, name, input)
@@ -310,12 +314,20 @@ function deliverGeneratedImage(s: Session, turn: TurnState, meta: TurnState['too
     if (!sent && imageKey) failures.push(`图片发送：${formatFeishuError(sendFailure)}`)
     meta.resolvedNote = [sent ? '图片已单独发送。' : '图片发送失败。', ...failures].join('\n')
     let noteFailure: unknown
-    const noteLanded = await cardkit.replaceElementChecked(cardId, elementId,
-      cards.toolCallElement(meta.i, meta.name, meta.input, meta.output ?? null, sent ? '✅' : '❌', meta.resolvedNote),
-      { notifyCardFailure: false, onFailure: failure => { noteFailure = failure } })
+    let noteLanded = false
+    try {
+      noteLanded = await cardkit.replaceElementChecked(cardId, elementId,
+        cards.toolCallElement(meta.i, meta.name, meta.input, meta.output ?? null, sent ? '✅' : '❌', meta.resolvedNote),
+        { notifyCardFailure: false, onFailure: failure => { noteFailure = failure } })
+    } catch (error) {
+      noteFailure = error
+    }
     if (!noteLanded) {
-      await feishu.sendTextRaw(s.chatId, `⚠️ 图片状态写入失败：${formatFeishuError(noteFailure)}\n${meta.resolvedNote}`)
-    } else if (!sent && imageKey) {
+      log(`generated image status write failed card=${cardId} path=${path}: ${formatFeishuError(noteFailure)}\n${meta.resolvedNote}`)
+    }
+    // Delivery failures remain visible even when the auxiliary status cannot
+    // be updated; uploadAndSend already reports its own failure to the chat.
+    if (!sent && imageKey) {
       await feishu.sendText(s.chatId, `❌ 生成图片发送失败：${failures.join('\n')}`)
     }
   })().catch(async error => {
@@ -349,7 +361,8 @@ function completeTaskTool(s: Session, meta: { i: number; name: string }, taskNam
   // 实时任务总览区同步刷新:applyTaskTool 已把 board 更新到最新,这里 replace
   // 让总览跟上(isError 不动 board,总览维持上次有效态,不显示坏结果)。
   if (s.currentTurn.taskLiveInserted) {
-    void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.taskBoardLive, cards.taskBoardLiveElement(s.taskBoard))
+    void cardkit.replaceElementChecked(s.currentTurn.cardId, cards.ELEMENTS.taskBoardLive,
+      cards.taskBoardLiveElement(s.taskBoard), { notifyCardFailure: false })
   }
   startThinkingIfNoToolsRunning(s)
 }

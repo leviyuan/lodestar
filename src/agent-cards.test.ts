@@ -174,6 +174,151 @@ describe('shared delegation card lifecycle', () => {
     expect(h.elements.get('message-1')!.size).toBe(2)
   })
 
+  test('background progress failures leave the last confirmed snapshot and remain retryable', async () => {
+    const h = harness()
+    const child = background('child', 'subagent')
+    await h.cards.syncBackground('chat', 'session', [child])
+    const progress = {
+      ...child, lastToolName: 'Read', usage: { total_tokens: 100, tool_uses: 1, duration_ms: 1000 },
+      steps: [{ toolUseId: 'read', tool: 'Read', brief: '读取任务文件' }],
+    }
+    const replace = h.deps.replaceElementResult
+    let attempts = 0
+    h.deps.replaceElementResult = async (...args) => ++attempts === 1
+      ? failure(300317, 'progress sequence rejected') : replace(...args)
+    await h.cards.syncBackground('chat', 'session', [progress])
+    expect(attempts).toBe(1)
+    expect(JSON.stringify([...h.elements.get('message-1')!.values()])).not.toContain('读取任务文件')
+    await h.cards.syncBackground('chat', 'session', [progress])
+    expect(attempts).toBe(2)
+    expect(JSON.stringify([...h.elements.get('message-1')!.values()])).toContain('读取任务文件')
+    await h.cards.syncBackground('chat', 'session', [progress])
+    expect(attempts).toBe(2)
+    await h.cards.syncBackground('chat', 'session', [{ ...progress, status: 'completed', summary: '任务结果' }])
+    expect(h.settings.get('message-1').config.streaming_mode).toBe(false)
+    expect(JSON.stringify([...h.elements.get('message-1')!.values()])).toContain('任务结果')
+  })
+
+  test('a mixed background batch still reports terminal failures', async () => {
+    const h = harness()
+    const progress = background('progress'), terminal = background('terminal')
+    await h.cards.syncBackground('chat', 'session', [progress, terminal])
+    let attempts = 0
+    h.deps.replaceElementResult = async () => failure(300317, ++attempts === 1 ? 'progress rejected' : 'terminal rejected')
+    const error = await h.cards.syncBackground('chat', 'session', [
+      { ...progress, lastToolName: 'Read' }, { ...terminal, status: 'completed', summary: '任务结果' },
+    ]).catch(error => error)
+    expect(error).toBeInstanceOf(AggregateError)
+    expect(error.errors).toHaveLength(1)
+    expect(String(error)).toContain('terminal rejected')
+    expect(String(error)).not.toContain('progress rejected')
+  })
+
+  test('background progress never suppresses settings failures or their pending retries', async () => {
+    const h = harness()
+    const child = background('child', 'subagent')
+    await h.cards.syncBackground('chat', 'session', [child])
+    const patch = h.deps.patchSettingsChecked
+    h.deps.patchSettingsChecked = async (cardId, _settings, onFailure) => {
+      onFailure?.({ cardId, operation: 'patchSettings', code: 300317, logId: 'progress-settings', message: 'settings rejected' })
+      return false
+    }
+    const progress = { ...child, lastToolName: 'Read' }
+    await expect(h.cards.syncBackground('chat', 'session', [progress]))
+      .rejects.toThrow('settings update MISS: code=300317 message=settings rejected log_id=progress-settings')
+    const replace = h.deps.replaceElementResult
+    h.deps.replaceElementResult = async () => failure(300317, 'pending settings row rejected')
+    await expect(h.cards.syncBackground('chat', 'session', [progress])).rejects.toThrow('pending settings row rejected')
+    h.deps.replaceElementResult = replace
+    h.deps.patchSettingsChecked = patch
+    await h.cards.syncBackground('chat', 'session', [progress])
+    expect(h.settings.get('message-1').config.streaming_mode).toBe(true)
+  })
+
+  test('first background rows and meaningful changes retain write failures', async () => {
+    const h = harness()
+    await h.cards.add(run('delegated'))
+    h.deps.addElementResult = async () => failure(300317, 'first row rejected')
+    await expect(h.cards.syncBackground('chat', 'session', [background('first')])).rejects.toThrow('first row rejected')
+
+    const changes: Partial<BgTaskEntry>[] = [
+      { status: 'paused' }, { status: 'pending' }, { status: 'completed' },
+      { id: 'sdk-id' }, { type: 'subagent' }, { description: '新任务说明' }, { prompt: '任务正文' },
+      { startedAt: 1 }, { error: '后台错误' }, { summary: '任务结果' },
+    ]
+    for (const change of changes) {
+      const next = harness()
+      const child = { ...background('child'), displayId: 'stable' }
+      await next.cards.syncBackground('chat', 'session', [child])
+      next.deps.replaceElementResult = async () => failure(300317, 'meaningful update rejected')
+      await expect(next.cards.syncBackground('chat', 'session', [{ ...child, ...change }]))
+        .rejects.toThrow('meaningful update rejected')
+    }
+  })
+
+  test('delegated tasks needing input still report row write failures', async () => {
+    const h = harness()
+    const delegated = run('question')
+    await h.cards.add(delegated)
+    delegated.status = 'needs_input'
+    h.deps.replaceElementResult = async () => failure(300317, 'question row rejected')
+    await expect(h.cards.update(delegated, false, true)).rejects.toThrow('question row rejected')
+  })
+
+  test('delegated progress is quiet only for unchanged confirmed task state', async () => {
+    const h = harness()
+    const delegated = run('progress')
+    await h.cards.add(delegated)
+    delegated.workers[0]!.steps.push({ at: '2026-09-13T00:00:01Z', phase: 'started', tool: 'Read', detail: '读取任务文件' })
+    const replace = h.deps.replaceElementResult
+    h.deps.replaceElementResult = async () => failure(300317, 'progress rejected')
+    await h.cards.update(delegated, false, true)
+    expect(JSON.stringify([...h.elements.get('message-1')!.values()])).not.toContain('读取任务文件')
+    h.deps.replaceElementResult = replace
+    await h.cards.update(delegated, false, true)
+    expect(JSON.stringify([...h.elements.get('message-1')!.values()])).toContain('读取任务文件')
+    terminal(delegated)
+    await h.cards.update(delegated, true)
+    expect(h.settings.get('message-1').config.streaming_mode).toBe(false)
+  })
+
+  test('delegated progress cannot hide another worker input, output or status change', async () => {
+    for (const change of [{ pendingInput: { requestId: 'question', questions: [] } }, { output: '新结果' }, { status: 'needs_input' as const }]) {
+      const h = harness()
+      const delegated = run('multi-worker')
+      delegated.workers.push({ ...delegated.workers[0]!, identityId: 'second-agent', identityName: 'Agent B', steps: [] })
+      await h.cards.add(delegated)
+      Object.assign(delegated.workers[1]!, change)
+      // The aggregate status can still be running when another worker changes.
+      expect(delegated.status).toBe('running')
+      h.deps.replaceElementResult = async () => failure(300317, 'worker change rejected')
+      await expect(h.cards.update(delegated, false, true)).rejects.toThrow('worker change rejected')
+    }
+  })
+
+  test('delegated progress retains settings errors and cannot conceal failed settings retries', async () => {
+    const h = harness()
+    const delegated = run('settings')
+    await h.cards.add(delegated)
+    h.deps.patchSettingsChecked = async () => false
+    await expect(h.cards.update(delegated, false, true)).rejects.toThrow('settings update MISS')
+    h.deps.replaceElementResult = async () => failure(300317, 'pending settings row rejected')
+    await expect(h.cards.update(delegated, false, true)).rejects.toThrow('pending settings row rejected')
+  })
+
+  test('background progress keeps capacity and migration cleanup failures visible', async () => {
+    const h = harness()
+    const child = background('child')
+    await h.cards.syncBackground('chat', 'session', [child])
+    h.deps.replaceElementResult = async () => failure(200860)
+    const progress = { ...child, lastToolName: 'Read' }
+    await expect(h.cards.syncBackground('chat', 'session', [progress])).rejects.toThrow('card over max size')
+    await h.cards.add(run('delegated'))
+    h.deps.deleteElementChecked = async () => false
+    await expect(h.cards.syncBackground('chat', 'session', [progress])).rejects.toThrow('moved task row deletion MISS')
+    expect(h.sent).toHaveLength(2)
+  })
+
   test('native follow-up preserves a result whose terminal settings failed', async () => {
     const h = harness()
     const child = background('child', 'subagent')

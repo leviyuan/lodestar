@@ -493,7 +493,7 @@ export class AgentService {
     if (run.progressTimers.has(worker.identityId)) return
     const timer = setTimeout(() => {
       run.progressTimers.delete(worker.identityId)
-      void this.updateWorkerCard(run, worker)
+      void this.updateWorkerCard(run, worker, 'progress')
     }, 250)
     run.progressTimers.set(worker.identityId, timer)
   }
@@ -606,11 +606,15 @@ export class AgentService {
     }
   }
 
-  private async updateWorkerCard(run: AgentRunRecord, worker: AgentWorkerResult): Promise<void> {
+  private async updateWorkerCard(
+    run: AgentRunRecord,
+    worker: AgentWorkerResult,
+    purpose: 'state' | 'progress' = 'state',
+  ): Promise<void> {
     if (run.finalized) return
     const previousMessageId = run.snapshot.cardMessageId
     try {
-      await this.presentation.update(run.snapshot)
+      await this.presentation.update(run.snapshot, false, purpose === 'progress')
     } catch (error) {
       this.recordPresentationError(run, `agent worker card update failed (${worker.identityName}): ${messageOf(error)}`)
     } finally {

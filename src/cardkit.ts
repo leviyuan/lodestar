@@ -257,7 +257,14 @@ async function call(method: string, path: string, body?: object, onAttemptFailur
   }, { api: 'cardkit' })
 }
 
-function isAmbiguousAddFailure(error: unknown): boolean {
+function isUuidConsumedFailure(error: unknown): boolean {
+  return error instanceof FeishuRequestError && (error.code === 200770 || error.code === '200770')
+}
+
+function isAmbiguousMutationFailure(error: unknown): boolean {
+  // A consumed UUID rejects this attempt; it says nothing about whether the
+  // previous attempt actually applied the content.
+  if (isUuidConsumedFailure(error)) return false
   if (error instanceof FeishuRequestError) {
     // An explicit rate-limit rejection did not commit this mutation. A
     // malformed 2xx acknowledgement, however, cannot prove it was rejected.
@@ -267,11 +274,31 @@ function isAmbiguousAddFailure(error: unknown): boolean {
   return isTransientFeishuError(error, { api: 'cardkit' })
 }
 
+/** PUT and settings PATCH assign an absolute state. If a retry hits a consumed
+ * UUID after an uncertain response, confirm that same state once with a new
+ * operation identity, inside the original queue slot. A consumed UUID alone
+ * is never success. The confirmation retains ordinary transport retries, but
+ * cannot recursively renew its UUID. DELETE and POST need separate semantics. */
+async function callStateMutation(cardId: string, method: 'PUT' | 'PATCH', path: string, body: object): Promise<void> {
+  let uncertain = false
+  try {
+    await call(method, path, { ...body, sequence: nextSeq(cardId) }, error => {
+      if (isAmbiguousMutationFailure(error)) uncertain = true
+    })
+  } catch (error) {
+    if (!uncertain || !isUuidConsumedFailure(error)) throw error
+    log(`cardkit confirm ${method} ${path}: ${error}; retrying same state with new UUID and sequence`)
+    await call(method, path, { ...body, sequence: nextSeq(cardId) })
+  }
+}
+
 /** A failed POST may already exist remotely. Retry keeps its UUID; only an
- * observed ambiguous attempt followed by Duplicate ID authorizes this PUT.
- * An unsolicited duplicate remains a real validation failure. */
+ * observed ambiguous attempt followed by Duplicate ID or a consumed UUID
+ * authorizes this PUT. Consumed UUID evidence is local to this request; an
+ * unsolicited duplicate remains a real validation failure. */
 async function addElementMutation(cardId: string, s: CardState, element: object, opts: ElementPlacement): Promise<void> {
   const elementId = (element as { element_id?: string }).element_id
+  let uncertain = false
   try {
     await call('POST', `/cards/${cardId}/elements`, {
       type: opts.type ?? 'append',
@@ -279,16 +306,18 @@ async function addElementMutation(cardId: string, s: CardState, element: object,
       elements: JSON.stringify([element]),
       sequence: nextSeq(cardId),
     }, error => {
-      if (elementId && isAmbiguousAddFailure(error)) s.uncertainAdds.add(elementId)
+      if (isAmbiguousMutationFailure(error)) {
+        uncertain = true
+        if (elementId) s.uncertainAdds.add(elementId)
+      }
     })
   } catch (error) {
     const failure = error as CardKitRequestError
-    if (!elementId || !s.uncertainAdds.has(elementId)
-      || !isDuplicateElementFailure(failure?.code, failure)) throw error
-    log(`cardkit reconcile uncertain add ${cardId} element=${elementId}: duplicate confirmed; replacing latest content`)
-    await call('PUT', `/cards/${cardId}/elements/${elementId}`, {
+    const duplicate = elementId && s.uncertainAdds.has(elementId) && isDuplicateElementFailure(failure?.code, failure)
+    if (!elementId || !(duplicate || (uncertain && isUuidConsumedFailure(error)))) throw error
+    log(`cardkit reconcile uncertain add ${cardId} element=${elementId}: ${error}; confirming latest content with PUT`)
+    await callStateMutation(cardId, 'PUT', `/cards/${cardId}/elements/${elementId}`, {
       element: JSON.stringify(element),
-      sequence: nextSeq(cardId),
     })
   }
   if (!elementId || !s.confirmedAdds.has(elementId)) s.elementCount++
@@ -317,10 +346,8 @@ function isStreamingClosed(e: unknown): boolean {
  * Called from inside the per-card queue's catch path, so it allocates
  * its own sequence and runs inline without re-enqueueing. */
 async function reopenStreaming(cardId: string): Promise<void> {
-  const seq = nextSeq(cardId)
-  await call('PATCH', `/cards/${cardId}/settings`, {
+  await callStateMutation(cardId, 'PATCH', `/cards/${cardId}/settings`, {
     settings: JSON.stringify({ config: { streaming_mode: true } }),
-    sequence: seq,
   })
 }
 
@@ -335,7 +362,7 @@ async function withReopenOnStreamingClosed(
   label: string,
   op: () => Promise<void>,
   onFailure?: (failure: CardWriteFailure) => void,
-  silent = false,
+  silent: boolean | 'non-capacity' = false,
   meta: Pick<CardWriteFailure, 'elementId' | 'targetElementId'> & { contentFingerprint?: string } = {},
 ): Promise<void> {
   // 失败统一出口:card-level handler 先(它同步快照当前段/tool 后再异步
@@ -364,7 +391,9 @@ async function withReopenOnStreamingClosed(
       )
     }
     try {
-      if (!silent) state(cardId).onFailure?.(failure.code, failure)
+      if (!silent || (silent === 'non-capacity' && isCardCapacityFailure(failure.code, failure))) {
+        state(cardId).onFailure?.(failure.code, failure)
+      }
     } catch (error) {
       log(`cardkit failure callback ${cardId}: ${error}`)
     }
@@ -448,13 +477,15 @@ export async function flush(cardId: string): Promise<void> {
  * Use it to invalidate
  * any daemon-side reference to the element you tried to add (e.g. a segment
  * id), so subsequent writes don't keep PUTting content to a phantom element
- * that Feishu will silently reject. Default (no callback) preserves the
- * legacy fire-and-forget swallow behavior. */
+ * that Feishu will silently reject. Optional running placeholders only notify
+ * on capacity errors, preserving automatic pagination. Failed-add state and the
+ * per-call callback still run so actual results can recreate missing elements. */
 export function addElement(
   cardId: string,
   element: object,
   opts: ElementPlacement = {},
   onFailure?: (code?: number, failure?: CardWriteFailure) => void,
+  notifyCardFailure: 'all' | 'capacity' = 'all',
 ): Promise<void> {
   if (isDisposed(cardId)) return Promise.resolve()
   const s = state(cardId)
@@ -487,7 +518,7 @@ export function addElement(
       missing()
       onFailure?.(failure.code, failure)
     },
-    false,
+    notifyCardFailure === 'capacity' ? 'non-capacity' : false,
     { elementId, targetElementId: opts.targetElementId, contentFingerprint: fingerprint },
   ))
   return s.queue
@@ -519,9 +550,8 @@ export function replaceElement(
       if (missing) {
         await addElementMutation(cardId, s, safeElement, missing)
       } else {
-        await call('PUT', `/cards/${cardId}/elements/${elementId}`, {
+        await callStateMutation(cardId, 'PUT', `/cards/${cardId}/elements/${elementId}`, {
           element: JSON.stringify(safeElement),
-          sequence: nextSeq(cardId),
         })
       }
       s.deadElements.delete(elementId)
@@ -742,10 +772,8 @@ export async function patchSettingsChecked(
     'patchSettings',
     async () => {
       if (isDisposed(cardId)) return
-      const seq = nextSeq(cardId)
-      await call('PATCH', `/cards/${cardId}/settings`, {
+      await callStateMutation(cardId, 'PATCH', `/cards/${cardId}/settings`, {
         settings: JSON.stringify(settings),
-        sequence: seq,
       })
       landed = true
     },

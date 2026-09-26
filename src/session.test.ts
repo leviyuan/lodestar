@@ -653,11 +653,15 @@ describe('generated image delivery', () => {
     } finally { release?.('img_delayed'); await sessionTools.waitForImageDeliveries(turn); session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
   })
 
-  test('reports rejected image and note writes together when neither can appear on the card', async () => {
+  test.each([true, false])('image status write failure only notifies when image delivery failed (sent: %s)', async sent => {
     const session = new Session('image-note-failure', 'chat_id') as any
     const turn = turnState('card_image_note_failure')
     session.currentTurn = turn
     cardkit.recordCardCreated(turn.cardId, 1)
+    const send = sent ? null : spyOn(feishu, 'sendImage').mockImplementation(async (_chatId, _key, onFailure) => {
+      onFailure?.({ code: 230001, msg: 'image send rejected', error: { log_id: 'image-send-log' } })
+      return null
+    })
     const normalFetch = globalThis.fetch
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       if (init?.method === 'PUT' && String(input).endsWith('/elements/tool_0')) {
@@ -671,11 +675,15 @@ describe('generated image delivery', () => {
       sessionTools.addTool(session, 'image-call', 'ImageGeneration', { revisedPrompt: 'Prompt' })
       sessionTools.completeTool(session, 'image-call', '/tmp/generated.png', false)
       await sessionTools.waitForImageDeliveries(turn)
-      expect(sentImages).toEqual([['chat_id', 'img_generated']])
-      expect(sentRawTexts).toHaveLength(1)
-      expect(sentRawTexts[0]).toContain('code=300121 message=image rejected log_id=image-rejection-log')
-      expect(sentRawTexts[0]).toContain('code=300121 message=note rejected log_id=note-rejection-log')
-    } finally { globalThis.fetch = normalFetch; session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+      expect(sentImages).toEqual(sent ? [['chat_id', 'img_generated']] : [])
+      expect(turn.outboundSentPaths.has('/tmp/generated.png')).toBe(sent)
+      expect(sentRawTexts).toHaveLength(0)
+      expect(sentTexts).toHaveLength(sent ? 0 : 1)
+      if (!sent) {
+        expect(sentTexts[0]).toContain('生成图片发送失败')
+        expect(sentTexts[0]).toContain('code=230001 message=image send rejected log_id=image-send-log')
+      }
+    } finally { send?.mockRestore(); globalThis.fetch = normalFetch; session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
   })
 
   test('retains an upload rejection returned through the failure callback', async () => {
@@ -5017,6 +5025,86 @@ describe('Session background tasks in shared delegation cards', () => {
   })
 })
 
+describe('Session optional progress presentation', () => {
+  test.each(['Bash', 'Read', 'Edit'].flatMap(name => [true, false].map(resultLands => ({ name, resultLands }))))(
+    'a tool placeholder fails silently but its result stays checked (%p)', async ({ name, resultLands }) => {
+    const session = new Session('optional-placeholder', 'chat_id') as any
+    const turn = turnState('card_optional_placeholder')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => session.onCardWriteFailure(turn, turn.cardId, code, failure))
+    const normalFetch = globalThis.fetch
+    let finishing = false
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST' && String(init.body).includes('tool_0') && (!finishing || !resultLands)) {
+        return Response.json({ code: 300121, msg: 'tool element rejected', error: { log_id: 'tool-write-log' } })
+      }
+      return normalFetch(input, init)
+    }) as typeof fetch
+    try {
+      sessionTools.addTool(session, 'ordinary-tool', name, { command: 'echo ready', file_path: '/tmp/source.ts' })
+      await cardkit.flush(turn.cardId)
+      expect(sentRawTexts).toHaveLength(0)
+      expect(turn.cardWriteFailureNotices.size).toBe(0)
+      expect(cardkit.isDeadElement(turn.cardId, 'tool_0')).toBe(true)
+      finishing = true
+      sessionTools.completeTool(session, 'ordinary-tool', 'actual tool result', false)
+      await cardkit.flush(turn.cardId)
+      expect(cardkit.isDeadElement(turn.cardId, 'tool_0')).toBe(!resultLands)
+      expect(sentRawTexts).toHaveLength(resultLands ? 0 : 1)
+      if (resultLands) {
+        const result = calls.find(call => call.method === 'POST' && String(call.body?.elements).includes('tool_0'))
+        expect(result?.body.target_element_id).toBe('footer')
+      } else expect(sentRawTexts[0]).toContain('log_id=tool-write-log')
+    } finally { globalThis.fetch = normalFetch; session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+
+  test.each(['plan', 'tasks'])('existing %s overview failures stay silent while timeline failures are reported', async kind => {
+    const session = new Session('optional-overview', 'chat_id') as any
+    const turn = turnState('card_optional_overview')
+    const proc = new FakeAgentProc('codex', 'overview-thread')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => session.onCardWriteFailure(turn, turn.cardId, code, failure))
+    let revision = 0
+    const update = () => {
+      revision++
+      if (kind === 'plan') {
+        proc.emit('turn_plan_updated', { plan: [{ step: `step ${revision}`, status: 'inProgress' }] })
+      } else {
+        const name = revision === 1 ? 'TaskCreate' : 'TaskUpdate'
+        sessionTools.addTool(session, `task-${revision}`, name, { subject: 'work', taskId: '1', status: 'in_progress' })
+        sessionTools.completeTool(session, `task-${revision}`, JSON.stringify({ task: { id: '1', subject: 'work', status: 'in_progress' } }), false)
+      }
+    }
+    const normalFetch = globalThis.fetch
+    let rejectTimeline = false
+    try {
+      update()
+      await cardkit.flush(turn.cardId)
+      const overviewId = kind === 'plan' ? 'plan_live' : 'task_board_live'
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const overview = init?.method === 'PUT' && String(input).endsWith(`/elements/${overviewId}`)
+        const timeline = kind === 'plan'
+          ? init?.method === 'POST' && String(init.body).includes('plan_update_')
+          : init?.method === 'PUT' && /\/elements\/tool_\d+$/.test(String(input))
+        if (overview || (rejectTimeline && timeline)) return Response.json({ code: 300121, msg: 'snapshot rejected' })
+        return normalFetch(input, init)
+      }) as typeof fetch
+      update()
+      await cardkit.flush(turn.cardId)
+      expect(sentRawTexts).toHaveLength(0)
+      expect(turn.cardWriteFailureNotices.size).toBe(0)
+      expect(cardkit.isDeadElement(turn.cardId, overviewId)).toBe(false)
+      rejectTimeline = true
+      update()
+      await cardkit.flush(turn.cardId)
+      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts[0]).toContain('snapshot rejected')
+    } finally { globalThis.fetch = normalFetch; session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+})
+
 describe('Session Claude task live panel (task_board_live)', () => {
   test('native SDK task calls render creation and every status update in one live panel', async () => {
     const session = new Session('claude-tasks', 'chat_id') as any
@@ -5234,7 +5322,7 @@ describe('Session live_elapsed second mode', () => {  test('second live_elapsed 
     }
   })
 
-  test('a transient live footer failure retries once without notices or queued clock ticks', async () => {
+  test.each([false, true])('a transient live footer failure recovers without pausing clocks (consumed UUID: %s)', async consumedUuid => {
     const session = new Session('footer-transient-miss', 'chat_id') as any
     const turn = turnState('card_footer_transient_miss')
     session.currentTurn = turn
@@ -5254,6 +5342,9 @@ describe('Session live_elapsed second mode', () => {  test('second live_elapsed 
             headers: { 'Content-Type': 'application/json' },
           })
         }
+        if (consumedUuid && footerAttempts === 2) {
+          return Response.json({ code: 200770, msg: 'ErrMsg: this UUID has been recently consumed;' })
+        }
       }
       return new Response(JSON.stringify({ code: 0, data: {} }), {
         headers: { 'Content-Type': 'application/json' },
@@ -5264,13 +5355,15 @@ describe('Session live_elapsed second mode', () => {  test('second live_elapsed 
       session.startThinkingFooter(turn)
       await cardkit.flush(turn.cardId)
       await waitUntil(() => !turn.footerStatusWriteCardId)
-      expect(footerAttempts).toBe(2)
+      expect(footerAttempts).toBe(consumedUuid ? 3 : 2)
+      expect(turn.footerStatusFailedCardId).not.toBe(turn.cardId)
+      expect(turn.footerStatusHandle).not.toBeNull()
       expect(sentRawTexts).toHaveLength(0)
       expect(turn.cardWriteFailureNotices.size).toBe(0)
 
       session.startWritingFooter(turn)
       await cardkit.flush(turn.cardId)
-      expect(footerAttempts).toBe(3)
+      expect(footerAttempts).toBe(consumedUuid ? 4 : 3)
       expect(sentRawTexts).toHaveLength(0)
       expect(turn.cardWriteFailureNotices.size).toBe(0)
     } finally {
@@ -5317,7 +5410,7 @@ describe('Session card outage backpressure', () => {
     }
   })
 
-  test('persistent 300308 exhausts three attempts then pauses clocks without blocking body or final state', async () => {
+  test.each([300308, 200770])('live footer failures stay silent without blocking body or final state (code: %s)', async code => {
     const cfg = config as any
     const previousRuntime = cfg.runtime
     cfg.runtime = { ...(previousRuntime ?? {}), live_elapsed: 'second' }
@@ -5332,7 +5425,11 @@ describe('Session card outage backpressure', () => {
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).endsWith('/elements/footer')) {
         attempts++
-        if (rejectFooter) return Response.json({ code: 300308, msg: 'Server Internal Error' }, {
+        const consumed = code === 200770 && attempts % 2 === 0
+        if (rejectFooter) return Response.json({
+          code: consumed ? 200770 : 300308,
+          msg: consumed ? 'this UUID has been recently consumed' : 'Server Internal Error',
+        }, {
           headers: { 'x-tt-logid': `outage-${attempts}` },
         })
       }
@@ -5342,15 +5439,14 @@ describe('Session card outage backpressure', () => {
       session.startThinkingFooter(turn)
       await cardkit.flush(turn.cardId)
       await waitUntil(() => turn.footerStatusFailedCardId === turn.cardId)
-      expect(attempts).toBe(3)
+      const failedAttempts = code === 200770 ? 4 : 3
+      expect(attempts).toBe(failedAttempts)
       expect(turn.footerStatusHandle).toBeNull()
-      expect(sentRawTexts).toHaveLength(1)
-      expect(sentRawTexts[0]).toContain('计时自动刷新已暂停')
-      expect(sentRawTexts[0]).toContain('code=300308')
-      expect(sentRawTexts[0]).toContain('log_id=outage-3')
+      expect(sentRawTexts).toHaveLength(0)
+      expect(turn.cardWriteFailureNotices.size).toBe(0)
       session.startThinkingFooter(turn)
       await cardkit.flush(turn.cardId)
-      expect(attempts).toBe(3)
+      expect(attempts).toBe(failedAttempts)
       expect(await cardkit.addElementChecked(turn.cardId, {
         tag: 'markdown', element_id: 'body_after_clock_failure', content: '正文仍然可以写入',
       })).toBe(true)
@@ -5358,14 +5454,14 @@ describe('Session card outage backpressure', () => {
       session.startWorkingFooter(turn)
       await cardkit.flush(turn.cardId)
       await waitUntil(() => !turn.footerStatusWriteCardId)
-      expect(attempts).toBe(4)
+      expect(attempts).toBe(failedAttempts + 1)
       expect(turn.footerStatusHandle).toBeNull()
       expect(JSON.parse(calls.filter(call => call.path.endsWith('/elements/footer')).at(-1)!.body.element).content)
         .toContain('Working...')
       await session.closeTurnCard(undefined, { hasFreshResult: false })
-      expect(attempts).toBe(5)
+      expect(attempts).toBe(failedAttempts + 2)
       expect(cardkit.isDisposed(turn.cardId)).toBe(true)
-      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts).toHaveLength(0)
     } finally {
       session.stopFooterStatus(turn)
       if (previousRuntime === undefined) delete cfg.runtime
@@ -5413,7 +5509,7 @@ describe('Session card outage backpressure', () => {
     }
   })
 
-  test('status card clocks pause after failure but still commit the final status', async () => {
+  test('status card clocks pause silently after failure but still commit the final status', async () => {
     const session = new Session('status-footer-outage', 'chat_id') as any
     const baseFetch = globalThis.fetch
     let rejectFooter = true
@@ -5428,8 +5524,8 @@ describe('Session card outage backpressure', () => {
     const handle = await session.openStatusCard('状态操作', '进行中')
     try {
       await cardkit.flush(handle.cardId)
-      await waitUntil(() => sentRawTexts.length === 1)
-      expect(sentRawTexts[0]).toContain('已暂停自动刷新')
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(sentRawTexts).toHaveLength(0)
       session.setStatusCard(handle, '进行中')
       await cardkit.flush(handle.cardId)
       expect(attempts).toBe(1)
@@ -5440,7 +5536,7 @@ describe('Session card outage backpressure', () => {
       await session.closeStatusCard(handle, '完成')
       expect(attempts).toBe(3)
       expect(cardkit.isDisposed(handle.cardId)).toBe(true)
-      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts).toHaveLength(0)
     } finally {
       handle.timer.stop()
       await cardkit.dispose(handle.cardId)

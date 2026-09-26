@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { AgentService, type AgentServiceDeps } from './agent-service'
 import type { AgentIdentity, AgentIdentityCatalog } from './agent-identities'
 import { AgentWorkerFailure, type AgentWorkerHandle, type AgentWorkerResult } from './agent-runner'
-import type { AgentRunSnapshot } from './agent-run-types'
+import type { AgentInputRequest, AgentRunSnapshot } from './agent-run-types'
 import { AGENT_RUNS_DIR } from './paths'
 import { projectProfiles } from './feishu-test-mock'
 
@@ -347,6 +347,137 @@ describe('AgentService', () => {
     expect(notices[0]).toContain('log_id=terminal-request-id')
     expect(notices[0]).toContain(started.runId)
     expect((artifacts.at(-1) as AgentRunSnapshot).presentationErrors).toEqual(saved.presentationErrors)
+  })
+
+  test.each([false, true])('recent-step write errors stay out of notices while terminal failures remain visible (terminal failure: %s)', async terminalFailure => {
+    const notices: string[] = []
+    const control = controlledHandle()
+    let progressRejected = false
+    let finalResultWritten = false
+    let rejectTerminal = terminalFailure
+    let observeProgress!: () => void
+    const progressWrite = new Promise<void>(resolve => { observeProgress = resolve })
+    const { service, root, artifacts } = harness({
+      startWorker: opts => {
+        opts.callbacks?.onProgress?.({ at: new Date().toISOString(), phase: 'info', tool: 'inspect', detail: 'recent-step-marker' })
+        return control.handle
+      },
+      replaceElementChecked: async (_cardId, _elementId, element) => {
+        const content = JSON.stringify(element)
+        if (content.includes('recent-step-marker') && !progressRejected) {
+          progressRejected = true
+          observeProgress()
+          return false
+        }
+        if (content.includes('authoritative-final-output')) finalResultWritten = true
+        return true
+      },
+      patchSettingsChecked: async (cardId, settings, onFailure) => {
+        if (!rejectTerminal || (settings as any).config.streaming_mode !== false) return true
+        onFailure?.({ cardId, operation: 'patchSettings', code: 300317,
+          logId: 'required-terminal-request', message: 'terminal settings rejected' })
+        return false
+      },
+      sendTextRaw: async (_chatId, text) => { notices.push(text); return true },
+    })
+    try {
+      const started = await service.startRun(root, { description: '进度提示降级', identityIds: ['agent:a'], prompt: 'inspect' })
+      await progressWrite
+      control.resolve(result('sid-progress', 'authoritative-final-output'))
+      await waitForCondition(() => artifacts.some((value: any) => value.runId === started.runId && value.status === 'completed'))
+      const saved = service.getRun(root, started.runId)
+      expect(progressRejected).toBe(true)
+      expect(finalResultWritten).toBe(true)
+      expect(saved.workers[0]!.output).toBe('authoritative-final-output')
+      expect(saved.workers[0]!.steps[0]!.detail).toBe('recent-step-marker')
+      expect((saved.presentationErrors ?? []).some(detail => detail.includes('agent task row update'))).toBe(false)
+      if (terminalFailure) {
+        expect(notices).toHaveLength(1)
+        expect(saved.presentationErrors).toHaveLength(1)
+        expect(notices[0]).toContain('terminal settings rejected')
+        expect(notices[0]).toContain('log_id=required-terminal-request')
+      } else {
+        expect(saved.presentationErrors).toBeUndefined()
+        expect(notices).toEqual([])
+      }
+    } finally {
+      rejectTerminal = false
+      await service.shutdown('test cleanup')
+    }
+  })
+
+  test('a pending settings failure during recent-step refresh remains visible', async () => {
+    const notices: string[] = []
+    const control = controlledHandle()
+    let liveSettingsAttempts = 0
+    let observeProgressSettings!: () => void
+    const progressSettingsWrite = new Promise<void>(resolve => { observeProgressSettings = resolve })
+    const { service, root } = harness({
+      startWorker: opts => {
+        opts.callbacks?.onProgress?.({ at: new Date().toISOString(), phase: 'info', tool: 'inspect', detail: 'latest progress' })
+        return control.handle
+      },
+      patchSettingsChecked: async (cardId, settings, onFailure) => {
+        if ((settings as any).config.streaming_mode !== true || liveSettingsAttempts >= 2) return true
+        liveSettingsAttempts++
+        onFailure?.({ cardId, operation: 'patchSettings', code: 300317,
+          logId: 'live-settings-' + liveSettingsAttempts, message: 'streaming settings rejected' })
+        if (liveSettingsAttempts === 2) observeProgressSettings()
+        return false
+      },
+      sendTextRaw: async (_chatId, text) => { notices.push(text); return true },
+    })
+    try {
+      const started = await service.startRun(root, { description: '进度不能隐藏设置失败', identityIds: ['agent:a'], prompt: 'inspect' })
+      await progressSettingsWrite
+      control.resolve(result('sid-progress-settings'))
+      await waitForCondition(() => notices.length === 1)
+      const saved = service.getRun(root, started.runId)
+      expect(saved.status).toBe('completed')
+      expect(saved.presentationErrors).toHaveLength(2)
+      expect(notices[0]).toContain('log_id=live-settings-1')
+      expect(notices[0]).toContain('log_id=live-settings-2')
+      expect(notices[0]).toContain('streaming settings rejected')
+    } finally { await service.shutdown('test cleanup') }
+  })
+
+  test('needs_input card failures remain recorded and visible after a successful final update', async () => {
+    const notices: string[] = []
+    const control = controlledHandle()
+    let pending: AgentInputRequest | null = null
+    let inputRejected = false
+    const { service, root } = harness({
+      startWorker: opts => {
+        queueMicrotask(() => {
+          pending = { requestId: 'req-visible-input', questions: [{ id: 'q1', question: 'important-input-question', options: [] }] }
+          opts.callbacks?.onNeedsInput?.(pending)
+        })
+        return {
+          ...control.handle,
+          pendingInput: () => pending,
+          answer: () => { pending = null; control.resolve(result('sid-input-visible')) },
+        }
+      },
+      replaceElementChecked: async (_cardId, _elementId, element) => {
+        if (JSON.stringify(element).includes('important-input-question') && !inputRejected) {
+          inputRejected = true
+          throw new Error('needs-input-presentation-rejected')
+        }
+        return true
+      },
+      sendTextRaw: async (_chatId, text) => { notices.push(text); return true },
+    })
+    try {
+      const started = await service.startRun(root, { description: '等待输入仍需提示', identityIds: ['agent:a'], prompt: 'ask' })
+      await waitForCondition(() => !!service.getRun(root, started.runId).presentationErrors?.length)
+      const waiting = service.getRun(root, started.runId)
+      expect(waiting.status).toBe('needs_input')
+      expect(waiting.presentationErrors?.[0]).toContain('needs-input-presentation-rejected')
+      await service.answer(root, started.runId, { requestId: 'req-visible-input', answers: { q1: 'yes' } })
+      await waitForCondition(() => notices.length === 1)
+      expect(service.getRun(root, started.runId).status).toBe('completed')
+      expect(notices[0]).toContain('needs-input-presentation-rejected')
+    } finally { await service.shutdown('test cleanup') }
   })
 
   test('writes the terminal chat-list summary inside Card Kit config', async () => {

@@ -95,6 +95,246 @@ test('lost acknowledgements retry queued mutations once per UUID and dispose wai
   `)
 })
 
+test('consumed UUIDs after uncertain footer and settings writes require a successful new-identity confirmation', async () => {
+  await runIsolated(`
+    for (const method of ['PUT', 'PATCH']) {
+      for (const firstAttemptLanded of [false, true]) {
+        const failures = []
+        let remoteValue = 'old'
+        cardkit.recordCardCreated('card', 1, (_code, failure) => failures.push(failure))
+        calls.length = 0; delays.length = 0
+        const footer = { tag: 'markdown', element_id: 'footer', content: 'Thinking(17s)' }
+        const settings = { config: { streaming_mode: false }, summary: { content: 'complete' } }
+        const expectedValue = JSON.stringify(method === 'PUT' ? footer : settings)
+        respond = async call => {
+          assert.equal(failures.length, 0, 'do not notify while confirming the write')
+          if (calls.length <= 3) {
+            assert.equal(call.method, method)
+            assert.equal(call.body[method === 'PUT' ? 'element' : 'settings'], expectedValue)
+          }
+          if (calls.length === 1) {
+            if (firstAttemptLanded) remoteValue = expectedValue
+            return Response.json({ code: 300308, msg: 'Server Internal Error' })
+          }
+          if (calls.length === 2) {
+            assert.equal(call.raw, calls[0].raw)
+            return Response.json({ code: 200770, msg: 'ErrMsg: this UUID has been recently consumed;' })
+          }
+          if (calls.length === 3) {
+            assert.notEqual(call.body.uuid, calls[0].body.uuid)
+            assert.equal(call.body.sequence, 2)
+            remoteValue = expectedValue
+            return Response.json({ code: 0 })
+          }
+          assert.equal(remoteValue, expectedValue, 'the next queued write must wait for confirmation')
+          assert.equal(call.body.sequence, 3)
+          return Response.json({ code: 0 })
+        }
+        const firstWrite = method === 'PUT'
+          ? cardkit.replaceElementChecked('card', 'footer', footer)
+          : cardkit.patchSettingsChecked('card', settings, failure => failures.push(failure))
+        const nextWrite = cardkit.replaceElementChecked('card', 'tool_19', element('done'))
+        assert.deepEqual(await Promise.all([firstWrite, nextWrite]), [true, true])
+        assert.equal(remoteValue, expectedValue)
+        assert.deepEqual(calls.map(call => call.body.sequence), [1, 1, 2, 3])
+        assert.equal(new Set(calls.map(call => call.body.uuid)).size, 3)
+        assert.equal(new Set(calls.map(call => call.signal)).size, 4)
+        assert.equal(cardkit.isDeadElement('card', 'footer'), false)
+        assert.deepEqual(delays, [1000])
+        assert.deepEqual(failures, [])
+        await cardkit.dispose('card')
+      }
+    }
+  `)
+})
+
+test('failed UUID confirmation is bounded and reports its final diagnostics once', async () => {
+  await runIsolated(`
+    for (const method of ['PUT', 'PATCH']) {
+      for (const repeatedConsumption of [false, true]) {
+        const failures = []
+        cardkit.recordCardCreated('card', 1, (_code, failure) => failures.push(failure))
+        calls.length = 0; delays.length = 0
+        respond = async () => {
+          assert.equal(failures.length, 0, 'notify only after confirmation has failed')
+          assert.ok(calls.length <= 4, 'a failed confirmation must not acquire another identity')
+          const internal = calls.length === 1 || (repeatedConsumption && calls.length === 3)
+          if (internal) return Response.json({ code: 300308, msg: 'Server Internal Error' })
+          const code = calls.length === 2 || repeatedConsumption ? 200770 : 300121
+          return Response.json({ code, msg: code === 200770 ? 'this UUID has been recently consumed' : 'replacement rejected' },
+            { headers: { 'x-tt-logid': 'confirmation-attempt-' + calls.length } })
+        }
+        const landed = method === 'PUT'
+          ? (await cardkit.replaceElementResult('card', 'footer', { tag: 'markdown', content: 'Thinking(17s)' })).landed
+          : await cardkit.patchSettingsChecked('card', { config: { streaming_mode: false } }, failure => failures.push(failure))
+        const count = repeatedConsumption ? 4 : 3
+        assert.equal(landed, false)
+        assert.equal(calls.length, count)
+        assert.deepEqual(calls.map(call => call.body.sequence), repeatedConsumption ? [1, 1, 2, 2] : [1, 1, 2])
+        assert.equal(new Set(calls.map(call => call.body.uuid)).size, 2)
+        assert.equal(failures.length, 1)
+        assert.equal(failures[0].code, repeatedConsumption ? 200770 : 300121)
+        assert.equal(failures[0].logId, 'confirmation-attempt-' + count)
+        assert.match(failures[0].message, new RegExp('log_id=confirmation-attempt-' + count))
+        assert.deepEqual(delays, repeatedConsumption ? [1000, 1000] : [1000])
+        if (method === 'PUT') assert.equal(cardkit.isDeadElement('card', 'footer'), true)
+        await cardkit.dispose('card')
+      }
+    }
+  `)
+})
+
+test('a consumed UUID without an uncertain attempt does not authorize a new mutation identity', async () => {
+  await runIsolated(`
+    for (const method of ['POST', 'PUT', 'PATCH']) {
+      for (const prior of [undefined, 99991400, 230020, 'http429']) {
+        const failures = []
+        cardkit.recordCardCreated('card', 1, (_code, failure) => failures.push(failure))
+        calls.length = 0; delays.length = 0
+        respond = async () => {
+          if (calls.length === 1 && prior !== undefined) {
+            return prior === 'http429'
+              ? new Response('rate limited', { status: 429 })
+              : Response.json({ code: prior, msg: 'rate limited' })
+          }
+          return Response.json({ code: 200770, msg: 'this UUID has been recently consumed' },
+            { headers: { 'x-tt-logid': 'unproven-consumption' } })
+        }
+        const landed = method === 'POST'
+          ? (await cardkit.addElementResult('card', element())).landed
+          : method === 'PUT'
+            ? (await cardkit.replaceElementResult('card', 'tool_19', element('done'))).landed
+            : await cardkit.patchSettingsChecked('card', { config: { streaming_mode: false } }, failure => failures.push(failure))
+        assert.equal(landed, false)
+        assert.equal(calls.length, prior === undefined ? 1 : 2)
+        assert.equal(new Set(calls.map(call => call.raw)).size, 1)
+        assert.ok(calls.every(call => call.method === method))
+        assert.equal(failures.length, 1)
+        assert.equal(failures[0].code, 200770)
+        assert.equal(failures[0].logId, 'unproven-consumption')
+        assert.equal(cardkit.getElementCount('card'), 1)
+        assert.deepEqual(delays, prior === undefined ? [] : [1000])
+        await cardkit.dispose('card')
+      }
+    }
+  `)
+})
+
+test('uncertain adds reconcile consumed UUIDs and reconfirm duplicate-ID replacements without inserting twice', async () => {
+  await runIsolated(`
+    for (const rejection of ['consumed', 'duplicate']) {
+      const failures = [], remote = new Map()
+      cardkit.recordCardCreated('card', 1, (_code, failure) => failures.push(failure))
+      calls.length = 0; delays.length = 0
+      respond = async call => {
+        if (calls.length === 1) {
+          assert.equal(call.method, 'POST')
+          remote.set('tool_19', JSON.parse(call.body.elements)[0])
+          return Response.json({ code: 300308, msg: 'Server Internal Error' })
+        }
+        if (calls.length === 2) {
+          assert.equal(call.raw, calls[0].raw)
+          return rejection === 'consumed'
+            ? Response.json({ code: 200770, msg: 'this UUID has been recently consumed' })
+            : Response.json({ code: 300315, msg: 'Duplicate ID; code: 300301' })
+        }
+        assert.equal(call.method, 'PUT', 'an uncertain add must reconcile the existing ID')
+        assert.equal(call.path, '/cards/card/elements/tool_19')
+        assert.equal(remote.has('tool_19'), true)
+        remote.set('tool_19', JSON.parse(call.body.element))
+        if (rejection === 'duplicate' && calls.length === 3) return Response.json({ code: 300308, msg: 'Server Internal Error' })
+        if (rejection === 'duplicate' && calls.length === 4) {
+          assert.equal(call.raw, calls[2].raw)
+          return Response.json({ code: 200770, msg: 'this UUID has been recently consumed' })
+        }
+        return Response.json({ code: 0 })
+      }
+      const expectedElement = element('latest result')
+      assert.deepEqual(await cardkit.addElementResult('card', expectedElement,
+        { type: 'insert_before', targetElementId: 'footer' }), { landed: true })
+      assert.deepEqual(calls.map(call => call.method), rejection === 'consumed'
+        ? ['POST', 'POST', 'PUT'] : ['POST', 'POST', 'PUT', 'PUT', 'PUT'])
+      assert.deepEqual(calls.map(call => call.body.sequence), rejection === 'consumed' ? [1, 1, 2] : [1, 1, 2, 2, 3])
+      assert.equal(new Set(calls.map(call => call.body.uuid)).size, rejection === 'consumed' ? 2 : 3)
+      assert.deepEqual(remote.get('tool_19'), expectedElement)
+      assert.equal(remote.size, 1)
+      assert.equal(cardkit.getElementCount('card'), 2)
+      assert.equal(cardkit.isDeadElement('card', 'tool_19'), false)
+      assert.deepEqual(cardkit.getWrittenContentElementIds('card'), ['tool_19'])
+      assert.deepEqual(failures, [])
+      assert.deepEqual(delays, rejection === 'consumed' ? [1000] : [1000, 1000])
+      await cardkit.dispose('card')
+    }
+  `)
+})
+
+test('an uncertain add with a consumed UUID is not counted when the authoritative replacement fails', async () => {
+  await runIsolated(`
+    const failures = []
+    cardkit.recordCardCreated('card', 1, (_code, failure) => failures.push(failure))
+    respond = async call => {
+      if (calls.length === 1) return Response.json({ code: 300308, msg: 'Server Internal Error' })
+      if (calls.length === 2) return Response.json({ code: 200770, msg: 'this UUID has been recently consumed' })
+      assert.equal(call.method, 'PUT')
+      return Response.json({ code: 300121, msg: 'element does not exist' },
+        { headers: { 'x-tt-logid': 'missing-after-consumption' } })
+    }
+    const result = await cardkit.addElementResult('card', element())
+    assert.equal(result.landed, false)
+    assert.equal(result.failure.code, 300121)
+    assert.equal(result.failure.logId, 'missing-after-consumption')
+    assert.deepEqual(calls.map(call => call.method), ['POST', 'POST', 'PUT'])
+    assert.equal(failures.length, 1)
+    assert.equal(failures[0], result.failure)
+    assert.equal(cardkit.getElementCount('card'), 1)
+    assert.equal(cardkit.isDeadElement('card', 'tool_19'), true)
+    assert.deepEqual(cardkit.getWrittenContentElementIds('card'), [])
+    await cardkit.dispose('card')
+  `)
+})
+
+test('an earlier uncertain add does not authorize a consumed UUID from a later request', async () => {
+  await runIsolated(`
+    cardkit.recordCardCreated('card', 1)
+    respond = async () => Response.json({ code: 300308, msg: 'Server Internal Error' })
+    assert.equal((await cardkit.addElementResult('card', element())).landed, false)
+    assert.equal(calls.length, 3)
+    calls.length = 0; delays.length = 0
+    respond = async () => Response.json({ code: 200770, msg: 'this UUID has been recently consumed' },
+      { headers: { 'x-tt-logid': 'later-request-consumption' } })
+    const result = await cardkit.addElementResult('card', element('latest result'))
+    assert.equal(result.landed, false)
+    assert.equal(result.failure.code, 200770)
+    assert.equal(result.failure.logId, 'later-request-consumption')
+    assert.equal(calls.length, 1, 'previous uncertainAdds state cannot authorize this request')
+    assert.equal(calls[0].method, 'POST')
+    assert.equal(cardkit.getElementCount('card'), 1)
+    assert.equal(cardkit.isDeadElement('card', 'tool_19'), true)
+    assert.deepEqual(delays, [])
+    await cardkit.dispose('card')
+  `)
+})
+
+test('an uncertain DELETE with a consumed UUID remains unconfirmed without changing the element count', async () => {
+  await runIsolated(`
+    const failures = []
+    cardkit.recordCardCreated('card', 2)
+    respond = async () => calls.length === 1
+      ? Response.json({ code: 300308, msg: 'Server Internal Error' })
+      : Response.json({ code: 200770, msg: 'this UUID has been recently consumed' },
+        { headers: { 'x-tt-logid': 'uncertain-delete' } })
+    assert.equal(await cardkit.deleteElementChecked('card', 'tool_19', failure => failures.push(failure)), false)
+    assert.equal(calls.length, 2)
+    assert.equal(calls[0].raw, calls[1].raw)
+    assert.equal(failures.length, 1)
+    assert.equal(failures[0].code, 200770)
+    assert.equal(failures[0].logId, 'uncertain-delete')
+    assert.equal(cardkit.getElementCount('card'), 2)
+    assert.equal(cardkit.isDeadElement('card', 'tool_19'), false)
+    await cardkit.dispose('card')
+  `)
+})
+
 test('card mutations retry known transport, gateway and rate-limit failures but reject permanent errors', async () => {
   await runIsolated(`
     cardkit.recordCardCreated('card', 1)
