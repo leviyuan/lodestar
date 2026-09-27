@@ -64,7 +64,7 @@ function harness(choices: Array<CodexAccountDecision | Promise<CodexAccountDecis
 }
 
 describe('Codex account process ownership and recovery', () => {
-  test('only actual current-turn usage consumes an unused-account priority', async () => {
+  test('only actual current-turn usage suppresses redundant background activation', async () => {
     const h = harness()
     await h.proc.initializationPromise()
     const child = h.children[0]

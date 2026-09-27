@@ -25,6 +25,7 @@ export interface CodexAccountCardView {
   page?: number
   scheduling?: { candidates: CodexAccountCandidate[]; ultra: boolean }
   resetUsage?: UsageSnapshot
+  activationErrors?: Record<string, string>
 }
 export const CODEX_ACCOUNTS_PAGE_SIZE = 4
 const PHASE = {
@@ -161,6 +162,9 @@ function accountRows(view: CodexAccountCardView): object[] {
     }
     row.push(accountUsageWindow(usage.weekly, '周'))
     if (usage.fiveHour) row.push(accountUsageWindow(usage.fiveHour, '5h'))
+    const activationError = view.activationErrors?.[entry.account.id]
+    if (activationError) row.push({ tag: 'collapsible_panel', expanded: false,
+      header: { title: { tag: 'plain_text', content: '后台激活 MISS' } }, elements: [md(text(activationError))] })
   }
   if (pages > 1) elements.push(muted(`${page}/${pages} 页 · ${page < pages ? `下一页 codex-accounts ${page + 1}` : '首页 codex-accounts'}`))
   return elements

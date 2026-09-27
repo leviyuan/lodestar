@@ -53,14 +53,19 @@ export class CodexAccountScheduler {
     stateFile: string
   }) {}
 
-  /** Called only for a current turn's real token usage, never when viewing or merely selecting an account. */
-  recordUsage(accountId: string, model: string): void {
-    const usage = this.deps.cachedUsage(accountId)
+  /** Real foreground or activation usage; never merely viewing/selecting an account. */
+  recordUsage(accountId: string, model: string, observed?: UsageSnapshot): void {
+    const usage = observed ?? this.deps.cachedUsage(accountId)
     // A manual launch may not have queried quota yet; its first read will observe the running window.
     if (usage?.state !== 'ok') return
     const identity = usage.accountFingerprint ?? this.deps.identity(accountId)
     if (!identity) return
     this.lastUses.set(JSON.stringify([identity, codexQuotaMeter(usage, model)]), this.deps.now())
+  }
+
+  weekWasUsed(identity: string, usage: Extract<UsageSnapshot, { state: 'ok' }>, model: string): boolean {
+    const usedAt = this.lastUses.get(JSON.stringify([identity, codexQuotaMeter(usage, model)]))
+    return usedAt !== undefined && codexWeekUsedSince(usage, model, usedAt)
   }
 
   private blocks(): Block[] {
@@ -150,9 +155,6 @@ export class CodexAccountScheduler {
       seen.set(identity, duplicateOf ?? account.name)
       if (duplicateOf) rank = { ...rank, state: 'miss', score: null, reason: `重复账号：${duplicateOf}` }
       const meter = usage?.state === 'ok' ? codexQuotaMeter(usage, opts.model) : null
-      const usedAt = this.lastUses.get(JSON.stringify([identity, meter]))
-      if (rank.priority === 'unused' && usage?.state === 'ok' && usedAt !== undefined
-        && codexWeekUsedSince(usage, opts.model, usedAt)) rank = { ...rank, priority: undefined }
       const block = blocks.find(b => (b.identity === identity || b.identity === `record:${account.id}`) && b.meter === meter)
       if (block && usage?.state === 'ok' && rank.state === 'ready') {
         const quota = codexModelQuota(usage, opts.model)

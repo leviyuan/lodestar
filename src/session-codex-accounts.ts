@@ -9,6 +9,7 @@ import { buildTokenSourcesFromConfig } from './token-source-builtins'
 import { removeCachedTokenSourceAccount } from './token-source-cache'
 import { aggregateCodexUsage, readAllCodexUsage, readCodexAccountEmails } from './codex-account-usage'
 import { codexAccountScheduler } from './codex-account-scheduler'
+import { codexActivation } from './codex-activation'
 import { CodexAccountCard } from './codex-account-card'
 import { codexAccountCard, type CodexAccountCardView } from './cards/codex-account'
 import { log } from './log'
@@ -120,6 +121,10 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
       })) : await readAllCodexUsage()
       if (catalogError) log(`codex-accounts: scheduling MISS: ${catalogError}`)
       await card.finish({ phase: 'accounts', total: await readCodexAccountEmails(total), currentId: accountId,
+        activationErrors: Object.fromEntries(total.entries.flatMap(entry => {
+          const error = codexActivation.error(entry.account.id)
+          return error ? [[entry.account.id, error]] : []
+        })),
         ...(codexAccounts.preferred(s.sessionName) ? { selectedId: codexAccounts.selected(s.sessionName) } : {}), page,
         ...(decision ? { scheduling: { candidates: decision.candidates, ultra: effort === 'ultra' } }
           : { message: '⚠️ 调度顺序 MISS：尚未确定 Codex 模型', details: catalogError,
@@ -130,13 +135,13 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
       if (argument) throw new Error('codex-auto 不需要备注')
       codexAccounts.selectAuto(s.sessionName)
       await card.finish({ phase: 'selected', name: '自动选择', current: codexAccounts.get(s.codexAccountId()).name,
-        selected: '自动 · 未使用 / 临期 / 评分', hint: 'Ultra：Pro 且周余量 ≥ 0.5 份' })
+        selected: '自动 · 临期 / 评分', hint: 'Ultra：Pro 且周余量 ≥ 0.5 份' })
       return
     }
     if (command === 'account') {
       if (!argument) {
         await card.finish({ phase: 'current', current: codexAccounts.get(s.codexAccountId()).name,
-          selected: codexAccounts.preferred(s.sessionName) === null ? '自动 · 未使用 / 临期 / 评分' : codexAccounts.get(codexAccounts.selected(s.sessionName)).name,
+          selected: codexAccounts.preferred(s.sessionName) === null ? '自动 · 临期 / 评分' : codexAccounts.get(codexAccounts.selected(s.sessionName)).name,
           hint: '周剩余份额 ÷（重置小时 − 5）· codex-auto' })
         return
       }

@@ -19,6 +19,7 @@
 
 import * as lark from '@larksuiteoapi/node-sdk'
 import { startBackgroundRefresh, stopBackgroundRefresh } from './src/background-refresh'
+import { codexActivation } from './src/codex-activation'
 import { refreshTokenSourceUsage } from './src/token-source-cache'
 import { pendingSourceCommands } from './src/session-commands'
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
@@ -122,6 +123,9 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
   if (shutdownPromise) return shutdownPromise
   shutdownRequested = true
   stopBackgroundRefresh()
+  const activationStopped = codexActivation.stop().then(
+    value => ({ status: 'fulfilled' as const, value }), reason => ({ status: 'rejected' as const, reason }),
+  )
   stopAgentAutoUpdates?.()
   // Seal both message and action admission synchronously before taking the
   // dynamic work snapshot. Already-admitted tails remain drainable.
@@ -158,7 +162,7 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
         const sessionResults = await Promise.allSettled(
           [...sessions.values()].map(session => session.stop(`daemon ${reason}`, { announce: false })),
         )
-        return [...agentResults, ...accountCardResults, ...sessionResults]
+        return [await activationStopped, ...agentResults, ...accountCardResults, ...sessionResults]
       })()
       let deadlineTimer: ReturnType<typeof setTimeout> | null = null
       const deadline = new Promise<'deadline'>(resolve => {
@@ -1270,6 +1274,7 @@ async function boot(): Promise<void> {
   await Promise.allSettled(listTokenSourceAccounts().map(refreshTokenSourceUsage))
   if (shutdownRequested) return
   startBackgroundRefresh()
+  codexActivation.start()
   feishu.loadTempSessionLeases()
   feishu.loadSessionChatMap()
   feishu.loadSessionResumeMap()

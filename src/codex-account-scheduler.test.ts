@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { checkCodexModelCompatibility, CodexAccountScheduler } from './codex-account-scheduler'
-import { compareCodexQuota, isCodexQuotaError, rankCodexQuota } from './codex-quota'
+import { compareCodexQuota, isCodexQuotaError, rankCodexQuota, unusedCodexWeek } from './codex-quota'
 import type { AgentReasoningEffort } from './agent-process'
 import type { TokenSource, TokenSourceModel } from './token-source'
 import type { UsageSnapshot } from './usage'
@@ -28,41 +28,43 @@ function harness(input: Record<string, UsageSnapshot>, cached: Record<string, Us
 }
 
 describe('weekly quota scheduling', () => {
-  test('an untouched complete week precedes expiring accounts, which precede numeric scores', async () => {
+  test('an untouched week uses normal scores; only expiring accounts take priority', async () => {
     const h = harness({ high: quota('pro', 0, 5.01), expiring: quota('pro', 99, 4), unused: quota('prolite', 0, 168) })
     const choice = await h.scheduler.choose({ model: 'model' })
-    expect(choice.selected?.account.id).toBe('unused')
-    expect(choice.candidates.slice().sort(compareCodexQuota).map(c => c.account.id)).toEqual(['unused', 'expiring', 'high'])
+    expect(choice.selected?.account.id).toBe('expiring')
+    expect(choice.candidates.slice().sort(compareCodexQuota).map(c => c.account.id)).toEqual(['expiring', 'high', 'unused'])
     expect(choice.candidates[1]).toMatchObject({ state: 'ready', priority: 'expiring', score: null, weeklyScore: null, hours: 4 })
-    expect(choice.candidates[2]).toMatchObject({ priority: 'unused' })
+    expect(choice.candidates[2].priority).toBeUndefined()
     expect(choice.candidates[2].score).toBeCloseTo(5 / 163)
     expect(choice.candidates[0].score).toBeCloseTo(20 / 0.01)
   })
-  test('unused priority requires an exact zero and a whole native week at observation time', () => {
+  test('activation requires an exact zero and a whole native week at observation time', () => {
     const full = quota('pro', 0, 168)
     full.fetchedAt += 999 // Native resetsAt only has second precision.
-    expect(rankCodexQuota(full, 'model', NOW + 1000).priority).toBe('unused')
+    expect(unusedCodexWeek(full, 'model')).toBe(true)
     for (const usage of [quota('pro', 0.001, 168), quota('pro', 0, 167.999), quota('pro', 0, 168.001)]) {
-      expect(rankCodexQuota(usage, 'model', NOW).priority).toBeUndefined()
+      expect(unusedCodexWeek(usage, 'model')).toBe(false)
     }
     full.weekly!.durationMins = null
-    expect(rankCodexQuota(full, 'model', NOW).priority).toBeUndefined()
+    expect(unusedCodexWeek(full, 'model')).toBe(false)
     full.weekly!.durationMins = 10080
     full.fetchedAt = NaN
-    expect(rankCodexQuota(full, 'model', NOW).priority).toBeUndefined()
+    expect(unusedCodexWeek(full, 'model')).toBe(false)
     full.readStartedAt = NOW
     full.fetchedAt = NOW + 5000
-    expect(rankCodexQuota(full, 'model', NOW + 5000).priority).toBe('unused')
+    expect(unusedCodexWeek(full, 'model')).toBe(true)
     full.readStartedAt = NOW + 1000
-    expect(rankCodexQuota(full, 'model', NOW + 5000).priority).toBeUndefined()
+    expect(unusedCodexWeek(full, 'model')).toBe(false)
   })
-  test('reading or choosing does not consume unused priority; actual use prevents stale-cache reuse', async () => {
+  test('only real usage suppresses activation; selection always keeps normal ordering', async () => {
     const input = { unused: quota('prolite', 0, 168), urgent: quota('pro', 99, 2) }
     const h = harness(input, input)
     for (const preferCachedUsage of [false, true, false]) {
-      expect((await h.scheduler.choose({ model: 'model', preferCachedUsage })).selected?.account.id).toBe('unused')
+      expect((await h.scheduler.choose({ model: 'model', preferCachedUsage })).selected?.account.id).toBe('urgent')
+      expect(h.scheduler.weekWasUsed('unused', input.unused, 'model')).toBe(false)
     }
     h.scheduler.recordUsage('unused', 'model')
+    expect(h.scheduler.weekWasUsed('unused', input.unused, 'model')).toBe(true)
     for (const preferCachedUsage of [true, false]) {
       const choice = await h.scheduler.choose({ model: 'model', preferCachedUsage })
       expect(choice.selected?.account.id).toBe('urgent')
@@ -73,7 +75,8 @@ describe('weekly quota scheduling', () => {
     const clock = spyOn((h.scheduler as any).deps, 'now').mockReturnValue(NOW + 60_000)
     expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('urgent')
     input.unused.weekly!.resetsAt = new Date(NOW + 60_000 + 168 * 3_600_000)
-    expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('unused')
+    expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('urgent')
+    expect(h.scheduler.weekWasUsed('unused', input.unused, 'model')).toBe(false)
     clock.mockRestore()
   })
   test('actual usage observations are shared by aliases but isolated by native quota meter and identity', async () => {
@@ -88,8 +91,10 @@ describe('weekly quota scheduling', () => {
     const main = await h.scheduler.choose({ model: 'model' })
     expect(main.candidates[0].priority).toBeUndefined()
     expect(main.candidates[1].priority).toBeUndefined()
-    expect(main.candidates[2].priority).toBe('unused')
-    expect((await h.scheduler.choose({ model: 'spark' })).candidates[0].priority).toBe('unused')
+    expect(main.candidates[2].priority).toBeUndefined()
+    expect(h.scheduler.weekWasUsed('shared', alias, 'model')).toBe(true)
+    expect(h.scheduler.weekWasUsed('different', other, 'model')).toBe(false)
+    expect(h.scheduler.weekWasUsed('shared', full, 'spark')).toBe(false)
   })
   test('last five hours are explicit priority, including Plus, with earliest reset first and no infinite score', async () => {
     const h = harness({ normal: quota('pro', 0, 5.001), five: quota('pro', 0, 5), two: quota('plus', 50, 2) })

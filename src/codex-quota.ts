@@ -43,7 +43,7 @@ export type CodexQuotaRank = {
   remaining: number | null
   hours: number | null
   /** Priority is independent of the hourly score; an expiring window has no positive scoring horizon. */
-  priority?: 'unused' | 'expiring'
+  priority?: 'expiring'
   weeklyScore?: number | null
   fiveHourRemaining?: number
   fiveHourHours?: number
@@ -75,7 +75,7 @@ export function compareCodexQuota(
   a: CodexQuotaRank & { account: { id: string } },
   b: CodexQuotaRank & { account: { id: string } },
 ): number {
-  const priority = (row: CodexQuotaRank) => row.priority === 'unused' ? 2 : row.priority === 'expiring' ? 1 : 0
+  const priority = (row: CodexQuotaRank) => row.priority === 'expiring' ? 1 : 0
   return priority(b) - priority(a)
     || (a.priority === 'expiring' ? a.hours! - b.hours! : b.score! - a.score!)
     || (b.availableNow ?? 0) - (a.availableNow ?? 0) || a.account.id.localeCompare(b.account.id)
@@ -113,9 +113,7 @@ export function rankCodexQuota(usage: UsageSnapshot, model: string, now = Date.n
     return { ...out, state: 'waiting', remaining, hours, weeklyScore,
       reason: `Ultra 至少需要 ${ULTRA_MIN_WEEKLY_SHARES} 份周余量`, retryAt: reset }
   }
-  // A formerly full cached window can now be near its recorded reset; it no longer describes a full week.
-  const priority = scoringHours <= 0 ? 'expiring' as const
-    : unusedCodexWeek(usage, model) ? 'unused' as const : undefined
+  const priority = scoringHours <= 0 ? 'expiring' as const : undefined
   if (usage.subscriptionType === 'plus') {
     const short = quota.fiveHour!
     const fiveHourRemaining = PLUS_FIVE_HOUR_SHARES * (100 - short.percent!) / 100

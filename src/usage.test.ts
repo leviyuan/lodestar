@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
 import { snapshotFromReadResponse, observeRateLimitsNotification, refreshUsageFromConnection, readUsage, readUsageForDisplay, peekUsage, peekSuccessfulUsage, captureCodexUsageCache, invalidateCodexUsage, requestCodexControlWithRetry } from './usage'
-import { rankCodexQuota } from './codex-quota'
+import { rankCodexQuota, unusedCodexWeek } from './codex-quota'
 
 let quotaNow: number
 let quotaClock: ReturnType<typeof spyOn>
@@ -23,7 +23,7 @@ describe('quota account isolation', () => {
       } } }
     }, account)
     expect(snapshot).toMatchObject({ readStartedAt: started, fetchedAt: started + 5000 })
-    expect(rankCodexQuota(snapshot!, 'model', quotaNow).priority).toBe('unused')
+    expect(snapshot?.state === 'ok' && unusedCodexWeek(snapshot, 'model')).toBe(true)
     invalidateCodexUsage(account)
   })
   test('invalid native percentages cannot become an apparently untouched week', () => {

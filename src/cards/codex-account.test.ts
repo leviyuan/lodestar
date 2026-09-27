@@ -53,15 +53,15 @@ describe('compact Codex account cards', () => {
     const panel = codexAccountPanel(view) as any
     const displayed = panel.elements.slice(0, 4)
     expect(displayed.map((row: any) => row.header.title.content.split('「')[0])).toEqual([
-      '#1·账号 1', '#2·账号 2', '#3·账号 4', '#4·账号 3',
+      '#1·账号 2', '#2·账号 4', '#3·账号 3', '#4·账号 1',
     ])
-    expect(displayed[1].header.title.content).toBe('#2·账号 2「临期优先」 · 重置 0')
-    expect(displayed[0].elements).toHaveLength(3)
-    expect(displayed[0].elements[0].content).toBe("<font color='grey'>邮箱：account-1@example.test</font>")
-    expect(displayed[0].elements[1].content).toBe("周　<font color='green'>▱▱▱▱▱▱</font>　0% <font color='grey'>「7.0d」</font>")
-    expect(displayed[0].elements[2].content).toBe("5h　<font color='green'>▱▱▱▱▱▱</font>　0% <font color='grey'>「2.0h」</font>")
-    expect(displayed[1].elements).toHaveLength(2)
-    expect(displayed[1].elements[1].content).toContain('「4.0h」') // Display the real reset time, not the scoring horizon.
+    expect(displayed[0].header.title.content).toBe('#1·账号 2「临期优先」 · 重置 0')
+    expect(displayed[3].elements).toHaveLength(3)
+    expect(displayed[3].elements[0].content).toBe("<font color='grey'>邮箱：account-1@example.test</font>")
+    expect(displayed[3].elements[1].content).toBe("周　<font color='green'>▱▱▱▱▱▱</font>　0% <font color='grey'>「7.0d」</font>")
+    expect(displayed[3].elements[2].content).toBe("5h　<font color='green'>▱▱▱▱▱▱</font>　0% <font color='grey'>「2.0h」</font>")
+    expect(displayed[0].elements).toHaveLength(2)
+    expect(displayed[0].elements[1].content).toContain('「4.0h」') // Display the real reset time, not the scoring horizon.
     expect(displayed.every((row: any) => row.expanded && row.vertical_spacing === '2px')).toBe(true)
     const next = codexAccountPanel({ ...view, page: 2 }) as any
     expect(next.elements[0].header.title.content).toStartWith('#5·账号 0「')
@@ -69,6 +69,22 @@ describe('compact Codex account cards', () => {
     expect(panel.elements.at(-1).expanded).toBe(false)
     expect(panel.elements.at(-1).header.title.content).toBe('⌨️ Codex 命令')
     expect(total.entries.map(row => row.account.id)).toEqual(['0', '1', '2', '3', '4'])
+  })
+  test('background activation errors are visible on the account without changing quota or ranking', () => {
+    const rows = [entry(0)]
+    if (rows[0].usage.state !== 'ok') throw new Error('fixture')
+    rows[0].usage.weekly!.resetsAt = new Date(Date.now() + 24 * 3600_000)
+    rows[0].usage.fiveHour!.resetsAt = new Date(Date.now() + 5 * 3600_000)
+    const total = aggregateCodexUsage(rows)
+    const candidates = rows.map(row => ({ ...row, identity: row.fingerprint!, ...rankCodexQuota(row.usage, 'model') }))
+    const view: CodexAccountCardView = { phase: 'accounts', total, scheduling: { candidates, ultra: false } }
+    const plain = codexAccountPanel(view) as any
+    const failed = codexAccountPanel({ ...view, activationErrors: { '0': 'request succeeded; refresh <failed>' } }) as any
+    expect(plain.elements[0].header.title.content).toStartWith('#1·')
+    expect(failed.elements[0].header).toEqual(plain.elements[0].header)
+    expect(failed.elements[0].elements.at(-1)).toMatchObject({ tag: 'collapsible_panel', expanded: false,
+      header: { title: { content: '后台激活 MISS' } } })
+    expect(JSON.stringify(failed)).toContain('request succeeded; refresh &#60;failed&#62;')
   })
   test('authorization is prominent and terminal cards remove the code and link', () => {
     const initial = JSON.stringify(codexAccountCard(waiting, true))
