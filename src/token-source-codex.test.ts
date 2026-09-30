@@ -42,7 +42,7 @@ test('Codex quota displays only main windows, regardless of model-specific bucke
   // Missing main quota stays MISS; auxiliary meters cannot stand in for it.
   const missing = codexUsageToUnified({ ...snapshot, fiveHour: null, weekly: null })
   expect(missing.windows).toEqual([])
-  expect(unifiedUsageSummary(missing)).toBe('额度 MISS')
+  expect(unifiedUsageSummary(missing)).toBe('额度 MISS · 积分 MISS')
   expect(snapshot.buckets).toHaveLength(3)
   expect(snapshot.buckets![0].fiveHour?.percent).toBe(11)
 })

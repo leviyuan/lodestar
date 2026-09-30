@@ -7,6 +7,7 @@ import type { AgentProvider, AgentReasoningEffort } from './agent-process'
 import type { TokenSourceConfig } from './config'
 import type { AccountInfo, Settings } from '@anthropic-ai/claude-agent-sdk'
 import type { CodexApiProvider } from './codex-process'
+import type { CodexCredits } from './codex-credits'
 import { log } from './log'
 import { codexAccounts } from './codex-accounts'
 
@@ -65,6 +66,8 @@ export interface UsageSnapshotUnified {
   retryAfterMs?: number
   /** Codex 账号可用的额度重置卡次数，仅在 hi 中展示。 */
   resetCredits?: number | null
+  /** Consumable Codex credits; omitted for sources without this concept. */
+  credits?: CodexCredits | null
 }
 
 // ── env helper(各 source 共享:scrub 残留凭据防 A 账号夹带 B 的 key) ─────

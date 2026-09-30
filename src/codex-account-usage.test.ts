@@ -4,10 +4,21 @@ import { codexAccountCard } from './cards/codex-account'
 
 function entry(id: string, short: number | null, weekly: number | null, fingerprint: string | null = id): CodexAccountUsage {
   return { account: { id, name: id }, fingerprint, usage: { state: 'ok', subscriptionType: 'pro',
+    credits: { hasCredits: false, unlimited: false, balance: 0 },
     fiveHour: { percent: short, resetsAt: new Date('2030-01-01'), durationMins: 300 },
     weekly: { percent: weekly, resetsAt: new Date('2030-01-07'), durationMins: 10080 }, resetCredits: 2, fetchedAt: 1 } }
 }
 describe('Codex account usage aggregation', () => {
+  test('available account counts include credits, deduplicate identities, and distinguish unknown from exhausted', () => {
+    const credit = entry('credit', 100, 100)
+    if (credit.usage.state !== 'ok') throw new Error('fixture')
+    credit.usage.credits = { hasCredits: true, unlimited: false, balance: 62500 }
+    const alias = { ...credit, account: { id: 'alias', name: 'alias' } }
+    const other = entry('other', 100, 100)
+    expect(aggregateCodexUsage([credit, alias, other]).available).toBe(1)
+    expect(aggregateCodexUsage([{ ...credit, usage: { ...credit.usage, spendControlReached: true } }]).available).toBe(0)
+    expect(aggregateCodexUsage([{ ...credit, usage: { ...credit.usage, credits: null } }]).available).toBeNull()
+  })
   test('account inspection reads each native email even when quota identities are duplicated', async () => {
     const rows = [entry('default', 20, 40, 'same'), entry('named', 20, 40, 'same')]
     rows[0].account.name = '默认'

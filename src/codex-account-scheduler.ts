@@ -7,6 +7,7 @@ import type { AgentReasoningEffort } from './agent-process'
 import { CODEX_QUOTA_BLOCKS_FILE } from './paths'
 import { writeJsonStateAtomic } from './state-store'
 import { log } from './log'
+import { codexCreditsReplenished, parseCodexCredits, type CodexCredits } from './codex-credits'
 
 export interface CodexAccountCandidate extends CodexQuotaRank {
   account: CodexAccount
@@ -24,6 +25,8 @@ interface Block {
   identity: string
   meter: string
   blockedAt?: number
+  credits?: CodexCredits | null
+  creditsObservedAt?: number
   windows: Array<{ kind: 'fiveHour' | 'weekly'; percent: number | null; reset: number | null }>
 }
 export interface CodexSelectionOptions {
@@ -73,6 +76,9 @@ export class CodexAccountScheduler {
     const data = JSON.parse(readFileSync(this.deps.stateFile, 'utf8'))
     if (data?.version !== 1 || !Array.isArray(data.blocks) || data.blocks.some((b: any) =>
       typeof b?.key !== 'string' || typeof b?.identity !== 'string' || typeof b?.meter !== 'string' || !Array.isArray(b?.windows)
+      || (b.credits != null && (!parseCodexCredits(b.credits)
+        || (b.credits.balance !== null && !Number.isFinite(b.credits.balance))))
+      || (b.creditsObservedAt !== undefined && !Number.isFinite(b.creditsObservedAt))
       || b.windows.some((w: any) => !['fiveHour', 'weekly'].includes(w?.kind)
         || (w.percent !== null && !Number.isFinite(w.percent)) || (w.reset !== null && !Number.isFinite(w.reset))))) {
       throw new Error('Codex 额度耗尽记录格式无效')
@@ -90,7 +96,7 @@ export class CodexAccountScheduler {
     const meter = codexQuotaMeter(candidate.usage, model)
     const key = JSON.stringify([candidate.identity, meter])
     const blocks = this.blocks().filter(b => b.key !== key)
-    blocks.push({ key, identity: candidate.identity, meter, windows, blockedAt: this.deps.now() })
+    blocks.push({ key, identity: candidate.identity, meter, windows, credits: quota?.credits ?? null, blockedAt: this.deps.now() })
     writeJsonStateAtomic(this.deps.stateFile, { version: 1, blocks })
   }
 
@@ -147,6 +153,7 @@ export class CodexAccountScheduler {
     const blocks = this.blocks()
     const now = this.deps.now()
     const recovered = new Set<string>()
+    const observations = new Map<string, Block>()
     const seen = new Map<string, string>()
     const candidates = rows.map(({ account, usage, identity, reason }): CodexAccountCandidate => {
       let rank = rankCodexQuota(usage ?? { state: 'network', reason: '尚无额度缓存' }, opts.model, now, opts.effort)
@@ -156,26 +163,39 @@ export class CodexAccountScheduler {
       if (duplicateOf) rank = { ...rank, state: 'miss', score: null, reason: `重复账号：${duplicateOf}` }
       const meter = usage?.state === 'ok' ? codexQuotaMeter(usage, opts.model) : null
       const block = blocks.find(b => (b.identity === identity || b.identity === `record:${account.id}`) && b.meter === meter)
-      if (block && usage?.state === 'ok' && rank.state === 'ready') {
+      if (block && usage?.state === 'ok' && !duplicateOf) {
         const quota = codexModelQuota(usage, opts.model)
         // Cached observations may predate the native failure; only a fresh read can clear it.
-        const resetObserved = (usage.readStartedAt ?? usage.fetchedAt) > (block.blockedAt ?? 0) && block.windows.some(old => {
+        const readAt = usage.readStartedAt ?? usage.fetchedAt
+        const fresh = readAt > (block.blockedAt ?? 0)
+        const freshCredits = fresh && readAt > (block.creditsObservedAt ?? 0)
+        const replenished = freshCredits && codexCreditsReplenished(block.credits, quota.credits)
+        const resetObserved = fresh && rank.funding !== 'credits' && block.windows.some(old => {
           const w = quota[old.kind]
           return w && w.percent !== null && ((old.percent !== null && w.percent < old.percent)
             || (old.reset !== null && old.reset <= now && (w.resetsAt?.getTime() ?? 0) > old.reset))
         })
-        if (resetObserved) recovered.add(block.key)
-        else rank = { ...rank, state: 'exhausted', score: null, reason: '上次请求已确认额度耗尽，等待接口确认恢复' }
+        if (rank.state === 'ready') {
+          if (resetObserved || replenished) recovered.add(block.key)
+          else rank = { ...rank, state: 'exhausted', score: null, reason: '上次请求已确认额度耗尽，等待接口确认恢复' }
+        }
+        // Observe an actually depleted balance before a later, possibly smaller replenishment.
+        // Unknown credit data never erases the last observation or becomes a zero baseline.
+        if (!recovered.has(block.key) && freshCredits && !replenished && quota.credits != null) {
+          observations.set(block.key, { ...block, credits: quota.credits, creditsObservedAt: readAt })
+        }
       }
       return { account, usage, identity, ...rank, ...(duplicateOf ? { duplicateOf } : {}) }
     })
-    if (recovered.size) writeJsonStateAtomic(this.deps.stateFile, { version: 1, blocks: blocks.filter(b => !recovered.has(b.key)) })
+    if (recovered.size || observations.size) writeJsonStateAtomic(this.deps.stateFile, {
+      version: 1, blocks: blocks.filter(b => !recovered.has(b.key)).map(b => observations.get(b.key) ?? b),
+    })
     const ready = candidates.filter(c => c.state === 'ready')
     ready.sort(compareCodexQuota)
     const selected = ready[0] ?? null
     const exhausted = candidates.filter(c => c.state === 'exhausted' || c.state === 'waiting')
     const retryAt = exhausted.length ? Math.min(...exhausted.map(c => c.retryAt ?? now + 60_000)) : undefined
-    for (const c of candidates) log(`codex scheduler${cached ? ' [cache]' : ''}: ${c.account.name} ${c.state} priority=${c.priority ?? 'score'} score=${c.score ?? (c.priority === 'expiring' ? 'N/A' : 'MISS')}${c.reason ? ` (${c.reason})` : ''}`)
+    for (const c of candidates) log(`codex scheduler${cached ? ' [cache]' : ''}: ${c.account.name} ${c.state} priority=${c.funding ?? c.priority ?? 'score'} score=${c.score ?? (c.funding === 'credits' || c.priority === 'expiring' ? 'N/A' : 'MISS')}${c.reason ? ` (${c.reason})` : ''}`)
     return { selected, candidates, ...(retryAt !== undefined ? { retryAt } : {}) }
   }
 }

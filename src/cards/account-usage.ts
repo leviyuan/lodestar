@@ -1,6 +1,6 @@
 import type { AccountUsage } from '../account-usage'
 import type { UsageSnapshotUnified, UsageWindowUnified } from '../token-source'
-import { fmtResetIn } from './usage'
+import { codexCreditsSummary, fmtResetIn } from './usage'
 
 function escape(value: string): string {
   return value.replace(/[\r\n]+/g, ' ').replace(/[&<>\\`*_\[\]~]/g, char => `&#${char.charCodeAt(0)};`)
@@ -44,6 +44,8 @@ export function compactAccountUsage(snapshot: UsageSnapshotUnified | undefined):
     : `额度 ${money(snapshot.quota.remaining, snapshot.quota.currency)} / ${money(snapshot.quota.limit, snapshot.quota.currency)}`
   const parts = snapshot.windows.map(windowContent)
   if (!parts.length) parts.push('额度 MISS')
+  const credits = snapshot.credits !== undefined ? codexCreditsSummary(snapshot.credits) : null
+  if (credits) parts.push(credits)
   if (snapshot.resetCredits !== undefined) parts.push(`重置 ${snapshot.resetCredits === null ? 'MISS' : snapshot.resetCredits}`)
   return parts.join(' · ')
 }

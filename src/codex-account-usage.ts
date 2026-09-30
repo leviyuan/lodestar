@@ -2,6 +2,7 @@ import { codexAccounts, type CodexAccount } from './codex-accounts'
 import { AppServerOnce, readUsageForDisplay, requestCodexControlWithRetry, type UsageSnapshot, type UsageWindow } from './usage'
 import { log } from './log'
 import { peekCodexAccountEmail } from './codex-account-info'
+import { codexCreditAvailability } from './codex-credits'
 
 export interface CodexAccountUsage {
   account: CodexAccount
@@ -32,8 +33,15 @@ export function aggregateCodexUsage(input: CodexAccountUsage[]): CodexUsageTotal
   const identityKnown = distinct.length <= 1 || distinct.every(entry => entry.fingerprint !== null)
   const complete = identityKnown && distinct.every(entry => entry.usage.state === 'ok')
   const snapshots = distinct.flatMap(entry => entry.usage.state === 'ok' ? [entry.usage] : [])
-  const available = complete && snapshots.every(s => [s.fiveHour, s.weekly].filter(Boolean).every(w => w!.percent !== null))
-    ? snapshots.filter(s => [s.fiveHour, s.weekly].filter(Boolean).every(w => w!.percent! < 100)).length : null
+  const availability = snapshots.map(s => {
+    if (s.ordinaryUsageAllowed === false || s.rateLimitReachedType || s.spendControlReached) return false
+    const windows = [s.fiveHour, s.weekly].filter((w): w is UsageWindow => w !== null)
+    if (!windows.length || windows.some(w => w.percent === null || !Number.isFinite(w.percent) || w.percent < 0 || w.percent > 100)) return null
+    if (windows.every(w => w.percent! < 100)) return true
+    const credits = codexCreditAvailability(s.credits)
+    return credits === 'unknown' ? null : credits === 'available'
+  })
+  const available = complete && availability.every(value => value !== null) ? availability.filter(Boolean).length : null
   const resetCredits = complete && snapshots.every(s => s.resetCredits != null)
     ? snapshots.reduce((sum, s) => sum + s.resetCredits!, 0) : null
   const windows = (['fiveHour', 'weekly'] as const).map(kind => {

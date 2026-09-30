@@ -13,6 +13,7 @@ const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
 function quota(plan: string, used = 0, hours = 24): Extract<UsageSnapshot, { state: 'ok' }> {
   return { state: 'ok', subscriptionType: plan, fiveHour: null,
+    credits: { hasCredits: false, unlimited: false, balance: 0 },
     weekly: { percent: used, resetsAt: new Date(NOW + hours * 3_600_000), durationMins: 10080 }, fetchedAt: NOW }
 }
 function harness(input: Record<string, UsageSnapshot>, cached: Record<string, UsageSnapshot> = {}) {
@@ -28,6 +29,112 @@ function harness(input: Record<string, UsageSnapshot>, cached: Record<string, Us
 }
 
 describe('weekly quota scheduling', () => {
+  test('exhausted subscription windows remain selectable with consumable credits, including Plus short windows', () => {
+    const credits = { hasCredits: true, unlimited: false, balance: 62500 }
+    for (const plan of ['plus', 'prolite', 'pro']) {
+      const usage = { ...quota(plan, 100), credits }
+      expect(rankCodexQuota(usage, 'model', NOW)).toMatchObject({ state: 'ready', funding: 'credits', score: null, credits })
+      expect(rankCodexQuota({ ...usage, credits: null }, 'model', NOW)).toMatchObject({ state: 'miss', reason: '订阅额度已用完，积分 MISS' })
+      expect(rankCodexQuota(quota(plan, 100), 'model', NOW).state).toBe('exhausted')
+    }
+    const plus = { ...quota('plus', 20), credits, fiveHour: { percent: 100, resetsAt: new Date(NOW + 3600_000) } }
+    expect(rankCodexQuota(plus, 'model', NOW)).toMatchObject({ state: 'ready', funding: 'credits' })
+    expect(rankCodexQuota({ ...plus, fiveHour: { percent: null, resetsAt: null } }, 'model', NOW).state).toBe('miss')
+  })
+  test('subscription allowance precedes credits; credit-only accounts rank by balance, with stable ties', async () => {
+    const credited = (balance: number | null, hours = 24) => ({ ...quota('pro', 100, hours),
+      credits: { hasCredits: true, unlimited: false, balance } })
+    const h = harness({ low: credited(10, 1), high: credited(62500), same: credited(62500),
+      unknownBalance: credited(null), subscription: quota('plus', 99, 100),
+      unlimited: { ...credited(null), credits: { hasCredits: true, unlimited: true, balance: null } } })
+    const choice = await h.scheduler.choose({ model: 'model' })
+    expect(choice.selected?.account.id).toBe('subscription')
+    expect(choice.candidates.slice().sort(compareCodexQuota).map(c => c.account.id))
+      .toEqual(['subscription', 'unlimited', 'high', 'same', 'low', 'unknownBalance'])
+    h.input.subscription = quota('plus', 100)
+    expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('unlimited')
+  })
+  test('credits lift only the Pro Ultra weekly reserve gate, never plan, model or upstream restrictions', async () => {
+    const credits = { hasCredits: true, unlimited: false, balance: 100 }
+    for (const plan of ['prolite', 'pro']) {
+      expect(rankCodexQuota({ ...quota(plan, 99.9), credits }, 'model', NOW, 'ultra').state).toBe('ready')
+      expect(rankCodexQuota({ ...quota(plan, 100), credits }, 'model', NOW, 'ultra').state).toBe('ready')
+      expect(rankCodexQuota(quota(plan, 99.9), 'model', NOW, 'ultra').state).toBe('waiting')
+      expect(rankCodexQuota({ ...quota(plan, 99.9), credits: null }, 'model', NOW, 'ultra').state).toBe('miss')
+    }
+    expect(rankCodexQuota({ ...quota('plus'), credits }, 'model', NOW, 'ultra').state).toBe('excluded')
+    for (const restriction of [{ ordinaryUsageAllowed: false }, { spendControlReached: true }, { rateLimitReachedType: 'rate_limit_reached' }]) {
+      expect(rankCodexQuota({ ...quota('pro', 100), credits, ...restriction }, 'model', NOW).state).toBe('exhausted')
+    }
+    const h = harness({ pro: { ...quota('pro', 100), credits } })
+    h.unavailable.set('pro', 'model unavailable')
+    expect((await h.scheduler.choose({ model: 'model' })).selected).toBeNull()
+  })
+  test('consumable credits stay on their native meter and cannot unblock a separate model quota', () => {
+    const usage = { ...quota('pro', 100), credits: { hasCredits: true, unlimited: false, balance: 100 },
+      buckets: [{ limitId: 'spark', limitName: 'spark', fiveHour: null, weekly: quota('pro', 100).weekly,
+        credits: { hasCredits: false, unlimited: false, balance: 0 } }] }
+    expect(rankCodexQuota(usage, 'model', NOW).state).toBe('ready')
+    expect(rankCodexQuota(usage, 'spark', NOW).state).toBe('exhausted')
+    usage.buckets[0].credits = { hasCredits: true, unlimited: false, balance: 200 }
+    usage.credits = { hasCredits: false, unlimited: false, balance: 0 }
+    expect(rankCodexQuota(usage, 'model', NOW).state).toBe('exhausted')
+    expect(rankCodexQuota(usage, 'spark', NOW)).toMatchObject({ state: 'ready', credits: { balance: 200 } })
+  })
+  test('native credit exhaustion persists across scheduler instances; stale and unchanged positive balances cannot clear it', async () => {
+    const original = { ...quota('pro', 100), credits: { hasCredits: true, unlimited: false, balance: 1000 } }
+    const h = harness({ pro: original }, { pro: original })
+    h.scheduler.block((await h.scheduler.choose({ model: 'model' })).selected!, 'model')
+    const restarted = new CodexAccountScheduler((h.scheduler as any).deps)
+    for (const readStartedAt of [NOW - 1, NOW + 1]) {
+      h.input.pro = { ...original, readStartedAt, fetchedAt: NOW + 2 }
+      expect((await restarted.choose({ model: 'model', preferCachedUsage: true })).selected).toBeNull()
+    }
+    h.input.pro = { ...original, credits: { hasCredits: false, unlimited: false, balance: 0 }, readStartedAt: NOW + 3 }
+    expect((await restarted.choose({ model: 'model' })).selected).toBeNull()
+    // An older read cannot restore the original positive balance after depletion was observed.
+    h.input.pro = { ...original, readStartedAt: NOW + 2 }
+    expect((await restarted.choose({ model: 'model' })).selected).toBeNull()
+    h.input.pro = { ...original, credits: { hasCredits: true, unlimited: false, balance: 50 }, readStartedAt: NOW + 4 }
+    expect((await restarted.choose({ model: 'model' })).selected?.account.id).toBe('pro')
+    expect(JSON.parse(readFileSync(h.stateFile, 'utf8')).blocks).toEqual([])
+  })
+  test('fresh credit replenishment restores selection, but unknown credit data and partial window resets do not', async () => {
+    const original = { ...quota('pro', 100), credits: { hasCredits: true, unlimited: false, balance: 100 },
+      fiveHour: { percent: 100, resetsAt: new Date(NOW + 3600_000) } }
+    const h = harness({ pro: original })
+    h.scheduler.block((await h.scheduler.choose({ model: 'model' })).selected!, 'model')
+    h.input.pro = { ...original, credits: null, readStartedAt: NOW + 1 }
+    expect((await h.scheduler.choose({ model: 'model' })).selected).toBeNull()
+    h.input.pro = { ...original, fiveHour: { ...original.fiveHour, percent: 0 }, readStartedAt: NOW + 2 }
+    expect((await h.scheduler.choose({ model: 'model' })).selected).toBeNull()
+    h.input.pro = { ...original, credits: { ...original.credits, balance: 101 }, readStartedAt: NOW + 3 }
+    expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('pro')
+  })
+  test('legacy exhaustion records gain a credit baseline without treating the first positive balance as recovery', async () => {
+    const usage = { ...quota('pro', 100), credits: { hasCredits: true, unlimited: false, balance: 100 } }
+    const h = harness({ pro: usage })
+    h.scheduler.block((await h.scheduler.choose({ model: 'model' })).selected!, 'model')
+    const saved = JSON.parse(readFileSync(h.stateFile, 'utf8'))
+    delete saved.blocks[0].credits
+    writeFileSync(h.stateFile, JSON.stringify(saved))
+    h.input.pro = { ...usage, readStartedAt: NOW + 1 }
+    expect((await h.scheduler.choose({ model: 'model' })).selected).toBeNull()
+    expect(JSON.parse(readFileSync(h.stateFile, 'utf8')).blocks[0].credits.balance).toBe(100)
+    h.input.pro = { ...usage, weekly: quota('pro', 0, 168).weekly, readStartedAt: NOW + 2 }
+    expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('pro')
+  })
+  test('duplicate account aliases cannot replace the authoritative credit observation and manufacture recovery', async () => {
+    const usage = { ...quota('pro', 100), accountFingerprint: 'same', credits: { hasCredits: true, unlimited: false, balance: 100 } }
+    const h = harness({ original: usage, alias: usage })
+    h.scheduler.block((await h.scheduler.choose({ model: 'model' })).selected!, 'model')
+    h.input.original = { ...usage, readStartedAt: NOW + 1 }
+    h.input.alias = { ...usage, credits: { hasCredits: false, unlimited: false, balance: 0 }, readStartedAt: NOW + 2 }
+    expect((await h.scheduler.choose({ model: 'model' })).selected).toBeNull()
+    expect(JSON.parse(readFileSync(h.stateFile, 'utf8')).blocks[0].credits.balance).toBe(100)
+    h.input.original = { ...usage, readStartedAt: NOW + 3 }
+    expect((await h.scheduler.choose({ model: 'model' })).selected).toBeNull()
+  })
   test('an untouched week uses normal scores; only expiring accounts take priority', async () => {
     const h = harness({ high: quota('pro', 0, 5.01), expiring: quota('pro', 99, 4), unused: quota('prolite', 0, 168) })
     const choice = await h.scheduler.choose({ model: 'model' })
@@ -251,7 +358,7 @@ describe('weekly quota scheduling', () => {
   test('Spark quota does not exhaust ordinary models; the requested meter is authoritative', () => {
     const usage = quota('pro')
     usage.buckets = [{ limitId: 'codex_bengalfox', limitName: 'GPT-5.3-Codex-Spark',
-      fiveHour: { percent: 100, resetsAt: new Date(NOW + 3600_000) }, weekly: usage.weekly }]
+      fiveHour: { percent: 100, resetsAt: new Date(NOW + 3600_000) }, weekly: usage.weekly, credits: usage.credits }]
     expect(rankCodexQuota(usage, 'gpt-6-astra', NOW).state).toBe('ready')
     expect(rankCodexQuota(usage, 'gpt-5.3-codex-spark', NOW).state).toBe('exhausted')
   })

@@ -4711,6 +4711,7 @@ describe('Session usage cache cross-backend isolation', () => {
       await refreshUsageFromConnection(async () => ({ rateLimits: {
         primary: { usedPercent: 12, windowDurationMins: 300 },
         secondary: { usedPercent: 34, windowDurationMins: 10080 },
+        credits: { hasCredits: true, unlimited: false, balance: '62500' },
       } }), accountId)
       quotaNow += 60_000
       await refreshUsageFromConnection(async () => { throw new Error('quota read failed') }, accountId)
@@ -4720,6 +4721,7 @@ describe('Session usage cache cross-backend isolation', () => {
       const footer = calls.find(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
       const content = JSON.parse(footer?.body.element ?? '{}').content as string
       expect(content).toContain('12%·[34%]')
+      expect(content).toContain('积分 62,500')
       expect(content).not.toContain('缓存')
       expect(content).not.toContain('刷新失败')
       expect(content).not.toContain('MISS')

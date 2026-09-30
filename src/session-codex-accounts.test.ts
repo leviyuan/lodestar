@@ -343,12 +343,13 @@ describe('bare Codex account commands', () => {
     let reads = 0
     proc.readRateLimits = async () => {
       reads++
-      return { rateLimits: { primary: { usedPercent: 11, windowDurationMins: 300 }, secondary: { usedPercent: 23, windowDurationMins: 10080 } } }
+      return { rateLimits: { primary: { usedPercent: 11, windowDurationMins: 300 }, secondary: { usedPercent: 23, windowDurationMins: 10080 },
+        credits: { hasCredits: true, unlimited: false, balance: '62500' } } }
     }
     await refreshUsageFromConnection(() => proc.readRateLimits(), 'default')
     reads = 0
     const suffix = await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)
-    expect(suffix).toBe('  |  11%·[23%]')
+    expect(suffix).toBe('  |  11%·[23%] · 积分 62,500')
     expect(reads).toBe(0)
     expect(s.codexAccountId()).toBe('default')
     expect(suffix).not.toContain('账号')
@@ -366,19 +367,20 @@ describe('bare Codex account commands', () => {
     const response = (percent: number) => ({ rateLimits: {
       primary: { usedPercent: percent, windowDurationMins: 300 },
       secondary: { usedPercent: 23, windowDurationMins: 10080 },
+      credits: { hasCredits: true, unlimited: false, balance: String(100 - percent) },
     } })
     const cached = await refreshUsageFromConnection(async () => response(11), account.id)
     await refreshUsageFromConnection(async () => response(99), next.id)
     let reads = 0
     proc.readRateLimits = async () => { reads++; throw new Error('quota read failed') }
     try {
-      expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)).toBe('  |  11%·[23%]')
+      expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)).toBe('  |  11%·[23%] · 积分 89')
       expect(reads).toBe(0)
       quotaNow += 60_000
       await refreshUsageFromConnection(() => proc.readRateLimits(), account.id)
       for (let attempt = 0; attempt < 2; attempt++) {
         const suffix = await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)
-        expect(suffix).toBe('  |  11%·[23%]')
+        expect(suffix).toBe('  |  11%·[23%] · 积分 89')
         expect(peekUsage(account.id)?.state).toBe('ok')
         expect(cached).toBe(peekSuccessfulUsage(account.id))
       }
@@ -387,7 +389,7 @@ describe('bare Codex account commands', () => {
       quotaNow += 60_000
       await refreshUsageFromConnection(() => proc.readRateLimits(), account.id)
       expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null))
-        .toBe('  |  15%·[23%]')
+        .toBe('  |  15%·[23%] · 积分 85')
     } finally {
       usageModule.invalidateCodexUsage(account.id)
       usageModule.invalidateCodexUsage(next.id)
@@ -416,7 +418,7 @@ describe('bare Codex account commands', () => {
       } })
       quotaNow += 60_000
       await refreshUsageFromConnection(() => proc.readRateLimits(), account.id)
-      expect(await read()).toBe('  |  MISS')
+      expect(await read()).toBe('  |  MISS · 积分 MISS')
     } finally { usageModule.invalidateCodexUsage(account.id) }
   })
 
@@ -431,11 +433,16 @@ describe('bare Codex account commands', () => {
     try {
       await refreshUsageFromConnection(async () => ({ rateLimits: {
         primary: { usedPercent: 11, windowDurationMins: 300 },
+        credits: { hasCredits: true, unlimited: false, balance: '50' },
       } }), account.id)
       const cache = usageModule.captureCodexUsageCache(account.id)
+      await refreshUsageFromConnection(async () => ({ rateLimits: {
+        primary: { usedPercent: 99, windowDurationMins: 300 },
+        credits: { hasCredits: true, unlimited: false, balance: '9000' },
+      } }), next.id)
       bindProcessCodexAccount(proc, next.id)
       expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), cache))
-        .toBe('  |  11%')
+        .toBe('  |  11% · 积分 50')
       expect(reads).toBe(0)
       usageModule.invalidateCodexUsage(account.id)
       expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), cache))
@@ -448,18 +455,20 @@ describe('bare Codex account commands', () => {
     const s = session()
     const proc = new Proc() as any; procs.push(proc)
     bindProcessCodexAccount(proc, account.id); s.proc = proc
-    const response = { rateLimits: { primary: { usedPercent: 11, windowDurationMins: 300 } } }
+    const response = { rateLimits: { primary: { usedPercent: 11, windowDurationMins: 300 },
+      credits: { hasCredits: true, unlimited: false, balance: '50' } } }
     await refreshUsageFromConnection(async () => response, account.id)
     quotaNow += 60_000
     let release!: (value: any) => void
     proc.readRateLimits = () => new Promise(resolve => { release = resolve })
     const pending = refreshUsageFromConnection(() => proc.readRateLimits(), account.id)
     await Promise.resolve()
-    expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)).toBe('  |  11%')
+    expect(await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)).toBe('  |  11% · 积分 50')
     try {
       usageModule.invalidateCodexUsage(account.id)
       await refreshUsageFromConnection(async () => ({ rateLimits: {
         primary: { usedPercent: 0, windowDurationMins: 300 },
+        credits: { hasCredits: false, unlimited: false, balance: '0' },
       } }), account.id)
       release(response)
       expect(await pending).toBeNull()

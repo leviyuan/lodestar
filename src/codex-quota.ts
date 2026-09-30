@@ -1,5 +1,6 @@
 import type { UsageSnapshot, UsageWindow } from './usage'
 import type { AgentReasoningEffort } from './agent-process'
+import { codexCreditAvailability, type CodexCredits } from './codex-credits'
 
 export const PLUS_FIVE_HOUR_SHARES = 0.15
 export const ULTRA_MIN_WEEKLY_SHARES = 0.5
@@ -48,6 +49,9 @@ export type CodexQuotaRank = {
   fiveHourRemaining?: number
   fiveHourHours?: number
   availableNow?: number
+  /** Credit-only candidates follow all accounts with usable subscription allowance. */
+  funding?: 'credits'
+  credits?: CodexCredits
   reason?: string
   retryAt?: number
 }
@@ -75,6 +79,15 @@ export function compareCodexQuota(
   a: CodexQuotaRank & { account: { id: string } },
   b: CodexQuotaRank & { account: { id: string } },
 ): number {
+  const creditOrder = Number(a.funding === 'credits') - Number(b.funding === 'credits')
+  if (creditOrder) return creditOrder
+  if (a.funding === 'credits' && b.funding === 'credits') {
+    const ac = a.credits!, bc = b.credits!
+    return Number(bc.unlimited) - Number(ac.unlimited)
+      || Number(ac.balance === null) - Number(bc.balance === null)
+      || (ac.balance !== null && bc.balance !== null ? bc.balance - ac.balance : 0)
+      || a.account.id.localeCompare(b.account.id)
+  }
   const priority = (row: CodexQuotaRank) => row.priority === 'expiring' ? 1 : 0
   return priority(b) - priority(a)
     || (a.priority === 'expiring' ? a.hours! - b.hours! : b.score! - a.score!)
@@ -93,13 +106,23 @@ export function rankCodexQuota(usage: UsageSnapshot, model: string, now = Date.n
   const quota = codexModelQuota(usage, model)
   const windows = [quota.fiveHour, quota.weekly].filter((w): w is UsageWindow => w !== null)
   const exhausted = windows.filter(w => w.percent !== null && w.percent >= 100)
-  if (exhausted.length || usage.ordinaryUsageAllowed === false || quota.rateLimitReachedType || quota.spendControlReached === true) {
+  const credits = codexCreditAvailability(quota.credits)
+  // A credit balance cannot override an explicit upstream refusal or spending restriction.
+  const denied = usage.ordinaryUsageAllowed === false || quota.rateLimitReachedType || quota.spendControlReached === true
+  if (denied || (exhausted.length && credits === 'empty')) {
     // All exhausted windows must reset before this account is usable.
     const resets = exhausted.map(w => w.resetsAt?.getTime()).filter((t): t is number => t != null && Number.isFinite(t) && t > now)
-    return { ...out, state: 'exhausted', reason: '额度耗尽',
+    const reason = quota.spendControlReached === true ? '已达到上游消费限制'
+      : usage.ordinaryUsageAllowed === false ? '上游暂不允许使用'
+      : quota.rateLimitReachedType ? `上游额度限制：${quota.rateLimitReachedType}` : '额度耗尽'
+    return { ...out, state: 'exhausted', reason,
       ...(resets.length === exhausted.length && resets.length ? { retryAt: Math.max(...resets) } : {}) }
   }
-  if (windows.some(w => w.percent === null || !Number.isFinite(w.percent) || w.percent < 0)) return { ...out, reason: '额度百分比 MISS' }
+  if (windows.some(w => w.percent === null || !Number.isFinite(w.percent) || w.percent < 0 || w.percent > 100)) return { ...out, reason: '额度百分比 MISS' }
+  if (exhausted.length) {
+    if (credits === 'unknown') return { ...out, reason: '订阅额度已用完，积分 MISS' }
+    return { ...out, state: 'ready', funding: 'credits', credits: quota.credits! }
+  }
   const weekly = quota.weekly
   if (!weekly || weekly.percent === null) return { ...out, reason: '周额度 MISS' }
   // A stale/resetting window is not an infinite score or a fabricated new allowance.
@@ -109,7 +132,8 @@ export function rankCodexQuota(usage: UsageSnapshot, model: string, now = Date.n
   const hours = (reset - now) / 3_600_000
   const scoringHours = hours - WEEKLY_EARLY_FINISH_HOURS
   const weeklyScore = scoringHours > 0 ? remaining / scoringHours : null
-  if (effort === 'ultra' && remaining < ULTRA_MIN_WEEKLY_SHARES) {
+  if (effort === 'ultra' && remaining < ULTRA_MIN_WEEKLY_SHARES && credits !== 'available') {
+    if (credits === 'unknown') return { ...out, remaining, hours, weeklyScore, reason: 'Ultra 周余量不足，积分 MISS' }
     return { ...out, state: 'waiting', remaining, hours, weeklyScore,
       reason: `Ultra 至少需要 ${ULTRA_MIN_WEEKLY_SHARES} 份周余量`, retryAt: reset }
   }

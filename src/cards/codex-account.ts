@@ -1,6 +1,6 @@
 import type { CodexUsageTotal } from '../codex-account-usage'
 import { ELEMENTS } from './elements'
-import { fmtResetIn, usageWindowElements } from './usage'
+import { codexCreditsSummary, fmtResetIn, usageWindowElements } from './usage'
 import { compareCodexQuota } from '../codex-quota'
 import type { CodexAccountCandidate } from '../codex-account-scheduler'
 import type { UsageSnapshot, UsageWindow } from '../usage'
@@ -82,6 +82,8 @@ export function codexAccountPanel(view: CodexAccountCardView): object {
     const usage = view.resetUsage
     elements.push(md(`**重置卡**　${usage.state === 'ok' && usage.resetCredits != null ? `${usage.resetCredits} 次可用` : 'MISS'}`))
     if (usage.state === 'ok') {
+      const credits = codexCreditsSummary(usage.credits)
+      if (credits) elements.push(md(credits))
       for (const [window, label] of [[usage.fiveHour, '5h'], [usage.weekly, '周']] as const) {
         if (window) elements.push(...usageWindowElements(window, label))
       }
@@ -137,7 +139,7 @@ function accountRows(view: CodexAccountCardView): object[] {
     const schedule = view.scheduling?.candidates.find(c => c.account.id === entry.account.id)
     const position = positions.get(entry.account.id)
     const score = entry.duplicateOf ? '重复' : schedule?.state === 'ready'
-      ? schedule.priority === 'expiring' ? '临期优先' : `${schedule.score!.toPrecision(3)}/h`
+      ? schedule.funding === 'credits' ? '积分' : schedule.priority === 'expiring' ? '临期优先' : `${schedule.score!.toPrecision(3)}/h`
       : 'MISS'
     elements.push({ tag: 'collapsible_panel', expanded: true,
       header: { title: { tag: 'plain_text', content: `#${position ?? '—'}·${entry.account.name}「${score}」 · 重置 ${usage.state === 'ok' ? usage.resetCredits ?? 'MISS' : 'MISS'}` }, background_color: 'grey-50' },
@@ -147,11 +149,11 @@ function accountRows(view: CodexAccountCardView): object[] {
       header: { title: { tag: 'plain_text', content: '邮箱查询错误' } }, elements: [md(text(entry.emailError))] })
     if (entry.duplicateOf) { row.push(muted(`与「${entry.duplicateOf}」同一账号，合计只计一次`)); continue }
     if (schedule && schedule.state !== 'ready') {
-      row.push(muted(schedule.state === 'exhausted' ? '⏳ 耗尽 · 暂不参与'
+      row.push(muted(schedule.state === 'exhausted' ? '⏳ 暂不可用'
           : schedule.state === 'excluded' ? 'Ultra 自动排除 Plus'
           : schedule.state === 'waiting' ? `⏳ 周余量 ${schedule.remaining?.toPrecision(3)} 份 · 未达 0.5 份`
           : 'MISS · 无法排序'))
-      if (schedule.state === 'miss' && schedule.reason && usage.state === 'ok') row.push({ tag: 'collapsible_panel', expanded: false,
+      if (schedule.reason && usage.state === 'ok') row.push({ tag: 'collapsible_panel', expanded: false,
         header: { title: { tag: 'plain_text', content: '未参与原因' } }, elements: [md(text(schedule.reason))] })
     }
     if (usage.state !== 'ok') {
@@ -162,6 +164,8 @@ function accountRows(view: CodexAccountCardView): object[] {
     }
     row.push(accountUsageWindow(usage.weekly, '周'))
     if (usage.fiveHour) row.push(accountUsageWindow(usage.fiveHour, '5h'))
+    const credits = codexCreditsSummary(usage.credits)
+    if (credits) row.push(md(credits))
     const activationError = view.activationErrors?.[entry.account.id]
     if (activationError) row.push({ tag: 'collapsible_panel', expanded: false,
       header: { title: { tag: 'plain_text', content: '后台激活 MISS' } }, elements: [md(text(activationError))] })

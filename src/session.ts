@@ -73,6 +73,7 @@ import { log } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { readSysInfo } from './sysinfo'
 import { observeRateLimitsNotification, captureCodexUsageCache, type UsageSnapshot } from './usage'
+import { codexCreditsSummary } from './cards/usage'
 import type { GlmUsageSnapshot } from './glm-usage'
 import { readAllAccountUsage } from './account-usage'
 import { claudeWeeklyUsageWindow } from './claude-usage'
@@ -5646,7 +5647,8 @@ export class Session {
       if (!cache) return '  |  额度 MISS'
       const u = cache.read()
       if (!u) return '  |  额度 MISS'
-      return this.fmtDualWindowSuffix(u.fiveHour, u.weekly)
+      const credits = codexCreditsSummary(u.credits)
+      return this.fmtDualWindowSuffix(u.fiveHour, u.weekly) + (credits ? ` · ${credits}` : '')
     }
     return '  |  额度 MISS'
   }

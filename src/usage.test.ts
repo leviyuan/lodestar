@@ -204,6 +204,37 @@ describe('quota transient failures', () => {
 })
 
 describe('usage read snapshot semantics', () => {
+  test('reads consumable credits per native meter, separate from reset credits', () => {
+    const main = { limitId: 'codex', primary: { usedPercent: 100, windowDurationMins: 10080 },
+      credits: { hasCredits: true, unlimited: false, balance: '62500.25' } }
+    const snapshot = snapshotFromReadResponse({ rateLimits: main, rateLimitResetCredits: { availableCount: 2 },
+      rateLimitsByLimitId: { codex: main, spark: { ...main, limitId: 'spark',
+        credits: { hasCredits: false, unlimited: false, balance: '0' } } } })
+    expect(snapshot).toMatchObject({ state: 'ok', resetCredits: 2,
+      credits: { hasCredits: true, unlimited: false, balance: 62500.25 } })
+    if (snapshot.state !== 'ok') throw new Error('expected quota')
+    expect(snapshot.buckets?.find(b => b.limitId === 'spark')?.credits)
+      .toEqual({ hasCredits: false, unlimited: false, balance: 0 })
+  })
+  test('missing, malformed and contradictory credits stay unknown; unlimited and unknown amounts preserve native flags', () => {
+    const snapshot = (credits: unknown) => snapshotFromReadResponse({ rateLimits: {
+      limitId: 'codex', primary: { usedPercent: 100, windowDurationMins: 10080 }, credits,
+    } })
+    for (const credits of [undefined, null, {}, [],
+      { hasCredits: 'true', unlimited: false, balance: '20' },
+      ...['', ' ', 'NaN', 'Infinity', '-1', '12x', '0x20', false, NaN, Infinity, -1].map(balance => ({ hasCredits: true, unlimited: false, balance })),
+      { hasCredits: false, unlimited: false, balance: '20' },
+      { hasCredits: true, unlimited: false, balance: '0' }]) {
+      expect(snapshot(credits)).toMatchObject({ state: 'ok', credits: null })
+    }
+    for (const credits of [
+      { hasCredits: true, unlimited: true, balance: null },
+      { hasCredits: false, unlimited: true, balance: null },
+      { hasCredits: true, unlimited: false, balance: null },
+      { hasCredits: false, unlimited: false, balance: null },
+      { hasCredits: false, unlimited: false, balance: 0 },
+    ]) expect(snapshot(credits)).toMatchObject({ state: 'ok', credits })
+  })
   test('reads available quota-reset credits and never infers them from window reset times', () => {
     const response = { rateLimits: { limitId: 'codex', primary: { usedPercent: 22, windowDurationMins: 10080, resetsAt: 1789632148 } } }
     for (const count of [0, 3]) {

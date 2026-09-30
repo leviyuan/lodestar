@@ -36,7 +36,7 @@ try {
     for (const agent of AGENTS) {
       const state = agentRuntimeState(agent)
       assert.ok(state?.directory && !state.error)
-      execFileSync('npm', ['audit', '--prefix', state.directory, '--omit=dev'], { stdio: 'pipe', timeout: 120000 })
+      execFileSync('npm', ['audit', '--prefix', state.directory, '--omit=dev'], { stdio: 'pipe', encoding: 'utf8', timeout: 120000 })
       if (agent !== 'dsh') console.log(execFileSync(agentBin(agent, agent), ['--version'], { encoding: 'utf8', timeout: 30000 }).trim())
       console.log(JSON.stringify({ agent, version: state.versions[agent === 'codex' ? '@openai/codex' : agent === 'claude' ? '@anthropic-ai/claude-agent-sdk' : '@deepseek-ai/dsh'], audit: 'passed' }))
     }

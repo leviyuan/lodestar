@@ -12,7 +12,7 @@ import type { UsageSnapshotUnified, TokenSourceModelCatalogState } from '../toke
 import type { AgentProvider } from '../agent-process'
 import { ELEMENTS } from './elements'
 import { formatDuration } from './duration'
-import { fmtResetIn } from './usage'
+import { codexCreditsSummary, fmtResetIn } from './usage'
 import type { AccountUsage } from '../account-usage'
 import { accountUsageRow, compactAccountUsage } from './account-usage'
 
@@ -212,6 +212,8 @@ export function consoleUsageContent(
     if (usage.weekly.resetsAt) parts.push(`重置 ${fmtResetIn(usage.weekly.resetsAt)}`)
     lines.push(`　· ${fmtWindowLabel(usage.weekly.durationMins, '次窗口')}　${parts.join(' · ')}`)
   }
+  const credits = codexCreditsSummary(usage.credits)
+  if (credits) lines.push(`　· ${credits}`)
   return lines.length === 1 ? '**📊 Codex 额度**　_无数据_' : lines.join('\n')
 }
 
@@ -422,8 +424,9 @@ export function unifiedUsageSummary(snap: UsageSnapshotUnified | undefined): str
   if (snap.quota) return snap.quota.limit === null ? '额度 未设上限'
     : snap.quota.remaining === null ? '额度 MISS'
     : `额度 ${money(snap.quota.remaining, snap.quota.currency)} / ${money(snap.quota.limit, snap.quota.currency)}`
-  if (!snap.windows.length) return '额度 MISS'
-  return `额度 ${snap.windows.map(usageWindowSummary).join(' · ')}`
+  const quota = snap.windows.length ? `额度 ${snap.windows.map(usageWindowSummary).join(' · ')}` : '额度 MISS'
+  const credits = snap.credits !== undefined ? codexCreditsSummary(snap.credits) : null
+  return [quota, credits].filter(Boolean).join(' · ')
 }
 
 function usageWindowSummary(w: UsageSnapshotUnified['windows'][number]): string {

@@ -19,6 +19,7 @@ import { bindProcessCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT } from '.
 import { plusFiveHourWindow } from './codex-quota'
 import { UsageReadCache, USAGE_FRESH_MS, isUsageAuthError, isUsageRateLimitError } from './usage-cache'
 import { observeCodexAccountEmail } from './codex-account-info'
+import { parseCodexCredits, type CodexCredits } from './codex-credits'
 
 const API_TIMEOUT_MS = 10_000
 
@@ -39,6 +40,7 @@ export interface UsageBucket {
   normalModelSlug?: string | null
   rateLimitReachedType?: string | null
   spendControlReached?: boolean | null
+  credits?: CodexCredits | null
 }
 
 export type UsageSnapshot =
@@ -54,6 +56,8 @@ export type UsageSnapshot =
       ordinaryUsageAllowed?: boolean
       rateLimitReachedType?: string | null
       spendControlReached?: boolean | null
+      /** Consumable credits on the main meter; null means unavailable data, not zero. */
+      credits?: CodexCredits | null
       fiveHour: UsageWindow | null
       weekly: UsageWindow | null
       /** read 端点全量桶 map(按服务端 limitId 键控)。权威状态,每次 read 整体替换。 */
@@ -365,7 +369,8 @@ function bucketsFromReadResponse(limitsRes: any): { buckets: UsageBucket[]; defa
     buckets.push({ limitId: id, limitName: raw?.limitName ?? null, fiveHour, weekly,
       normalModelSlug: raw?.normalModelSlug ?? null,
       rateLimitReachedType: raw?.rateLimitReachedType ?? null,
-      spendControlReached: raw?.spendControlReached ?? null })
+      spendControlReached: raw?.spendControlReached ?? null,
+      credits: parseCodexCredits(raw?.credits) })
   }
   return { buckets, defaultLimitId: limitsRes?.rateLimits?.limitId ?? undefined }
 }
@@ -446,6 +451,7 @@ export function snapshotFromReadResponse(limitsRes: any, planType?: string | nul
     ...(typeof limitsRes?.ordinaryUsageAllowed === 'boolean' ? { ordinaryUsageAllowed: limitsRes.ordinaryUsageAllowed } : {}),
     rateLimitReachedType: def.rateLimitReachedType,
     spendControlReached: def.spendControlReached,
+    credits: def.credits,
     fiveHour: def.fiveHour,
     weekly: def.weekly,
     buckets,

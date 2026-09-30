@@ -1,4 +1,14 @@
 import type { UsageWindow } from '../usage'
+import { codexCreditAvailability, type CodexCredits } from '../codex-credits'
+
+/** Omit confirmed empty credits; keep unknown credit data visibly distinct from zero. */
+export function codexCreditsSummary(credits: CodexCredits | null | undefined): string | null {
+  if (!credits) return '积分 MISS'
+  if (codexCreditAvailability(credits) === 'empty') return null
+  if (credits.unlimited) return '积分 无限'
+  if (credits.balance === null) return '积分 MISS'
+  return `积分 ${credits.balance.toLocaleString('en-US', { maximumFractionDigits: 20 })}`
+}
 
 /** Human-readable time until reset; keep the compact footer's h/d precision. */
 export function fmtResetIn(date: Date | null): string {

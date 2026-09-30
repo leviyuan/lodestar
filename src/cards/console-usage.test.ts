@@ -9,6 +9,22 @@ describe('compact hi account quota panel', () => {
   beforeEach(() => { clock = spyOn(Date, 'now').mockReturnValue(1_900_000_000_000) })
   afterEach(() => { clock.mockRestore() })
 
+  test('hi and unified summaries show main consumable credits alongside unchanged percentages', () => {
+    const main = { limitId: 'codex', primary: { usedPercent: 100, windowDurationMins: 10080 },
+      credits: { hasCredits: true, unlimited: false, balance: '62500.25' } }
+    const usage = codexUsageToUnified(snapshotFromReadResponse({ rateLimits: main,
+      rateLimitsByLimitId: { codex: main, spark: { ...main, limitId: 'spark',
+        credits: { hasCredits: true, unlimited: false, balance: '999999' } } },
+      rateLimitResetCredits: { availableCount: 2 } }))
+    expect(consoleUnifiedUsageContent(usage)).toBe("周 <font color='red'>100%</font>/MISS · 积分 62,500.25 · 重置 2")
+    expect(unifiedUsageSummary(usage)).toBe('额度 周配额 已用 100% · 积分 62,500.25')
+    expect(consoleUnifiedUsageContent({ ...usage, credits: { hasCredits: false, unlimited: false, balance: 0 } })).not.toContain('积分')
+    expect(consoleUnifiedUsageContent({ ...usage, credits: null })).toContain('积分 MISS')
+    expect(consoleUnifiedUsageContent({ ...usage, credits: { hasCredits: true, unlimited: true, balance: null } })).toContain('积分 无限')
+    expect(consoleUnifiedUsageContent({ ...usage, credits: { hasCredits: true, unlimited: false, balance: null } })).toContain('积分 MISS')
+    expect(consoleUnifiedUsageContent({ ...usage, credits: { hasCredits: true, unlimited: false, balance: 0.0001 } })).toContain('积分 0.0001')
+  })
+
   test('one account occupies one row and includes main windows plus reset credits', () => {
     const usage = { state: 'ok' as const, resetCredits: 0, windows: [
       { kind: 'fiveHour', label: '5h 窗口', percent: 11, resetsAt: new Date(Date.now() + 3600_000) },
@@ -40,7 +56,7 @@ describe('compact hi account quota panel', () => {
       rateLimitResetCredits: { availableCount: 3 },
     }))
     const content = consoleUnifiedUsageContent(usage)
-    expect(content).toBe('周 12%/MISS · 重置 3')
+    expect(content).toBe('周 12%/MISS · 积分 MISS · 重置 3')
     expect(content).not.toMatch(/Spark|reserve|重置卡/)
   })
 

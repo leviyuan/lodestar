@@ -41,13 +41,15 @@ export function codexUsageToUnified(s: UsageSnapshot): UsageSnapshotUnified {
         : 'network',
       windows: [],
       resetCredits: null,
+      credits: null,
       ...(s.state === 'network' && s.reason ? { reason: s.reason } : {}),
     }
   }
   const windows: UsageWindowUnified[] = []
   if (s.fiveHour) windows.push(windowToUnified(s.fiveHour, 'fiveHour', '5h 窗口'))
   if (s.weekly) windows.push(windowToUnified(s.weekly, 'weekly', '周配额'))
-  return { state: 'ok', planLabel: s.subscriptionType, windows, fetchedAt: s.fetchedAt, resetCredits: s.resetCredits ?? null }
+  return { state: 'ok', planLabel: s.subscriptionType, windows, fetchedAt: s.fetchedAt,
+    resetCredits: s.resetCredits ?? null, credits: s.credits ?? null }
 }
 
 /** Default auth can live in an OS keyring or managed store. Only the native account/read is authoritative. */
