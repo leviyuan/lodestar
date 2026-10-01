@@ -12,12 +12,30 @@ describe('Codex account usage aggregation', () => {
   test('available account counts include credits, deduplicate identities, and distinguish unknown from exhausted', () => {
     const credit = entry('credit', 100, 100)
     if (credit.usage.state !== 'ok') throw new Error('fixture')
+    credit.usage.ordinaryUsageAllowed = false
+    credit.usage.rateLimitReachedType = 'rate_limit_reached'
+    credit.usage.spendControlReached = false
     credit.usage.credits = { hasCredits: true, unlimited: false, balance: 62500 }
     const alias = { ...credit, account: { id: 'alias', name: 'alias' } }
     const other = entry('other', 100, 100)
     expect(aggregateCodexUsage([credit, alias, other]).available).toBe(1)
     expect(aggregateCodexUsage([{ ...credit, usage: { ...credit.usage, spendControlReached: true } }]).available).toBe(0)
     expect(aggregateCodexUsage([{ ...credit, usage: { ...credit.usage, credits: null } }]).available).toBeNull()
+  })
+  test('included-usage flags and spending restrictions apply consistently when windows still show remaining allowance', () => {
+    const row = entry('credit', 20, 50)
+    if (row.usage.state !== 'ok') throw new Error('fixture')
+    for (const flags of [{ ordinaryUsageAllowed: false }, { rateLimitReachedType: 'rate_limit_reached' }]) {
+      const usage = { ...row.usage, ...flags }
+      expect(aggregateCodexUsage([{ ...row, usage }]).available).toBe(0)
+      expect(aggregateCodexUsage([{ ...row, usage: { ...usage, credits: null } }]).available).toBeNull()
+      const funded = { ...usage, credits: { hasCredits: true, unlimited: false, balance: 100 } }
+      expect(aggregateCodexUsage([{ ...row, usage: funded }]).available).toBe(1)
+      for (const rateLimitReachedType of ['workspace_owner_credits_depleted', 'workspace_member_credits_depleted',
+        'workspace_owner_usage_limit_reached', 'workspace_member_usage_limit_reached', 'unknown_limit']) {
+        expect(aggregateCodexUsage([{ ...row, usage: { ...funded, rateLimitReachedType } }]).available).toBe(0)
+      }
+    }
   })
   test('account inspection reads each native email even when quota identities are duplicated', async () => {
     const rows = [entry('default', 20, 40, 'same'), entry('named', 20, 40, 'same')]

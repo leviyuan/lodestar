@@ -18,6 +18,9 @@ describe('compact Codex account cards', () => {
     for (const row of rows) {
       if (row.usage.state !== 'ok') throw new Error('fixture')
       row.usage.weekly!.percent = 100
+      row.usage.ordinaryUsageAllowed = false
+      row.usage.rateLimitReachedType = 'rate_limit_reached'
+      row.usage.spendControlReached = false
       row.usage.credits = { hasCredits: true, unlimited: false, balance: row.account.id === '0' ? 10 : 62500 }
     }
     const candidates = rows.map(row => ({ ...row, identity: row.fingerprint!, ...rankCodexQuota(row.usage, 'model') }))

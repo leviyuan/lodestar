@@ -6,7 +6,7 @@ import { checkCodexModelCompatibility, CodexAccountScheduler } from './codex-acc
 import { compareCodexQuota, isCodexQuotaError, rankCodexQuota, unusedCodexWeek } from './codex-quota'
 import type { AgentReasoningEffort } from './agent-process'
 import type { TokenSource, TokenSourceModel } from './token-source'
-import type { UsageSnapshot } from './usage'
+import { snapshotFromReadResponse, type UsageSnapshot } from './usage'
 
 const NOW = 1_800_000_000_000
 const roots: string[] = []
@@ -41,6 +41,21 @@ describe('weekly quota scheduling', () => {
     expect(rankCodexQuota(plus, 'model', NOW)).toMatchObject({ state: 'ready', funding: 'credits' })
     expect(rankCodexQuota({ ...plus, fiveHour: { percent: null, resetsAt: null } }, 'model', NOW).state).toBe('miss')
   })
+  test('native included-usage denial still permits credits after subscription exhaustion', async () => {
+    const usage = snapshotFromReadResponse({ ordinaryUsageAllowed: false, rateLimits: {
+      limitId: 'codex', primary: { usedPercent: 100, windowDurationMins: 10080, resetsAt: (NOW + 24 * 3600_000) / 1000 },
+      rateLimitReachedType: 'rate_limit_reached', spendControlReached: false,
+      credits: { hasCredits: true, unlimited: false, balance: '62500' },
+    } }, 'pro', NOW)
+    const h = harness({ credited: usage, subscription: quota('pro', 90) })
+    const choice = await h.scheduler.choose({ model: 'model', effort: 'ultra' })
+    expect(choice.selected?.account.id).toBe('subscription')
+    expect(choice.candidates.find(c => c.account.id === 'credited')).toMatchObject({
+      state: 'ready', funding: 'credits', score: null, credits: { balance: 62500 },
+    })
+    h.input.subscription = quota('pro', 100)
+    expect((await h.scheduler.choose({ model: 'model', effort: 'ultra' })).selected?.account.id).toBe('credited')
+  })
   test('subscription allowance precedes credits; credit-only accounts rank by balance, with stable ties', async () => {
     const credited = (balance: number | null, hours = 24) => ({ ...quota('pro', 100, hours),
       credits: { hasCredits: true, unlimited: false, balance } })
@@ -54,7 +69,7 @@ describe('weekly quota scheduling', () => {
     h.input.subscription = quota('plus', 100)
     expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('unlimited')
   })
-  test('credits lift only the Pro Ultra weekly reserve gate, never plan, model or upstream restrictions', async () => {
+  test('credits lift the Pro Ultra reserve gate but preserve plan, model and spending restrictions', async () => {
     const credits = { hasCredits: true, unlimited: false, balance: 100 }
     for (const plan of ['prolite', 'pro']) {
       expect(rankCodexQuota({ ...quota(plan, 99.9), credits }, 'model', NOW, 'ultra').state).toBe('ready')
@@ -63,7 +78,10 @@ describe('weekly quota scheduling', () => {
       expect(rankCodexQuota({ ...quota(plan, 99.9), credits: null }, 'model', NOW, 'ultra').state).toBe('miss')
     }
     expect(rankCodexQuota({ ...quota('plus'), credits }, 'model', NOW, 'ultra').state).toBe('excluded')
-    for (const restriction of [{ ordinaryUsageAllowed: false }, { spendControlReached: true }, { rateLimitReachedType: 'rate_limit_reached' }]) {
+    for (const restriction of [{ spendControlReached: true }, ...[
+      'workspace_owner_credits_depleted', 'workspace_member_credits_depleted',
+      'workspace_owner_usage_limit_reached', 'workspace_member_usage_limit_reached', 'unknown_limit',
+    ].map(rateLimitReachedType => ({ rateLimitReachedType }))]) {
       expect(rankCodexQuota({ ...quota('pro', 100), credits, ...restriction }, 'model', NOW).state).toBe('exhausted')
     }
     const h = harness({ pro: { ...quota('pro', 100), credits } })
@@ -371,9 +389,22 @@ describe('weekly quota scheduling', () => {
     expect((await h.scheduler.choose({ model: 'gpt-5.6-sol' })).selected?.account.id).toBe('plus')
     expect((await h.scheduler.choose({ model: 'gpt-5.3-codex-spark' })).selected?.account.id).toBe('pro')
   })
-  test('authoritative ordinaryUsageAllowed and spend controls exclude accounts even below 100%', () => {
-    expect(rankCodexQuota({ ...quota('pro'), ordinaryUsageAllowed: false }, 'model', NOW).state).toBe('exhausted')
-    expect(rankCodexQuota({ ...quota('pro'), rateLimitReachedType: 'rate_limit_reached' }, 'model', NOW).state).toBe('exhausted')
+  test('included-usage flags require credits even below 100%; empty and unknown credits never grant access', () => {
+    for (const flags of [{ ordinaryUsageAllowed: false }, { rateLimitReachedType: 'rate_limit_reached' }]) {
+      const usage = { ...quota('pro'), ...flags }
+      expect(rankCodexQuota(usage, 'model', NOW)).toMatchObject({ state: 'exhausted', reason: '套餐内额度暂不可用，且无可用积分' })
+      expect(rankCodexQuota({ ...usage, credits: null }, 'model', NOW))
+        .toMatchObject({ state: 'miss', reason: '套餐内额度暂不可用，积分 MISS' })
+      expect(rankCodexQuota({ ...usage, credits: { hasCredits: true, unlimited: false, balance: 100 } }, 'model', NOW))
+        .toMatchObject({ state: 'ready', funding: 'credits', score: null })
+    }
+  })
+  test('ordinary included-usage denial belongs to the main meter, not an independent model allowance', () => {
+    const usage = { ...quota('pro', 100), defaultLimitId: 'codex', ordinaryUsageAllowed: false,
+      rateLimitReachedType: 'rate_limit_reached',
+      buckets: [{ limitId: 'reserve', limitName: 'reserve', fiveHour: null, weekly: quota('pro', 10).weekly }] }
+    expect(rankCodexQuota(usage, 'model', NOW).state).toBe('exhausted')
+    expect(rankCodexQuota(usage, 'reserve', NOW)).toMatchObject({ state: 'ready', remaining: 18 })
   })
   test('corrupt durable state cannot be silently reset', async () => {
     const h = harness({ pro: quota('pro') }); writeFileSync(h.stateFile, '{"version":1,"blocks":[{}]}')

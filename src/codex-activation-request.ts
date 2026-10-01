@@ -37,10 +37,11 @@ export function activationBody(effort: CodexReasoningEffort) {
 }
 
 export function isUnusedMainWeek(usage: CodexActivationUsage): boolean {
+  const rank = rankCodexQuota(usage, '')
   return !!usage.defaultLimitId
     && (usage.fiveHour === null || usage.fiveHour.percent === 0)
     && unusedCodexWeek(usage, '')
-    && rankCodexQuota(usage, '').state === 'ready'
+    && rank.state === 'ready' && rank.funding !== 'credits'
 }
 
 async function credentialsFromNativeFile(accountId: string): Promise<Credentials> {

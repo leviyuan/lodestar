@@ -69,12 +69,24 @@ describe('zero-context Codex activation', () => {
     expect(JSON.stringify(h.posts)).not.toMatch(/AGENTS|skills|previous_response_id|conversation|session-id|threadId/)
   })
   test('another device consuming any quota or fixing the reset clock prevents sending', async () => {
-    for (const change of ['usage', 'clock', 'short-window', 'spend-control']) {
+    for (const change of ['usage', 'clock', 'short-window', 'included-usage', 'spend-control']) {
       const h = harness()
       if (change === 'usage') h.state.raw.rateLimits.primary.usedPercent = 0.001
       if (change === 'clock') h.state.raw.rateLimits.primary.resetsAt -= 60
       if (change === 'short-window') (h.state.raw.rateLimits as any).secondary = { usedPercent: 1, windowDurationMins: 300, resetsAt: Math.floor(Date.now() / 1000) + 18000 }
-      if (change === 'spend-control') h.state.raw.ordinaryUsageAllowed = false
+      if (change === 'included-usage') h.state.raw.ordinaryUsageAllowed = false
+      if (change === 'spend-control') Object.assign(h.state.raw.rateLimits, { spendControlReached: true })
+      expect(await activateCodexAccount(h.opts, h.deps)).toBe('skipped')
+      expect(h.posts).toHaveLength(0)
+      expect(h.calls.at(-1)).toBe('close')
+    }
+  })
+  test('credit-funded task eligibility cannot activate an unavailable included allowance', async () => {
+    for (const flag of ['ordinaryUsageAllowed', 'rateLimitReachedType']) {
+      const h = harness()
+      Object.assign(h.state.raw.rateLimits, { credits: { hasCredits: true, unlimited: false, balance: '100' } })
+      if (flag === 'ordinaryUsageAllowed') h.state.raw.ordinaryUsageAllowed = false
+      else Object.assign(h.state.raw.rateLimits, { rateLimitReachedType: 'rate_limit_reached' })
       expect(await activateCodexAccount(h.opts, h.deps)).toBe('skipped')
       expect(h.posts).toHaveLength(0)
       expect(h.calls.at(-1)).toBe('close')

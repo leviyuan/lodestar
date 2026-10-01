@@ -53,6 +53,7 @@ export type UsageSnapshot =
       subscriptionType?: string
       /** Native account identity, hashed before it enters scheduling/state. Supports OS keyring auth. */
       accountFingerprint?: string
+      /** Permission for ordinary included usage on the main meter, not credit-funded usage. */
       ordinaryUsageAllowed?: boolean
       rateLimitReachedType?: string | null
       spendControlReached?: boolean | null

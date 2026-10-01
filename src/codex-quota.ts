@@ -28,7 +28,37 @@ export function codexModelQuota(usage: Extract<UsageSnapshot, { state: 'ok' }>, 
   // Separate meters (e.g. Spark) must not block ordinary models or borrow their quota.
   const quota = usage.buckets?.find(b => b.limitName?.toLowerCase() === model.toLowerCase()
     || b.normalModelSlug === model) ?? usage
-  return { ...quota, fiveHour: plusFiveHourWindow(usage.subscriptionType, quota.fiveHour) }
+  const ordinaryUsageAllowed = !('limitId' in quota) || quota.limitId === usage.defaultLimitId
+    ? usage.ordinaryUsageAllowed : undefined
+  return { ...quota, ordinaryUsageAllowed, fiveHour: plusFiveHourWindow(usage.subscriptionType, quota.fiveHour) }
+}
+
+type CodexQuotaAccess = { state: 'subscription' | 'credits' } | { state: 'exhausted' | 'miss'; reason: string }
+
+/** Included-usage denial can be funded by this meter's credits; spending restrictions cannot. */
+export function codexQuotaAccess(quota: Pick<Extract<UsageSnapshot, { state: 'ok' }>,
+  'fiveHour' | 'weekly' | 'ordinaryUsageAllowed' | 'rateLimitReachedType' | 'spendControlReached' | 'credits'>): CodexQuotaAccess {
+  if (quota.spendControlReached === true) return { state: 'exhausted', reason: '已达到上游消费限制' }
+  // The native client distinguishes ordinary rate limits from workspace credit/usage restrictions.
+  // Unknown restriction types remain visible and blocked, rather than assumed credit-eligible.
+  if (quota.rateLimitReachedType && quota.rateLimitReachedType !== 'rate_limit_reached') {
+    return { state: 'exhausted', reason: `上游额度限制：${quota.rateLimitReachedType}` }
+  }
+  const windows = [quota.fiveHour, quota.weekly].filter((w): w is UsageWindow => w !== null)
+  const exhausted = windows.some(w => w.percent !== null && w.percent >= 100)
+  const needsCredits = exhausted || quota.ordinaryUsageAllowed === false || quota.rateLimitReachedType === 'rate_limit_reached'
+  const credits = codexCreditAvailability(quota.credits)
+  if (needsCredits && credits === 'empty') {
+    return { state: 'exhausted', reason: exhausted ? '额度耗尽' : '套餐内额度暂不可用，且无可用积分' }
+  }
+  if (windows.some(w => w.percent === null || !Number.isFinite(w.percent) || w.percent < 0 || w.percent > 100)) {
+    return { state: 'miss', reason: '额度百分比 MISS' }
+  }
+  if (needsCredits) {
+    return credits === 'available' ? { state: 'credits' }
+      : { state: 'miss', reason: `${exhausted ? '订阅额度已用完' : '套餐内额度暂不可用'}，积分 MISS` }
+  }
+  return { state: 'subscription' }
 }
 
 export function codexQuotaMeter(usage: UsageSnapshot, model: string): string {
@@ -104,23 +134,16 @@ export function rankCodexQuota(usage: UsageSnapshot, model: string, now = Date.n
     return { ...out, state: 'excluded', reason: 'Ultra 自动选择不使用 Plus' }
   }
   const quota = codexModelQuota(usage, model)
-  const windows = [quota.fiveHour, quota.weekly].filter((w): w is UsageWindow => w !== null)
-  const exhausted = windows.filter(w => w.percent !== null && w.percent >= 100)
-  const credits = codexCreditAvailability(quota.credits)
-  // A credit balance cannot override an explicit upstream refusal or spending restriction.
-  const denied = usage.ordinaryUsageAllowed === false || quota.rateLimitReachedType || quota.spendControlReached === true
-  if (denied || (exhausted.length && credits === 'empty')) {
+  const access = codexQuotaAccess(quota)
+  if (access.state === 'miss') return { ...out, reason: access.reason }
+  if (access.state === 'exhausted') {
+    const exhausted = [quota.fiveHour, quota.weekly].filter((w): w is UsageWindow => w !== null && w.percent !== null && w.percent >= 100)
     // All exhausted windows must reset before this account is usable.
     const resets = exhausted.map(w => w.resetsAt?.getTime()).filter((t): t is number => t != null && Number.isFinite(t) && t > now)
-    const reason = quota.spendControlReached === true ? '已达到上游消费限制'
-      : usage.ordinaryUsageAllowed === false ? '上游暂不允许使用'
-      : quota.rateLimitReachedType ? `上游额度限制：${quota.rateLimitReachedType}` : '额度耗尽'
-    return { ...out, state: 'exhausted', reason,
+    return { ...out, state: 'exhausted', reason: access.reason,
       ...(resets.length === exhausted.length && resets.length ? { retryAt: Math.max(...resets) } : {}) }
   }
-  if (windows.some(w => w.percent === null || !Number.isFinite(w.percent) || w.percent < 0 || w.percent > 100)) return { ...out, reason: '额度百分比 MISS' }
-  if (exhausted.length) {
-    if (credits === 'unknown') return { ...out, reason: '订阅额度已用完，积分 MISS' }
+  if (access.state === 'credits') {
     return { ...out, state: 'ready', funding: 'credits', credits: quota.credits! }
   }
   const weekly = quota.weekly
@@ -132,6 +155,7 @@ export function rankCodexQuota(usage: UsageSnapshot, model: string, now = Date.n
   const hours = (reset - now) / 3_600_000
   const scoringHours = hours - WEEKLY_EARLY_FINISH_HOURS
   const weeklyScore = scoringHours > 0 ? remaining / scoringHours : null
+  const credits = codexCreditAvailability(quota.credits)
   if (effort === 'ultra' && remaining < ULTRA_MIN_WEEKLY_SHARES && credits !== 'available') {
     if (credits === 'unknown') return { ...out, remaining, hours, weeklyScore, reason: 'Ultra 周余量不足，积分 MISS' }
     return { ...out, state: 'waiting', remaining, hours, weeklyScore,
