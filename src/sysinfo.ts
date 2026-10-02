@@ -1,6 +1,6 @@
 /**
  * Lightweight host snapshot for the `hi` console panel —— CPU 负载、
- * 内存、根/家目录磁盘、以及当前用户下的 cc-* / codex-* 系列 systemd 服务。
+ * 内存、根/家目录磁盘、以及当前用户下的 cc-* / codex-* 服务。
  *
  * 服务前缀约定:AI 助手拉起的常驻进程通常走
  *   systemd-run --user --unit=cc-<project>-<purpose> -- <cmd>
@@ -9,19 +9,21 @@
  * 一眼可见,跟系统自带 / 第三方服务区分开。
  *
  * 所有数据源都是本机文件 / 系统调用,没有网络往返:
- *   /proc/loadavg          —— 1m / 5m / 15m
- *   /proc/meminfo          —— Total / Available
+ *   os.loadavg()          —— Linux / macOS 的 1m / 5m / 15m
+ *   /proc/meminfo          —— Linux Total / Available
+ *   vm_stat + os.totalmem —— macOS 应用、wired、压缩内存
  *   statfsSync(path)       —— 各挂载点容量
  *   /proc/uptime           —— monotonic seconds since boot (uptime 推算)
  *   systemctl --user show  —— cc-* / codex-* 服务的状态与启动时间
+ *   launchctl list + ps    —— macOS 当前用户服务状态与进程运行时长
  *
  * 失败可见: 任何一段读不到就把对应字段标 null,卡片层按 null 渲染
- * `_n/a_`,绝不假数据 (no_fallbacks)。
+ * `MISS`,绝不假数据 (no_fallbacks)。
  */
 
 import { execFile } from 'node:child_process'
 import { readFileSync, statfsSync, statSync } from 'node:fs'
-import { cpus, homedir } from 'node:os'
+import { cpus, homedir, loadavg, totalmem } from 'node:os'
 import { promisify } from 'node:util'
 import { log } from './log'
 
@@ -35,9 +37,9 @@ export interface CpuInfo {
 }
 
 export interface MemInfo {
-  /** Bytes — MemTotal 来自 /proc/meminfo */
+  /** Bytes — Linux MemTotal / macOS os.totalmem() */
   totalBytes: number
-  /** Bytes — MemAvailable;比 free + buffers + cached 更准 (考虑 reclaimable) */
+  /** Bytes — Linux MemAvailable;macOS 总量减应用、wired 和压缩内存。 */
   availBytes: number
   usedBytes: number
   /** 0–100 */
@@ -57,7 +59,7 @@ export interface DiskInfo {
 }
 
 export interface ServiceInfo {
-  /** 不带 .service 后缀,贴卡片用 */
+  /** systemd 不带 .service 后缀;launchd 使用完整 label。 */
   name: string
   /** systemd ActiveState: active | inactive | failed | activating | deactivating */
   active: string
@@ -65,12 +67,18 @@ export interface ServiceInfo {
   sub: string
   /** 自最近一次进入 active 状态起的秒数。从未活跃过则为 null。
    * 对 active 服务等于 "已运行 X 秒";对 inactive/failed 等于
-   * "上次跑起来到现在过了 X 秒"。 */
+   * "上次跑起来到现在过了 X 秒"。launchd 停止后无此数据。 */
   lastActiveAgoSec: number | null
   /** 当前 ActiveState 的持续秒数 (StateChangeTimestamp → 现在)。
    * 对 active 服务等于 lastActiveAgoSec;对 inactive 服务等于
    * "已停了多久";对 activating/deactivating 等于"切换中多久"。 */
   stateAgoSec: number | null
+  /** false 仅表示系统明确报告从未启动;null/缺失表示未知。 */
+  hasStarted?: boolean | null
+  /** launchctl 的上一退出状态;负数表示终止信号。 */
+  lastExitStatus?: number
+  /** 已读取状态但无法读取运行时长时保留服务及具体错误。 */
+  error?: string
 }
 
 export interface SysInfo {
@@ -78,25 +86,24 @@ export interface SysInfo {
   mem: MemInfo | null
   disks: DiskInfo[]
   services: ServiceInfo[]
-  /** 真的查不到时(systemctl 不存在 / 拒绝)就 null;空数组表示"没有匹配服务"。 */
+  /** 查询失败时返回具体错误;只有成功且无匹配服务才为空数组 + null。 */
   servicesError: string | null
 }
 
-/** 用户态 systemd-run 服务的统一前缀。cc-* 是历史兼容, codex-* 是新命名。 */
+/** 用户态 systemd / launchd 服务的统一前缀。 */
 export const SERVICE_PREFIXES = ['cc-', 'codex-'] as const
 export const SERVICE_LABEL = 'cc-* / codex-*'
 
 function readCpu(): CpuInfo | null {
   try {
-    const raw = readFileSync('/proc/loadavg', 'utf8').trim().split(/\s+/)
-    return {
-      cores: cpus().length,
-      load1: parseFloat(raw[0] ?? '0'),
-      load5: parseFloat(raw[1] ?? '0'),
-      load15: parseFloat(raw[2] ?? '0'),
+    const [load1, load5, load15] = loadavg()
+    const cores = cpus().length
+    if (!cores || ![load1, load5, load15].every(n => Number.isFinite(n) && n >= 0)) {
+      throw new Error('CPU 核数或负载无效')
     }
+    return { cores, load1, load5, load15 }
   } catch (e) {
-    log(`sysinfo: read /proc/loadavg failed: ${e}`)
+    log(`sysinfo: read CPU failed: ${e}`)
     return null
   }
 }
@@ -106,12 +113,13 @@ function readMem(): MemInfo | null {
     const raw = readFileSync('/proc/meminfo', 'utf8')
     const find = (k: string): number => {
       const m = raw.match(new RegExp(`^${k}:\\s+(\\d+)\\s*kB`, 'm'))
-      return m ? parseInt(m[1]!, 10) * 1024 : 0
+      if (!m) throw new Error(`/proc/meminfo 缺少 ${k}`)
+      return Number(m[1]) * 1024
     }
     const totalBytes = find('MemTotal')
     const availBytes = find('MemAvailable')
-    if (!totalBytes) return null
-    const usedBytes = Math.max(0, totalBytes - availBytes)
+    if (totalBytes <= 0 || availBytes > totalBytes) throw new Error('/proc/meminfo 内存数据无效')
+    const usedBytes = totalBytes - availBytes
     return {
       totalBytes, availBytes, usedBytes,
       percent: Math.round((usedBytes / totalBytes) * 100),
@@ -120,6 +128,130 @@ function readMem(): MemInfo | null {
     log(`sysinfo: read /proc/meminfo failed: ${e}`)
     return null
   }
+}
+
+/** macOS 的已用内存 = 应用（anonymous - purgeable）+ wired + compressor。
+ * 压缩部分取 occupied 而非 stored（压缩前页数），页大小取真实输出，兼容
+ * Intel 的 4 KiB 和 Apple Silicon 的 16 KiB。不把可回收文件缓存算成已用。 */
+export function parseMacMemory(raw: string, totalBytes: number): MemInfo {
+  const pageMatch = raw.match(/^Mach Virtual Memory Statistics: \(page size of (\d+) bytes\)/m)
+  if (!pageMatch) throw new Error('vm_stat 缺少 page size')
+  const pageSize = Number(pageMatch[1])
+  if (!Number.isSafeInteger(pageSize) || pageSize <= 0 || !Number.isSafeInteger(totalBytes) || totalBytes <= 0) {
+    throw new Error('macOS 内存总量或 page size 无效')
+  }
+  const pages = (key: string): number => {
+    const match = raw.match(new RegExp(`^${key}:\\s+(\\d+)\\.\\s*$`, 'm'))
+    if (!match || !Number.isSafeInteger(Number(match[1]))) throw new Error(`vm_stat 缺少或无效 ${key}`)
+    return Number(match[1])
+  }
+  const appPages = pages('Anonymous pages') - pages('Pages purgeable')
+  const usedBytes = (appPages + pages('Pages wired down') + pages('Pages occupied by compressor')) * pageSize
+  if (appPages < 0 || !Number.isSafeInteger(usedBytes) || usedBytes > totalBytes) {
+    throw new Error('vm_stat 内存数据超出物理内存范围')
+  }
+  return { totalBytes, availBytes: totalBytes - usedBytes, usedBytes, percent: Math.round(usedBytes / totalBytes * 100) }
+}
+
+type HostCommand = (file: string, args: string[]) => Promise<string>
+
+const runHostCommand: HostCommand = async (file, args) => {
+  const { stdout } = await execFileAsync(file, args, {
+    timeout: 2000,
+    maxBuffer: 4 * 1024 * 1024,
+    env: { ...process.env, LC_ALL: 'C', LANG: 'C' },
+  })
+  return stdout
+}
+
+export async function readMacMemory(command: HostCommand = runHostCommand): Promise<MemInfo | null> {
+  try {
+    return parseMacMemory(await command('/usr/bin/vm_stat', []), totalmem())
+  } catch (e) {
+    log(`sysinfo: read macOS memory failed: ${e}`)
+    return null
+  }
+}
+
+interface LaunchdService extends ServiceInfo { pid: number | null }
+
+/** launchctl list 的三列协议: PID / 上次退出状态（负值为信号）/ Label。
+ * 只看当前用户 bootstrap domain，不枚举系统服务，不读取 plist 中的环境变量。 */
+export function parseLaunchctlList(raw: string): LaunchdService[] {
+  const lines = raw.trim().split(/\r?\n/)
+  if (!/^PID\s+Status\s+Label$/.test(lines.shift()?.trim() ?? '')) throw new Error('launchctl list 表头无效')
+  const services: LaunchdService[] = []
+  for (const line of lines) {
+    if (!line.trim()) continue
+    const match = line.trim().match(/^(\d+|-)\s+(-?\d+)\s+(\S+)$/)
+    if (!match) throw new Error(`launchctl list 行无效: ${line.trim()}`)
+    const [, pidText, statusText, name] = match
+    if (!SERVICE_PREFIXES.some(prefix => name!.startsWith(prefix))) continue
+    const pid = pidText === '-' ? null : Number(pidText)
+    const lastExitStatus = Number(statusText)
+    if ((pid !== null && (!Number.isSafeInteger(pid) || pid <= 0)) || !Number.isSafeInteger(lastExitStatus)) {
+      throw new Error(`launchctl list PID 或退出状态无效: ${name}`)
+    }
+    services.push({
+      name: name!, pid, lastExitStatus,
+      active: pid !== null ? 'active' : lastExitStatus === 0 ? 'inactive' : 'failed',
+      sub: pid !== null ? 'running' : lastExitStatus < 0 ? 'signal' : 'exited',
+      hasStarted: pid !== null || lastExitStatus !== 0 ? true : null,
+      lastActiveAgoSec: null, stateAgoSec: null,
+    })
+  }
+  return services.sort((a, b) => a.name.localeCompare(b.name))
+}
+
+/** BSD ps etime: [[dd-]hh:]mm:ss;不解析受语言和时区影响的启动日期。 */
+export function parseProcessElapsed(raw: string): Map<number, number> {
+  const times = new Map<number, number>()
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue
+    const match = line.trim().match(/^(\d+)\s+(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/)
+    if (!match) throw new Error(`ps etime 行无效: ${line.trim()}`)
+    const pid = Number(match[1])
+    const days = match[2] === undefined ? 0 : Number(match[2])
+    const hours = match[3] === undefined ? 0 : Number(match[3])
+    const minutes = Number(match[4])
+    const seconds = Number(match[5])
+    const elapsed = ((days * 24 + hours) * 60 + minutes) * 60 + seconds
+    if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isSafeInteger(elapsed) || minutes >= 60 || seconds >= 60 || (match[2] !== undefined && (match[3] === undefined || hours >= 24))) {
+      throw new Error(`ps etime 数值无效: ${line.trim()}`)
+    }
+    times.set(pid, elapsed)
+  }
+  return times
+}
+
+export async function readMacServices(command: HostCommand = runHostCommand): Promise<{ services: ServiceInfo[]; error: string | null }> {
+  let jobs: LaunchdService[]
+  try {
+    jobs = parseLaunchctlList(await command('/bin/launchctl', ['list']))
+  } catch (e) {
+    log(`sysinfo: launchctl list failed: ${e}`)
+    return { services: [], error: `launchctl 查询失败: ${e instanceof Error ? e.message : String(e)}` }
+  }
+  const running = jobs.filter(job => job.pid !== null)
+  if (running.length > 0) {
+    try {
+      const times = parseProcessElapsed(await command('/bin/ps', ['-p', running.map(job => job.pid).join(','), '-o', 'pid=,etime=']))
+      for (const job of running) {
+        const elapsed = times.get(job.pid!)
+        if (elapsed === undefined) {
+          job.error = 'ps 未返回该进程，运行时长 MISS'
+          log(`sysinfo: ${job.name}: ${job.error}`)
+        } else {
+          job.lastActiveAgoSec = elapsed
+          job.stateAgoSec = elapsed
+        }
+      }
+    } catch (e) {
+      log(`sysinfo: read launchd process elapsed failed: ${e}`)
+      for (const job of running) job.error = `运行时长 MISS: ${e instanceof Error ? e.message : String(e)}`
+    }
+  }
+  return { services: jobs.map(({ pid: _pid, ...service }) => service), error: null }
 }
 
 /** statfsSync 拿到的 blocks/bavail 都按 f_frsize 计算 bytes —— 注意
@@ -180,8 +312,7 @@ function readMonotonicSec(): number | null {
 /** 用 `node:child_process.execFile` 跑 `systemctl --user` —— 跨 Bun /
  * Node 通用,超时(默认 2s)由 execFile 内置 timeout 处理,非零退出码
  * execFile 会 reject,被外层 catch 统一兜成 null,跟旧版 Bun.spawn 行为
- * 一致(调用方拿 null 走 error 分支)。Linux-only:Windows 在 readSysInfo
- * 入口已经 early-return,这里不会被命中。 */
+ * 一致(调用方拿 null 走 error 分支)。仅由 readSysInfo 的 Linux 分支调用。 */
 async function runSystemctl(args: string[], timeoutMs = 2000): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync('systemctl', ['--user', ...args], {
@@ -264,6 +395,7 @@ async function readServices(): Promise<{ services: ServiceInfo[]; error: string 
       sub: props.SubState ?? '',
       lastActiveAgoSec: ageFrom(props.ActiveEnterTimestampMonotonic),
       stateAgoSec: ageFrom(props.StateChangeTimestampMonotonic),
+      hasStarted: props.ActiveEnterTimestampMonotonic === '0' ? false : null,
     })
   }
   services.sort((a, b) => a.name.localeCompare(b.name))
@@ -271,18 +403,15 @@ async function readServices(): Promise<{ services: ServiceInfo[]; error: string 
 }
 
 export async function readSysInfo(): Promise<SysInfo> {
-  // Linux 专属:CPU/mem/disks 全靠 /proc + statfs,services 走
-  // `systemctl --user`。Windows 上这套全不可用,直接返回空 SysInfo,
-  // 让 `hi` 面板按 no_fallbacks 的约定渲染 `_n/a_`,不假数据也不
-  // 在日志里刷 systemctl/proc 的 ENOENT 噪音。Windows 真实指标
-  // (wmic / PowerShell Get-CimInstance) 留给以后用 Windows 真机
-  // spike,这里只做最低限度的"不崩"。
-  if (process.platform === 'win32') {
-    return { cpu: null, mem: null, disks: [], services: [], servicesError: 'Windows: sysinfo 暂未支持' }
+  if (process.platform !== 'linux' && process.platform !== 'darwin') {
+    const platform = process.platform === 'win32' ? 'Windows' : process.platform
+    return { cpu: null, mem: null, disks: [], services: [], servicesError: `${platform}: sysinfo 暂未支持` }
   }
   const cpu = readCpu()
-  const mem = readMem()
   const disks = readDisks()
-  const { services, error } = await readServices()
+  const [mem, { services, error }] = await Promise.all([
+    process.platform === 'darwin' ? readMacMemory() : readMem(),
+    process.platform === 'darwin' ? readMacServices() : readServices(),
+  ])
   return { cpu, mem, disks, services, servicesError: error }
 }

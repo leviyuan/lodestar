@@ -47,8 +47,8 @@ export interface ConsoleOpts {
   /** 统一用量快照(来自 tokenSource.readUsage)。设了优先用它(取代 usage/glmUsage 二元)。
    * 加新 token source 的额度自动支持 —— 只要 source.readUsage 返回 unified。 */
   unifiedUsage?: UsageSnapshotUnified
-  /** Host snapshot: CPU 负载、内存、AI-managed systemd 服务。
-   * undefined 或字段缺失时明确渲染 `_n/a_`,不假数据。 */
+  /** Host snapshot: CPU 负载、内存、AI-managed systemd / launchd 服务。
+   * undefined 或字段缺失时明确渲染 MISS,不假数据。 */
   sysinfo?: SysInfo
 }
 
@@ -291,9 +291,9 @@ function hostSummary(sysinfo?: SysInfo): string[] {
 export function consoleHostContent(sysinfo?: SysInfo): string {
   if (!sysinfo) {
     return [
-      '**负载**　_n/a_',
-      '**内存**　_n/a_',
-      `**服务** ${SERVICE_LABEL}　_n/a_`,
+      '**负载**　MISS',
+      '**内存**　MISS',
+      `**服务** ${SERVICE_LABEL}　MISS`,
     ].join('\n')
   }
 
@@ -302,13 +302,13 @@ export function consoleHostContent(sysinfo?: SysInfo): string {
     const { cores, load1, load5, load15 } = sysinfo.cpu
     lines.push(`**负载**　${load1.toFixed(2)} / ${load5.toFixed(2)} / ${load15.toFixed(2)} (${cores}核)`)
   } else {
-    lines.push('**负载**　_n/a_')
+    lines.push('**负载**　MISS')
   }
 
   if (sysinfo.mem) {
     lines.push(`**内存**　${sysinfo.mem.percent}% (${fmtBytes(sysinfo.mem.usedBytes)}/${fmtBytes(sysinfo.mem.totalBytes)})`)
   } else {
-    lines.push('**内存**　_n/a_')
+    lines.push('**内存**　MISS')
   }
 
   if (sysinfo.servicesError) {
@@ -327,8 +327,10 @@ export function consoleHostContent(sysinfo?: SysInfo): string {
       } else if (s.active === 'inactive' || s.active === 'failed') {
         if (lastActive != null) {
           parts.push(`上次活跃 ${fmtUptime(lastActive * 1000)}前`)
-        } else {
+        } else if (s.hasStarted === false) {
           parts.push('从未启动')
+        } else {
+          parts.push('上次活跃 MISS')
         }
         if (stateAge != null) {
           const verb = s.active === 'failed' ? '已挂' : '已停'
@@ -337,6 +339,10 @@ export function consoleHostContent(sysinfo?: SysInfo): string {
       } else if (stateAge != null) {
         parts.push(`已 ${fmtUptime(stateAge * 1000)}`)
       }
+      if (s.active !== 'active' && s.lastExitStatus !== undefined) {
+        parts.push(s.lastExitStatus < 0 ? `终止信号 ${-s.lastExitStatus}` : `退出码 ${s.lastExitStatus}`)
+      }
+      if (s.error) parts.push(s.error)
       lines.push(`　· ${dot} \`${s.name}\` · ${parts.join(' · ')}`)
     }
   }
