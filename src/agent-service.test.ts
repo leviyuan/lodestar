@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, test } from 'bun:test'
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { AgentService, type AgentServiceDeps } from './agent-service'
 import type { AgentPrincipal } from './agent-context'
 import type { AgentIdentity, AgentIdentityCatalog } from './agent-identities'
@@ -231,7 +231,7 @@ describe('AgentService', () => {
     expect(artifacts).toHaveLength(0)
   })
 
-  test('keeps subdirectory history within its owning Session and rejects changes to the continuation directory', async () => {
+  test('allows project-local directory changes but rejects different project roots', async () => {
     const { service, root } = harness()
     const first = await service.startRun(root, {
       description: '子目录任务', identityIds: ['agent:a'], prompt: 'first', workDir: 'packages/app',
@@ -240,15 +240,16 @@ describe('AgentService', () => {
     for (const workDir of [terminal.workDir, testDir, join(testDir, 'other')]) {
       const other = service.rootPrincipal({ ...session, workDir })
       expect(() => service.getRun(other, first.runId)).toThrow('different Session')
-      await expect(service.startRun(other, { description: '越界续接', identityIds: [], sessionId: terminal.workers[0]!.sessionId, prompt: 'next' }))
-        .rejects.toThrow('agent session not found')
+      await expect(service.startRun(other, { description: '同项目恢复', identityIds: [], sessionId: terminal.workers[0]!.sessionId, prompt: 'next' }))
+        .rejects.toThrow('different project or group')
       await expect(service.cancelRun(other, first.runId)).rejects.toThrow('different Session')
     }
+    await expect(service.followUp(root, first.runId, { description: '越界目录', prompt: 'next', workDir: join(testDir, 'other') }))
+      .rejects.toThrow('main Agent working directory')
     for (const workDir of ['.', 'packages']) {
-      await expect(service.followUp(root, first.runId, { description: '更换目录', prompt: 'next', workDir }))
-        .rejects.toThrow('original work_dir')
-      await expect(service.startRun(root, { description: '更换目录', identityIds: [], sessionId: terminal.workers[0]!.sessionId, prompt: 'next', workDir }))
-        .rejects.toThrow('original work_dir')
+      const resumed = await service.followUp(root, first.runId, { description: '更换目录恢复', prompt: 'next', workDir })
+      await waitFor(service, root, resumed.runId, 'completed')
+      expect(resumed.workDir).toBe(resolve(session.workDir, workDir))
     }
     const next = await service.followUp(root, first.runId, { description: '原目录续跑', prompt: 'next' })
     await waitFor(service, root, next.runId, 'completed')
@@ -275,7 +276,7 @@ describe('AgentService', () => {
     } finally { await service.shutdown('test cleanup') }
   })
 
-  test('does not resume a completed task in a replacement directory', async () => {
+  test('lets the backend resume a native id in an explicitly changed directory', async () => {
     const workDir = join(session.workDir, 'replaced-worker-dir')
     mkdirSync(workDir)
     let starts = 0
@@ -284,9 +285,10 @@ describe('AgentService', () => {
     await waitFor(service, root, started.runId, 'completed')
     rmSync(workDir, { recursive: true })
     symlinkSync(join(session.workDir, 'packages', 'app'), workDir, 'dir')
-    await expect(service.startRun(root, { description: '目录已替换', identityIds: [], sessionId: 'sid-replaced-directory', prompt: 'next' }))
-      .rejects.toThrow('work_dir changed')
-    expect(starts).toBe(1)
+    const resumed = await service.startRun(root, { description: '目录已替换', identityIds: [], sessionId: 'sid-replaced-directory', prompt: 'next', workDir })
+    await waitFor(service, root, resumed.runId, 'completed')
+    expect(resumed.workDir).toBe(workDir)
+    expect(starts).toBe(2)
   })
 
   test('rejects a directory replaced with an outside symlink while waiting for a worker slot', async () => {
@@ -655,9 +657,10 @@ describe('AgentService', () => {
     for (const other of [{ chatId: 'other-chat' }, { sessionName: 'other-session' }, { workDir: '/other-repo' }]) {
       const outsider = service.rootPrincipal({ ...session, ...other })
       expect(() => service.getRun(outsider, 'agent_history_0')).toThrow()
-      await expect(service.startRun(outsider, {
-        description: '越界续接', identityIds: [], sessionId: 'sid-history-0', prompt: 'next',
-      })).rejects.toThrow('agent session not found')
+      if (other.chatId || other.workDir) {
+        await expect(service.startRun(outsider, { description: '越界恢复', identityIds: [], sessionId: 'sid-history-0', prompt: 'next' }))
+          .rejects.toThrow('different project or group')
+      }
     }
     expect(artifactReads).toHaveLength(0)
     const outputArtifact = history[0]!.workers[0]!.outputArtifact!
@@ -685,27 +688,31 @@ describe('AgentService', () => {
     })
   }
 
-  test('resolves the right worker in a parallel run and rejects inaccessible or mismatched sessions', async () => {
-    let starts = 0
-    let cards = 0
+  test('resumes with another model within the project and rejects cross-project or cross-group callers', async () => {
+    const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
     const { service, root } = harness({
       identities: [identity('a'), identity('b')],
-      sendCard: async () => `card-${++cards}`,
-      startWorker: opts => { starts++; return resolvedHandle(result(opts.resumeSessionId ?? `sid-${opts.identity.id}`)) },
+      startWorker: opts => { calls.push(opts); return resolvedHandle(result(opts.resumeSessionId ?? `sid-${opts.identity.id}`)) },
     })
     const first = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a', 'agent:b'], prompt: 'first' })
     await waitFor(service, root, first.runId, 'completed')
-    for (const request of [
-      { description: '任务说明', identityIds: [], sessionId: 'missing', prompt: 'next' },
-      { description: '任务说明', identityIds: ['agent:b'], sessionId: 'sid-agent:a', prompt: 'next' },
-    ]) await expect(service.startRun(root, request)).rejects.toThrow('agent session not found')
-    for (const other of [{ chatId: 'other-chat' }, { sessionName: 'other-session' }, { workDir: '/other-repo' }]) {
+    await expect(service.startRun(root, { description: '缺少后端', identityIds: [], sessionId: 'missing', prompt: 'next' }))
+      .rejects.toThrow('ownership is unknown')
+    const switched = await service.startRun(root, { description: '换模型恢复', identityIds: ['agent:b'], sessionId: 'sid-agent:a', prompt: 'next' })
+    await waitFor(service, root, switched.runId, 'completed')
+    expect(calls.at(-1)).toMatchObject({ identity: { id: 'agent:b' }, resumeSessionId: 'sid-agent:a' })
+    for (const other of [{ chatId: 'other-chat' }, { workDir: '/other-repo' }]) {
       const outsider = service.rootPrincipal({ ...session, ...other })
-      await expect(service.startRun(outsider, { description: '任务说明', identityIds: [], sessionId: 'sid-agent:a', prompt: 'next' }))
-        .rejects.toThrow('agent session not found')
+      await expect(service.startRun(outsider, { description: '跨范围恢复', identityIds: [], sessionId: 'sid-agent:a', prompt: 'next' }))
+        .rejects.toThrow('different project or group')
+      await expect(service.followUp(outsider, first.runId, { description: '跨范围恢复', identityId: 'agent:a', prompt: 'next' }))
+        .rejects.toThrow('different project or group')
     }
-    expect(starts).toBe(2)
-    expect(cards).toBe(1)
+    const sameProject = service.rootPrincipal({ ...session, sessionName: 'another-session' })
+    const resumed = await service.startRun(sameProject, { description: '同项目恢复', identityIds: [], sessionId: 'sid-agent:a', prompt: 'next' })
+    await waitFor(service, sameProject, resumed.runId, 'completed')
+    expect(resumed.parentRunId).toBeUndefined()
+    expect(resumed.resumedFromRunId).toBeDefined()
     const next = await service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid-agent:b', prompt: 'second' })
     const terminal = await waitFor(service, root, next.runId, 'completed')
     expect(terminal.workers).toHaveLength(1)
@@ -738,7 +745,7 @@ describe('AgentService', () => {
       const second = await creating
       await waitFor(service, root, second.runId, 'running')
       await expect(service.followUp(root, first.runId, { description: '任务说明', prompt: 'still duplicate' })).rejects.toThrow('already running or starting')
-      await expect(service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'too early' })).rejects.toThrow('terminal source run')
+      await expect(service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'too early' })).rejects.toThrow('already running or starting')
       control.resolve(result('sid'))
       await waitFor(service, root, second.runId, 'completed')
       const third = await service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'third' })
@@ -747,7 +754,7 @@ describe('AgentService', () => {
     } finally { releaseCard(); await service.shutdown('test cleanup') }
   })
 
-  test('releases a continuation reservation after card failure and rejects identity drift', async () => {
+  test('releases a continuation reservation after card failure and rejects unavailable identities', async () => {
     let cards = 0
     let starts = 0
     const selected = identity('a')
@@ -758,13 +765,6 @@ describe('AgentService', () => {
     const first = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a'], prompt: 'first' })
     await waitFor(service, root, first.runId, 'completed')
     await expect(service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'second' })).rejects.toThrow('card creation failed')
-    for (const field of ['model', 'tokenSourceId', 'provider'] as const) {
-      const original = selected[field]
-      Object.assign(selected, { [field]: field === 'provider' ? 'codex' : 'changed' })
-      await expect(service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'wrong identity' }))
-        .rejects.toThrow('identity changed')
-      Object.assign(selected, { [field]: original })
-    }
     selected.status = 'catalog_failed'
     await expect(service.startRun(root, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'unavailable' })).rejects.toThrow('catalog_failed')
     selected.status = 'ready'
@@ -1258,7 +1258,11 @@ describe('project-owned Agent runs', () => {
     const project = h.service.projectPrincipal(context())
     const started = await h.service.startRun(project, { ...request, workDir: 'packages/app', effort: 'low' })
     const completed = await waitFor(h.service, project, started.runId, 'completed')
-    await expect(h.service.followUp(h.root, completed.runId, { description: 'cross owner', prompt: 'next' })).rejects.toThrow('not found')
+    const cross = await h.service.followUp(h.root, completed.runId, { description: 'cross owner', prompt: 'next' })
+    await waitFor(h.service, h.root, cross.runId, 'completed')
+    expect(cross.owner?.kind).toBe('session')
+    expect(cross.parentRunId).toBeUndefined()
+    expect(cross.resumedFromRunId).toBe(completed.runId)
     const calls: any[] = []
     const loaded = harness({ loadArtifacts: () => [structuredClone(completed), ...completedHistory(1)], startWorker: opts => {
       calls.push(opts)
@@ -1382,5 +1386,189 @@ describe('project-owned Agent runs', () => {
     await h.service.shutdown('daemon stop')
     expect(aborted).toBe(true)
     expect(h.service.getRun(principal, run.runId).status).toBe('cancelled')
+  })
+})
+
+describe('native session-id recovery', () => {
+  for (const provider of ['codex', 'claude', 'dsh'] as const) {
+    for (const mode of ['session', 'project'] as const) {
+      test(`${provider}/${mode}: restores a registered project session with the same native id across binding modes`, async () => {
+        const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
+        const selected = { ...identity('a'), provider }
+        const history = completedHistory(1)[0]
+        history.workers[0].provider = provider
+        history.owner = { kind: mode === 'session' ? 'project' : 'session', name: session.sessionName, chatId: session.chatId, workDir: session.workDir }
+        history.sessionWorkDir = session.workDir
+        const h = harness({ identities: [selected], loadArtifacts: () => [history], startWorker: opts => {
+          calls.push(opts)
+          return resolvedHandle(result(opts.resumeSessionId!, 'native history restored'))
+        } })
+        const principal = mode === 'session' ? h.root : h.service.projectPrincipal({
+          owner: { kind: 'project', name: 'project', chatId: session.chatId, workDir: session.workDir },
+        })
+        const run = await h.service.startRun(principal, {
+          description: '原生 ID 恢复', identityIds: [selected.id], sessionId: 'sid-history-0', prompt: 'next',
+          workDir: 'packages/app', effort: 'low',
+        })
+        const completed = await waitFor(h.service, principal, run.runId, 'completed')
+        expect(calls).toHaveLength(1)
+        expect(calls[0]).toMatchObject({ resumeSessionId: 'sid-history-0', workDir: join(session.workDir, 'packages', 'app'),
+          effort: 'low', identity: { provider }, projectBound: mode === 'project' })
+        expect(completed.workers[0].sessionId).toBe('sid-history-0')
+        expect(completed.parentRunId).toBeUndefined()
+        expect(completed.owner?.kind).toBe(mode)
+      })
+    }
+  }
+
+  test('unknown project ownership is rejected even with an identity; known native failures never create a fresh session', async () => {
+    const calls: Array<string | undefined> = []
+    const h = harness({ loadArtifacts: () => completedHistory(1), startWorker: opts => {
+      calls.push(opts.resumeSessionId)
+      return { ...resolvedHandle(result('unused')), done: Promise.reject(new AgentWorkerFailure(new Error('native session missing'), '', null)) }
+    } })
+    for (const identityIds of [[], ['agent:a']]) {
+      await expect(h.service.startRun(h.root, { description: '归属未知', identityIds, sessionId: 'unrecorded', prompt: 'next' }))
+        .rejects.toThrow('ownership is unknown')
+    }
+    expect(calls).toHaveLength(0)
+    const started = await h.service.startRun(h.root, { description: '交给后端恢复', identityIds: ['agent:a'], sessionId: 'sid-history-0', prompt: 'next' })
+    const failed = await waitFor(h.service, h.root, started.runId, 'failed')
+    expect(failed.workers[0].error).toBe('native session missing')
+    expect(calls).toEqual(['sid-history-0'])
+  })
+
+  test('changing binding within the project does not join cancellation trees or inherit delivery recipients', async () => {
+    const history = completedHistory(1)[0]
+    history.owner = { kind: 'project', name: history.sessionName, chatId: history.chatId, workDir: history.workDir }
+    history.sessionWorkDir = history.workDir
+    history.requesterOpenId = 'original-requester'
+    const control = controlledHandle()
+    let startedWorker = false
+    const h = harness({ loadArtifacts: () => [history], startWorker: () => { startedWorker = true; return control.handle } })
+    const old = h.service.projectPrincipal({ owner: history.owner })
+    const target = h.service.rootPrincipal(session)
+    const started = await h.service.startRun(target, { description: '同项目恢复', identityIds: [], sessionId: 'sid-history-0', prompt: 'next' })
+    await waitForCondition(() => startedWorker)
+    expect(started).toMatchObject({ resumedFromRunId: history.runId, workDir: history.workDir, owner: { kind: 'session', name: session.sessionName, chatId: session.chatId } })
+    expect(started.parentRunId).toBeUndefined()
+    expect(started.requesterOpenId).toBeUndefined()
+    expect(await h.service.cancelRun(old, history.runId)).toBe(false)
+    expect(h.service.getRun(target, started.runId).status).toBe('running')
+    expect(() => h.service.getRun(old, started.runId)).toThrow('not found')
+    await h.service.cancelRun(target, started.runId)
+    expect(h.service.getRun(target, started.runId).status).toBe('cancelled')
+  })
+
+  test('project resume history retains its native id and latest model across binding changes and reload', async () => {
+    const a = identity('a')
+    const b = { ...identity('b'), defaultEffort: 'max' as const }
+    const history = completedHistory(1)[0]
+    history.workers[0].effort = 'low'
+    const h = harness({ identities: [a, b], loadArtifacts: () => [history], startWorker: opts => resolvedHandle(result(opts.resumeSessionId!)) })
+    const target = h.service.projectPrincipal({ owner: { kind: 'project', name: 'project', chatId: session.chatId, workDir: session.workDir } })
+    const changed = await h.service.startRun(target, { description: '新模型恢复', identityIds: [b.id], sessionId: 'sid-history-0', prompt: 'next', workDir: '.' })
+    const completed = await waitFor(h.service, target, changed.runId, 'completed')
+    expect(completed.workers[0]).toMatchObject({ identityId: b.id, effort: 'max' })
+    const records = [completed, history].map(run => ({ ...run, createdAt: '2026-10-01T00:00:00Z' }))
+    const reloaded = harness({ identities: [a, b], loadArtifacts: () => records, startWorker: opts => resolvedHandle(result(opts.resumeSessionId!)) })
+    const next = await reloaded.service.startRun(reloaded.root, { description: '沿用最后配置', identityIds: [], sessionId: 'sid-history-0', prompt: 'continue' })
+    await waitFor(reloaded.service, reloaded.root, next.runId, 'completed')
+    expect(next).toMatchObject({ resumedFromRunId: changed.runId, workDir: session.workDir })
+    expect(next.parentRunId).toBeUndefined()
+    expect(next.workers[0]).toMatchObject({ identityId: b.id, effort: 'max', sessionId: 'sid-history-0' })
+  })
+
+  test('a completed worker can resume while other workers in its original run remain active', async () => {
+    const waiting = controlledHandle()
+    let calls = 0
+    const h = harness({ identities: [identity('a'), identity('b')], startWorker: opts => {
+      calls++
+      return opts.identity.id === 'agent:b' ? waiting.handle : resolvedHandle(result('native-a'))
+    } })
+    const first = await h.service.startRun(h.root, { description: '两个 Agent', identityIds: ['agent:a', 'agent:b'], prompt: 'work' })
+    await waitForCondition(() => calls === 2 && h.service.getRun(h.root, first.runId).workers[0].status === 'completed')
+    expect(h.service.getRun(h.root, first.runId).status).toBe('running')
+    const next = await h.service.followUp(h.root, first.runId, { description: '只续跑已完成项', identityId: 'agent:a', prompt: 'next' })
+    await waitFor(h.service, h.root, next.runId, 'completed')
+    expect(calls).toBe(3)
+    await h.service.cancelRun(h.root, first.runId)
+  })
+
+  test('project-owned native ids reserve execution before opening a card across binding modes', async () => {
+    let open!: () => void
+    let entered!: () => void
+    const gate = new Promise<void>(resolve => { open = resolve })
+    const opening = new Promise<void>(resolve => { entered = resolve })
+    const h = harness({ loadArtifacts: () => completedHistory(1), sendCard: async () => { entered(); await gate; return 'new-card' }, startWorker: opts => resolvedHandle(result(opts.resumeSessionId!)) })
+    const request = { description: '外部会话', identityIds: ['agent:a'], sessionId: 'sid-history-0', prompt: 'next' }
+    const first = h.service.startRun(h.root, request)
+    await opening
+    const other = h.service.projectPrincipal({ owner: { kind: 'project', name: 'project', chatId: session.chatId, workDir: session.workDir } })
+    await expect(h.service.startRun(other, request)).rejects.toThrow('already running or starting')
+    open()
+    const started = await first
+    await waitFor(h.service, h.root, started.runId, 'completed')
+  })
+})
+
+describe('project-owned session identity boundaries', () => {
+  test('explicit identity and workdir cannot import a foreign project or group session', async () => {
+    let starts = 0
+    let cards = 0
+    const h = harness({ loadArtifacts: () => completedHistory(1), identities: [identity('a'), identity('codex')],
+      startWorker: opts => { starts++; return resolvedHandle(result(opts.resumeSessionId!)) },
+      sendCard: async () => { cards++; return 'unexpected' },
+    })
+    for (const owner of [
+      { kind: 'project' as const, name: 'other', chatId: session.chatId, workDir: join(testDir, 'other') },
+      { kind: 'project' as const, name: session.sessionName, chatId: 'other-chat', workDir: session.workDir },
+    ]) {
+      const principal = h.service.projectPrincipal({ owner })
+      for (const identityIds of [[], ['agent:a'], ['agent:codex']]) {
+        await expect(h.service.startRun(principal, { identityIds, sessionId: 'sid-history-0', description: '禁止越界', prompt: 'next', workDir: session.workDir }))
+          .rejects.toThrow('different project or group')
+      }
+      await expect(h.service.followUp(principal, 'agent_history_0', { description: '禁止越界续跑', prompt: 'next', identityId: 'agent:a' }))
+        .rejects.toThrow('different project or group')
+    }
+    expect(starts).toBe(0)
+    expect(cards).toBe(0)
+  })
+
+  test('a native session id cannot select another backend or ambiguous ownership records', async () => {
+    const history = completedHistory(1)[0]
+    const h = harness({ identities: [identity('a'), identity('codex')], loadArtifacts: () => [history] })
+    await expect(h.service.startRun(h.root, { identityIds: ['agent:codex'], sessionId: 'sid-history-0', description: '禁止换后端', prompt: 'next' }))
+      .rejects.toThrow('different Agent backend')
+    const conflicting = structuredClone(history)
+    conflicting.runId = 'agent_conflicting'
+    conflicting.workers[0].provider = 'codex'
+    const duplicate = harness({ loadArtifacts: () => [history, conflicting] })
+    await expect(duplicate.service.startRun(duplicate.root, { identityIds: ['agent:a'], sessionId: 'sid-history-0', description: '冲突记录', prompt: 'next' }))
+      .rejects.toThrow('conflicting backend records')
+    conflicting.workers[0].provider = 'claude'
+    conflicting.chatId = 'other-chat'
+    const ambiguous = harness({ loadArtifacts: () => [history, conflicting] })
+    await expect(ambiguous.service.startRun(ambiguous.root, { identityIds: ['agent:a'], sessionId: 'sid-history-0', description: '归属冲突', prompt: 'next' }))
+      .rejects.toThrow('different project or group')
+  })
+
+  test('project aliases share session ids but resume directories cannot escape the project', async () => {
+    const alias = join(testDir, 'resume-project-alias')
+    symlinkSync(session.workDir, alias, 'dir')
+    const escape = join(session.workDir, 'resume-project-escape')
+    symlinkSync(join(testDir, 'other'), escape, 'dir')
+    const h = harness({ loadArtifacts: () => completedHistory(1), startWorker: opts => resolvedHandle(result(opts.resumeSessionId!)) })
+    const principal = h.service.projectPrincipal({ owner: { kind: 'project', name: 'project-alias', chatId: session.chatId, workDir: alias } })
+    const restored = await h.service.startRun(principal, { identityIds: [], sessionId: 'sid-history-0', description: '同项目别名恢复', prompt: 'next' })
+    const complete = await waitFor(h.service, principal, restored.runId, 'completed')
+    expect(complete.workers[0].sessionId).toBe('sid-history-0')
+    expect(complete.runId).not.toBe('agent_history_0')
+    expect(complete.owner).toMatchObject({ kind: 'project', chatId: session.chatId, workDir: alias })
+    for (const workDir of ['../other', escape, join(testDir, 'other')]) {
+      await expect(h.service.startRun(principal, { identityIds: [], sessionId: 'sid-history-0', description: '拒绝越界目录', prompt: 'next', workDir }))
+        .rejects.toThrow('main Agent working directory')
+    }
   })
 })

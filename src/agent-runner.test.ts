@@ -194,3 +194,26 @@ describe('full delegated Agent runner', () => {
     expect(error.sessionId).toBe('sid-1')
   })
 })
+
+test('native resume rejects a backend that silently creates a different conversation', async () => {
+  const proc = new FakeProcess() as any
+  proc.sessionId = 'unexpected-new-session'
+  const remembered: string[] = []
+  const handle = collectAgentTurn(proc, 'continue', {}, (_provider, id) => { remembered.push(id) }, 'original-session')
+  proc.emit('init', { session_id: proc.sessionId })
+  await expect(handle.done).rejects.toThrow('native resume returned session unexpected-new-session, expected original-session')
+  expect(proc.isAlive()).toBe(false)
+  expect(remembered).toContain('unexpected-new-session')
+})
+
+test('native resume preserves the original history classification of an external conversation', async () => {
+  const proc = new FakeProcess() as any
+  proc.sessionId = 'external-session'
+  const classified: string[] = []
+  const handle = collectAgentTurn(proc, 'continue', {}, (_provider, id) => { classified.push(id) }, 'external-session')
+  proc.emit('init', { session_id: proc.sessionId })
+  proc.emit('assistant_text', { text: 'restored' })
+  proc.emit('result', { is_error: false })
+  await expect(handle.done).resolves.toMatchObject({ sessionId: 'external-session', output: 'restored' })
+  expect(classified).toEqual([])
+})

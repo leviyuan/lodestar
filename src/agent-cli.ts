@@ -258,6 +258,10 @@ export function extractProjectOption(argv: string[]): { project?: string; argv: 
 function cliContext(project?: string): CliContext {
   if (project !== undefined) {
     if (process.env.LODESTAR_AGENT_ROLE === 'worker') throw new Error('Delegated Agents cannot start project calls')
+    if (['LODESTAR_AGENT_ROLE', 'LODESTAR_AGENT_URL', 'LODESTAR_AGENT_CAPABILITY', 'LODESTAR_AGENT_SESSION', 'DSH_LODESTAR_AGENT_CONTEXT']
+      .some(key => process.env[key] !== undefined)) {
+      throw new Error('Agent task calls must remain session-bound; --project is only for independent services and applications')
+    }
     return { ...readAgentProjectClient(), project }
   }
   if (process.env.DSH_LODESTAR_AGENT_CONTEXT !== undefined) {
@@ -381,12 +385,16 @@ function usage(): string {
     '  lodestar-agent cancel <run_id>',
     '',
     'Use --prompt <text> instead of --stdin for inline input. --no-wait returns the started run as JSON.',
-    '--project explicitly creates project-owned tasks with independent cards, using the local daemon credentials.',
+    'Agent task calls must use the managed-session context. --project is only for independent services and applications.',
     'Without --project, the existing managed-session context is required; invalid contexts never switch modes.',
     'Project run/follow-up: --request-id <unique-key> deduplicates retries; --requester <open_id> identifies the cloud-file recipient.',
-    '--session continues the native Agent conversation within the same session/project owner and workspace.',
+    '--session resumes the unique native conversation id only within its registered project and group.',
+    'Unknown ownership and cross-project/group resumes are rejected, even with an explicit identity.',
+    '--identity may change the model/source within the original backend; effort and project-local workdir may be overridden.',
+    'The new run belongs to the current caller; the previous run keeps its original owner and cancellation scope.',
     '--workdir defaults to the managed-session or explicit-project directory; relative paths are resolved from it.',
-    'The directory must exist within that root (symlinks are resolved). Continuations keep their original directory.',
+    'New conversations and resumes stay within that project root. Resumes otherwise reuse the recorded directory.',
+    'session_id is the stable conversation identity; run_id identifies only one invocation, not a second session.',
     '--description is required for every run/follow-up: one short line, at most 60 characters, shown on the collapsed card.',
     'Each turn has a new run_id; workers[].session_id identifies the native conversation.',
   ].join('\n')

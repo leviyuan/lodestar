@@ -42,9 +42,9 @@
 
 ## 委派 Agent
 
-- 项目独立调用显式使用 `--project` / HTTP `?project=`，默认会话委派不变，不做凭据失效后的自动切换。`agent-context.ts` 区分 session/project/worker，`agent-project.ts` 从群绑定和实际目录解析项目，不构造或启动 Session，不继承主会话账号/模型；`agent-project-client.ts` 通过 paths.ts 下的私有文件向本机客户端提供轮换凭据，不注入 worker。项目/会话凭据不能跨路由，worker 仍禁止继续派工。
+- Agent 执行任务中的调用强制绑定当前会话，包括通过脚本或 HTTP 调用；独立服务/软件强制使用 `--project` / HTTP `?project=` 项目绑定。检测到受管 Agent 上下文的 CLI 不接受 --project，禁止清除环境或复制项目凭据绕过。两种模式不做失败后的自动切换。`agent-context.ts` 区分 session/project/worker，`agent-project.ts` 从群绑定和实际目录解析项目，不构造或启动 Session，不继承主会话账号/模型；`agent-project-client.ts` 通过 paths.ts 下的私有文件向本机客户端提供轮换凭据，不注入 worker。项目/会话凭据不能跨路由，worker 仍禁止继续派工。
 - 新快照记录 owner；缺 owner 的旧快照仅解释为会话归属。会话 stop/kill/restart 只取消会话任务，daemon shutdown 取消所有任务并排空交付。项目 run 一次一张独立卡，不能进入群尾共享委派卡；取消按钮在 Session 存在性检查前分流，并核验存储的群、消息和 run。提问由同项目 `answer` 回填，普通群消息不重定向。项目任务直接处理交付标记，交付方式按实际目录在启动时固定；云空间发起人由 `--requester` 显式提供，失败可见且不切换通道。
-- 项目 `request_id` 按归属去重并持久化请求摘要，同键不同输入拒绝，续跑保留项目、群和原目录，不允许跨会话归属；旧历史不因此迁移。重启只结算未完成状态，不自动重放任务。两种任务共享原全局及来源并发限制。
+- 项目 `request_id` 按归属去重并持久化请求摘要，同键不同输入拒绝，恢复仅限同一规范项目根目录和同一 chat_id；两种绑定方式可互相恢复，新 run 归当前调用方，旧历史不迁移。`resumedFromRunId` 仅作来源索引，切换绑定方式不设置取消树的 parentRunId。重启只结算未完成状态，不自动重放任务。两种任务共享原全局及来源并发限制。
 
 - `agent-*` 提供单层模型委派。会话内只有主 Agent 能发起任务或续跑；主 Agent 按任务和可用能力自行选择原生 subagent 或 `lodestar-agent`，调用自身模型或 Agent 时也适用。同一任务的多个身份放在一个 run 内并发。被委派的 Agent 自行完成任务，需要额外派工时报告主 Agent。
 - `lodestar-agent identities` / `GET /agents/identities` 与 `agents` 面板只读取已提交的目录与订阅额度缓存，不查询、不等待后台刷新；不再维护独立的 30 分钟订阅缓存。可用性失败保留在 `source_failures`，后台确认恢复后，下次读取立即反映新状态。
@@ -53,10 +53,10 @@
 - 委派任务按全局 8 个并发槽和 Token Source 上限排队并显示原因；OpenRouter 在同一 daemon 的所有项目、模型间共用 2 个委派名额，这是本地策略而非上游额度。满额来源不得堵住其他来源。取消未确认的进程必须继续保留 handle 与槽位，失败向 Session 传播，不能标成已取消后丢掉控制权。
 - 提问进入 `needs_input`，answer 后恢复；非输入权限请求放行。委派任务不设整轮时长上限，不截断返回正文，结束由后端终态或用户取消决定；follow-up 复用 provider 原生 session。
 - 新委派可用 `--workdir` / `work_dir` 指定主 Agent 工作目录内的现有子目录；默认主目录，相对路径以主目录解析，绝对路径也须在范围内。按真实路径校验软链接，启动前再次校验；越界、缺失和非目录报错。快照 `sessionWorkDir` 保留所属主会话目录，`workDir` 记录实际执行目录；旧快照缺少 `sessionWorkDir` 时其 `workDir` 就是原主目录。
-- `run --session <session_id>` / `POST /agents/runs` 的 `session_id` 从本群同主工作目录的委派历史选择最新一轮，复用原身份及上一轮 effort，并保留原任务目录；显式 `work_dir` 必须解析到原目录。每轮新建 run，原生 session 不变。续跑必须等原任务终态和进程退出；同一 provider/session 在开卡、排队及执行期间禁止重叠续跑，不能把恢复失败转为新会话。
+- `session_id` 是会话唯一的原生 ID，恢复保持不变；`run_id` 只是一轮调用。`run --session` / `follow-up` 先验证 ID 的全部已知记录均属当前项目和群，再由原后端恢复；未知归属不因传入 identity 或目录而放行，跨项目/群以及后端归属冲突均报错。允许同项目同群的 session/project 两种绑定互相恢复，工作目录可在项目根内调整；不同工作子目录不改变项目归属。默认沿用最近记录的身份、effort 和目录，显式选择同后端其他模型/来源可覆盖；切换身份未指定 effort 时取新身份默认档位。仅等待目标 worker 退出，不等待同 run 其他 worker；按 provider/session 保留并发保护，后端错误和返回不同原生 ID 均报错，不自动新建会话。
 - `run` / `follow-up` 必填单行 `description`（CLI `--description`，最多 60 字）。委派、原生子 Agent、后台任务共用 `agent-cards.ts` 的同一实例；一项一个默认收起的面板，标题明确标出“委派任务 / 子 Agent / 后台进程”类别、状态与说明，详情中的任务说明只显示短摘要，结果在卡片安全上限内完整展示，超限明确截断，错误及最近三步动作仍保留。子 Agent 启动即展示，普通前台命令仍先观察；原生启动工具与 SDK task id 回填复用同一项。按群尾实际消息复用委派卡，满卡或新消息后新任务开新卡，原任务留在原卡更新，不再迁移后台游标。共享卡的 streaming/dispose 统一结算，单项终态不得关闭同卡其他任务；停止进程先排空已接收写入，再结算所属任务。群内出站消息与委派追加通过 `chat-message-order.ts` 排序；读取群尾或写卡失败须报错，不能猜测位置。
-- 每次状态转换原子落盘；大 prompt/输出单独存入私有 artifact，快照不重复内嵌。委派 session id 单独登记，从主会话 `rs`/`fk` 历史排除。
-- 委派历史索引和父子关系不能按缓存数量删除；仅淘汰已完成、已落盘且进程退出的旧正文缓存。`status` 按原 artifact 读取完整正文，读取失败报错；续接保留原生 session、最新一轮 effort 和群/目录边界。
+- 每次状态转换原子落盘；大 prompt/输出单独存入私有 artifact，快照不重复内嵌。新建的委派原生 session id 单独登记，从主会话 `rs`/`fk` 历史排除；恢复已有原生 ID 不改变原登记，不能把外部或主会话恢复后从历史列表隐藏。
+- 委派历史索引和父子关系不能按缓存数量删除；仅淘汰已完成、已落盘且进程退出的旧正文缓存。`status` 按原 artifact 读取完整正文，读取失败报错；续接以原生 session 及恢复来源关系查最新参数，任务访问和取消仍按当前归属隔离。
 - 父 run 取消、Session stop/kill/restart 和 daemon shutdown 在首次 await 前关闭新建入口、吊销 capability，并递归回收后代进程。
 - Skill 内容由 `managed-skills.ts` 同源同步至 Codex/Claude standalone 目录和 Claude 本地插件。排除 user settings 的主会话显式加载插件，不能为发现 Skill 混入 user env。
 - 文件交付约定仅由 `instructions.ts` 注入会话，不生成或安装独立 Skill。npm 安装/更新与 daemon 启动共用 `managed-skill-cleanup.cjs` 清理旧 `lodestar-files` 的 Codex、Claude 和共享插件副本；`data-dir.cjs` 与 `paths.ts` 共用跨平台/自定义数据目录解析，清理失败明确报错。安装清理使用随包的 CommonJS 源文件，不依赖预先构建、配置或 Agent。`channelInstructions(provider, mode)` 在主 Agent 启动时按工作目录设置生成，只有聊天附件模式在交付标记旁注入 30 MB 约束；云空间提示词不提这个数字。Agent 只生成/检查本地文件并提交标记，不承担上传、分片、授权或发卡接口；委派 Agent 返回路径给主 Agent。目录开关由用户操作，不能让 Agent 为交付读取凭据、查询接口推断限制或修改配置。

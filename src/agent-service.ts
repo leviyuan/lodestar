@@ -9,6 +9,7 @@ import { config } from './config'
 import { getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
 import { AgentWorkerFailure, startAgentWorker, type AgentWorkerHandle } from './agent-runner'
 import { agentApiUrl } from './agent-runtime'
+import { workspaceKey } from './workspace'
 import type {
   AgentAnswerRequest,
   AgentFollowUpRequest,
@@ -61,7 +62,8 @@ interface CreateRunOptions {
   parentRunId?: string
   parentKind?: 'follow_up'
   cancellationEpoch: number
-  resumeWorker?: AgentWorkerResult
+  resumeSessionId?: string
+  resumedFromRunId?: string
   requestId?: string
   requestHash?: string
 }
@@ -133,12 +135,9 @@ export class AgentService {
     if (request.sessionId !== undefined) {
       if (!request.sessionId.trim()) throw new Error('agent session_id must be a non-empty string')
       if (request.identityIds.length > 1) throw new Error('agent session continuation accepts at most one identity_id')
-      const { run, worker } = this.requireSessionRun(principal, request.sessionId, request.identityIds[0])
-      return this.followUpOnce(principal, run.snapshot.runId, {
-        identityId: worker.identityId, description: request.description, prompt: request.prompt, effort: request.effort,
-        workDir: request.workDir,
-        requesterOpenId: request.requesterOpenId,
-      }, metadata)
+      const history = this.findSessionHistory(principal, request.sessionId)
+      const selected = request.identityIds[0] ? this.requireIdentity(principal, request.identityIds[0]) : undefined
+      return this.resumeRun(principal, request, metadata, history, selected)
     }
     const release = this.reserveCapacity(principal, request.identityIds.length)
     try {
@@ -164,38 +163,52 @@ export class AgentService {
     this.assertAcceptingRuns()
     if (principal.kind === 'worker') throw new Error(NESTED_DELEGATION_ERROR)
     requireAgentDescription(request.description)
-    const source = this.requireMutableDescendant(principal, runId)
-    if (!isTerminal(source.snapshot.status)) throw new Error('agent follow-up requires a terminal source run')
-    const worker = selectWorker(source.snapshot, request.identityId)
+    const source = this.runs.get(runId)
+    if (!source) throw new Error(`agent run not found: ${runId}`)
+    this.assertResumeProject(principal, source)
+    const worker = source.snapshot.workers.length === 1 ? source.snapshot.workers[0] : selectWorker(source.snapshot, request.identityId)
     if (source.handles.get(worker.identityId)?.isAlive?.()) {
       throw new Error('Agent process has not stopped; cannot start follow-up yet')
     }
     if (!worker.sessionId) throw new Error(`${worker.identityName} has no resumable native session id`)
-    const workDir = resolveAgentWorkDir(agentPrincipalContext(principal).owner.workDir, source.snapshot.workDir)
-    if (source.snapshot.sessionWorkDir !== undefined && workDir !== source.snapshot.workDir) {
-      throw new Error('agent work_dir changed since the original run')
-    }
-    if (request.workDir !== undefined && resolveAgentWorkDir(agentPrincipalContext(principal).owner.workDir, request.workDir) !== workDir) {
-      throw new Error('agent session continuation must use its original work_dir')
-    }
-    const effort = request.effort ?? worker.effort
+    this.findSessionHistory(principal, worker.sessionId)
+    const selected = request.identityId ? this.requireIdentity(principal, request.identityId) : undefined
+    return this.resumeRun(principal, {
+      ...request, identityIds: request.identityId ? [request.identityId] : [], sessionId: worker.sessionId,
+    }, metadata, { run: source, worker }, selected)
+  }
+
+  private requireIdentity(principal: AgentPrincipal, id: string): AgentIdentity {
+    const identity = this.deps.getCatalog(agentPrincipalContext(principal).codexAccountId).identities.find(item => item.id === id)
+    if (!identity) throw new Error(`agent identity not found: ${id}`)
+    if (identity.status !== 'ready') throw new Error(`${identity.displayName}: ${identity.reason ?? identity.status}`)
+    return identity
+  }
+
+  private async resumeRun(
+    principal: AgentPrincipal, request: AgentRunRequest, metadata: RequestMetadata,
+    history: { run: AgentRunRecord; worker: AgentWorkerResult }, selected?: AgentIdentity,
+  ): Promise<AgentRunSnapshot> {
+    const context = agentPrincipalContext(principal)
+    this.assertResumeProject(principal, history.run)
+    const identity = selected ?? this.requireIdentity(principal, history.worker.identityId)
+    if (identity.provider !== history.worker.provider) throw new Error('native session belongs to a different Agent backend')
+    const sameOwner = agentOwnerKey(agentRunOwner(history.run.snapshot)) === agentOwnerKey(context.owner)
+    const effort = request.effort ?? (history.worker.identityId === identity.id ? history.worker.effort : undefined)
+    const workDir = request.workDir ?? history.run.snapshot.workDir
     const release = this.reserveCapacity(principal, 1)
     let releaseSession: (() => void) | undefined
     try {
-      releaseSession = this.reserveNativeSession(worker)
-      return await this.createRun(agentPrincipalContext(principal), {
-        identityIds: [worker.identityId],
-        description: request.description,
-        prompt: request.prompt,
-        effort,
-        workDir,
-        requesterOpenId: request.requesterOpenId ?? source.snapshot.requesterOpenId,
+      releaseSession = this.reserveNativeSession({ provider: identity.provider, sessionId: request.sessionId! })
+      return await this.createRun(context, {
+        identityIds: [identity.id], description: request.description, prompt: request.prompt, effort, workDir,
+        requesterOpenId: request.requesterOpenId ?? (sameOwner ? history.run.snapshot.requesterOpenId : undefined),
       }, {
         ...metadata,
-        parentRunId: source.snapshot.runId,
-        parentKind: 'follow_up',
-        cancellationEpoch: this.currentCancellationEpoch(agentPrincipalContext(principal)),
-        resumeWorker: worker,
+        ...(sameOwner ? { parentRunId: history.run.snapshot.runId, parentKind: 'follow_up' as const } : {}),
+        resumedFromRunId: history.run.snapshot.runId,
+        cancellationEpoch: this.currentCancellationEpoch(context),
+        resumeSessionId: request.sessionId!,
       })
     } finally {
       releaseSession?.()
@@ -343,7 +356,10 @@ export class AgentService {
     options: CreateRunOptions,
   ): Promise<AgentRunSnapshot> {
     const { owner } = context
-    const workDir = resolveAgentWorkDir(owner.workDir, request.workDir)
+    const workDir = options.resumeSessionId
+      ? resolveAgentResumeWorkDir(owner.workDir, request.workDir)
+      : resolveAgentWorkDir(owner.workDir, request.workDir)
+    const admittedWorkDir = realpathSync(workDir)
     let parent: AgentRunRecord | undefined
     if (options.parentRunId) {
       parent = this.runs.get(options.parentRunId)
@@ -356,17 +372,12 @@ export class AgentService {
       const identity = catalog.identities.find(item => item.id === id)
       if (!identity) throw new Error(`agent identity not found: ${id}`)
       if (identity.status !== 'ready') throw new Error(`${identity.displayName}: ${identity.reason ?? identity.status}`)
-      const previous = options.resumeWorker
-      if (previous && (identity.id !== previous.identityId || identity.provider !== previous.provider
-        || identity.tokenSourceId !== previous.tokenSourceId || identity.model !== previous.model)) {
-        throw new Error('agent session identity changed; cannot resume with a different provider, source or model')
-      }
       return identity
     })
     const workers = identities.map(identity => workerSnapshot(
       identity,
       resolveEffort(identity, request.effort),
-      options.resumeWorker?.sessionId,
+      options.resumeSessionId,
     ))
     const runId = `agent_${randomUUID()}`
     const snapshot: AgentRunSnapshot = {
@@ -386,6 +397,7 @@ export class AgentService {
       description: requireAgentDescription(request.description),
       ...(options.parentRunId ? { parentRunId: options.parentRunId } : {}),
       ...(options.parentKind ? { parentKind: options.parentKind } : {}),
+      ...(options.resumedFromRunId ? { resumedFromRunId: options.resumedFromRunId } : {}),
       depth: 0,
       status: 'queued',
       workers,
@@ -440,8 +452,8 @@ export class AgentService {
     }
     this.persist(run)
     for (const identity of identities) {
-      const resumeSessionId = options.resumeWorker?.sessionId
-      void this.executeWorker(run, identity, request.prompt, resumeSessionId).catch(error => {
+      const resumeSessionId = options.resumeSessionId
+      void this.executeWorker(run, identity, request.prompt, admittedWorkDir, resumeSessionId).catch(error => {
         log(`agent: run=${runId} worker=${identity.id} crashed: ${messageOf(error)}`)
       })
     }
@@ -452,6 +464,7 @@ export class AgentService {
     run: AgentRunRecord,
     identity: AgentIdentity,
     prompt: string,
+    admittedWorkDir: string,
     resumeSessionId?: string,
   ): Promise<void> {
     const worker = run.snapshot.workers.find(item => item.identityId === identity.id)!
@@ -485,7 +498,10 @@ export class AgentService {
       if (run.cancelled) return
       this.assertSameOwner(run, run.context!)
       // Queued tasks may wait while directories are removed or replaced by symlinks.
-      if (resolveAgentWorkDir(run.context!.owner.workDir, run.snapshot.workDir) !== run.snapshot.workDir) {
+      const validatedWorkDir = resumeSessionId
+        ? resolveAgentResumeWorkDir(run.context!.owner.workDir, run.snapshot.workDir)
+        : resolveAgentWorkDir(run.context!.owner.workDir, run.snapshot.workDir)
+      if (validatedWorkDir !== run.snapshot.workDir || realpathSync(validatedWorkDir) !== admittedWorkDir) {
         throw new Error('agent work_dir changed before the worker could start')
       }
       const handle = this.deps.startWorker({
@@ -766,28 +782,34 @@ export class AgentService {
     return run
   }
 
-  private requireSessionRun(principal: AgentPrincipal, sessionId: string, identityId?: string): {
+  private assertResumeProject(principal: AgentPrincipal, run: AgentRunRecord): void {
+    const caller = agentPrincipalContext(principal).owner
+    const origin = agentRunOwner(run.snapshot)
+    if (caller.chatId !== origin.chatId || workspaceKey(caller.workDir) !== workspaceKey(origin.workDir)) {
+      throw new Error('agent session belongs to a different project or group; cross-project and cross-group resume is not allowed')
+    }
+  }
+
+  private findSessionHistory(principal: AgentPrincipal, sessionId: string): {
     run: AgentRunRecord; worker: AgentWorkerResult
   } {
-    const matches = [...this.runs.values()].flatMap(run => {
-      if (!this.canAccess(principal, run) || runSessionWorkDir(run.snapshot) !== agentPrincipalContext(principal).owner.workDir) return []
-      return run.snapshot.workers
-        .filter(worker => worker.sessionId === sessionId && (!identityId || worker.identityId === identityId))
-        .map(worker => ({ run, worker }))
-    })
-    if (!matches.length) throw new Error(`agent session not found in this Session${identityId ? ' for the requested identity' : ''}: ${sessionId}`)
-    if (new Set(matches.map(({ worker }) => worker.identityId)).size > 1) {
-      throw new Error('agent session id matches multiple identities; specify identity_id')
+    const matches = [...this.runs.values()].flatMap(run => run.snapshot.workers
+      .filter(worker => worker.sessionId === sessionId)
+      .map(worker => ({ run, worker })))
+    if (!matches.length) throw new Error('agent session project/group ownership is unknown; only registered sessions in this project and group can be resumed')
+    for (const { run } of matches) this.assertResumeProject(principal, run)
+    if (new Set(matches.map(({ worker }) => worker.provider)).size > 1) {
+      throw new Error('native session id has conflicting backend records; its unique identity cannot be established')
     }
-    // Follow-up lineage breaks timestamp ties, including after durable history is reloaded.
-    const parents = new Set(matches.map(({ run }) => run.snapshot.parentRunId))
+    // Session/project bindings can share a native id within one project and group, without joining cancellation trees.
+    const parents = new Set(matches.flatMap(({ run }) => [run.snapshot.resumedFromRunId, run.snapshot.parentRunId]))
     const latest = matches.filter(({ run }) => !parents.has(run.snapshot.runId))
       .sort((a, b) => Date.parse(b.run.snapshot.createdAt) - Date.parse(a.run.snapshot.createdAt))[0]
     if (!latest) throw new Error(`agent session history has no latest run: ${sessionId}`)
     return latest
   }
 
-  private reserveNativeSession(worker: AgentWorkerResult): () => void {
+  private reserveNativeSession(worker: Pick<AgentWorkerResult, 'provider' | 'sessionId'>): () => void {
     const key = JSON.stringify([worker.provider, worker.sessionId])
     const occupied = [...this.runs.values()].some(run => run.snapshot.workers.some(other => {
       if (other.provider !== worker.provider || other.sessionId !== worker.sessionId) return false
@@ -995,9 +1017,12 @@ function resolveAgentWorkDir(sessionWorkDir: string, requestedWorkDir?: string):
   return fromRoot === '' ? sessionWorkDir : workDir
 }
 
-function runSessionWorkDir(snapshot: AgentRunSnapshot): string {
-  // Before selectable worker directories, workDir was always the main Session's directory.
-  return snapshot.sessionWorkDir ?? snapshot.workDir
+/** Native resumes may change directories within their owning project, preserving native cwd spelling. */
+function resolveAgentResumeWorkDir(callerWorkDir: string, requestedWorkDir?: string): string {
+  const workDir = requestedWorkDir === undefined ? callerWorkDir : resolve(callerWorkDir, requireAgentWorkDir(requestedWorkDir))
+  resolveAgentWorkDir(callerWorkDir, workDir)
+  // Keep the spelling used by native persistence, including legacy symlinked cwd paths.
+  return workDir
 }
 
 function workerSnapshot(
@@ -1076,6 +1101,7 @@ function isAgentRunSnapshot(value: unknown): value is AgentRunSnapshot {
     && (run.owner === undefined || !!run.owner && ['session', 'project'].includes(run.owner.kind)
       && run.owner.name === run.sessionName && run.owner.chatId === run.chatId
       && typeof run.owner.workDir === 'string' && run.owner.workDir === run.sessionWorkDir)
+    && (run.resumedFromRunId === undefined || typeof run.resumedFromRunId === 'string')
     && (run.requestId === undefined || typeof run.requestId === 'string' && typeof run.requestHash === 'string')
     && (run.deliveryMode === undefined || run.deliveryMode === 'chat' || run.deliveryMode === 'drive')
     && (run.sessionWorkDir === undefined || typeof run.sessionWorkDir === 'string')

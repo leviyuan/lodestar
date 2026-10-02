@@ -84,7 +84,7 @@ export function startAgentWorker(opts: {
     hostEnv: { ...opts.hostEnv, LODESTAR_AGENT_ROLE: 'worker' },
     serviceName: 'lodestar-agent',
   })
-  return collectAgentTurn(proc, opts.prompt, opts.callbacks)
+  return collectAgentTurn(proc, opts.prompt, opts.callbacks, undefined, opts.resumeSessionId)
 }
 
 export function collectAgentTurn(
@@ -92,6 +92,7 @@ export function collectAgentTurn(
   prompt: string,
   callbacks: AgentWorkerCallbacks = {},
   remember: typeof rememberAgentSession = rememberAgentSession,
+  expectedSessionId?: string,
 ): AgentWorkerHandle {
   const output: string[] = []
   let lastError: Error | null = null
@@ -110,7 +111,12 @@ export function collectAgentTurn(
   const rememberSession = (sessionId: string | null | undefined): Error | null => {
     if (!sessionId) return null
     try {
-      remember(proc.provider, sessionId)
+      // Resuming an existing conversation does not make it a newly delegated one.
+      // Preserve its original visibility in the main rs/fk history.
+      if (!expectedSessionId || sessionId !== expectedSessionId) remember(proc.provider, sessionId)
+      if (expectedSessionId && sessionId !== expectedSessionId) {
+        throw new Error(`native resume returned session ${sessionId}, expected ${expectedSessionId}; refusing to treat it as a resumed conversation`)
+      }
       callbacks.onSession?.(sessionId)
       return null
     } catch (error) {

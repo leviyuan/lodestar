@@ -173,7 +173,7 @@ test('explicit project CLI uses the private daemon endpoint and preserves projec
       identity_id: 'agent:a', identity_name: 'A', session_id: 'native', status: 'completed', output: 'done',
     }] })
   } })
-  const env = { ...process.env, LODESTAR_DATA_DIR: dir, LODESTAR_AGENT_ROLE: '', DSH_LODESTAR_AGENT_CONTEXT: undefined,
+  const env = { ...process.env, LODESTAR_DATA_DIR: dir, LODESTAR_AGENT_ROLE: undefined, LODESTAR_AGENT_SESSION: undefined, DSH_LODESTAR_AGENT_CONTEXT: undefined,
     LODESTAR_AGENT_URL: undefined, LODESTAR_AGENT_CAPABILITY: undefined }
   const exec = async (args: string[], extra = {}) => {
     const proc = Bun.spawn([process.execPath, join(import.meta.dir, 'agent-cli.ts'), ...args], {
@@ -195,6 +195,15 @@ test('explicit project CLI uses the private daemon endpoint and preserves projec
     const worker = await exec(['--project', 'repo', 'identities'], { LODESTAR_AGENT_ROLE: 'worker' })
     expect(worker.code).toBe(1)
     expect(worker.error).toContain('cannot start project')
+    for (const context of [
+      { LODESTAR_AGENT_ROLE: 'main' }, { LODESTAR_AGENT_CAPABILITY: 'stale' },
+      { LODESTAR_AGENT_SESSION: 'managed' }, { DSH_LODESTAR_AGENT_CONTEXT: '{}' },
+    ]) {
+      const agent = await exec(['--project', 'repo', 'identities'], context)
+      expect(agent.code).toBe(1)
+      expect(agent.error).toContain('must remain session-bound')
+    }
+    expect(requests).toHaveLength(2)
     const duplicate = await exec(['--project', 'repo', 'identities', '--project', 'repo'])
     expect(duplicate.code).toBe(1)
     expect(duplicate.error).toContain('only be specified once')

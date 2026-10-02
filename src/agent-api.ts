@@ -149,6 +149,7 @@ function serializeRun(run: AgentRunSnapshot): object {
     prompt: run.prompt,
     description: run.description,
     parent_run_id: run.parentRunId,
+    resumed_from_run_id: run.resumedFromRunId,
     parent_kind: run.parentKind,
     depth: run.depth,
     status: run.status,

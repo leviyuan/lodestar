@@ -14,9 +14,9 @@ export interface AgentRunRequest {
   description: string
   prompt: string
   effort?: string
-  /** Relative to the main Agent's directory, or an absolute path within it. */
+  /** Fresh runs and native resumes stay within the caller's project directory. */
   workDir?: string
-  /** Resume a native session previously delegated by this Lodestar Session. */
+  /** Unique native conversation id, registered to the same project and group. */
   sessionId?: string
   requestId?: string
   requesterOpenId?: string
@@ -27,7 +27,7 @@ export interface AgentFollowUpRequest {
   description: string
   prompt: string
   effort?: string
-  /** If supplied, must resolve to the original run's working directory. */
+  /** Optional working directory for this native continuation. */
   workDir?: string
   requestId?: string
   requesterOpenId?: string
@@ -112,6 +112,8 @@ export interface AgentRunSnapshot {
   /** Required for new runs; absent only in history written before compact cards. */
   description?: string
   parentRunId?: string
+  /** Resume provenance only; never grants access or joins another owner's cancellation tree. */
+  resumedFromRunId?: string
   parentKind?: 'delegate' | 'follow_up'
   /** Legacy history metadata. New tasks are always main-Agent delegates (0). */
   depth: number

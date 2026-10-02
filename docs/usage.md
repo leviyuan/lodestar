@@ -127,15 +127,24 @@ lodestar-agent run --identity '<identity-id>' --description '完成第一步' --
 lodestar-agent run --session '<session-id>' --description '继续第二步' --prompt '根据上面的结果继续第二步' --json
 ```
 
-第二轮及后续轮次恢复同一个后端原生会话，自动沿用原身份和上一轮的 effort，每轮产生新的 `run_id`。`--identity` 可省略，指定时必须与原身份一致；可用 `--effort` 显式选择本轮档位。多模型首轮会分别返回各 worker 的会话 ID，续跑时一次选择一个会话。也可继续使用 `lodestar-agent follow-up '<run-id>' --description '继续下一步' --prompt '下一步'`；原 run 包含多个 Agent 时需用 `--identity` 指定。
+第二轮及后续轮次恢复同一个后端原生会话，每轮产生新的 `run_id`。已有 Lodestar 历史时，省略 `--identity` 会沿用最新记录的身份和 effort；也可显式选择原后端下的其他身份、模型来源及 `--effort`。切换身份且不指定 effort 时，使用新身份的默认档位。多模型首轮分别返回各 worker 的会话 ID，续跑时一次选择一个会话。也可使用 `lodestar-agent follow-up '<run-id>' --description '继续下一步' --prompt '下一步'`；原 run 包含多个 Agent 时需用 `--identity` 选择原 worker，若还需换模型，使用该 worker 的原生会话 ID 加新身份恢复。
 
-续跑要求原任务已经结束，且属于同一个 Lodestar 群会话和主 Agent 工作目录。`run --session` 和 `follow-up` 自动保留原任务目录；续跑时若填写 `--workdir`，必须仍指向原目录，更换目录需要新建任务。持久化的委派历史仍可用时，daemon 重启后也可凭原会话 ID 继续；会话不存在、身份不可用或原生恢复失败会报错。同一个原生会话不能同时执行两轮。`run`、`follow-up`、`status` 支持 `--json`，返回的 `work_dir` 表示实际工作目录；使用 `--stdin` 可输入多行任务，`--no-wait` 立即返回启动状态，随后通过 `status <run-id>` 查询结果。HTTP API 的 `POST /agents/runs` 和 `POST /agents/runs/<run-id>/follow-up` 同样接受可选的 `work_dir`。
+`session_id` 是原生会话唯一且不变的 ID；`run_id` 只是一次调用记录，不是另一套会话 ID。会话归属项目和群，`run --session` 与 `follow-up` 只允许恢复同一项目、同一群的已登记会话，不要求与原调用使用相同的会话绑定或项目绑定。禁止跨项目、跨群；未知或归属不明的 ID 即使指定 `--identity` 也会报错。
 
-省略 `--project` 时，`lodestar-agent` 继续要求 Lodestar 管理的 Agent 会话上下文；会话凭据缺失或失效会报错，不会自动转为项目调用。会话内的正常委派用法见 [Agent Skill](../src/agent-skill.ts)。
+```bash
+# desc: 在当前会话中恢复同项目同群的原生会话
+lodestar-agent run --session '<原生会话 ID>' --identity '<identity-id>' --workdir 'packages/app' --description '继续已有工作' --prompt '继续上一轮任务' --json
+```
+
+恢复时 `--workdir` 可选择本项目内的其他现有目录，省略则沿用历史执行目录；相对路径以当前项目目录解析。项目以规范工作目录识别，群以 `chat_id` 识别；子目录不改变所属项目。新调用依照调用场景绑定当前会话或项目，旧记录不迁移。同项目同群内切换绑定方式时，旧调用的取消不会连带停止新调用。原生会话 ID 和所属后端保持不变，模型、来源与 effort 可以在原后端支持范围内调整。
+
+同一个后端原生会话在开卡、排队和执行期间不能重叠恢复。多 Agent 任务中某个 worker 已结束并退出后，可以单独续跑它，无需等待其他 worker。`run`、`follow-up`、`status` 支持 `--json`；返回的 `work_dir` 是实际执行目录，`resumed_from_run_id` 仅记录可用的恢复来源，不建立跨绑定方式的取消关系。使用 `--stdin` 可输入多行任务，`--no-wait` 立即返回启动状态。HTTP API 的 `session_id`、`identity_ids` / `identity_id` 和 `work_dir` 遵循同一规则。
+
+Agent 在执行任务中调用其他 Agent 或模型时，必须绑定当前会话，使用不带 `--project` 的命令；通过 Shell、Python 或脚本调用也适用。禁止清除会话环境或借用项目凭据转成项目调用。没有有效会话上下文必须报错。独立服务、定时任务及其他软件调用必须使用项目绑定。两种模式不能作为失败后的替代路径，详见 [Agent Skill](../src/agent-skill.ts)。
 
 ### 从终端或脚本调用项目 Agent
 
-显式指定 `--project <项目名>` 可直接调用本机 daemon，无需在对应群启动主 Agent。项目必须已有明确的群绑定和现有目录；worktree 使用完整的 `项目名[分支名]`，BTW/FK 临时会话名不作为项目入口。
+独立服务、定时任务或其他软件通过 `--project <项目名>` 直接调用本机 daemon，无需在对应群启动主 Agent；Agent 执行用户任务时不能使用此入口。项目必须已有明确的群绑定和现有目录；worktree 使用完整的 `项目名[分支名]`，BTW/FK 临时会话名不作为项目入口。
 
 ```bash
 # desc: 查询项目可用身份并发起独立任务
@@ -145,7 +154,7 @@ lodestar-agent --project '<项目名>' run --identity '<identity-id>' --descript
 
 每次项目调用在绑定群新建独立的“项目任务”卡，后续进度和结果更新原卡。它不复用会话委派卡，不读取或修改主会话的模型、账号和上下文；停止、重启、切换主会话不影响项目任务。可点击任务卡的“停止本次任务”，或使用同一 `--project` 下的 `cancel <run-id>`。两类任务仍共享实际工作目录及全局、来源并发限制。
 
-所有命令都支持 `--project`，包括 `status`、`answer`、`follow-up` 和 `run --session`；最后一个仍表示继续任务自身的原生 Agent 会话。续跑限定同一项目、绑定群和原目录，不能把会话委派转成项目任务。没有 `--no-wait` 时客户端等到任务终态或 `needs_input`；等待期间 Ctrl+C 会取消任务，普通 HTTP 断开不会取消已接受的任务。
+所有命令都支持 `--project`，包括 `status`、`answer`、`follow-up` 和 `run --session`；最后一个仍表示继续任务自身的原生 Agent 会话。只能恢复当前项目、当前群中已登记的原生会话；本轮按项目绑定创建，旧记录不迁移。没有 `--no-wait` 时客户端等到任务终态或 `needs_input`；等待期间 Ctrl+C 会取消任务，普通 HTTP 断开不会取消已接受的任务。
 
 ```bash
 # desc: 查询状态并回答项目任务的问题
@@ -153,7 +162,7 @@ lodestar-agent --project '<项目名>' status '<run-id>' --json
 lodestar-agent --project '<项目名>' answer '<run-id>' --identity '<identity-id>' --request '<request-id>' --answer 'question-id=回答内容'
 ```
 
-普通群消息仍交给主会话，项目任务的问题通过调用端的 `answer` 回答。项目任务可直接用交付标记提交文件，按实际任务目录的文件交付设置处理；云空间交付须在 `run` 或 `follow-up` 提供 `--requester <发起人的 open_id>`，用于授予交付权限，续跑默认沿用。缺少发起人或上传失败明确报错，不切换交付通道。
+普通群消息仍交给主会话，项目任务的问题通过调用端的 `answer` 回答。项目任务可直接用交付标记提交文件，按实际任务目录的文件交付设置处理；云空间交付须在 `run` 或 `follow-up` 提供 `--requester <发起人的 open_id>`，用于授予交付权限，同归属续跑默认沿用；切换绑定方式恢复时须重新提供。缺少发起人或上传失败明确报错，不切换交付通道。
 
 项目任务的 `run` / `follow-up` 可用 `--request-id` 防止超时重试重复执行：同一归属、同一编号及相同输入返回原任务，输入不同则拒绝，daemon 重启后仍有效。重启不会自动重跑未完成任务；遗留非终态任务标为失败，已有原生会话可显式续跑。
 
