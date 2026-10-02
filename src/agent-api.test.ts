@@ -7,15 +7,16 @@ import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, type T
 let server: Server | null = null
 afterEach(() => { server?.close(); server = null })
 
-async function serve(onStart?: (request: any) => void) {
+async function serve(onStart?: (request: any) => void, projectMode = false) {
   const session = { sessionName: 'project', chatId: 'chat', workDir: '/repo', codexAccountId: () => 'default' } as any
   let current: any = null
   const service = {
     rootPrincipal: () => ({ kind: 'session', session, depth: -1 }),
     principalForCapability: () => null,
-    async startRun(_principal: any, request: any) {
+    async startRun(principal: any, request: any) {
       onStart?.(request)
       current = {
+        ...(principal.kind === 'project' ? { owner: principal.context.owner } : {}),
         runId: 'agent_1', sessionName: 'project', chatId: 'chat', workDir: request.workDir ?? '/repo', description: request.description, prompt: request.prompt,
         depth: 0, status: 'running', createdAt: new Date().toISOString(), workers: [{
           identityId: 'agent:a', status: 'running', sessionId: request.sessionId, output: request.prompt, steps: [],
@@ -35,6 +36,12 @@ async function serve(onStart?: (request: any) => void) {
     void handleAgentRequest(req, res, url, {
       service: service as any,
       authorizeSession: token => token === 'secret' ? session : null,
+      ...(projectMode ? { authorizeProject: (token: string, project: string) => {
+        if (token !== 'project-secret') return null
+        if (project !== 'project') throw new Error('unknown project')
+        return { kind: 'project' as const, depth: -1 as const,
+          context: { owner: { kind: 'project' as const, name: project, chatId: 'chat', workDir: '/repo' } } }
+      } } : {}),
     })
   })
   await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', resolve))
@@ -181,4 +188,30 @@ describe('delegated Agent HTTP API', () => {
     expect(invalid.status).toBe(409)
     expect(requests).toHaveLength(1)
   })
+})
+
+test('project API authenticates independently and never upgrades session or worker credentials', async () => {
+  const base = await serve(undefined, true)
+  const request = { description: '独立项目任务', identity_ids: ['agent:a'], prompt: 'work' }
+  const headers = (token: string) => ({ authorization: `Bearer ${token}`, 'content-type': 'application/json' })
+  for (const token of ['secret', 'wrong']) {
+    expect((await fetch(`${base}/agents/runs?project=project`, { method: 'POST', headers: headers(token), body: JSON.stringify(request) })).status).toBe(403)
+  }
+  expect((await fetch(`${base}/agents/identities`, { headers: headers('project-secret') })).status).toBe(403)
+  expect((await fetch(`${base}/agents/identities?project=`, { headers: headers('project-secret') })).status).toBe(400)
+  expect((await fetch(`${base}/agents/identities?project=project&project=other`, { headers: headers('project-secret') })).status).toBe(400)
+  expect((await fetch(`${base}/agents/identities?project=unknown`, { headers: headers('project-secret') })).status).toBe(409)
+  const created = await fetch(`${base}/agents/runs?project=project`, { method: 'POST', headers: headers('project-secret'), body: JSON.stringify(request) })
+  expect(created.status).toBe(202)
+  const value = await created.json() as any
+  expect(value).toMatchObject({ binding: 'project', project: 'project', work_dir: '/repo' })
+  expect(value.session_name).toBeUndefined()
+  for (const action of ['follow-up', 'answer']) {
+    const response = await fetch(`${base}/agents/runs/agent_1/${action}?project=project`, {
+      method: 'POST', headers: headers('project-secret'),
+      body: JSON.stringify(action === 'follow-up' ? { description: '继续', prompt: 'next' } : { request_id: 'q', answers: { q: 'yes' } }),
+    })
+    expect(response.status).toBe(action === 'follow-up' ? 202 : 200)
+  }
+  expect((await fetch(`${base}/agents/runs/agent_1?project=project`, { method: 'DELETE', headers: headers('project-secret') })).status).toBe(200)
 })

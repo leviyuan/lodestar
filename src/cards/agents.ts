@@ -69,6 +69,7 @@ export function agentRunCard(run: AgentRunSnapshot): object {
 
 /** One visible line per invocation. Everything else stays inside this panel. */
 export function agentRunElement(run: AgentRunSnapshot): object {
+  const project = run.owner?.kind === 'project'
   return {
     tag: 'collapsible_panel',
     element_id: agentRunElementId(run.runId),
@@ -78,11 +79,16 @@ export function agentRunElement(run: AgentRunSnapshot): object {
       tag: 'markdown',
       content: [
         `**${escapeMarkdown(run.description ?? '说明 MISS')}**`,
+        ...(project ? [`项目 ${inlineCode(run.owner!.name)} · ${inlineCode(run.runId)}`] : []),
         agentRunFooterElement(run).content,
         `**任务说明**\n${sanitizeMarkdownForCardKit(compactTaskContent(run.prompt))}`,
-        ...run.workers.map(worker => agentWorkerElement(worker).content),
+        ...run.workers.map(worker => agentWorkerElement(worker, WORKER_MAX_PREVIEW_CHARS, project).content),
+        ...(project && run.status === 'needs_input' ? ['通过调用端的 `answer` 命令回答，普通群消息仍发送给主会话。'] : []),
       ].join('\n\n'),
-    }],
+    }, ...(project && !isTerminal(run.status) ? [{
+      tag: 'button', text: { tag: 'plain_text', content: '停止本次任务' }, type: 'danger',
+      behaviors: [{ type: 'callback', value: { kind: 'agent_project_cancel', run_id: run.runId } }],
+    }] : [])],
   }
 }
 
@@ -115,13 +121,13 @@ export function delegationCardSummary(tasks: Array<{
 }
 
 /** Render a bounded worker result; only the task prompt uses the shorter limit. */
-export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars = WORKER_MAX_PREVIEW_CHARS) {
+export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars = WORKER_MAX_PREVIEW_CHARS, project = false) {
   const status = workerStatusLabel(worker)
   const body: string[] = [`模型 ${inlineCode(worker.model)} · 推理 ${inlineCode(worker.effort)}`]
   if (worker.durationMs != null) body.push(`用时 ${formatDuration(worker.durationMs / 1000)}`)
   if (worker.status === 'queued' && worker.queuedReason) body.push('', escapeMarkdown(worker.queuedReason))
   if (worker.pendingInput) {
-    body.push('', '**等待主 Agent 回答**')
+    body.push('', project ? '**等待调用方回答**' : '**等待主 Agent 回答**')
     for (const question of worker.pendingInput.questions) {
       body.push(`- ${escapeMarkdown(question.question)}`)
       if (question.options.length) body.push(`  选项：${question.options.map(option => inlineCode(option.label)).join(' / ')}`)
@@ -236,12 +242,12 @@ function isTerminal(status: AgentRunSnapshot['status']): boolean {
 }
 
 function runStatusLabel(run: AgentRunSnapshot): string {
-  const kindLabel = agentCardTaskKindLabel('delegated')
+  const kindLabel = agentCardTaskKindLabel(run.owner?.kind === 'project' ? 'project' : 'delegated')
   switch (run.status) {
     case 'completed': return `✅ ${kindLabel}完成`
     case 'failed': return `❌ ${kindLabel}失败`
     case 'cancelled': return `🛑 ${kindLabel}已取消`
-    case 'needs_input': return `❓ ${kindLabel}等待主 Agent 回复`
+    case 'needs_input': return `❓ ${kindLabel}等待${run.owner?.kind === 'project' ? '调用方' : '主 Agent '}回复`
     case 'queued': return `⏳ ${kindLabel}等待执行`
     case 'running': return run.workers.length > 0 && run.workers.every(worker => isTerminal(worker.status))
       ? `⏳ ${kindLabel}正在收尾` : `⏳ ${kindLabel}正在执行`

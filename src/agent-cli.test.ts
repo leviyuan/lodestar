@@ -163,3 +163,43 @@ describe('lodestar-agent CLI args', () => {
     } finally { await server.stop(true) }
   })
 })
+
+test('explicit project CLI uses the private daemon endpoint and preserves project scope in continuation commands', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lodestar-project-cli-'))
+  const requests: { url: string; token: string | null; body: any }[] = []
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    requests.push({ url: request.url, token: request.headers.get('authorization'), body: request.method === 'POST' ? await request.json() : null })
+    return Response.json({ run_id: 'agent_cli_project', binding: 'project', project: 'repo', status: 'completed', workers: [{
+      identity_id: 'agent:a', identity_name: 'A', session_id: 'native', status: 'completed', output: 'done',
+    }] })
+  } })
+  const env = { ...process.env, LODESTAR_DATA_DIR: dir, LODESTAR_AGENT_ROLE: '', DSH_LODESTAR_AGENT_CONTEXT: undefined,
+    LODESTAR_AGENT_URL: undefined, LODESTAR_AGENT_CAPABILITY: undefined }
+  const exec = async (args: string[], extra = {}) => {
+    const proc = Bun.spawn([process.execPath, join(import.meta.dir, 'agent-cli.ts'), ...args], {
+      env: { ...env, ...extra }, stdout: 'pipe', stderr: 'pipe',
+    })
+    const [code, out, error] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()])
+    return { code, out, error }
+  }
+  try {
+    writeFileSync(join(dir, 'agent-project-client.json'), JSON.stringify({ baseUrl: `http://127.0.0.1:${server.port}`, capability: 'test-project-key' }))
+    const result = await exec(['run', '--project', 'repo', '--identity', 'agent:a', '--description', '任务', '--prompt', '--project', '--request-id', 'job-1'])
+    expect(result.code, result.error).toBe(0)
+    expect(result.out).toContain("lodestar-agent --project 'repo' run --session 'native'")
+    expect(requests[0]).toMatchObject({ token: 'Bearer test-project-key', body: { prompt: '--project', request_id: 'job-1' } })
+    expect(new URL(requests[0].url).searchParams.get('project')).toBe('repo')
+    const noContext = await exec(['identities'])
+    expect(noContext.code).toBe(1)
+    expect(noContext.error).toContain('missing capability')
+    const worker = await exec(['--project', 'repo', 'identities'], { LODESTAR_AGENT_ROLE: 'worker' })
+    expect(worker.code).toBe(1)
+    expect(worker.error).toContain('cannot start project')
+    const duplicate = await exec(['--project', 'repo', 'identities', '--project', 'repo'])
+    expect(duplicate.code).toBe(1)
+    expect(duplicate.error).toContain('only be specified once')
+  } finally {
+    await server.stop(true)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

@@ -42,7 +42,11 @@
 
 ## 委派 Agent
 
-- `agent-*` 提供单层模型委派。只有主 Agent 能发起任务或续跑；主 Agent 按任务和可用能力自行选择原生 subagent 或 `lodestar-agent`，调用自身模型或 Agent 时也适用。同一任务的多个身份放在一个 run 内并发。被委派的 Agent 自行完成任务，需要额外派工时报告主 Agent。
+- 项目独立调用显式使用 `--project` / HTTP `?project=`，默认会话委派不变，不做凭据失效后的自动切换。`agent-context.ts` 区分 session/project/worker，`agent-project.ts` 从群绑定和实际目录解析项目，不构造或启动 Session，不继承主会话账号/模型；`agent-project-client.ts` 通过 paths.ts 下的私有文件向本机客户端提供轮换凭据，不注入 worker。项目/会话凭据不能跨路由，worker 仍禁止继续派工。
+- 新快照记录 owner；缺 owner 的旧快照仅解释为会话归属。会话 stop/kill/restart 只取消会话任务，daemon shutdown 取消所有任务并排空交付。项目 run 一次一张独立卡，不能进入群尾共享委派卡；取消按钮在 Session 存在性检查前分流，并核验存储的群、消息和 run。提问由同项目 `answer` 回填，普通群消息不重定向。项目任务直接处理交付标记，交付方式按实际目录在启动时固定；云空间发起人由 `--requester` 显式提供，失败可见且不切换通道。
+- 项目 `request_id` 按归属去重并持久化请求摘要，同键不同输入拒绝，续跑保留项目、群和原目录，不允许跨会话归属；旧历史不因此迁移。重启只结算未完成状态，不自动重放任务。两种任务共享原全局及来源并发限制。
+
+- `agent-*` 提供单层模型委派。会话内只有主 Agent 能发起任务或续跑；主 Agent 按任务和可用能力自行选择原生 subagent 或 `lodestar-agent`，调用自身模型或 Agent 时也适用。同一任务的多个身份放在一个 run 内并发。被委派的 Agent 自行完成任务，需要额外派工时报告主 Agent。
 - `lodestar-agent identities` / `GET /agents/identities` 与 `agents` 面板只读取已提交的目录与订阅额度缓存，不查询、不等待后台刷新；不再维护独立的 30 分钟订阅缓存。可用性失败保留在 `source_failures`，后台确认恢复后，下次读取立即反映新状态。
 - 共用 `agent-launch.ts` 的 coding-agent 启动入口。主会话保留原生能力；委派进程只关闭继续委派的工具（Codex `multi_agent`、Claude `Agent`/`Task`），其余代码工具、MCP、Skill、模型与 effort 保持不变。
 - 每个 worker 获得独立、可撤销的 `LODESTAR_AGENT_*` capability，运行时拒绝其再次发起任务或续跑；Skill 与 worker 提示词同步声明禁止继续委派。历史父子记录仍可读取和清理。

@@ -6,7 +6,7 @@ import type { AgentInputQuestion, AgentInputRequest, AgentStep } from './agent-r
 import type { ConversationLaunch } from './conversation'
 import type { ProjectProfile } from './config'
 import { getTokenSourceForAccount } from './token-source'
-import { DELEGATED_AGENT_INSTRUCTIONS } from './agent-skill'
+import { DELEGATED_AGENT_INSTRUCTIONS, PROJECT_AGENT_INSTRUCTIONS } from './agent-skill'
 import { log } from './log'
 
 export interface AgentWorkerResult {
@@ -43,6 +43,7 @@ export interface AgentWorkerHandle {
 }
 
 export function startAgentWorker(opts: {
+  projectBound?: boolean
   identity: AgentIdentity
   codexAccountId?: string
   effort: AgentReasoningEffort
@@ -76,7 +77,7 @@ export function startAgentWorker(opts: {
     model: opts.identity.model,
     effort: opts.effort,
     launch,
-    developerInstructions: [opts.developerInstructions, DELEGATED_AGENT_INSTRUCTIONS].filter(Boolean).join('\n\n'),
+    developerInstructions: [opts.developerInstructions, opts.projectBound ? PROJECT_AGENT_INSTRUCTIONS : DELEGATED_AGENT_INSTRUCTIONS].filter(Boolean).join('\n\n'),
     allowDelegation: false,
     profile: opts.profile,
     managedSkillPluginPath: opts.managedSkillPluginPath,

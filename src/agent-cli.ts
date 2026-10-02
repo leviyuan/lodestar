@@ -2,13 +2,17 @@ import { localFetch } from './network'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { requireAgentDescription } from './agent-run-types'
+import { readAgentProjectClient } from './agent-project-client'
 
 interface CliContext {
   baseUrl: string
   capability: string
+  project?: string
 }
 
 interface PromptArgs {
+  requestId?: string
+  requesterOpenId?: string
   identityIds: string[]
   identityId: string
   sessionId: string
@@ -22,12 +26,14 @@ interface PromptArgs {
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
+  const selected = extractProjectOption(argv)
+  argv = selected.argv
   const command = argv.shift() ?? ''
   if (!command || command === 'help' || command === '--help' || command === '-h') {
     process.stdout.write(`${usage()}\n`)
     return
   }
-  const context = cliContext()
+  const context = cliContext(selected.project)
   switch (command) {
     case 'identities': {
       const data = await requestJson(context, 'GET', '/agents/identities')
@@ -72,6 +78,8 @@ async function runCommand(context: CliContext, argv: string[]): Promise<void> {
     ...(parsed.effort ? { effort: parsed.effort } : {}),
     ...(parsed.sessionId ? { session_id: parsed.sessionId } : {}),
     ...(parsed.workDir ? { work_dir: parsed.workDir } : {}),
+    ...(parsed.requestId ? { request_id: parsed.requestId } : {}),
+    ...(parsed.requesterOpenId ? { requester_open_id: parsed.requesterOpenId } : {}),
   }
   const started = await requestJson(context, 'POST', '/agents/runs', body)
   await presentStartedRun(context, started, parsed.noWait, parsed.json)
@@ -87,6 +95,8 @@ async function followUpCommand(context: CliContext, argv: string[]): Promise<voi
     ...(parsed.identityId ? { identity_id: parsed.identityId } : {}),
     ...(parsed.effort ? { effort: parsed.effort } : {}),
     ...(parsed.workDir ? { work_dir: parsed.workDir } : {}),
+    ...(parsed.requestId ? { request_id: parsed.requestId } : {}),
+    ...(parsed.requesterOpenId ? { requester_open_id: parsed.requesterOpenId } : {}),
   }
   const started = await requestJson(context, 'POST', `/agents/runs/${encodeURIComponent(runId)}/follow-up`, body)
   await presentStartedRun(context, started, parsed.noWait, parsed.json)
@@ -147,6 +157,12 @@ export function parsePromptArgs(argv: string[], identitiesRequired: boolean): Pr
         else out.identityId = next()
         break
       case '--effort': out.effort = next(); break
+      case '--request-id':
+        if (out.requestId) throw new Error('--request-id may only be specified once')
+        out.requestId = next(); break
+      case '--requester':
+        if (out.requesterOpenId) throw new Error('--requester may only be specified once')
+        out.requesterOpenId = next(); break
       case '--description': out.description = next(); break
       case '--workdir':
         if (out.workDir) throw new Error('--workdir may only be specified once')
@@ -186,6 +202,7 @@ async function presentStartedRun(context: CliContext, started: any, noWait: bool
   if (!runId) throw new Error('agent API returned no run_id')
   if (noWait) {
     process.stdout.write(`${JSON.stringify(started, null, 2)}\n`)
+    if (started.status === 'failed' || started.status === 'cancelled') process.exitCode = 1
     return
   }
   await waitAndPrintRun(context, runId, json)
@@ -220,7 +237,29 @@ async function waitAndPrintRun(context: CliContext, runId: string, json = false)
   }
 }
 
-function cliContext(): CliContext {
+export function extractProjectOption(argv: string[]): { project?: string; argv: string[] } {
+  let project: string | undefined
+  const remaining: string[] = []
+  const paired = new Set(['--identity', '-i', '--effort', '--description', '--workdir', '--session', '--prompt',
+    '--request', '--answer', '--request-id', '--requester'])
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (arg === '--project') {
+      if (project !== undefined) throw new Error('--project may only be specified once')
+      project = requiredArg(argv[++i], '--project requires a project name')
+    } else {
+      remaining.push(arg)
+      if (paired.has(arg) && i + 1 < argv.length) remaining.push(argv[++i])
+    }
+  }
+  return { ...(project !== undefined ? { project } : {}), argv: remaining }
+}
+
+function cliContext(project?: string): CliContext {
+  if (project !== undefined) {
+    if (process.env.LODESTAR_AGENT_ROLE === 'worker') throw new Error('Delegated Agents cannot start project calls')
+    return { ...readAgentProjectClient(), project }
+  }
   if (process.env.DSH_LODESTAR_AGENT_CONTEXT !== undefined) {
     const context = JSON.parse(process.env.DSH_LODESTAR_AGENT_CONTEXT)
     if (typeof context.baseUrl !== 'string' || !context.baseUrl || typeof context.capability !== 'string' || !context.capability) {
@@ -237,7 +276,9 @@ function cliContext(): CliContext {
 }
 
 async function requestJson(context: CliContext, method: string, path: string, body?: object): Promise<any> {
-  const response = await localFetch(`${context.baseUrl}${path}`, {
+  const url = new URL(`${context.baseUrl}${path}`)
+  if (context.project) url.searchParams.set('project', context.project)
+  const response = await localFetch(url.toString(), {
     method,
     headers: {
       authorization: `Bearer ${context.capability}`,
@@ -275,10 +316,12 @@ function printRun(run: any, json: boolean): void {
 }
 
 function formatRun(run: any): string {
+  const command = `lodestar-agent${run.binding === 'project' ? ` --project ${shellQuote(String(run.project))}` : ''}`
   const lines = [
     `# Lodestar agent ${run.run_id ?? 'MISS'}`,
     '',
     `- Status: ${run.status ?? 'MISS'}`,
+    ...(run.binding === 'project' ? [`- Project: ${run.project}`] : []),
     `- Description: ${run.description ?? 'MISS'}`,
     `- Work directory: ${run.work_dir ?? 'MISS'}`,
     ...(run.parent_run_id ? [`- Parent: ${run.parent_run_id} (${run.parent_kind ?? 'delegate'})`] : []),
@@ -294,13 +337,13 @@ function formatRun(run: any): string {
         lines.push(`- [${question.id}] ${question.question}`)
         if (question.options?.length) lines.push(`  Options: ${question.options.map((option: any) => option.label).join(' / ')}`)
       }
-      lines.push('', 'Answer with:', `lodestar-agent answer ${run.run_id} --identity '${worker.identity_id}' --request '${worker.pending_input.request_id}' --stdin`)
+      lines.push('', 'Answer with:', `${command} answer ${shellQuote(run.run_id)} --identity ${shellQuote(worker.identity_id)} --request ${shellQuote(worker.pending_input.request_id)} --stdin`)
     }
     if (worker.output) lines.push('', worker.output)
     if (worker.session_id && worker.identity_id
       && ['completed', 'failed', 'cancelled'].includes(run.status)) {
       lines.push('', 'Continue with:',
-        `lodestar-agent run --session ${shellQuote(worker.session_id)} --identity ${shellQuote(worker.identity_id)} --description '<brief next step>' --stdin`)
+        `${command} run --session ${shellQuote(worker.session_id)} --identity ${shellQuote(worker.identity_id)} --description '<brief next step>' --stdin`)
     }
   }
   if (run.presentation_errors?.length) {
@@ -328,6 +371,7 @@ function requiredArg(value: string | undefined, message: string): string {
 function usage(): string {
   return [
     'Usage:',
+    '  lodestar-agent --project <project-or-worktree> <command> [options]',
     '  lodestar-agent identities [--json]',
     '  lodestar-agent run --identity <id> [--identity <id>...] --description <summary> [--workdir <path>] [--effort <level>] [--json] --stdin',
     '  lodestar-agent run --session <session_id> [--identity <id>] --description <summary> [--workdir <path>] [--effort <level>] [--json] --stdin',
@@ -337,9 +381,12 @@ function usage(): string {
     '  lodestar-agent cancel <run_id>',
     '',
     'Use --prompt <text> instead of --stdin for inline input. --no-wait returns the started run as JSON.',
-    '--session continues a delegated session in the same Lodestar Session and workspace.',
-    '--workdir defaults to the main Agent working directory; relative paths are resolved from it.',
-    'The directory must exist within the main directory (symlinks are resolved). Continuations keep their original directory.',
+    '--project explicitly creates project-owned tasks with independent cards, using the local daemon credentials.',
+    'Without --project, the existing managed-session context is required; invalid contexts never switch modes.',
+    'Project run/follow-up: --request-id <unique-key> deduplicates retries; --requester <open_id> identifies the cloud-file recipient.',
+    '--session continues the native Agent conversation within the same session/project owner and workspace.',
+    '--workdir defaults to the managed-session or explicit-project directory; relative paths are resolved from it.',
+    'The directory must exist within that root (symlinks are resolved). Continuations keep their original directory.',
     '--description is required for every run/follow-up: one short line, at most 60 characters, shown on the collapsed card.',
     'Each turn has a new run_id; workers[].session_id identifies the native conversation.',
   ].join('\n')

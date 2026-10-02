@@ -1,6 +1,14 @@
 export const MAX_AGENT_PROMPT_CHARS = 800_000
 export const MAX_AGENT_DESCRIPTION_CHARS = 60
 
+/** Ownership is independent of the chat used to display a run. */
+export interface AgentRunOwner {
+  kind: 'session' | 'project'
+  name: string
+  chatId: string
+  workDir: string
+}
+
 export interface AgentRunRequest {
   identityIds: string[]
   description: string
@@ -10,6 +18,8 @@ export interface AgentRunRequest {
   workDir?: string
   /** Resume a native session previously delegated by this Lodestar Session. */
   sessionId?: string
+  requestId?: string
+  requesterOpenId?: string
 }
 
 export interface AgentFollowUpRequest {
@@ -19,6 +29,8 @@ export interface AgentFollowUpRequest {
   effort?: string
   /** If supplied, must resolve to the original run's working directory. */
   workDir?: string
+  requestId?: string
+  requesterOpenId?: string
 }
 
 export interface AgentAnswerRequest {
@@ -81,6 +93,12 @@ export interface AgentWorkerResult {
 }
 
 export interface AgentRunSnapshot {
+  /** Missing only on legacy, session-owned runs. */
+  owner?: AgentRunOwner
+  requestId?: string
+  requestHash?: string
+  requesterOpenId?: string
+  deliveryMode?: 'chat' | 'drive'
   codexAccountId?: string
   runId: string
   sessionName: string
@@ -129,6 +147,7 @@ export function parseAgentRunRequest(raw: unknown): AgentRunRequest {
     identityIds, description: requireAgentDescription(value.description), prompt,
     ...(effort ? { effort } : {}), ...(sessionId ? { sessionId } : {}),
     ...(workDir !== undefined ? { workDir } : {}),
+    ...parseProjectOptions(value),
   }
 }
 
@@ -144,7 +163,29 @@ export function parseAgentFollowUpRequest(raw: unknown): AgentFollowUpRequest {
     ...(identityId ? { identityId } : {}),
     ...(effort ? { effort } : {}),
     ...(workDir !== undefined ? { workDir } : {}),
+    ...parseProjectOptions(value),
   }
+}
+
+function parseProjectOptions(value: Record<string, unknown>): { requestId?: string; requesterOpenId?: string } {
+  const out: { requestId?: string; requesterOpenId?: string } = {}
+  for (const [key, field] of [['request_id', 'requestId'], ['requester_open_id', 'requesterOpenId']] as const) {
+    if (value[key] === undefined) continue
+    const raw = value[key]
+    if (typeof raw !== 'string' || !raw.trim() || raw.length > 200 || /[\x00-\x1f]/.test(raw)) {
+      throw new Error(`invalid ${key}`)
+    }
+    out[field] = raw.trim()
+  }
+  return out
+}
+
+export function agentRunOwner(run: AgentRunSnapshot): AgentRunOwner {
+  return run.owner ?? { kind: 'session', name: run.sessionName, chatId: run.chatId, workDir: run.sessionWorkDir ?? run.workDir }
+}
+
+export function agentOwnerKey(owner: AgentRunOwner): string {
+  return JSON.stringify([owner.kind, owner.name, owner.chatId, owner.workDir])
 }
 
 export function requireAgentWorkDir(raw: unknown): string {

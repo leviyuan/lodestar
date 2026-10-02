@@ -49,6 +49,9 @@ import { startNotifyServer } from './src/notify'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
 import { createNotifyReplyRuntime } from './src/notify-replies'
 import { AgentService } from './src/agent-service'
+import { acceptsProjectCapability, createAgentProjectClient } from './src/agent-project-client'
+import { resolveAgentProject } from './src/agent-project'
+import { agentApiUrl } from './src/agent-runtime'
 import { codexLogins } from './src/codex-login'
 import { settleCodexAccountCards } from './src/session-codex-accounts'
 import { handleAgentRequest } from './src/agent-api'
@@ -561,6 +564,7 @@ function cardActionLabel(kind: string): string {
     tasklist_delete_confirm: '确认删除任务清单', token_source_enable: '启用账号',
     agent_identity_page: 'Agent 身份翻页',
     notify_callback: '通知反馈', notify_reply: '通知回复', notify_reply_cancel: '取消通知回复',
+    agent_project_cancel: '停止项目任务',
   }
   return labels[kind] ?? kind
 }
@@ -752,6 +756,13 @@ async function handleCardAction(data: any): Promise<any> {
   if (!value?.kind) return
   const chatId = data?.context?.open_chat_id ?? ''
   const userId = data?.operator?.open_id ?? ''
+
+  if (value.kind === 'agent_project_cancel') {
+    const cancelled = await agentService.cancelProjectRunFromCard(
+      String(value.run_id ?? ''), chatId, String(data?.context?.open_message_id ?? ''), userId,
+    )
+    return withBusinessOutcome({ toast: { type: 'success', content: cancelled ? '项目任务已停止' : '项目任务已结束' } }, true)
+  }
 
   // Interactive /notify cards must route even when no Session exists for
   // this chat — a notify push doesn't start a session, and the click's
@@ -1541,11 +1552,14 @@ async function boot(): Promise<void> {
     ws.close({ force: true })
   }
   const recoveredCallbacks = loadCallbacks()
+  const projectClient = createAgentProjectClient(agentApiUrl(config.notify.bind, config.notify.port))
   startNotifyServer({
     bind: config.notify.bind,
     port: config.notify.port,
     extraHandler: (req, res, url) => handleAgentRequest(req, res, url, {
       service: agentService,
+      authorizeProject: (capability, project) => acceptsProjectCapability(projectClient, capability)
+        ? agentService.projectPrincipal(resolveAgentProject(project)) : null,
       authorizeSession: capability => {
         for (const session of sessions.values()) {
           if (session.acceptsAgentCapability(capability)) return session

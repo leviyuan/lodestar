@@ -53,6 +53,8 @@ export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')
 /** Durable delegated-agent runs. Every state transition is written so completed
  * native sessions remain follow-up capable across daemon restarts. */
 export const AGENT_RUNS_DIR = join(DATA_DIR, 'agent-runs')
+/** Private local client credentials, rotated on daemon startup. Never injected into workers. */
+export const AGENT_PROJECT_CLIENT_FILE = join(DATA_DIR, 'agent-project-client.json')
 /** Provider-native session ids created by delegated agents. Main-session
  * history pickers exclude these ids so background work never pollutes rs/fk. */
 export const AGENT_SESSION_IDS_FILE = join(DATA_DIR, 'agent-session-ids.json')

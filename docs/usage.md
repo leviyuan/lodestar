@@ -131,7 +131,33 @@ lodestar-agent run --session '<session-id>' --description '继续第二步' --pr
 
 续跑要求原任务已经结束，且属于同一个 Lodestar 群会话和主 Agent 工作目录。`run --session` 和 `follow-up` 自动保留原任务目录；续跑时若填写 `--workdir`，必须仍指向原目录，更换目录需要新建任务。持久化的委派历史仍可用时，daemon 重启后也可凭原会话 ID 继续；会话不存在、身份不可用或原生恢复失败会报错。同一个原生会话不能同时执行两轮。`run`、`follow-up`、`status` 支持 `--json`，返回的 `work_dir` 表示实际工作目录；使用 `--stdin` 可输入多行任务，`--no-wait` 立即返回启动状态，随后通过 `status <run-id>` 查询结果。HTTP API 的 `POST /agents/runs` 和 `POST /agents/runs/<run-id>/follow-up` 同样接受可选的 `work_dir`。
 
-`lodestar-agent` 只能在 Lodestar 管理的 Agent 进程里调用。命令用法见 [Agent Skill](../src/agent-skill.ts)。
+省略 `--project` 时，`lodestar-agent` 继续要求 Lodestar 管理的 Agent 会话上下文；会话凭据缺失或失效会报错，不会自动转为项目调用。会话内的正常委派用法见 [Agent Skill](../src/agent-skill.ts)。
+
+### 从终端或脚本调用项目 Agent
+
+显式指定 `--project <项目名>` 可直接调用本机 daemon，无需在对应群启动主 Agent。项目必须已有明确的群绑定和现有目录；worktree 使用完整的 `项目名[分支名]`，BTW/FK 临时会话名不作为项目入口。
+
+```bash
+# desc: 查询项目可用身份并发起独立任务
+lodestar-agent --project '<项目名>' identities --json
+lodestar-agent --project '<项目名>' run --identity '<identity-id>' --description '检查项目' --prompt '检查代码并报告结果' --request-id '<本次业务调用唯一编号>' --no-wait
+```
+
+每次项目调用在绑定群新建独立的“项目任务”卡，后续进度和结果更新原卡。它不复用会话委派卡，不读取或修改主会话的模型、账号和上下文；停止、重启、切换主会话不影响项目任务。可点击任务卡的“停止本次任务”，或使用同一 `--project` 下的 `cancel <run-id>`。两类任务仍共享实际工作目录及全局、来源并发限制。
+
+所有命令都支持 `--project`，包括 `status`、`answer`、`follow-up` 和 `run --session`；最后一个仍表示继续任务自身的原生 Agent 会话。续跑限定同一项目、绑定群和原目录，不能把会话委派转成项目任务。没有 `--no-wait` 时客户端等到任务终态或 `needs_input`；等待期间 Ctrl+C 会取消任务，普通 HTTP 断开不会取消已接受的任务。
+
+```bash
+# desc: 查询状态并回答项目任务的问题
+lodestar-agent --project '<项目名>' status '<run-id>' --json
+lodestar-agent --project '<项目名>' answer '<run-id>' --identity '<identity-id>' --request '<request-id>' --answer 'question-id=回答内容'
+```
+
+普通群消息仍交给主会话，项目任务的问题通过调用端的 `answer` 回答。项目任务可直接用交付标记提交文件，按实际任务目录的文件交付设置处理；云空间交付须在 `run` 或 `follow-up` 提供 `--requester <发起人的 open_id>`，用于授予交付权限，续跑默认沿用。缺少发起人或上传失败明确报错，不切换交付通道。
+
+项目任务的 `run` / `follow-up` 可用 `--request-id` 防止超时重试重复执行：同一归属、同一编号及相同输入返回原任务，输入不同则拒绝，daemon 重启后仍有效。重启不会自动重跑未完成任务；遗留非终态任务标为失败，已有原生会话可显式续跑。
+
+HTTP 使用原 `/agents/…` 路径并增加 `?project=<项目名>`，Bearer 凭据来自 daemon 启动时生成的私有 `agent-project-client.json`（状态目录内，本机同用户读取，重启后轮换）。CLI 自动读取，无需配置或输出凭据。项目凭据只用于显式项目路由，会话和 worker 凭据不能用来调用项目路由。请求体可增加 `request_id` 和 `requester_open_id`；响应中的 `binding: "project"`、`project` 标明归属。旧会话接口保持原调用方式。
 
 ## 飞书任务清单
 

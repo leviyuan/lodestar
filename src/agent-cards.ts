@@ -38,6 +38,7 @@ interface CardGroup {
 }
 
 interface TaskRow {
+  dedicated?: boolean
   key: string
   chatId: string
   elementId: string
@@ -119,7 +120,7 @@ export class AgentCards {
         await this.updateRow(row, row.terminal, true)
         return
       }
-      const group = this.tails.get(row.chatId)
+      const group = row.dedicated ? undefined : this.tails.get(row.chatId)
       if (group) {
         const atTail = await this.deps.getChatTailMessageId(row.chatId) === group.messageId
         if (atTail && this.deps.getElementCount(group.cardId) < CARD_ROW_SOFT_LIMIT) {
@@ -218,10 +219,10 @@ export class AgentCards {
     const cardId = await this.deps.convertMessageToCard(messageId)
     this.deps.recordCardCreated(cardId, 1)
     const group: CardGroup = {
-      cardId, messageId, chatId: row.chatId, rows: new Map(), settled: new Set(), sealed: false,
+      cardId, messageId, chatId: row.chatId, rows: new Map(), settled: new Set(), sealed: row.dedicated === true,
     }
     this.attach(group, row)
-    this.tails.set(row.chatId, group)
+    if (!row.dedicated) this.tails.set(row.chatId, group)
     return group
   }
 
@@ -263,7 +264,8 @@ function runRow(run: AgentRunSnapshot): TaskRow {
   const { cardMessageId: _cardMessageId, presentationErrors: _presentationErrors, promptArtifact: _promptArtifact, ...state } = run
   return {
     key: `run:${run.runId}`, chatId: run.chatId, elementId: cards.agentRunElementId(run.runId),
-    element: cards.agentRunElement(run), summary: cards.agentRunSummary(run), kind: 'delegated', status: run.status,
+    dedicated: run.owner?.kind === 'project',
+    element: cards.agentRunElement(run), summary: cards.agentRunSummary(run), kind: run.owner?.kind === 'project' ? 'project' : 'delegated', status: run.status,
     terminal: run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled',
     // Steps may arrive alongside a result or input request from another worker.
     // Only omit live progress fields from the confirmed-content comparison.

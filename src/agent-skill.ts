@@ -2,11 +2,21 @@ import { removeManagedSkill, syncManagedSkill } from './managed-skills'
 
 export const AGENT_SKILL_NAME = 'lodestar-agent'
 
-export const DELEGATED_AGENT_INSTRUCTIONS = [
-  'You are a delegated Agent working on a task assigned by the main Agent.',
+const NO_FURTHER_AGENTS = [
   'Complete this task yourself. You must not create or invoke any further Agents or subagents.',
   'This includes Lodestar delegation, provider-native Agent/subagent tools, and delegation through CLIs or HTTP APIs.',
+]
+
+export const DELEGATED_AGENT_INSTRUCTIONS = [
+  'You are a delegated Agent working on a task assigned by the main Agent.',
+  ...NO_FURTHER_AGENTS,
   'If additional Agent work is needed, report the need to the main Agent so it can assign that work.',
+].join('\n')
+
+export const PROJECT_AGENT_INSTRUCTIONS = [
+  'You are executing an independent project task owned by Lodestar. There is no parent main Agent.',
+  ...NO_FURTHER_AGENTS,
+  'If additional Agent work is needed, report the need to the caller.',
 ].join('\n')
 
 export function agentSkillBody(): string {
@@ -39,6 +49,10 @@ export function agentSkillBody(): string {
     '- The main Agent chooses between native Agent/subagent capabilities and',
     '  `lodestar-agent` based on the task and available capabilities.',
     '- Both methods are allowed when calling your own model or Agent.',
+    '- Inside a managed session, use the ordinary commands below so ownership,',
+    '  cancellation and results remain attached to that session.',
+    '- `--project <name>` is a separate explicit mode for independent local callers.',
+    '  Do not use it to escape a stale session capability or delegated-worker restrictions.',
     '',
     '## Required workflow',
     '',
@@ -176,6 +190,7 @@ export function agentSkillBody(): string {
     '',
     '- Do not invoke provider CLIs or provider HTTP APIs directly for delegation.',
     '- Never expose `LODESTAR_AGENT_CAPABILITY` in prompts, output, logs, or args.',
+    '- Never read or copy daemon project-client credentials to bypass delegation restrictions.',
     '- A non-zero command exit is a real failure. Do not claim the child succeeded.',
     '- Scope the Agent task and authorized actions to the user request.',
     '',

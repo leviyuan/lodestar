@@ -1,6 +1,8 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Session } from './session'
 import type { AgentService, AgentPrincipal } from './agent-service'
+import { agentPrincipalContext } from './agent-context'
+import { agentRunOwner } from './agent-run-types'
 import { getAgentSkillIdentityCatalog, type AgentIdentityCatalog } from './agent-identities'
 import {
   parseAgentAnswerRequest,
@@ -14,6 +16,7 @@ const MAX_BODY_BYTES = 4 * 1024 * 1024
 export interface AgentApiContext {
   service: AgentService
   authorizeSession(capability: string): Session | null
+  authorizeProject?(capability: string, project: string): AgentPrincipal | null
 }
 
 export async function handleAgentRequest(
@@ -31,11 +34,18 @@ export async function handleAgentRequest(
   }
   const capability = bearerToken(req.headers.authorization)
   if (!capability) return send(401, { error: 'missing bearer capability' })
-  const principal = authorizePrincipal(context, capability)
+  let principal: AgentPrincipal | null
+  try {
+    const projects = url.searchParams.getAll('project')
+    if (projects.length > 1 || (projects.length && !projects[0].trim())) return send(400, { error: 'invalid project selector' })
+    principal = projects.length
+      ? context.authorizeProject?.(capability, projects[0]) ?? null
+      : authorizePrincipal(context, capability)
+  } catch (error) { return send(409, { error: messageOf(error) }) }
   if (!principal) return send(403, { error: 'invalid or stale agent capability' })
 
   if (req.method === 'GET' && url.pathname === '/agents/identities') {
-    return send(200, serializeCatalog(await getAgentSkillIdentityCatalog(principal.session.codexAccountId())))
+    return send(200, serializeCatalog(await getAgentSkillIdentityCatalog(agentPrincipalContext(principal).codexAccountId)))
   }
   if (req.method === 'POST' && url.pathname === '/agents/runs') {
     try {
@@ -132,7 +142,9 @@ function serializeCatalog(catalog: AgentIdentityCatalog): object {
 function serializeRun(run: AgentRunSnapshot): object {
   return {
     run_id: run.runId,
-    session_name: run.sessionName,
+    binding: agentRunOwner(run).kind,
+    ...(agentRunOwner(run).kind === 'project' ? { project: agentRunOwner(run).name } : { session_name: run.sessionName }),
+    ...(run.requestId ? { request_id: run.requestId } : {}),
     work_dir: run.workDir,
     prompt: run.prompt,
     description: run.description,
