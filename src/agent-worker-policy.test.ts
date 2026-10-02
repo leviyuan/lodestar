@@ -33,7 +33,7 @@ test('the Claude SDK receives worker-only delegation restrictions while retainin
   ])
 })
 
-test('every delegated worker launch carries the policy and a worker role', () => {
+test('new and resumed workers use caller-owned delivery across all backends and bindings', () => {
   const captured = runIsolated(`
     import { mock } from 'bun:test'
     import { EventEmitter } from 'node:events'
@@ -42,7 +42,8 @@ test('every delegated worker launch carries the policy and a worker role', () =>
     mock.module('./src/agent-session-registry', () => ({ rememberAgentSession() {} }))
     mock.module('./src/agent-launch', () => ({ createAgentProcess: options => {
       captured.push({ allowDelegation: options.allowDelegation, instructions: options.developerInstructions,
-        role: options.hostEnv.LODESTAR_AGENT_ROLE, model: options.model, effort: options.effort, codexAccountId: options.codexAccountId })
+        role: options.hostEnv.LODESTAR_AGENT_ROLE, model: options.model, effort: options.effort,
+        codexAccountId: options.codexAccountId, launch: options.launch })
       const proc = new EventEmitter()
       Object.assign(proc, { provider: options.provider, sessionId: 'test-session', alive: true,
         isAlive() { return this.alive }, sendInitialize() {},
@@ -52,14 +53,19 @@ test('every delegated worker launch carries the policy and a worker role', () =>
       return { process: proc }
     } }))
     const { startAgentWorker } = await import('./src/agent-runner')
-    for (const provider of ['codex', 'claude']) {
-      await startAgentWorker({ identity: { tokenSourceId: 'test-source', provider, model: 'worker-model', supportedEfforts: ['high'] },
-        effort: 'high', codexAccountId: 'named-work', workDir: process.cwd(), prompt: 'task', developerInstructions: 'project rule',
-        hostEnv: { LODESTAR_AGENT_ROLE: 'main' } }).done
+    for (const provider of ['codex', 'claude', 'dsh']) {
+      for (const projectBound of [false, true]) {
+        for (const resumeSessionId of [undefined, 'test-session']) {
+          await startAgentWorker({ identity: { tokenSourceId: 'test-source', provider, model: 'worker-model', supportedEfforts: ['high'] },
+            projectBound, resumeSessionId, effort: 'high', codexAccountId: 'named-work', workDir: process.cwd(),
+            prompt: 'task', developerInstructions: 'project rule', hostEnv: { LODESTAR_AGENT_ROLE: 'main' } }).done
+        }
+      }
     }
     console.log(JSON.stringify(captured))
   `)
-  expect(captured).toHaveLength(2)
+  expect(captured).toHaveLength(12)
+  expect(captured.filter((launch: any) => launch.launch.kind === 'resume')).toHaveLength(6)
   for (const launch of captured) {
     expect(launch.allowDelegation).toBe(false)
     expect(launch.role).toBe('worker')
@@ -68,5 +74,9 @@ test('every delegated worker launch carries the policy and a worker role', () =>
     expect(launch.codexAccountId).toBe('named-work')
     expect(launch.instructions).toContain('project rule')
     expect(launch.instructions).toContain('must not create or invoke any further Agents or subagents')
+    expect(launch.instructions).toContain('Return task results and local artifact paths to the caller')
+    expect(launch.instructions).toContain('Do not emit file-delivery markers')
+    expect(launch.instructions).toContain('replace any earlier Lodestar file-delivery instructions')
+    expect(launch.instructions).not.toMatch(/\[\[send:|30 MB|files on|需要交付文件时直接提交/)
   }
 })

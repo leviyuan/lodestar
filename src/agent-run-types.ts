@@ -19,6 +19,7 @@ export interface AgentRunRequest {
   /** Unique native conversation id, registered to the same project and group. */
   sessionId?: string
   requestId?: string
+  /** Optional caller attribution; never enables file delivery. */
   requesterOpenId?: string
 }
 
@@ -98,6 +99,7 @@ export interface AgentRunSnapshot {
   requestId?: string
   requestHash?: string
   requesterOpenId?: string
+  /** Legacy history only. Agent output no longer triggers file delivery. */
   deliveryMode?: 'chat' | 'drive'
   codexAccountId?: string
   runId: string

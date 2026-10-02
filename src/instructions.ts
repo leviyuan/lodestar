@@ -20,7 +20,7 @@ const COMMON_TAIL_INSTRUCTIONS = [
     "- 每次调用 Bash / shell 命令时,第一行都必须写 shell 注释 `# desc: <一句中文说明>`,再写真正命令。这个注释只给 Lodestar 卡片做摘要,不要依赖它改变命令行为。",
 ]
 
-export function channelInstructions(provider: AgentProvider, mode: FileDeliveryMode, binding: 'session' | 'project' = 'session'): string {
+export function channelInstructions(provider: AgentProvider, mode: FileDeliveryMode): string {
   const questions = {
     codex: '- 当你有问题需要澄清时，使用 request_user_input 工具向用户提问；不要把多选题写成文本。',
     claude: '- 当你有问题需要澄清时，使用 Claude Code 自带的 AskUserQuestion 工具向用户提问。',
@@ -30,15 +30,11 @@ export function channelInstructions(provider: AgentProvider, mode: FileDeliveryM
     '- 以 `[file: /abs/path]` 开头的文本表示该路径上挂着一个文件,相关时去读它。',
     fileDeliveryInstructions(mode),
     '- 文件交付约定由 Lodestar 按工作目录设置生成；后续收到宿主注入的“文件交付约定更新”时，用其完整替换此前的文件交付约定。',
-    binding === 'project'
-      ? '- 你是独立的项目任务，没有主 Agent。需要交付文件时直接提交交付标记，由 Lodestar 处理上传、权限和卡片；不直接调用飞书接口，不读取凭据或查找 token，也不依赖飞书 CLI。'
-      : `- ${FILE_TRANSPORT_OWNER}`,
+    `- ${FILE_TRANSPORT_OWNER}`,
     `- ${FILE_DELIVERY_RESULT}`,
     `- ${FILE_DELIVERY_SWITCH}`,
     questions[provider],
-    ...(binding === 'project'
-      ? ['- 生成图片后，使用实际本地图片路径提交 `[[send: /abs/path]]`，由 Lodestar 交付。', COMMON_TAIL_INSTRUCTIONS[1]]
-      : COMMON_TAIL_INSTRUCTIONS),
+    ...COMMON_TAIL_INSTRUCTIONS,
   ].join('\n')
 }
 

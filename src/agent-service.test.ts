@@ -8,7 +8,7 @@ import type { AgentIdentity, AgentIdentityCatalog } from './agent-identities'
 import { AgentWorkerFailure, type AgentWorkerHandle, type AgentWorkerResult } from './agent-runner'
 import type { AgentInputRequest, AgentRunSnapshot } from './agent-run-types'
 import { AGENT_RUNS_DIR } from './paths'
-import { projectProfiles } from './feishu-test-mock'
+import { projectProfiles, sentLocalFiles } from './feishu-test-mock'
 
 function identity(id: string, name = id): AgentIdentity {
   return {
@@ -83,7 +83,6 @@ function completedHistory(count: number, chain = false): AgentRunSnapshot[] {
 }
 
 function harness(opts: {
-  projectRuntime?: AgentServiceDeps['projectRuntime']
   identities?: AgentIdentity[]
   startWorker?: AgentServiceDeps['startWorker']
   loadArtifacts?: AgentServiceDeps['loadArtifacts']
@@ -99,7 +98,6 @@ function harness(opts: {
   const textArtifacts = new Map<string, string>()
   const artifactReads: string[] = []
   const deps: AgentServiceDeps = {
-    projectRuntime: opts.projectRuntime ?? { mode: () => 'chat', deliver: async () => {} },
     getCatalog: () => catalog,
     startWorker: opts.startWorker ?? (worker => resolvedHandle(result(`sid-${worker.identity.id}`, `output-${worker.identity.id}`))),
     sendCard: opts.sendCard ?? (async () => 'message-1'),
@@ -1241,7 +1239,7 @@ describe('project-owned Agent runs', () => {
     expect(calls[0].codexAccountId).toBe('default')
     expect(calls[1].codexAccountId).toBeUndefined()
     expect(calls[1].projectBound).toBe(true)
-    expect(calls[1].developerInstructions).toContain('独立的项目任务')
+    expect(calls[1].developerInstructions).toBeUndefined()
     expect(() => h.service.getRun(h.root, projectRun.runId)).toThrow('not found')
     expect(() => h.service.getRun(project, sessionRun.runId)).toThrow('not found')
     const worker = h.service.principalForCapability(calls[1].hostEnv.LODESTAR_AGENT_CAPABILITY!)!
@@ -1344,24 +1342,53 @@ describe('project-owned Agent runs', () => {
     await waitFor(h.service, principal, run.runId, 'completed')
   })
 
-  test('delivery failures preserve generated output and mark the project run failed', async () => {
-    const h = harness({ projectRuntime: { mode: () => 'drive', deliver: async () => { throw new Error('delivery rejected') } } })
-    const principal = h.service.projectPrincipal(context())
-    const run = await h.service.startRun(principal, { ...request, requesterOpenId: 'requester' })
-    const failed = await waitFor(h.service, principal, run.runId, 'failed')
-    expect(failed).toMatchObject({ deliveryMode: 'drive', requesterOpenId: 'requester', workers: [{ output: 'output-agent:a', error: 'delivery rejected' }] })
-  })
+  for (const provider of ['codex', 'claude', 'dsh'] as const) {
+    for (const legacyMode of ['chat', 'drive'] as const) {
+      test(`${provider}/${legacyMode}: new runs and legacy continuations return file markers as data without delivering`, async () => {
+        const output = '任务结果\n[[send: /tmp/agent-result.glb]]\n[[send: /tmp/agent-result.json]]'
+        const history = completedHistory(1)[0]!
+        history.owner = context().owner
+        history.deliveryMode = legacyMode
+        history.requesterOpenId = 'legacy-requester'
+        history.workers[0]!.provider = provider
+        history.workers[0]!.output = output
+        const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
+        const before = sentLocalFiles.length
+        const h = harness({ identities: [{ ...identity('a'), provider }], loadArtifacts: () => [history], startWorker: opts => {
+          calls.push(opts)
+          return resolvedHandle(result(opts.resumeSessionId ?? `${provider}-fresh`, output))
+        } })
+        const principal = h.service.projectPrincipal(context())
+        expect(h.service.getRun(principal, history.runId).workers[0]!.output).toBe(output)
+        const fresh = await h.service.startRun(principal, { ...request, requesterOpenId: 'requester' })
+        const completed = await waitFor(h.service, principal, fresh.runId, 'completed')
+        const resumed = await h.service.startRun(principal, { ...request, identityIds: [], sessionId: 'sid-history-0' })
+        const resumedResult = await waitFor(h.service, principal, resumed.runId, 'completed')
+        const followUp = await h.service.followUp(principal, history.runId, { description: '续跑旧项目任务', prompt: 'next' })
+        const followUpResult = await waitFor(h.service, principal, followUp.runId, 'completed')
+        for (const run of [completed, resumedResult, followUpResult]) {
+          expect(run.workers[0]!.output).toBe(output)
+          expect(run.workers[0]!.error).toBeUndefined()
+          expect(run.deliveryMode).toBeUndefined()
+        }
+        expect(calls).toHaveLength(3)
+        expect(calls.every(call => call.projectBound && call.developerInstructions === undefined)).toBe(true)
+        expect(sentLocalFiles.length).toBe(before)
+      })
+    }
+  }
 
-  test('concurrent cancellation waits for delivery cleanup even after the Agent handle has exited', async () => {
-    let delivering = false
+  test('concurrent project cancellation waits for the worker to exit', async () => {
+    const control = controlledHandle()
+    let started = false
     let release!: () => void
-    const h = harness({ projectRuntime: { mode: () => 'chat', deliver: async (_run, _output, signal) => {
-      delivering = true
-      await new Promise<void>((_resolve, reject) => { release = () => reject(signal.reason) })
-    } } })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const cancel = control.handle.cancel
+    control.handle.cancel = async reason => { await gate; await cancel(reason) }
+    const h = harness({ startWorker: () => { started = true; return control.handle } })
     const principal = h.service.projectPrincipal(context())
     const run = await h.service.startRun(principal, request)
-    await waitForCondition(() => delivering)
+    await waitForCondition(() => started)
     const first = h.service.cancelRun(principal, run.runId)
     await new Promise(resolve => setTimeout(resolve, 2))
     let secondReturned = false
@@ -1373,18 +1400,18 @@ describe('project-owned Agent runs', () => {
     expect(h.service.getRun(principal, run.runId).status).toBe('cancelled')
   })
 
-  test('daemon shutdown cancels project work and drains ongoing deliveries', async () => {
-    let delivering = false
-    let aborted = false
-    const h = harness({ projectRuntime: { mode: () => 'chat', deliver: async (_run, _output, signal) => {
-      delivering = true
-      await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => { aborted = true; reject(signal.reason) }, { once: true }))
-    } } })
+  test('daemon shutdown cancels project work and waits for the worker to exit', async () => {
+    const control = controlledHandle()
+    let started = false
+    let stopped = false
+    const cancel = control.handle.cancel
+    control.handle.cancel = async reason => { await cancel(reason); stopped = true }
+    const h = harness({ startWorker: () => { started = true; return control.handle } })
     const principal = h.service.projectPrincipal(context())
     const run = await h.service.startRun(principal, request)
-    await waitForCondition(() => delivering)
+    await waitForCondition(() => started)
     await h.service.shutdown('daemon stop')
-    expect(aborted).toBe(true)
+    expect(stopped).toBe(true)
     expect(h.service.getRun(principal, run.runId).status).toBe('cancelled')
   })
 })
@@ -1438,7 +1465,7 @@ describe('native session-id recovery', () => {
     expect(calls).toEqual(['sid-history-0'])
   })
 
-  test('changing binding within the project does not join cancellation trees or inherit delivery recipients', async () => {
+  test('changing binding within the project does not join cancellation trees or inherit requester attribution', async () => {
     const history = completedHistory(1)[0]
     history.owner = { kind: 'project', name: history.sessionName, chatId: history.chatId, workDir: history.workDir }
     history.sessionWorkDir = history.workDir

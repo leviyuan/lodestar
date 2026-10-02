@@ -43,7 +43,7 @@
 ## 委派 Agent
 
 - Agent 执行任务中的调用强制绑定当前会话，包括通过脚本或 HTTP 调用；独立服务/软件强制使用 `--project` / HTTP `?project=` 项目绑定。检测到受管 Agent 上下文的 CLI 不接受 --project，禁止清除环境或复制项目凭据绕过。两种模式不做失败后的自动切换。`agent-context.ts` 区分 session/project/worker，`agent-project.ts` 从群绑定和实际目录解析项目，不构造或启动 Session，不继承主会话账号/模型；`agent-project-client.ts` 通过 paths.ts 下的私有文件向本机客户端提供轮换凭据，不注入 worker。项目/会话凭据不能跨路由，worker 仍禁止继续派工。
-- 新快照记录 owner；缺 owner 的旧快照仅解释为会话归属。会话 stop/kill/restart 只取消会话任务，daemon shutdown 取消所有任务并排空交付。项目 run 一次一张独立卡，不能进入群尾共享委派卡；取消按钮在 Session 存在性检查前分流，并核验存储的群、消息和 run。提问由同项目 `answer` 回填，普通群消息不重定向。项目任务直接处理交付标记，交付方式按实际目录在启动时固定；云空间发起人由 `--requester` 显式提供，失败可见且不切换通道。
+- 新快照记录 owner；缺 owner 的旧快照仅解释为会话归属。会话 stop/kill/restart 只取消会话任务，daemon shutdown 取消所有任务并等待进程退出。项目 run 一次一张独立卡，不能进入群尾共享委派卡；取消按钮在 Session 存在性检查前分流，并核验存储的群、消息和 run。提问由同项目 `answer` 回填，普通群消息不重定向。会话委派与项目调用均只向调用方返回结果和本地路径，不注入 `channelInstructions`，不解析或执行输出中的交付标记，不读取目录交付设置或调用附件/云空间交付接口；新建和续跑都追加调用方负责交付的约定，覆盖旧会话中的交付规则。旧快照 `deliveryMode` 只保留历史读取，`requesterOpenId` 仅记录调用方，不授予交付权限。
 - 项目 `request_id` 按归属去重并持久化请求摘要，同键不同输入拒绝，恢复仅限同一规范项目根目录和同一 chat_id；两种绑定方式可互相恢复，新 run 归当前调用方，旧历史不迁移。`resumedFromRunId` 仅作来源索引，切换绑定方式不设置取消树的 parentRunId。重启只结算未完成状态，不自动重放任务。两种任务共享原全局及来源并发限制。
 
 - `agent-*` 提供单层模型委派。会话内只有主 Agent 能发起任务或续跑；主 Agent 按任务和可用能力自行选择原生 subagent 或 `lodestar-agent`，调用自身模型或 Agent 时也适用。同一任务的多个身份放在一个 run 内并发。被委派的 Agent 自行完成任务，需要额外派工时报告主 Agent。

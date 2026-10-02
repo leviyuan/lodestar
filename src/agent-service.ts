@@ -24,7 +24,6 @@ import { writeJsonStateAtomic, writeStateFileAtomic } from './state-store'
 import { log } from './log'
 import type { Session } from './session'
 import { agentPrincipalContext, type AgentExecutionContext, type AgentPrincipal } from './agent-context'
-import { agentProjectRuntime, projectAgentInstructions, type AgentProjectRuntime } from './agent-project'
 import type { AgentReasoningEffort } from './agent-process'
 
 export type { AgentPrincipal } from './agent-context'
@@ -41,9 +40,6 @@ const MAX_GLOBAL_INFLIGHT_WORKERS = 128
 interface AgentRunRecord {
   snapshot: AgentRunSnapshot
   context: AgentExecutionContext | null
-  deliveryAbort: AbortController
-  deliveryWork: Set<Promise<void>>
-  outboundPaths: Set<string>
   handles: Map<string, AgentWorkerHandle>
   slotOwners: Map<string, string>
   capabilityByIdentity: Map<string, string>
@@ -69,7 +65,6 @@ interface CreateRunOptions {
 }
 
 export interface AgentServiceDeps extends AgentCardsDeps {
-  projectRuntime?: AgentProjectRuntime
   getCatalog: typeof getAgentIdentityCatalog
   startWorker: typeof startAgentWorker
   sendTextRaw(chatId: string, text: string): Promise<unknown>
@@ -81,7 +76,6 @@ export interface AgentServiceDeps extends AgentCardsDeps {
 
 const DEFAULT_DEPS: AgentServiceDeps = {
   ...agentCardsDeps,
-  projectRuntime: agentProjectRuntime,
   getCatalog: getAgentIdentityCatalog,
   startWorker: startAgentWorker,
   sendTextRaw: feishu.sendTextRaw,
@@ -389,7 +383,6 @@ export class AgentService {
       sessionWorkDir: owner.workDir,
       ...(options.requestId ? { requestId: options.requestId, requestHash: options.requestHash } : {}),
       ...(owner.kind === 'project' ? {
-        deliveryMode: this.projectRuntime().mode(owner.chatId, workDir),
         ...(request.requesterOpenId ? { requesterOpenId: request.requesterOpenId } : {}),
       } : {}),
       workDir,
@@ -406,9 +399,6 @@ export class AgentService {
     const run: AgentRunRecord = {
       snapshot,
       context,
-      deliveryAbort: new AbortController(),
-      deliveryWork: new Set(),
-      outboundPaths: new Set(),
       handles: new Map(),
       slotOwners: new Map(),
       capabilityByIdentity: new Map(),
@@ -512,9 +502,8 @@ export class AgentService {
         prompt,
         resumeSessionId,
         projectBound: run.context!.owner.kind === 'project',
-        developerInstructions: run.context!.owner.kind === 'project'
-          ? projectAgentInstructions(identity.provider, run.snapshot.deliveryMode!)
-          : run.context!.sessionInstructions!(identity.provider),
+        ...(run.context!.owner.kind === 'session'
+          ? { developerInstructions: run.context!.sessionInstructions!(identity.provider) } : {}),
         profile: fullAgentProfile(feishu.projectProfileForDirectory(run.snapshot.workDir)),
         ...(process.env.LODESTAR_DISABLE_SKILL_SYNC === '1' ? {} : { managedSkillPluginPath: MANAGED_CLAUDE_PLUGIN_DIR }),
         hostEnv: {
@@ -556,12 +545,6 @@ export class AgentService {
       worker.usage = result.usage
       worker.finishedAt = new Date().toISOString()
       delete worker.pendingInput
-      if (run.context!.owner.kind === 'project') {
-        this.persist(run)
-        const delivery = this.projectRuntime().deliver(run.snapshot, worker.output, run.deliveryAbort.signal, run.outboundPaths)
-        run.deliveryWork.add(delivery)
-        try { await delivery } finally { run.deliveryWork.delete(delivery) }
-      }
       if (run.cancelled) return
       worker.status = 'completed'
       this.persist(run)
@@ -641,11 +624,10 @@ export class AgentService {
   }
 
   private async cancelTree(run: AgentRunRecord, reason: string): Promise<void> {
-    const activeSelf = (!isTerminal(run.snapshot.status) && !run.cancelled) || run.handles.size > 0 || run.deliveryWork.size > 0
+    const activeSelf = (!isTerminal(run.snapshot.status) && !run.cancelled) || run.handles.size > 0
     const failures: PromiseSettledResult<void>[] = []
     if (activeSelf) {
       run.cancelled = true
-      run.deliveryAbort.abort(new Error(reason))
       for (const identityId of [...run.progressTimers.keys()]) this.clearProgressTimer(run, identityId)
       for (const capability of run.capabilityByIdentity.values()) this.capabilities.delete(capability)
       run.capabilityByIdentity.clear()
@@ -666,12 +648,6 @@ export class AgentService {
       run.handles.delete(identityId)
       this.releaseWorkerSlot(run, identityId)
     })))
-    const deliveries = await Promise.allSettled([...run.deliveryWork])
-    for (const result of deliveries) {
-      if (result.status === 'rejected' && result.reason !== run.deliveryAbort.signal.reason) {
-        this.recordPresentationError(run, `项目交付取消时出错: ${messageOf(result.reason)}`)
-      }
-    }
     if (failures.some(result => result.status === 'rejected')) {
       const error = cancellationError(failures)
       run.snapshot.status = 'failed'
@@ -851,13 +827,8 @@ export class AgentService {
     }
   }
 
-  private projectRuntime(): AgentProjectRuntime {
-    if (!this.deps.projectRuntime) throw new Error('project Agent runtime is unavailable')
-    return this.deps.projectRuntime
-  }
-
   private treeHasActiveRun(run: AgentRunRecord): boolean {
-    if (run.handles.size > 0 || run.deliveryWork.size > 0) return true
+    if (run.handles.size > 0) return true
     if (!isTerminal(run.snapshot.status)) return true
     for (const childId of run.children) {
       const child = this.runs.get(childId)
@@ -963,9 +934,6 @@ export class AgentService {
       const record: AgentRunRecord = {
         snapshot,
         context: null,
-        deliveryAbort: new AbortController(),
-        deliveryWork: new Set(),
-        outboundPaths: new Set(),
         handles: new Map(),
         slotOwners: new Map(),
         capabilityByIdentity: new Map(),

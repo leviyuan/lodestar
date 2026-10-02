@@ -7,16 +7,24 @@ const NO_FURTHER_AGENTS = [
   'This includes Lodestar delegation, provider-native Agent/subagent tools, and delegation through CLIs or HTTP APIs.',
 ]
 
+const CALLER_OWNS_DELIVERY = [
+  'Return task results and local artifact paths to the caller; the caller is responsible for delivering files to the user.',
+  'Do not emit file-delivery markers or upload, share, or send generated files to Feishu.',
+  'These rules replace any earlier Lodestar file-delivery instructions, including those in a resumed conversation.',
+]
+
 export const DELEGATED_AGENT_INSTRUCTIONS = [
   'You are a delegated Agent working on a task assigned by the main Agent.',
   ...NO_FURTHER_AGENTS,
   'If additional Agent work is needed, report the need to the main Agent so it can assign that work.',
+  ...CALLER_OWNS_DELIVERY,
 ].join('\n')
 
 export const PROJECT_AGENT_INSTRUCTIONS = [
-  'You are executing an independent project task owned by Lodestar. There is no parent main Agent.',
+  'You are executing a project task for the calling service or application through Lodestar.',
   ...NO_FURTHER_AGENTS,
   'If additional Agent work is needed, report the need to the caller.',
+  ...CALLER_OWNS_DELIVERY,
 ].join('\n')
 
 export function agentSkillBody(): string {
@@ -216,6 +224,8 @@ export function agentSkillBody(): string {
     '- Never read or copy daemon project-client credentials to bypass delegation restrictions.',
     '- A non-zero command exit is a real failure. Do not claim the child succeeded.',
     '- Scope the Agent task and authorized actions to the user request.',
+    '- Both session-bound and project-bound Agents return results and local artifact paths to the caller.',
+    '- The caller owns file delivery. Agent output markers do not upload files or grant sharing permissions.',
     '',
   ].join('\n')
 }

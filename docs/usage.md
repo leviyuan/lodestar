@@ -162,11 +162,11 @@ lodestar-agent --project '<项目名>' status '<run-id>' --json
 lodestar-agent --project '<项目名>' answer '<run-id>' --identity '<identity-id>' --request '<request-id>' --answer 'question-id=回答内容'
 ```
 
-普通群消息仍交给主会话，项目任务的问题通过调用端的 `answer` 回答。项目任务可直接用交付标记提交文件，按实际任务目录的文件交付设置处理；云空间交付须在 `run` 或 `follow-up` 提供 `--requester <发起人的 open_id>`，用于授予交付权限，同归属续跑默认沿用；切换绑定方式恢复时须重新提供。缺少发起人或上传失败明确报错，不切换交付通道。
+普通群消息仍交给主会话，项目任务的问题通过调用端的 `answer` 回答。会话委派和项目任务均只向调用方返回结果与本地文件路径，由主 Agent 或调用程序处理交付。`--project` 只决定任务归属和展示群，不注入主会话的文件交付规则，也不上传附件、设置权限或执行输出中的交付标记；新建任务和续跑旧会话都遵循此规则。
 
 项目任务的 `run` / `follow-up` 可用 `--request-id` 防止超时重试重复执行：同一归属、同一编号及相同输入返回原任务，输入不同则拒绝，daemon 重启后仍有效。重启不会自动重跑未完成任务；遗留非终态任务标为失败，已有原生会话可显式续跑。
 
-HTTP 使用原 `/agents/…` 路径并增加 `?project=<项目名>`，Bearer 凭据来自 daemon 启动时生成的私有 `agent-project-client.json`（状态目录内，本机同用户读取，重启后轮换）。CLI 自动读取，无需配置或输出凭据。项目凭据只用于显式项目路由，会话和 worker 凭据不能用来调用项目路由。请求体可增加 `request_id` 和 `requester_open_id`；响应中的 `binding: "project"`、`project` 标明归属。旧会话接口保持原调用方式。
+HTTP 使用原 `/agents/…` 路径并增加 `?project=<项目名>`，Bearer 凭据来自 daemon 启动时生成的私有 `agent-project-client.json`（状态目录内，本机同用户读取，重启后轮换）。CLI 自动读取，无需配置或输出凭据。项目凭据只用于显式项目路由，会话和 worker 凭据不能用来调用项目路由。请求体可增加 `request_id`；`requester_open_id`（CLI `--requester`）保留为调用方记录，不触发文件交付或授权。响应中的 `binding: "project"`、`project` 标明归属。旧会话接口保持原调用方式。
 
 ## 飞书任务清单
 

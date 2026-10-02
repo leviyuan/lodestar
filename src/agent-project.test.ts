@@ -3,8 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, statSync, symlinkSync, writeFileSync } 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { acceptsProjectCapability, createAgentProjectClient, readAgentProjectClient } from './agent-project-client'
-import { createAgentProjectRuntime, projectAgentInstructions, resolveAgentProject } from './agent-project'
-import type { AgentRunSnapshot } from './agent-run-types'
+import { resolveAgentProject } from './agent-project'
 
 // Each local service credential is private and replaced on daemon startup.
 describe('project Agent client', () => {
@@ -49,73 +48,5 @@ describe('project Agent client', () => {
       rmSync(join(dir, 'wt'), { recursive: true })
       expect(() => resolveAgentProject('repo[feature]', deps)).toThrow()
     } finally { rmSync(dir, { recursive: true, force: true }) }
-  })
-})
-
-describe('project output delivery', () => {
-  const run = (mode: 'chat' | 'drive'): AgentRunSnapshot => ({
-    runId: 'agent_project', sessionName: 'repo', chatId: 'chat', workDir: '/repo',
-    owner: { kind: 'project', name: 'repo', chatId: 'chat', workDir: '/repo' },
-    deliveryMode: mode, status: 'running', prompt: '', depth: 0, workers: [], createdAt: new Date().toISOString(),
-  })
-  test('uploads explicit paths once per run and surfaces attachment failures without changing transport', async () => {
-    const paths: string[] = []
-    let ok = true
-    const runtime = createAgentProjectRuntime({
-      mode: () => 'chat', uploadAndSend: async (_chat, path) => { paths.push(path); return ok },
-      createFileDelivery: () => { throw new Error('must not switch transport') },
-    })
-    const seen = new Set<string>()
-    const signal = new AbortController().signal
-    await runtime.deliver(run('chat'), '[[send: /tmp/a]]\n[[send: /tmp/a]]', signal, seen)
-    await runtime.deliver(run('chat'), '[[send: /tmp/a]]', signal, seen)
-    expect(paths).toEqual(['/tmp/a'])
-    ok = false
-    await expect(runtime.deliver(run('chat'), '[[send: /tmp/b]]', signal, seen)).rejects.toThrow('交付失败')
-    await expect(runtime.deliver(run('chat'), '[[send: relative]]', signal, seen)).rejects.toThrow('绝对路径')
-  })
-
-  test('cloud output requires an explicit requester and does not report partially delivered batches as success', async () => {
-    const contexts: unknown[] = []
-    const runtime = createAgentProjectRuntime({ mode: () => 'drive',
-      uploadAndSend: async () => { throw new Error('must not switch transport') },
-      createFileDelivery: context => {
-        contexts.push(context)
-        return { add: () => {}, cancel: () => true, finish: async () => ['/tmp/a'] }
-      },
-    })
-    const signal = new AbortController().signal
-    await expect(runtime.deliver(run('drive'), '[[send: /tmp/a]]', signal, new Set())).rejects.toThrow('--requester')
-    const owned = { ...run('drive'), requesterOpenId: 'requester' }
-    await runtime.deliver(owned, '[[send: /tmp/a]]', signal, new Set())
-    expect(contexts[0]).toMatchObject({ chatId: 'chat', managerOpenId: 'requester', projectName: 'repo' })
-    await expect(runtime.deliver(owned, '[[send: /tmp/a]]\n[[send: /tmp/b]]', signal, new Set())).rejects.toThrow('/tmp/b')
-  })
-
-  test('a synchronous cloud enqueue failure cancels and drains already admitted delivery work', async () => {
-    let drained = false
-    let cancelled = false
-    const runtime = createAgentProjectRuntime({ mode: () => 'drive', uploadAndSend: async () => true,
-      createFileDelivery: () => ({
-        add: () => { throw new Error('persistence unavailable') },
-        cancel: () => { cancelled = true; return true },
-        finish: async () => { drained = true; return [] },
-      }),
-    })
-    await expect(runtime.deliver({ ...run('drive'), requesterOpenId: 'requester' }, '[[send: /tmp/a]]', new AbortController().signal, new Set()))
-      .rejects.toThrow('persistence unavailable')
-    expect(cancelled).toBe(true)
-    expect(drained).toBe(true)
-  })
-
-  test('independent instructions retain provider questions and never direct handoff to a missing main Agent', () => {
-    for (const provider of ['codex', 'claude', 'dsh'] as const) {
-      const text = projectAgentInstructions(provider, 'chat')
-      expect(text).toContain('没有主 Agent')
-      expect(text).toContain('[[send: /abs/path]]')
-      expect(text).toContain('30 MB')
-      expect(text).not.toContain('由主 Agent 提交')
-    }
-    expect(projectAgentInstructions('codex', 'drive')).not.toContain('30 MB')
   })
 })
