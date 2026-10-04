@@ -28,20 +28,14 @@ import type { AgentReasoningEffort } from './agent-process'
 
 export type { AgentPrincipal } from './agent-context'
 
-const GLOBAL_AGENT_CONCURRENCY = 8
-// Local delegation policy, not an upstream API quota. Shared across all Sessions/models.
-const TOKEN_SOURCE_AGENT_CONCURRENCY = new Map<string, number>([['openrouter', 2]])
 const NESTED_DELEGATION_ERROR = 'Delegated Agents cannot delegate again; ask the main Agent to assign additional work.'
 const MAX_CACHED_RUN_ARTIFACTS = 512
 const MAX_WORKER_STEPS = 50
-const MAX_SESSION_ACTIVE_RUNS = 64
-const MAX_GLOBAL_INFLIGHT_WORKERS = 128
 
 interface AgentRunRecord {
   snapshot: AgentRunSnapshot
   context: AgentExecutionContext | null
   handles: Map<string, AgentWorkerHandle>
-  slotOwners: Map<string, string>
   capabilityByIdentity: Map<string, string>
   progressTimers: Map<string, ReturnType<typeof setTimeout>>
   children: Set<string>
@@ -89,12 +83,7 @@ export class AgentService {
   readonly presentation: AgentCards
   private readonly runs = new Map<string, AgentRunRecord>()
   private readonly capabilities = new Map<string, AgentPrincipal>()
-  private activeTurns = 0
-  private readonly activeTurnsBySource = new Map<string, number>()
-  private readonly slotWaiters: Array<{ tokenSourceId: string; resolve: () => void }> = []
   private readonly cancellationEpochBySession = new Map<string, number>()
-  private startingWorkers = 0
-  private readonly startingRunsBySession = new Map<string, number>()
   private readonly startingNativeSessions = new Set<string>()
   private readonly pendingRunCreations = new Set<Promise<AgentRunSnapshot>>()
   private readonly requests = new Map<string, { hash: string; promise: Promise<AgentRunSnapshot> }>()
@@ -133,15 +122,11 @@ export class AgentService {
       const selected = request.identityIds[0] ? this.requireIdentity(principal, request.identityIds[0]) : undefined
       return this.resumeRun(principal, request, metadata, history, selected)
     }
-    const release = this.reserveCapacity(principal, request.identityIds.length)
-    try {
-      return await this.createRun(agentPrincipalContext(principal), request, {
-        ...metadata,
-        cancellationEpoch: this.currentCancellationEpoch(agentPrincipalContext(principal)),
-      })
-    } finally {
-      release()
-    }
+    const context = agentPrincipalContext(principal)
+    return this.createRun(context, request, {
+      ...metadata,
+      cancellationEpoch: this.currentCancellationEpoch(context),
+    })
   }
 
   followUp(principal: AgentPrincipal, runId: string, request: AgentFollowUpRequest): Promise<AgentRunSnapshot> {
@@ -190,10 +175,8 @@ export class AgentService {
     const sameOwner = agentOwnerKey(agentRunOwner(history.run.snapshot)) === agentOwnerKey(context.owner)
     const effort = request.effort ?? (history.worker.identityId === identity.id ? history.worker.effort : undefined)
     const workDir = request.workDir ?? history.run.snapshot.workDir
-    const release = this.reserveCapacity(principal, 1)
-    let releaseSession: (() => void) | undefined
+    const releaseSession = this.reserveNativeSession({ provider: identity.provider, sessionId: request.sessionId! })
     try {
-      releaseSession = this.reserveNativeSession({ provider: identity.provider, sessionId: request.sessionId! })
       return await this.createRun(context, {
         identityIds: [identity.id], description: request.description, prompt: request.prompt, effort, workDir,
         requesterOpenId: request.requesterOpenId ?? (sameOwner ? history.run.snapshot.requesterOpenId : undefined),
@@ -205,8 +188,7 @@ export class AgentService {
         resumeSessionId: request.sessionId!,
       })
     } finally {
-      releaseSession?.()
-      release()
+      releaseSession()
     }
   }
 
@@ -401,7 +383,6 @@ export class AgentService {
       snapshot,
       context,
       handles: new Map(),
-      slotOwners: new Map(),
       capabilityByIdentity: new Map(),
       progressTimers: new Map(),
       children: new Set(),
@@ -459,16 +440,7 @@ export class AgentService {
     resumeSessionId?: string,
   ): Promise<void> {
     const worker = run.snapshot.workers.find(item => item.identityId === identity.id)!
-    await this.acquireSlot(identity, reason => {
-      worker.queuedReason = reason
-      this.persist(run)
-      void this.updateWorkerCard(run, worker)
-    })
-    run.slotOwners.set(identity.id, identity.tokenSourceId)
-    if (run.cancelled) {
-      this.releaseWorkerSlot(run, identity.id)
-      return
-    }
+    if (run.cancelled) return
     let capability = ''
     try {
       capability = randomBytes(32).toString('base64url')
@@ -488,7 +460,7 @@ export class AgentService {
       await this.updateWorkerCard(run, worker)
       if (run.cancelled) return
       this.assertSameOwner(run, run.context!)
-      // Queued tasks may wait while directories are removed or replaced by symlinks.
+      // Card creation and updates may wait while directories are removed or replaced by symlinks.
       const validatedWorkDir = resumeSessionId
         ? resolveAgentResumeWorkDir(run.context!.owner.workDir, run.snapshot.workDir)
         : resolveAgentWorkDir(run.context!.owner.workDir, run.snapshot.workDir)
@@ -571,7 +543,6 @@ export class AgentService {
     } finally {
       if (!run.handles.get(identity.id)?.isAlive?.()) {
         run.handles.delete(identity.id)
-        this.releaseWorkerSlot(run, identity.id)
       }
       if (capability) this.capabilities.delete(capability)
       run.capabilityByIdentity.delete(identity.id)
@@ -648,7 +619,6 @@ export class AgentService {
       await handle.cancel(reason)
       if (handle.isAlive?.()) throw new Error(`${identityId}: Agent process is still alive after cancellation`)
       run.handles.delete(identityId)
-      this.releaseWorkerSlot(run, identityId)
     })))
     if (failures.some(result => result.status === 'rejected')) {
       const error = cancellationError(failures)
@@ -839,33 +809,6 @@ export class AgentService {
     return false
   }
 
-  private reserveCapacity(principal: AgentPrincipal, workerCount: number): () => void {
-    const sessionKey = agentOwnerKey(agentPrincipalContext(principal).owner)
-    const activeSessionRuns = [...this.runs.values()].filter(run =>
-      agentOwnerKey(agentRunOwner(run.snapshot)) === sessionKey
-      && (!isTerminal(run.snapshot.status) || run.handles.size > 0)).length
-    const startingSessionRuns = this.startingRunsBySession.get(sessionKey) ?? 0
-    if (activeSessionRuns + startingSessionRuns >= MAX_SESSION_ACTIVE_RUNS) {
-      throw new Error(`${principal.kind === 'project' ? 'Project' : 'Session'} has reached ${MAX_SESSION_ACTIVE_RUNS} active Agent runs`)
-    }
-    const inflightWorkers = [...this.runs.values()].reduce((sum, run) =>
-      sum + run.snapshot.workers.filter(worker =>
-        !isWorkerTerminal(worker.status) || run.handles.get(worker.identityId)?.isAlive?.(),
-      ).length, 0)
-    if (inflightWorkers + this.startingWorkers + workerCount > MAX_GLOBAL_INFLIGHT_WORKERS) {
-      throw new Error(`global Agent worker limit ${MAX_GLOBAL_INFLIGHT_WORKERS} would be exceeded`)
-    }
-    this.startingWorkers += workerCount
-    this.startingRunsBySession.set(sessionKey, startingSessionRuns + 1)
-    let released = false
-    return () => {
-      if (released) return
-      released = true
-      this.startingWorkers = Math.max(0, this.startingWorkers - workerCount)
-      decrementMap(this.startingRunsBySession, sessionKey)
-    }
-  }
-
   private sessionKey(sessionName: string, chatId: string): string {
     return `${sessionName}\u0000${chatId}`
   }
@@ -878,44 +821,6 @@ export class AgentService {
   private bumpCancellationEpoch(sessionName: string, chatId: string): void {
     const key = this.sessionKey(sessionName, chatId)
     this.cancellationEpochBySession.set(key, (this.cancellationEpochBySession.get(key) ?? 0) + 1)
-  }
-
-  private tryAcquireSlot(tokenSourceId: string): boolean {
-    const sourceLimit = TOKEN_SOURCE_AGENT_CONCURRENCY.get(tokenSourceId)
-    const sourceTurns = this.activeTurnsBySource.get(tokenSourceId) ?? 0
-    if (this.activeTurns >= GLOBAL_AGENT_CONCURRENCY
-      || (sourceLimit !== undefined && sourceTurns >= sourceLimit)) return false
-    this.activeTurns++
-    this.activeTurnsBySource.set(tokenSourceId, sourceTurns + 1)
-    return true
-  }
-
-  private acquireSlot(identity: AgentIdentity, onQueued: (reason: string) => void): Promise<void> {
-    if (this.tryAcquireSlot(identity.tokenSourceId)) return Promise.resolve()
-    const sourceLimit = TOKEN_SOURCE_AGENT_CONCURRENCY.get(identity.tokenSourceId)
-    onQueued(sourceLimit !== undefined
-      ? `等待 ${identity.tokenSourceDisplay} 执行名额（同一来源最多同时运行 ${sourceLimit} 个 Agent）`
-      : `等待执行名额（最多同时运行 ${GLOBAL_AGENT_CONCURRENCY} 个 Agent）`)
-    return new Promise(resolve => this.slotWaiters.push({ tokenSourceId: identity.tokenSourceId, resolve }))
-  }
-
-  private releaseSlot(tokenSourceId: string): void {
-    this.activeTurns--
-    decrementMap(this.activeTurnsBySource, tokenSourceId)
-    // A saturated source must not block other sources from using free global slots.
-    for (let i = 0; i < this.slotWaiters.length && this.activeTurns < GLOBAL_AGENT_CONCURRENCY;) {
-      const next = this.slotWaiters[i]!
-      if (!this.tryAcquireSlot(next.tokenSourceId)) { i++; continue }
-      this.slotWaiters.splice(i, 1)
-      next.resolve()
-    }
-  }
-
-  private releaseWorkerSlot(run: AgentRunRecord, identityId: string): void {
-    const tokenSourceId = run.slotOwners.get(identityId)
-    if (tokenSourceId === undefined) return
-    run.slotOwners.delete(identityId)
-    this.releaseSlot(tokenSourceId)
   }
 
   private loadDurableRuns(): void {
@@ -937,7 +842,6 @@ export class AgentService {
         snapshot,
         context: null,
         handles: new Map(),
-        slotOwners: new Map(),
         capabilityByIdentity: new Map(),
         progressTimers: new Map(),
         children: new Set(),
@@ -963,7 +867,7 @@ export class AgentService {
     if (this.runs.size <= MAX_CACHED_RUN_ARTIFACTS) return
     const terminal = [...this.runs.values()]
       .filter(run => !run.artifactsUnloaded && run.finalized && !run.finalizing && isTerminal(run.snapshot.status)
-        && run.handles.size === 0 && run.slotOwners.size === 0)
+        && run.handles.size === 0)
       .sort((a, b) => Date.parse(a.snapshot.finishedAt ?? a.snapshot.createdAt) - Date.parse(b.snapshot.finishedAt ?? b.snapshot.createdAt))
     // The run map is the continuation index and cancellation tree, not a cache.
     // Keep every record and link; only evict text already saved in artifacts.
@@ -1121,10 +1025,4 @@ function readTextArtifact(name: string, label: string): string {
 
 function assertArtifactName(name: string): void {
   if (!/^[A-Za-z0-9._-]+$/.test(name)) throw new Error(`invalid Agent artifact name: ${name}`)
-}
-
-function decrementMap<TKey>(map: Map<TKey, number>, key: TKey): void {
-  const next = (map.get(key) ?? 0) - 1
-  if (next > 0) map.set(key, next)
-  else map.delete(key)
 }

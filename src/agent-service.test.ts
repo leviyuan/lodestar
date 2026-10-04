@@ -289,27 +289,29 @@ describe('AgentService', () => {
     expect(starts).toBe(2)
   })
 
-  test('rejects a directory replaced with an outside symlink while waiting for a worker slot', async () => {
-    const workDir = join(session.workDir, 'queued-worker-dir')
+  test('rejects a directory replaced with an outside symlink while opening the card', async () => {
+    const workDir = join(session.workDir, 'opening-worker-dir')
     mkdirSync(workDir)
-    const controls = [controlledHandle(), controlledHandle()]
+    let cardEntered!: () => void
+    let releaseCard!: () => void
+    const entered = new Promise<void>(resolve => { cardEntered = resolve })
+    const released = new Promise<void>(resolve => { releaseCard = resolve })
     let starts = 0
     const { service, root } = harness({
-      identities: [openRouterIdentity('a')],
-      startWorker: () => controls[starts++]!.handle,
+      sendCard: async () => { cardEntered(); await released; return 'message-1' },
+      startWorker: () => { starts++; return resolvedHandle(result('unexpected')) },
     })
+    const creating = service.startRun(root, { description: '检查启动目录', identityIds: ['agent:a'], prompt: 'work', workDir })
     try {
-      for (let i = 0; i < 2; i++) await service.startRun(root, { description: '占用并发槽', identityIds: ['agent:a'], prompt: 'wait' })
-      await waitForCondition(() => starts === 2)
-      const queued = await service.startRun(root, { description: '检查排队目录', identityIds: ['agent:a'], prompt: 'work', workDir })
-      await waitForCondition(() => !!service.getRun(root, queued.runId).workers[0]!.queuedReason)
+      await entered
       rmSync(workDir, { recursive: true })
       symlinkSync(join(testDir, 'other'), workDir, 'dir')
-      controls[0]!.resolve(result('sid-release-slot'))
-      const failed = await waitFor(service, root, queued.runId, 'failed')
+      releaseCard()
+      const started = await creating
+      const failed = await waitFor(service, root, started.runId, 'failed')
       expect(failed.workers[0]!.error).toContain('main Agent working directory')
-      expect(starts).toBe(2)
-    } finally { await service.shutdown('test cleanup') }
+      expect(starts).toBe(0)
+    } finally { releaseCard(); await service.shutdown('test cleanup') }
   })
 
   test('persists shared card ownership and a new description for each native follow-up', async () => {
@@ -919,54 +921,36 @@ describe('AgentService', () => {
     expect(starts).toBe(1)
   })
 
-  test('rejects unbounded queued workers before sending another card', async () => {
-    const identities = Array.from({ length: 64 }, (_, index) => identity(`q${index}`))
-    let cards = 0
+  test.each(['session', 'project'] as const)('%s starts more than 64 active runs and 128 workers without local limits', async kind => {
+    const identities = [identity('codex'), identity('claude')]
     const controls: ReturnType<typeof controlledHandle>[] = []
     const { service, root } = harness({
       identities,
-      sendCard: async () => { cards++; return `message-${cards}` },
       startWorker: () => {
         const control = controlledHandle()
         controls.push(control)
         return control.handle
       },
     })
-    const ids = identities.map(item => item.id)
-    await service.startRun(root, { description: '任务说明', identityIds: ids, prompt: 'batch one' })
-    await service.startRun(root, { description: '任务说明', identityIds: ids, prompt: 'batch two' })
-    await expect(service.startRun(root, { description: '任务说明', identityIds: [ids[0]], prompt: 'overflow' }))
-      .rejects.toThrow('global Agent worker limit')
-    expect(cards).toBe(2)
-    await service.shutdown('test cleanup')
-  })
-
-  test('main-Agent tasks share the concurrency limit and queued work starts when a slot is released', async () => {
-    const identities = Array.from({ length: 9 }, (_, i) => identity(`worker-${i}`))
-    const controls: ReturnType<typeof controlledHandle>[] = []
-    const { service, root } = harness({
-      identities,
-      startWorker: () => {
-        const control = controlledHandle()
-        controls.push(control)
-        return control.handle
-      },
+    const principal = kind === 'session' ? root : service.projectPrincipal({
+      owner: { kind: 'project', name: session.sessionName, chatId: session.chatId, workDir: session.workDir },
     })
     try {
-      const run = await service.startRun(root, { description: '任务说明', identityIds: identities.map(item => item.id), prompt: 'parallel work' })
-      for (let i = 0; i < 200 && controls.length < 8; i++) await new Promise(resolve => setTimeout(resolve, 1))
-      expect(controls).toHaveLength(8)
-      expect(service.getRun(root, run.runId).workers[8]!.status).toBe('queued')
-      expect(service.getRun(root, run.runId).workers[8]!.queuedReason).toContain('等待执行名额')
-      controls[0]!.resolve(result('first-session'))
-      for (let i = 0; i < 200 && controls.length < 9; i++) await new Promise(resolve => setTimeout(resolve, 1))
-      expect(controls).toHaveLength(9)
+      const runs = await Promise.all(Array.from({ length: 65 }, (_, index) => service.startRun(principal, {
+        description: `并行任务 ${index}`, identityIds: identities.map(item => item.id), prompt: 'parallel work',
+      })))
+      await waitForCondition(() => controls.length === 130)
+      for (const run of runs) {
+        const current = service.getRun(principal, run.runId)
+        expect(current.status).toBe('running')
+        expect(current.workers.every(worker => worker.status === 'running' && !worker.queuedReason)).toBe(true)
+      }
     } finally {
       await service.shutdown('test cleanup')
     }
   })
 
-  test('shares OpenRouter slots across projects and models without blocking other queued sources', async () => {
+  test('starts OpenRouter and other models across session and project calls without local limits', async () => {
     const router = ['router-a', 'router-b', 'router-c'].map(openRouterIdentity)
     const others = Array.from({ length: 7 }, (_, i) => identity(`other-${i}`))
     const controls = new Map<string, ReturnType<typeof controlledHandle>>()
@@ -978,32 +962,24 @@ describe('AgentService', () => {
         return control.handle
       },
     })
-    const otherRoot = service.rootPrincipal({ ...session, sessionName: 'other-project', chatId: 'chat-2', workDir: join(testDir, 'other') })
+    const otherRoot = service.projectPrincipal({
+      owner: { kind: 'project', name: 'other-project', chatId: 'chat-2', workDir: join(testDir, 'other') },
+    })
     try {
       await service.startRun(root, { description: '任务说明', identityIds: router.slice(0, 2).map(item => item.id), prompt: 'first project' })
-      const queued = await service.startRun(otherRoot, { description: '任务说明',
+      const started = await service.startRun(otherRoot, { description: '任务说明',
         identityIds: [router[2]!.id, ...others.map(item => item.id)], prompt: 'second project',
       })
-      await waitForCondition(() => controls.size === 8)
-      const workers = service.getRun(otherRoot, queued.runId).workers
-      expect(workers[0]!.status).toBe('queued')
-      expect(workers[0]!.queuedReason).toContain('等待 OpenRouter 执行名额')
-      expect(workers.at(-1)!.status).toBe('queued')
-      expect(controls.has(router[2]!.id)).toBe(false)
-
-      controls.get(others[0]!.id)!.resolve(result('other-finished'))
-      await waitForCondition(() => controls.has(others[6]!.id))
-      expect(controls.has(router[2]!.id)).toBe(false)
-
-      controls.get(router[0]!.id)!.resolve(result('router-finished'))
-      await waitForCondition(() => controls.has(router[2]!.id))
-      expect(service.getRun(otherRoot, queued.runId).workers[0]!.queuedReason).toBeUndefined()
+      await waitForCondition(() => controls.size === 10)
+      const workers = service.getRun(otherRoot, started.runId).workers
+      expect(workers.every(worker => worker.status === 'running' && !worker.queuedReason)).toBe(true)
+      expect(router.every(item => controls.has(item.id))).toBe(true)
     } finally {
       await service.shutdown('test cleanup')
     }
   })
 
-  test.each(['completed', 'failed', 'cancelled'] as const)('releases OpenRouter slots after %s and skips cancelled queued tasks', async status => {
+  test.each(['completed', 'failed', 'cancelled'] as const)('OpenRouter tasks settle as %s without affecting concurrent tasks', async status => {
     const identities = Array.from({ length: 4 }, (_, i) => openRouterIdentity(`router-${i}`))
     const controls = new Map<string, ReturnType<typeof controlledHandle>>()
     const { service, root } = harness({
@@ -1017,25 +993,24 @@ describe('AgentService', () => {
     try {
       const runs = []
       for (const item of identities) runs.push(await service.startRun(root, { description: '任务说明', identityIds: [item.id], prompt: 'work' }))
-      await waitForCondition(() => controls.size === 2)
-      expect(service.getRun(root, runs[2]!.runId).status).toBe('queued')
-      expect(service.getRun(root, runs[3]!.runId).status).toBe('queued')
-      await service.cancelRun(root, runs[2]!.runId, 'cancel queued task')
+      await waitForCondition(() => controls.size === 4)
+      await service.cancelRun(root, runs[2]!.runId, 'cancel another task')
       const first = controls.get(identities[0]!.id)!
       if (status === 'completed') first.resolve(result('first-finished'))
       else if (status === 'failed') first.reject(new Error('upstream 429'))
       else await service.cancelRun(root, runs[0]!.runId, 'cancel running task')
       const terminal = await waitFor(service, root, runs[0]!.runId, status)
       if (status === 'failed') expect(terminal.workers[0]!.error).toBe('upstream 429')
-      await waitForCondition(() => controls.has(identities[3]!.id))
-      expect(controls.has(identities[2]!.id)).toBe(false)
-      expect(controls.size).toBe(3)
+      expect(service.getRun(root, runs[2]!.runId).status).toBe('cancelled')
+      expect(service.getRun(root, runs[1]!.runId).status).toBe('running')
+      expect(service.getRun(root, runs[3]!.runId).status).toBe('running')
+      expect(controls.size).toBe(4)
     } finally {
       await service.shutdown('test cleanup')
     }
   })
 
-  test('keeps OpenRouter slots while waiting for input and queues native follow-ups', async () => {
+  test('OpenRouter input waits and native follow-ups do not block other tasks', async () => {
     const identities = ['router-a', 'router-b', 'router-c'].map(openRouterIdentity)
     const controls = new Map<string, ReturnType<typeof controlledHandle>>()
     let pending: any = null
@@ -1068,24 +1043,22 @@ describe('AgentService', () => {
       await waitFor(service, root, first.runId, 'needs_input')
       const second = await service.startRun(root, { description: '任务说明', identityIds: [identities[1]!.id], prompt: 'work' })
       const third = await service.startRun(root, { description: '任务说明', identityIds: [identities[2]!.id], prompt: 'wait' })
-      await waitForCondition(() => controls.size === 2)
-      expect(service.getRun(root, third.runId).status).toBe('queued')
+      await waitForCondition(() => controls.size === 3)
+      expect(service.getRun(root, first.runId).status).toBe('needs_input')
+      expect(service.getRun(root, third.runId).status).toBe('running')
       await service.answer(root, first.runId, { requestId: 'req-router', answers: { q1: 'yes' } })
       await waitFor(service, root, first.runId, 'completed')
-      await waitForCondition(() => controls.size === 3)
-
       const follow = await service.followUp(root, first.runId, { description: '任务说明', prompt: 'continue' })
-      expect(service.getRun(root, follow.runId).status).toBe('queued')
-      expect(resumedSession).toBeUndefined()
-      await service.cancelRun(root, second.runId, 'make room')
       await waitFor(service, root, follow.runId, 'completed')
       expect(resumedSession).toBe('sid-router')
+      expect(service.getRun(root, second.runId).status).toBe('running')
+      expect(service.getRun(root, third.runId).status).toBe('running')
     } finally {
       await service.shutdown('test cleanup')
     }
   })
 
-  test('retains an OpenRouter slot until cancellation confirms the process has stopped', async () => {
+  test('retains an OpenRouter process after failed cancellation without blocking other tasks', async () => {
     const identities = ['router-a', 'router-b', 'router-c'].map(openRouterIdentity)
     const controls = new Map<string, ReturnType<typeof controlledHandle>>()
     let alive = true
@@ -1114,13 +1087,14 @@ describe('AgentService', () => {
       const first = await service.startRun(root, { description: '任务说明', identityIds: [identities[0]!.id], prompt: 'work' })
       await service.startRun(root, { description: '任务说明', identityIds: [identities[1]!.id], prompt: 'work' })
       const third = await service.startRun(root, { description: '任务说明', identityIds: [identities[2]!.id], prompt: 'wait' })
-      await waitForCondition(() => controls.size === 2)
+      await waitForCondition(() => controls.size === 3)
       await expect(service.cancelRun(root, first.runId, 'stop')).rejects.toThrow('kill was not confirmed')
-      expect(service.getRun(root, third.runId).status).toBe('queued')
-      expect(controls.size).toBe(2)
+      expect(service.getRun(root, first.runId).status).toBe('failed')
+      expect(service.getRun(root, third.runId).status).toBe('running')
+      expect(alive).toBe(true)
       rejectCancel = false
       await service.cancelRun(root, first.runId, 'retry stop')
-      await waitForCondition(() => controls.size === 3)
+      expect(controls.size).toBe(3)
       expect(alive).toBe(false)
     } finally {
       rejectCancel = false
@@ -1176,7 +1150,7 @@ describe('AgentService', () => {
     expect([...textArtifacts.values()]).toContain('调查结果仍应保留')
   })
 
-  test('cancellation updates every worker panel, including tasks that never left the queue', async () => {
+  test('cancellation updates every worker panel when more than eight workers are running', async () => {
     const identities = Array.from({ length: 9 }, (_, i) => identity(`cancel-${i}`))
     const panels = new Map<string, any>()
     let starts = 0
@@ -1189,8 +1163,7 @@ describe('AgentService', () => {
       },
     })
     const run = await service.startRun(root, { description: '任务说明', identityIds: identities.map(item => item.id), prompt: 'tasks' })
-    for (let i = 0; i < 100 && starts < 8; i++) await new Promise(resolve => setTimeout(resolve, 1))
-    expect(starts).toBe(8)
+    await waitForCondition(() => starts === identities.length)
     await service.cancelRun(root, run.runId, '用户取消')
     expect(panels.size).toBe(1)
     for (const panel of panels.values()) {
@@ -1200,7 +1173,7 @@ describe('AgentService', () => {
       expect(JSON.stringify(panel)).toContain('停止原因')
       expect(JSON.stringify(panel)).not.toContain('等待执行名额')
     }
-    expect(starts).toBe(8)
+    expect(starts).toBe(identities.length)
   })
 })
 

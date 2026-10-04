@@ -144,7 +144,6 @@ export function parseAgentRunRequest(raw: unknown): AgentRunRequest {
     && value.session_id !== value.sessionId) throw new Error('conflicting agent session_id and sessionId')
   if (sessionId && identityIds.length > 1) throw new Error('agent session continuation accepts at most one identity_id')
   if (!sessionId && identityIds.length === 0) throw new Error('agent run requires at least one identity_id')
-  if (identityIds.length > 64) throw new Error('agent run supports at most 64 identities')
   const prompt = requiredPrompt(value.prompt, 'agent run requires "prompt"')
   const effort = optionalString(value.effort)
   const workDir = parseWorkDir(value)

@@ -51,6 +51,22 @@ async function serve(onStart?: (request: any) => void, projectMode = false) {
 }
 
 describe('delegated Agent HTTP API', () => {
+  test.each(['session', 'project'] as const)('%s accepts more than 64 identities in one request', async kind => {
+    const requests: any[] = []
+    const projectMode = kind === 'project'
+    const base = await serve(value => requests.push(value), projectMode)
+    const identityIds = Array.from({ length: 129 }, (_, index) => `agent:${index}`)
+    const response = await fetch(`${base}/agents/runs${projectMode ? '?project=project' : ''}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${projectMode ? 'project-secret' : 'secret'}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ description: '多身份并行调用', identity_ids: identityIds, prompt: 'work' }),
+    })
+    expect(response.status).toBe(202)
+    await response.json()
+    expect(requests).toHaveLength(1)
+    expect(requests[0].identityIds).toEqual(identityIds)
+  })
+
   test('preserves Chinese task input split inside a UTF-8 character', async () => {
     const requests: any[] = []
     const base = await serve(value => requests.push(value))
