@@ -202,7 +202,10 @@ async function runCase(name: string, projectBound: boolean, resumeSessionId?: st
   assert.equal(active.needsInput, projectBound ? 0 : 1)
   assert(active.summaries.every(item => item.questionToolPresent === !projectBound))
   assert(active.summaries.every(item => item.planApprovalToolsPresent === !projectBound))
-  assert(active.summaries.every(item => !(item.toolNames as string[]).includes('Workflow')))
+  assert(active.summaries.every(item => {
+    const names = item.toolNames as string[]
+    return names.includes('Workflow') && (names.includes('Agent') || names.includes('Task'))
+  }), 'native delegation tools were lost')
   assert(active.summaries.every(item => item.projectInstructionsPresent === projectBound))
   assert(active.summaries.every(item => item.delegatedQuestionInstructionsPresent === !projectBound))
   assert(active.summaries.every(item => item.questionToolInstructionsPresent === !projectBound))

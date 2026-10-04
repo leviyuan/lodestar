@@ -27,7 +27,7 @@ let failure: unknown
 try {
   for (let turn = 0; turn < 2; turn++) {
     const proc: DshProcess = new DshProcess({ workDir: dir, model: model.model, effort: model.defaultEffort as import('../src/agent-process').DshReasoningEffort,
-      tokenSourceId: source.id, transformEnv: env => source.spawnEnv(env), allowDelegation: false,
+      tokenSourceId: source.id, transformEnv: env => source.spawnEnv(env),
       profile: { loadProjectMcp: false }, runtimeOptions: { home: join(dir, 'home') }, launch })
     let text = ''
     const tools: string[] = []

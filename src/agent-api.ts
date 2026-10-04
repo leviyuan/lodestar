@@ -11,8 +11,6 @@ import {
   type AgentRunSnapshot,
 } from './agent-run-types'
 
-const MAX_BODY_BYTES = 4 * 1024 * 1024
-
 export interface AgentApiContext {
   service: AgentService
   authorizeSession(capability: string): Session | null
@@ -75,7 +73,7 @@ export async function handleAgentRequest(
       return send(202, serializeRun(run))
     }
     if (action === 'answer' && req.method === 'POST') {
-      if (principal.kind === 'project') return send(409, { error: PROJECT_AGENT_INPUT_ERROR })
+      if (agentPrincipalContext(principal).owner.kind === 'project') return send(409, { error: PROJECT_AGENT_INPUT_ERROR })
       const run = await context.service.answer(principal, runId, parseAgentAnswerRequest(await readJsonBody(req)))
       return send(200, serializeRun(run))
     }
@@ -102,14 +100,8 @@ function bearerToken(header: string | undefined): string {
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   let raw = ''
-  let bytes = 0
   req.setEncoding('utf8')
-  for await (const chunk of req) {
-    bytes += Buffer.byteLength(chunk)
-    if (bytes <= MAX_BODY_BYTES) raw += chunk
-    else raw = ''
-  }
-  if (bytes > MAX_BODY_BYTES) throw new Error(`request body exceeds ${MAX_BODY_BYTES} bytes`)
+  for await (const chunk of req) raw += chunk
   try { return JSON.parse(raw || '{}') }
   catch { throw new Error('bad json') }
 }

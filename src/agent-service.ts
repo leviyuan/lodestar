@@ -28,7 +28,6 @@ import type { AgentReasoningEffort } from './agent-process'
 
 export type { AgentPrincipal } from './agent-context'
 
-const NESTED_DELEGATION_ERROR = 'Delegated Agents cannot delegate again; ask the main Agent to assign additional work.'
 const MAX_CACHED_RUN_ARTIFACTS = 512
 const MAX_WORKER_STEPS = 50
 
@@ -39,7 +38,9 @@ interface AgentRunRecord {
   capabilityByIdentity: Map<string, string>
   progressTimers: Map<string, ReturnType<typeof setTimeout>>
   children: Set<string>
+  pendingChildCreations: number
   cancelled: boolean
+  cancellationEpoch: number
   finalizing: boolean
   finalized: boolean
   persistedArtifacts: Set<string>
@@ -50,7 +51,8 @@ type RequestMetadata = { requestId?: string; requestHash?: string }
 
 interface CreateRunOptions {
   parentRunId?: string
-  parentKind?: 'follow_up'
+  parentKind?: 'delegate' | 'follow_up'
+  depth: number
   cancellationEpoch: number
   resumeSessionId?: string
   resumedFromRunId?: string
@@ -113,7 +115,6 @@ export class AgentService {
 
   private async startRunOnce(principal: AgentPrincipal, request: AgentRunRequest, metadata: RequestMetadata): Promise<AgentRunSnapshot> {
     this.assertAcceptingRuns()
-    if (principal.kind === 'worker') throw new Error(NESTED_DELEGATION_ERROR)
     requireAgentDescription(request.description)
     if (request.sessionId !== undefined) {
       if (!request.sessionId.trim()) throw new Error('agent session_id must be a non-empty string')
@@ -125,6 +126,8 @@ export class AgentService {
     const context = agentPrincipalContext(principal)
     return this.createRun(context, request, {
       ...metadata,
+      ...this.delegationParent(principal),
+      depth: principal.depth + 1,
       cancellationEpoch: this.currentCancellationEpoch(context),
     })
   }
@@ -140,7 +143,6 @@ export class AgentService {
     metadata: RequestMetadata,
   ): Promise<AgentRunSnapshot> {
     this.assertAcceptingRuns()
-    if (principal.kind === 'worker') throw new Error(NESTED_DELEGATION_ERROR)
     requireAgentDescription(request.description)
     const source = this.runs.get(runId)
     if (!source) throw new Error(`agent run not found: ${runId}`)
@@ -182,7 +184,9 @@ export class AgentService {
         requesterOpenId: request.requesterOpenId ?? (sameOwner ? history.run.snapshot.requesterOpenId : undefined),
       }, {
         ...metadata,
-        ...(sameOwner ? { parentRunId: history.run.snapshot.runId, parentKind: 'follow_up' as const } : {}),
+        ...(principal.kind === 'worker' ? this.delegationParent(principal)
+          : sameOwner ? { parentRunId: history.run.snapshot.runId, parentKind: 'follow_up' as const } : {}),
+        depth: principal.depth + 1,
         resumedFromRunId: history.run.snapshot.runId,
         cancellationEpoch: this.currentCancellationEpoch(context),
         resumeSessionId: request.sessionId!,
@@ -197,7 +201,7 @@ export class AgentService {
     runId: string,
     request: AgentAnswerRequest,
   ): Promise<AgentRunSnapshot> {
-    if (principal.kind === 'project') throw new Error(PROJECT_AGENT_INPUT_ERROR)
+    if (agentPrincipalContext(principal).owner.kind === 'project') throw new Error(PROJECT_AGENT_INPUT_ERROR)
     const run = this.requireMutableDescendant(principal, runId)
     const worker = selectWorker(run.snapshot, request.identityId)
     if (worker.status !== 'needs_input' || !worker.pendingInput) {
@@ -256,7 +260,6 @@ export class AgentService {
     principal: AgentPrincipal, request: AgentRunRequest | AgentFollowUpRequest, operation: string,
     action: (metadata: RequestMetadata) => Promise<AgentRunSnapshot>,
   ): Promise<AgentRunSnapshot> {
-    if (principal.kind === 'worker') throw new Error(NESTED_DELEGATION_ERROR)
     if ((request.requestId || request.requesterOpenId) && principal.kind !== 'project') {
       throw new Error('request_id and requester_open_id require explicit project mode')
     }
@@ -313,17 +316,27 @@ export class AgentService {
     if (this.shuttingDown) throw new Error('Agent service is shutting down; cannot start new runs')
   }
 
+  private delegationParent(principal: AgentPrincipal): Pick<CreateRunOptions, 'parentRunId' | 'parentKind'> {
+    if (principal.kind !== 'worker') return {}
+    const parent = this.requireAccessibleRun(principal, principal.runId)
+    if (!parent.capabilityByIdentity.has(principal.identityId)) throw new Error('calling Agent capability is no longer active')
+    return { parentRunId: parent.snapshot.runId, parentKind: 'delegate' }
+  }
+
   private createRun(
     context: AgentExecutionContext,
     request: AgentRunRequest,
     options: CreateRunOptions,
   ): Promise<AgentRunSnapshot> {
+    const parent = options.parentRunId ? this.runs.get(options.parentRunId) : undefined
+    if (parent) parent.pendingChildCreations++
     const creation = this.createRunInternal(context, request, options)
     this.pendingRunCreations.add(creation)
-    void creation.then(
-      () => this.pendingRunCreations.delete(creation),
-      () => this.pendingRunCreations.delete(creation),
-    )
+    const settled = () => {
+      this.pendingRunCreations.delete(creation)
+      if (parent) parent.pendingChildCreations--
+    }
+    void creation.then(settled, settled)
     return creation
   }
 
@@ -333,16 +346,21 @@ export class AgentService {
     options: CreateRunOptions,
   ): Promise<AgentRunSnapshot> {
     const { owner } = context
-    const workDir = options.resumeSessionId
-      ? resolveAgentResumeWorkDir(owner.workDir, request.workDir)
-      : resolveAgentWorkDir(owner.workDir, request.workDir)
-    const admittedWorkDir = realpathSync(workDir)
     let parent: AgentRunRecord | undefined
     if (options.parentRunId) {
       parent = this.runs.get(options.parentRunId)
       if (!parent) throw new Error(`parent agent run not found: ${options.parentRunId}`)
       this.assertSameOwner(parent, context)
     }
+    const ancestorEpochs: Array<[AgentRunRecord, number]> = []
+    for (let ancestor = parent; ancestor; ancestor = ancestor.snapshot.parentRunId ? this.runs.get(ancestor.snapshot.parentRunId) : undefined) {
+      ancestorEpochs.push([ancestor, ancestor.cancellationEpoch])
+    }
+    const requestedWorkDir = request.workDir ?? (options.parentKind === 'delegate' ? parent?.snapshot.workDir : undefined)
+    const workDir = options.resumeSessionId
+      ? resolveAgentResumeWorkDir(owner.workDir, requestedWorkDir)
+      : resolveAgentWorkDir(owner.workDir, requestedWorkDir)
+    const admittedWorkDir = realpathSync(workDir)
     const codexAccountId = context.codexAccountId
     const catalog = this.deps.getCatalog(codexAccountId)
     const identities = request.identityIds.map(id => {
@@ -374,7 +392,7 @@ export class AgentService {
       ...(options.parentRunId ? { parentRunId: options.parentRunId } : {}),
       ...(options.parentKind ? { parentKind: options.parentKind } : {}),
       ...(options.resumedFromRunId ? { resumedFromRunId: options.resumedFromRunId } : {}),
-      depth: 0,
+      depth: options.depth,
       status: 'queued',
       workers,
       createdAt: new Date().toISOString(),
@@ -386,7 +404,9 @@ export class AgentService {
       capabilityByIdentity: new Map(),
       progressTimers: new Map(),
       children: new Set(),
+      pendingChildCreations: 0,
       cancelled: false,
+      cancellationEpoch: 0,
       finalizing: false,
       finalized: false,
       persistedArtifacts: new Set(),
@@ -409,6 +429,7 @@ export class AgentService {
     this.runs.set(runId, run)
     if (options.parentRunId) parent?.children.add(runId)
     const invalidated = this.shuttingDown || this.currentCancellationEpoch(context) !== options.cancellationEpoch
+      || ancestorEpochs.some(([ancestor, epoch]) => ancestor.cancellationEpoch !== epoch)
     if (invalidated) {
       run.cancelled = true
       const reason = '任务已在启动前取消'
@@ -597,6 +618,8 @@ export class AgentService {
   }
 
   private async cancelTree(run: AgentRunRecord, reason: string): Promise<void> {
+    // Include children whose card creation has not yet joined the durable tree.
+    run.cancellationEpoch++
     const activeSelf = (!isTerminal(run.snapshot.status) && !run.cancelled) || run.handles.size > 0
     const failures: PromiseSettledResult<void>[] = []
     if (activeSelf) {
@@ -605,11 +628,13 @@ export class AgentService {
       for (const capability of run.capabilityByIdentity.values()) this.capabilities.delete(capability)
       run.capabilityByIdentity.clear()
     }
+    const visited = new Set<string>()
     while (true) {
       const children = [...run.children]
         .map(childId => this.runs.get(childId))
-        .filter((child): child is AgentRunRecord => !!child && this.treeHasActiveRun(child))
+        .filter((child): child is AgentRunRecord => !!child && !visited.has(child.snapshot.runId) && this.treeHasActiveRun(child))
       if (children.length === 0) break
+      for (const child of children) visited.add(child.snapshot.runId)
       const results = await Promise.allSettled(children.map(child => this.cancelTree(child, reason)))
       failures.push(...results)
       if (results.some(result => result.status === 'rejected')) break
@@ -800,6 +825,7 @@ export class AgentService {
   }
 
   private treeHasActiveRun(run: AgentRunRecord): boolean {
+    if (run.pendingChildCreations > 0) return true
     if (run.handles.size > 0) return true
     if (!isTerminal(run.snapshot.status)) return true
     for (const childId of run.children) {
@@ -845,7 +871,9 @@ export class AgentService {
         capabilityByIdentity: new Map(),
         progressTimers: new Map(),
         children: new Set(),
+        pendingChildCreations: 0,
         cancelled: snapshot.status === 'cancelled',
+        cancellationEpoch: 0,
         finalizing: false,
         finalized: true,
         artifactsUnloaded: false,

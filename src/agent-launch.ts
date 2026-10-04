@@ -26,8 +26,6 @@ export interface AgentLaunchOptions {
   effort?: AgentReasoningEffort
   launch?: ConversationLaunch
   developerInstructions?: string
-  /** Only delegated workers disable delegation; main Sessions keep native capabilities. */
-  allowDelegation?: boolean
   /** Service/application calls cannot wait for a human or another Agent to answer. */
   allowUserInput?: boolean
   profile?: ProjectProfile
@@ -41,9 +39,8 @@ export interface CreatedAgentProcess {
   sourceRevision: string | null
 }
 
-/** Single source of truth for both the Feishu main Session and delegated
- * agents. Workers use the same coding tools, with further delegation disabled
- * according to the user's single-level delegation policy. */
+/** Single source of truth for main Sessions and delegated agents, including
+ * their native delegation capabilities. */
 export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProcess {
   if (opts.provider === 'codex' && opts.tokenSourceId === 'codex-sub' && opts.codexAccountPreference !== undefined) {
     if (!opts.model && !opts.codexAccountPreference) throw new Error('Codex 自动选号需要明确模型')
@@ -108,7 +105,6 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
                 : {}),
             }),
         ...(opts.developerInstructions ? { appendSystemPrompt: opts.developerInstructions } : {}),
-        ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
         ...(opts.allowUserInput === false ? { allowUserInput: false } : {}),
         ...(opts.profile ? { profile: opts.profile } : {}),
         ...(source ? { settingSources: source.settingSources ?? ['project', 'local'] } : {}),
@@ -130,7 +126,6 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
     effort: opts.effort,
     launch: opts.launch,
     ...(opts.developerInstructions ? { appendSystemPrompt: opts.developerInstructions } : {}),
-    ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
     ...(opts.allowUserInput === false ? { allowUserInput: false } : {}),
     tokenSourceId: source?.id ?? null,
     transformEnv,

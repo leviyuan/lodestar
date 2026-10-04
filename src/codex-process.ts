@@ -86,7 +86,6 @@ export interface SpawnOpts {
   model?: string
   effort?: CodexReasoningEffort
   appendSystemPrompt?: string
-  allowDelegation?: boolean
   allowUserInput?: boolean
   /** Host-owned environment injected before token-source credential routing. */
   hostEnv?: Record<string, string | undefined>
@@ -125,8 +124,8 @@ export function codexApiProviderArgs(provider: CodexApiProvider): string[] {
     '-c', 'features.apps=false']
 }
 
-export function codexAppServerArgs(allowDelegation = true): string[] {
-  return ['app-server', '--listen', 'stdio://', ...(allowDelegation ? [] : ['--disable', 'multi_agent'])]
+export function codexAppServerArgs(): string[] {
+  return ['app-server', '--listen', 'stdio://']
 }
 
 export function codexAppServerSpawnOptions(
@@ -422,7 +421,7 @@ export class CodexProcess extends EventEmitter {
     const start = (catalog?: CodexInputPolicyCatalog) => {
       if (this.expectedExit) throw new Error('Codex startup cancelled')
       this.inputPolicyCatalog = catalog ?? null
-      this.spawnNative(codexBin, [...codexAppServerArgs(opts.allowDelegation !== false), ...providerArgs,
+      this.spawnNative(codexBin, [...codexAppServerArgs(), ...providerArgs,
         ...(catalog ? ['-c', `model_catalog_json=${JSON.stringify(catalog.path)}`,
           ...catalog.disabledFeatures.flatMap(feature => ['--disable', feature])] : []),
       ], spawnEnv)
@@ -1701,7 +1700,6 @@ export class CodexProcess extends EventEmitter {
         // mode; the native tool switch controls exposure in the model's catalog.
         'tools.experimental_request_user_input.enabled': this.opts.allowUserInput !== false,
         'features.default_mode_request_user_input': this.opts.allowUserInput !== false,
-        ...(this.opts.allowDelegation === false ? { 'features.multi_agent': false } : {}),
         ...(this.opts.effort ? { model_reasoning_effort: this.opts.effort } : {}),
       },
       ...(this.opts.model ? { model: this.opts.model } : {}),

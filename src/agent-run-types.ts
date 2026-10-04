@@ -1,4 +1,3 @@
-export const MAX_AGENT_PROMPT_CHARS = 800_000
 export const MAX_AGENT_DESCRIPTION_CHARS = 60
 export const PROJECT_AGENT_INPUT_ERROR = 'project Agent calls are non-interactive and have no question or answer interface; complete the supplied goal autonomously'
 
@@ -118,7 +117,7 @@ export interface AgentRunSnapshot {
   /** Resume provenance only; never grants access or joins another owner's cancellation tree. */
   resumedFromRunId?: string
   parentKind?: 'delegate' | 'follow_up'
-  /** Legacy history metadata. New tasks are always main-Agent delegates (0). */
+  /** Delegation ancestry, starting at zero; no Lodestar depth limit. */
   depth: number
   status: AgentRunStatus
   workers: AgentWorkerResult[]
@@ -242,9 +241,6 @@ function objectValue(raw: unknown, label: string): Record<string, unknown> {
 function requiredPrompt(raw: unknown, message: string): string {
   const prompt = String(raw ?? '')
   if (!prompt.trim()) throw new Error(message)
-  if (prompt.length > MAX_AGENT_PROMPT_CHARS) {
-    throw new Error(`agent prompt exceeds ${MAX_AGENT_PROMPT_CHARS} chars`)
-  }
   return prompt
 }
 

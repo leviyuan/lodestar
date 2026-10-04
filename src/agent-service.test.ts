@@ -775,38 +775,113 @@ describe('AgentService', () => {
     expect(starts).toBe(2)
   })
 
-  test('delegated capabilities cannot create tasks or use follow-up to delegate again', async () => {
-    const control = controlledHandle()
-    let capability = ''
-    let cardCount = 0
-    let starts = 0
-    const { service, root } = harness({
-      sendCard: async () => `message-${++cardCount}`,
-      startWorker: opts => {
-        starts++
-        capability = String(opts.hostEnv.LODESTAR_AGENT_CAPABILITY)
-        return control.handle
-      },
+  test.each(['session', 'project'] as const)('%s workers delegate and resume descendants without a depth limit', async kind => {
+    const calls = new Map<string, { opts: Parameters<AgentServiceDeps['startWorker']>[0]; control: ReturnType<typeof controlledHandle> }>()
+    const { service, root } = harness({ startWorker: opts => {
+      const control = controlledHandle()
+      calls.set(opts.prompt, { opts, control })
+      return control.handle
+    } })
+    const owner = kind === 'session' ? root : service.projectPrincipal({
+      owner: { kind: 'project', name: session.sessionName, chatId: session.chatId, workDir: session.workDir },
     })
-    try {
-      const parent = await service.startRun(root, { description: '任务说明', identityIds: ['agent:a'], prompt: 'parent' })
-      for (let i = 0; i < 50 && !capability; i++) await new Promise(resolve => setTimeout(resolve, 1))
-      const worker = service.principalForCapability(capability)!
-      await expect(service.startRun(worker, { description: '任务说明', identityIds: ['agent:a'], prompt: 'nested' }))
-        .rejects.toThrow('cannot delegate again')
-      await expect(service.startRun(worker, { description: '任务说明', identityIds: [], sessionId: 'sid', prompt: 'nested resume' }))
-        .rejects.toThrow('cannot delegate again')
-      await expect(service.followUp(worker, parent.runId, { description: '任务说明', prompt: 'nested follow-up' }))
-        .rejects.toThrow('cannot delegate again')
-      expect(cardCount).toBe(1)
-      expect(starts).toBe(1)
-      expect(service.getRun(worker, parent.runId).runId).toBe(parent.runId)
-      await expect(service.cancelRun(worker, parent.runId, 'self-cancel')).rejects.toThrow('containing run')
-      await service.cancelRun(root, parent.runId, 'stop')
-      expect(service.principalForCapability(capability)).toBeNull()
-    } finally {
-      await service.shutdown('test cleanup')
+    const request = { description: '继续委派', identityIds: ['agent:a'] }
+    const spawn = async (caller: AgentPrincipal, prompt: string, workDir?: string) => {
+      const run = await service.startRun(caller, { ...request, prompt, workDir })
+      await waitForCondition(() => calls.has(prompt))
+      const capability = calls.get(prompt)!.opts.hostEnv.LODESTAR_AGENT_CAPABILITY!
+      return { run, capability, principal: service.principalForCapability(capability)! }
     }
+    try {
+      const parent = await spawn(owner, 'parent', 'packages/app')
+      const child = await spawn(parent.principal, 'child')
+      expect(child.run).toMatchObject({ parentRunId: parent.run.runId, parentKind: 'delegate', depth: 1,
+        workDir: parent.run.workDir, owner: parent.run.owner })
+      const descendants = [child]
+      for (let depth = 2; depth <= 8; depth++) {
+        const next = await spawn(descendants.at(-1)!.principal, `depth-${depth}`)
+        expect(next.run.depth).toBe(depth)
+        descendants.push(next)
+      }
+      const unrelated = await spawn(owner, 'unrelated')
+      expect(() => service.getRun(parent.principal, unrelated.run.runId)).toThrow('not found')
+      await expect(service.cancelRun(parent.principal, parent.run.runId)).rejects.toThrow('containing run')
+      if (kind === 'project') {
+        await expect(service.answer(parent.principal, child.run.runId, { requestId: 'q', answers: { q: 'yes' } }))
+          .rejects.toThrow('non-interactive')
+      }
+
+      calls.get('child')!.control.resolve(result('child-native'))
+      await waitFor(service, owner, child.run.runId, 'completed')
+      const resumed = await service.startRun(parent.principal, {
+        description: '按会话继续', identityIds: [], sessionId: 'child-native', prompt: 'resume',
+      })
+      await waitForCondition(() => calls.has('resume'))
+      expect(resumed).toMatchObject({ parentRunId: parent.run.runId, parentKind: 'delegate', depth: 1,
+        resumedFromRunId: child.run.runId })
+      expect(calls.get('resume')!.opts.resumeSessionId).toBe('child-native')
+      calls.get('resume')!.control.resolve(result('child-native'))
+      await waitFor(service, owner, resumed.runId, 'completed')
+      const followed = await service.followUp(parent.principal, resumed.runId, { description: '继续子任务', prompt: 'follow-up' })
+      await waitForCondition(() => calls.has('follow-up'))
+      expect(followed).toMatchObject({ parentRunId: parent.run.runId, parentKind: 'delegate', depth: 1,
+        resumedFromRunId: resumed.runId })
+      expect(service.getRun(parent.principal, followed.runId).runId).toBe(followed.runId)
+      for (const { opts } of calls.values()) expect(opts.projectBound).toBe(kind === 'project')
+
+      await service.cancelRun(owner, parent.run.runId, 'stop nested task tree')
+      for (const descendant of descendants.slice(1)) {
+        expect(service.getRun(owner, descendant.run.runId).status).toBe('cancelled')
+        expect(service.principalForCapability(descendant.capability)).toBeNull()
+      }
+      expect(service.getRun(owner, followed.runId).status).toBe('cancelled')
+      expect(service.getRun(owner, unrelated.run.runId).status).toBe('running')
+      expect(service.principalForCapability(parent.capability)).toBeNull()
+    } finally { await service.shutdown('test cleanup') }
+  })
+
+  test.each(['session', 'project'] as const)('%s cancellation reaches a pending grandchild after its ancestors finish', async kind => {
+    let cardEntered!: () => void
+    let releaseCard!: () => void
+    const entered = new Promise<void>(resolve => { cardEntered = resolve })
+    const released = new Promise<void>(resolve => { releaseCard = resolve })
+    let cards = 0
+    const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
+    const controls = [controlledHandle(), controlledHandle()]
+    const { service, root } = harness({
+      sendCard: async () => `message-${cards}`,
+      startWorker: opts => { calls.push(opts); return controls[calls.length - 1]!.handle },
+    })
+    const add = service.presentation.add.bind(service.presentation)
+    service.presentation.add = async snapshot => {
+      // Hold admission before entering the shared chat writer, so ancestor
+      // results can finish while this child is still opening its card.
+      if (++cards === 3) { cardEntered(); await released }
+      return add(snapshot)
+    }
+    const owner = kind === 'session' ? root : service.projectPrincipal({
+      owner: { kind: 'project', name: session.sessionName, chatId: session.chatId, workDir: session.workDir },
+    })
+    const request = { description: '开卡期间取消', identityIds: ['agent:a'], prompt: 'task' }
+    try {
+      const parent = await service.startRun(owner, request)
+      await waitForCondition(() => calls.length === 1)
+      const worker = service.principalForCapability(calls[0].hostEnv.LODESTAR_AGENT_CAPABILITY!)!
+      const child = await service.startRun(worker, request)
+      await waitForCondition(() => calls.length === 2)
+      const childWorker = service.principalForCapability(calls[1].hostEnv.LODESTAR_AGENT_CAPABILITY!)!
+      const creating = service.startRun(childWorker, request)
+      await entered
+      controls[0].resolve(result('parent-native'))
+      controls[1].resolve(result('child-native'))
+      await waitFor(service, owner, parent.runId, 'completed')
+      await waitFor(service, owner, child.runId, 'completed')
+      expect(await service.cancelRun(owner, parent.runId, 'cancel pending descendant')).toBe(true)
+      releaseCard()
+      const grandchild = await creating
+      expect(grandchild.status).toBe('cancelled')
+      expect(calls).toHaveLength(2)
+    } finally { releaseCard(); await service.shutdown('test cleanup') }
   })
 
   test('marks interrupted durable runs failed on daemon restart', () => {
@@ -821,7 +896,7 @@ describe('AgentService', () => {
     expect(service.getRun(root, 'agent_old')).toMatchObject({ status: 'failed', error: expect.stringContaining('daemon restarted') })
   })
 
-  test('the main Agent can continue a legacy nested run as a new single-level task', async () => {
+  test('the main Agent can continue legacy nested history as a directly owned task', async () => {
     const source = {
       runId: 'agent_legacy', sessionName: 'project', chatId: 'chat-1', workDir: session.workDir, prompt: 'old task', depth: 2,
       status: 'completed' as const, createdAt: '2026-09-05T00:00:00Z', workers: [{
@@ -1216,7 +1291,7 @@ describe('project-owned Agent runs', () => {
     expect(() => h.service.getRun(h.root, projectRun.runId)).toThrow('not found')
     expect(() => h.service.getRun(project, sessionRun.runId)).toThrow('not found')
     const worker = h.service.principalForCapability(calls[1].hostEnv.LODESTAR_AGENT_CAPABILITY!)!
-    await expect(h.service.startRun(worker, request)).rejects.toThrow('cannot delegate')
+    expect(h.service.getRun(worker, projectRun.runId).runId).toBe(projectRun.runId)
     await h.service.cancelSessionRuns(session.sessionName, session.chatId, 'stop session')
     expect(h.service.getRun(h.root, sessionRun.runId).status).toBe('cancelled')
     expect(h.service.getRun(project, projectRun.runId).status).toBe('running')

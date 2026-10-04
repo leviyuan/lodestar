@@ -35,7 +35,7 @@ test('native SDK wire requests exclude project question/approval tools and refre
   }
 }, 120_000)
 
-for (const codeMode of [false, true]) test(`native Codex fresh project removes questions without losing execution (codeMode=${codeMode})`, async () => {
+for (const codeMode of [false, true]) test(`native Codex preserves delegation and execution across input policies (codeMode=${codeMode})`, async () => {
   const parent = join(homedir(), '.cache', 'lodestar-acceptance')
   mkdirSync(parent, { recursive: true })
   const root = mkdtempSync(join(parent, 'codex-input-boundary-test-'))
@@ -50,8 +50,8 @@ for (const codeMode of [false, true]) test(`native Codex fresh project removes q
   const output = join(root, 'capture')
   try {
     const proc = Bun.spawn([process.execPath, join(import.meta.dir, '../scripts/test-codex-input-boundary.ts'),
-      '--agent-runtimes', runtimes, '--output-dir', output, '--fresh-only',
-      ...(codeMode ? ['--model', 'gpt-6-astra', '--effort', 'xhigh', '--code-mode'] : []),
+      '--agent-runtimes', runtimes, '--output-dir', output,
+      ...(codeMode ? ['--model', 'gpt-6-astra', '--effort', 'xhigh', '--code-mode', '--fresh-only'] : []),
     ], {
       cwd: process.cwd(), env: process.env, stdout: 'pipe', stderr: 'pipe',
     })
@@ -63,9 +63,10 @@ for (const codeMode of [false, true]) test(`native Codex fresh project removes q
     expect(report.validationStatus).toBe('passed')
     expect(report.errors).toEqual([])
     expect(report.projectNeedsInputSnapshots).toBe(0)
-    expect(report.completed.map((item: any) => [item.name, item.needsInput])).toEqual([
-      ['project_fresh', 0], ['session_control', codeMode ? 0 : 1],
-    ])
+    expect(report.completed.filter((item: any) => !item.seed).map((item: any) => [item.name, item.needsInput])).toEqual(codeMode
+      ? [['project_fresh', 0], ['session_control', 0]]
+      : [['project_fresh', 0], ['session_control', 1], ['project_resume', 0], ['session_to_project', 0],
+        ['project_to_session', 1], ['plan_to_session', 1], ['plan_to_project', 0]])
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

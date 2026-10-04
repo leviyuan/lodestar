@@ -107,7 +107,7 @@ async function requestClaudeSubscriptionUsage(options: Pick<ClaudeSpawnOpts,
   try {
     const { ClaudeAgentProcess } = await import('./claude-agent-process')
     const proc = new ClaudeAgentProcess({ workDir: homedir(), effort: 'default',
-      allowDelegation: false, profile: { loadProjectMcp: false }, ...options })
+      profile: { loadProjectMcp: false }, ...options })
     proc.on('error', error => log(`Claude subscription usage MISS: ${error.message}`))
     let timer: ReturnType<typeof setTimeout> | undefined
     let failure: Error | undefined

@@ -51,6 +51,27 @@ async function serve(onStart?: (request: any) => void, projectMode = false) {
 }
 
 describe('delegated Agent HTTP API', () => {
+  test.each(['session', 'project'] as const)('%s preserves inputs beyond the former character and HTTP body limits', async kind => {
+    const projectMode = kind === 'project'
+    const base = await serve(undefined, projectMode)
+    const query = projectMode ? '?project=project' : ''
+    const headers = { authorization: `Bearer ${projectMode ? 'project-secret' : 'secret'}`, 'content-type': 'application/json' }
+    const prompt = `  开始\n${'输入🎉'.repeat(450_000)}\n结束  `
+    expect(prompt.length).toBeGreaterThan(800_000)
+    for (const [path, fields] of [
+      ['/agents/runs', { identity_ids: ['agent:a'] }],
+      ['/agents/runs', { session_id: 'native-sid' }],
+      ['/agents/runs/agent_1/follow-up', {}],
+    ] as const) {
+      const body = JSON.stringify({ description: '完整传入大任务', prompt, ...fields })
+      expect(Buffer.byteLength(body)).toBeGreaterThan(4 * 1024 * 1024)
+      const response = await fetch(`${base}${path}${query}`, { method: 'POST', headers, body })
+      const value = await response.json() as any
+      expect(response.status, value.error).toBe(202)
+      expect(value.prompt === prompt).toBe(true)
+    }
+  })
+
   test.each(['session', 'project'] as const)('%s accepts more than 64 identities in one request', async kind => {
     const requests: any[] = []
     const projectMode = kind === 'project'

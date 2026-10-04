@@ -197,7 +197,7 @@ test('explicit project CLI uses the private daemon endpoint and preserves projec
     expect(noContext.error).toContain('missing capability')
     const worker = await exec(['--project', 'repo', 'identities'], { LODESTAR_AGENT_ROLE: 'worker' })
     expect(worker.code).toBe(1)
-    expect(worker.error).toContain('cannot start project')
+    expect(worker.error).toContain('must remain session-bound')
     for (const context of [
       { LODESTAR_AGENT_ROLE: 'main' }, { LODESTAR_AGENT_CAPABILITY: 'stale' },
       { LODESTAR_AGENT_SESSION: 'managed' }, { DSH_LODESTAR_AGENT_CONTEXT: '{}' },

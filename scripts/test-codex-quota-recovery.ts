@@ -70,7 +70,7 @@ const port = (server.address() as { port: number }).port
 writeFileSync(join(home, 'config.toml'), [
   'model = "gpt-5.5"', 'model_provider = "local_test"', 'cli_auth_credentials_store = "file"',
   'sandbox_mode = "danger-full-access"', 'web_search = "disabled"',
-  '[features]', 'code_mode = false', 'multi_agent = false',
+  '[features]', 'code_mode = false',
   '[model_providers.local_test]', 'name = "Local quota acceptance"',
   `base_url = "http://127.0.0.1:${port}/v1"`, 'wire_api = "responses"', 'requires_openai_auth = false',
   'env_http_headers = { "X-Lodestar-Test-Account" = "LODESTAR_TEST_QUOTA_ACCOUNT" }',
@@ -88,7 +88,7 @@ const proc = new CodexAccountProcess({ model: 'gpt-5.5', effort: 'high', workDir
   create: (id, launch) => {
     assert.ok(nativeChildren.every(child => !child.isAlive()), 'two native processes overlap')
     const child = new CodexProcess({ workDir: cwd, model: 'gpt-5.5', effort: 'high', launch, codexAccountId: id,
-      allowDelegation: false, transformEnv: () => ({ ...osEnv, CODEX_SQLITE_HOME: home, LODESTAR_TEST_QUOTA_ACCOUNT: id,
+      transformEnv: () => ({ ...osEnv, CODEX_SQLITE_HOME: home, LODESTAR_TEST_QUOTA_ACCOUNT: id,
         HTTP_PROXY: 'http://127.0.0.1:9', HTTPS_PROXY: 'http://127.0.0.1:9', NO_PROXY: '127.0.0.1,localhost' }) })
     // Synthetic authoritative quota endpoint; the terminal usageLimitExceeded error remains native.
     child.readRateLimits = async () => limits(id)
@@ -134,7 +134,7 @@ try {
   })
   const { createAgentProcess } = await import('../src/agent-launch')
   manualProcess = createAgentProcess({ provider: 'codex', tokenSourceId: 'codex-sub', codexAccountPreference: third.id,
-    model: 'gpt-6-astra', effort: 'ultra', workDir: cwd, allowDelegation: false }).process
+    model: 'gpt-6-astra', effort: 'ultra', workDir: cwd }).process
   const manualDone = new Promise<void>((resolve, reject) => {
     timer = setTimeout(() => reject(new Error('manual native launch timed out')), 30_000)
     manualProcess!.on('result', result => result.is_error ? reject(new Error(result.error ?? result.subtype)) : resolve())

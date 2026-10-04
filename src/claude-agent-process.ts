@@ -667,7 +667,6 @@ export class ClaudeAgentProcess extends EventEmitter {
     )
     const toolsOption = toolsFromProfile(profile)
     const disallowedTools = [
-      ...(this.opts.allowDelegation === false ? ['Agent', 'Task', 'Workflow'] : []),
       ...(this.opts.allowUserInput === false ? ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'] : []),
     ]
     const strictMcpConfig = profile?.strictMcp === true

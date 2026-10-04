@@ -40,7 +40,7 @@ async function fixture(reply: (body: any, count: number) => Response | Promise<R
   cleanups.push(async () => { await server.stop(true) })
   const opts: DshSpawnOptions = {
     workDir: dir, tokenSourceId: 'deepseek-harness', model: 'deepseek-v4-flash', effort: 'high',
-    allowDelegation: false, profile: { loadProjectMcp: false },
+    profile: { loadProjectMcp: false },
     runtimeOptions: { home: join(dir, 'home') },
     transformEnv: env => ({ ...env, DEEPSEEK_API_KEY: 'local-test-key', DEEPSEEK_BASE_URL: `http://127.0.0.1:${server.port}` }),
   }
@@ -146,7 +146,7 @@ describe('DSH native runtime through Lodestar bridge', () => {
       } }] }, 'tool_calls')
       return completion({ content: 'parent-released' })
     })
-    const proc = f.processFor(undefined, { allowDelegation: true })
+    const proc = f.processFor()
     let store = emptyBgStore()
     proc.on('bg_task_started', e => { store = applyBgTaskStarted(store, e) })
     proc.on('assistant_block_stop', e => { if (!e.parentToolUseId) store = promotePendingOnAdvance(store) })
@@ -311,13 +311,11 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(await result).toMatchObject({ is_error: true, subtype: 'max-tokens' })
   }, 30_000)
 
-  test('stages model changes for the next turn and hides delegation tools in workers', async () => {
+  test('stages model changes for the next turn while retaining native delegation', async () => {
     let proc!: DshProcess
     const f = await fixture(async (body, count) => {
       const names = body.tools.map((tool: any) => tool.function.name)
-      expect(names).not.toContain('subagent')
-      expect(names).not.toContain('subagent_fork')
-      expect(names).not.toContain('workflow')
+      expect(names).toContain('subagent')
       if (count === 1) {
         await proc.setModelSettings('deepseek-v4-pro', 'off')
         return completion({ tool_calls: [{ index: 0, id: 'route-call', type: 'function', function: {
@@ -340,7 +338,7 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(f.requests[2].thinking).toEqual({ type: 'disabled' })
   }, 30_000)
 
-  test('routes Lodestar capability through root-only shell environment', async () => {
+  test('routes inherited Lodestar capability through the native shell environment', async () => {
     const f = await fixture((_body, count) => count === 1
       ? completion({ tool_calls: [{ index: 0, id: 'call-env', type: 'function', function: {
         name: 'bash', arguments: JSON.stringify({
@@ -348,7 +346,7 @@ describe('DSH native runtime through Lodestar bridge', () => {
           description: 'Verify scoped root environment',
         }),
       } }] }, 'tool_calls') : completion({ content: 'environment checked' }))
-    const proc = f.processFor(undefined, { hostEnv: { LODESTAR_AGENT_URL: 'http://127.0.0.1:9876', LODESTAR_AGENT_CAPABILITY: 'test-root-only' } })
+    const proc = f.processFor(undefined, { hostEnv: { LODESTAR_AGENT_URL: 'http://127.0.0.1:9876', LODESTAR_AGENT_CAPABILITY: 'test-task-context' } })
     const results: any[] = []
     proc.on('tool_result', value => results.push(value))
     await proc.initializationPromise()
@@ -406,22 +404,33 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(await result).toMatchObject({ is_error: false })
   }, 30_000)
 
-  test('native children cannot delegate again or inherit the root capability', async () => {
+  test('native children retain delegation tools and inherit the managed task context', async () => {
     let rootRequests = 0
     let childRequests = 0
+    let grandchildRequests = 0
     const f = await fixture(body => {
+      const grandchild = body.messages.some((message: any) => message.role === 'user'
+        && typeof message.content === 'string' && message.content.startsWith('grandchild-scope-check'))
+      if (grandchild) {
+        grandchildRequests++
+        expect(body.tools.map((tool: any) => tool.function.name)).toContain('subagent')
+        return completion({ content: 'grandchild-finished' })
+      }
       const child = body.messages.some((message: any) => message.role === 'user'
         && typeof message.content === 'string' && message.content.startsWith('child-scope-check'))
       if (child) {
         childRequests++
         const names = body.tools.map((tool: any) => tool.function.name)
-        expect(names).not.toContain('subagent')
-        expect(names).not.toContain('send_message')
+        expect(names).toContain('subagent')
+        expect(names).toContain('send_message')
         if (childRequests === 1) return completion({ tool_calls: [{ index: 0, id: 'child-shell', type: 'function', function: {
           name: 'bash', arguments: JSON.stringify({
-            command: '# desc: 验证子 Agent 没有主会话凭据\ntest -z "$DSH_LODESTAR_AGENT_CONTEXT" && test -z "$LODESTAR_AGENT_CAPABILITY" && printf child-isolated',
-            description: 'Verify child capability isolation',
+            command: '# desc: 验证子 Agent 继承受管调用上下文\ntest -n "$DSH_LODESTAR_AGENT_CONTEXT" && test -z "$LODESTAR_AGENT_CAPABILITY" && printf child-context-inherited',
+            description: 'Verify inherited task context',
           }),
+        } }] }, 'tool_calls')
+        if (childRequests === 2) return completion({ tool_calls: [{ index: 0, id: 'spawn-grandchild', type: 'function', function: {
+          name: 'subagent', arguments: JSON.stringify({ description: 'Check nested native child', prompt: 'grandchild-scope-check', run_in_background: false }),
         } }] }, 'tool_calls')
         return completion({ content: 'child-finished' })
       }
@@ -431,8 +440,8 @@ describe('DSH native runtime through Lodestar bridge', () => {
       } }] }, 'tool_calls')
       return completion({ content: 'root-finished' })
     })
-    const proc = f.processFor(undefined, { allowDelegation: true,
-      hostEnv: { LODESTAR_AGENT_URL: 'http://127.0.0.1:9876', LODESTAR_AGENT_CAPABILITY: 'root-only-test' } })
+    const proc = f.processFor(undefined, {
+      hostEnv: { LODESTAR_AGENT_URL: 'http://127.0.0.1:9876', LODESTAR_AGENT_CAPABILITY: 'inherited-task-test' } })
     const background: any[] = []
     const toolResults: any[] = []
     const rootText: string[] = []
@@ -443,11 +452,12 @@ describe('DSH native runtime through Lodestar bridge', () => {
     const result = nextResult(proc)
     proc.sendUserText('delegate a scoped task')
     expect(await result).toMatchObject({ is_error: false })
-    expect(childRequests).toBe(2)
-    expect(background).toHaveLength(1)
+    expect(childRequests).toBe(3)
+    expect(grandchildRequests).toBe(1)
+    expect(background).toHaveLength(2)
     expect(rootText.join('')).toBe('root-finished')
     expect(toolResults.find(result => result.tool_use_id === 'child-shell')).toMatchObject({ is_error: false })
-    expect(JSON.stringify(toolResults)).toContain('child-isolated')
+    expect(JSON.stringify(toolResults)).toContain('child-context-inherited')
   }, 30_000)
 
   test('loads project MCP over stdio and executes its discovered tool', async () => {

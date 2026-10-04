@@ -297,14 +297,14 @@ test('Claude subscription gates queued input on native authentication for main a
       ANTHROPIC_BASE_URL: 'https://wrong.test', CLAUDE_CODE_OAUTH_TOKEN: 'wrong-oauth',
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'wrong-model', CLAUDE_CODE_USE_VERTEX: '1',
     }
-    const launch = allowDelegation => createAgentProcess({
+    const launch = role => createAgentProcess({
       provider: 'claude', tokenSourceId: 'claude-sub', workDir: '/tmp', model: 'sonnet', effort: 'high',
-      profile: { loadProjectMcp: false }, allowDelegation,
-      hostEnv: { LODESTAR_AGENT_CAPABILITY: 'test-cap' },
+      profile: { loadProjectMcp: false },
+      hostEnv: { LODESTAR_AGENT_CAPABILITY: 'test-cap', LODESTAR_AGENT_ROLE: role },
     }).process
-    for (const allowDelegation of [true, false]) {
+    for (const role of ['main', 'worker']) {
       authGate = new Promise(resolve => { releaseAuth = resolve })
-      const proc = launch(allowDelegation)
+      const proc = launch(role)
       proc.sendUserText('queued task')
       await waitFor(() => queries.at(-1).authRequested && !queries.at(-1).closed)
       const record = queries.at(-1)
@@ -319,7 +319,7 @@ test('Claude subscription gates queued input on native authentication for main a
       assert.equal(record.options.settings.env.ANTHROPIC_DEFAULT_SONNET_MODEL, '')
       assert.equal(record.options.settings.apiKeyHelper, '')
       assert.equal(record.options.settings.forceLoginMethod, 'claudeai')
-      assert.equal(record.options.disallowedTools?.includes('Agent') ?? false, !allowDelegation)
+      assert.equal(record.options.disallowedTools?.includes('Agent') ?? false, false)
       releaseAuth()
       await waitFor(() => record.delivered.length === 1)
       await proc.kill()

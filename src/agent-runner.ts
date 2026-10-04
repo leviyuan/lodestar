@@ -79,7 +79,6 @@ export function startAgentWorker(opts: {
     effort: opts.effort,
     launch,
     developerInstructions: [opts.developerInstructions, opts.projectBound ? PROJECT_AGENT_INSTRUCTIONS : DELEGATED_AGENT_INSTRUCTIONS].filter(Boolean).join('\n\n'),
-    allowDelegation: false,
     allowUserInput: !opts.projectBound,
     profile: opts.profile,
     managedSkillPluginPath: opts.managedSkillPluginPath,

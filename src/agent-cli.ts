@@ -258,7 +258,6 @@ export function extractProjectOption(argv: string[]): { project?: string; argv: 
 
 function cliContext(project?: string): CliContext {
   if (project !== undefined) {
-    if (process.env.LODESTAR_AGENT_ROLE === 'worker') throw new Error('Delegated Agents cannot start project calls')
     if (['LODESTAR_AGENT_ROLE', 'LODESTAR_AGENT_URL', 'LODESTAR_AGENT_CAPABILITY', 'LODESTAR_AGENT_SESSION', 'DSH_LODESTAR_AGENT_CONTEXT']
       .some(key => process.env[key] !== undefined)) {
       throw new Error('Agent task calls must remain session-bound; --project is only for independent services and applications')

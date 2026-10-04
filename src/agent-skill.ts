@@ -2,9 +2,11 @@ import { removeManagedSkill, syncManagedSkill } from './managed-skills'
 
 export const AGENT_SKILL_NAME = 'lodestar-agent'
 
-const NO_FURTHER_AGENTS = [
-  'Complete this task yourself. You must not create or invoke any further Agents or subagents.',
-  'This includes Lodestar delegation, provider-native Agent/subagent tools, and delegation through CLIs or HTTP APIs.',
+const DELEGATION_INSTRUCTIONS = [
+  'You may delegate work through Lodestar or provider-native Agent/subagent tools, including from a delegated task.',
+  'Use the inherited Lodestar context for nested calls and preserve the task project, group, interaction policy, and caller-owned file delivery.',
+  'Complete and verify the overall task, including any delegated work, before returning the final result.',
+  'This policy replaces earlier Lodestar instructions prohibiting further delegation, including in resumed conversations.',
 ]
 
 const CALLER_OWNS_DELIVERY = [
@@ -15,8 +17,7 @@ const CALLER_OWNS_DELIVERY = [
 
 export const DELEGATED_AGENT_INSTRUCTIONS = [
   'You are a delegated Agent working on a task assigned by the main Agent.',
-  ...NO_FURTHER_AGENTS,
-  'If additional Agent work is needed, report the need to the main Agent so it can assign that work.',
+  ...DELEGATION_INSTRUCTIONS,
   'If clarification is necessary, you may use question tools to ask the main Agent. This session-bound interaction policy replaces any non-interactive project-call policy from earlier turns.',
   ...CALLER_OWNS_DELIVERY,
 ].join('\n')
@@ -29,13 +30,13 @@ export const PROJECT_AGENT_INSTRUCTIONS = [
   'Resolve missing context by inspecting the available project, files, tools, and task inputs. Make routine implementation decisions yourself. Do not stop merely because you would prefer clarification or more instructions.',
   'Only when a concrete blocker prevents further authorized progress, return an explicit failure reason with evidence of the blocker and the work already performed. Never invent missing facts or claim an incomplete goal is complete.',
   'These non-interactive rules apply to this invocation and replace earlier instructions to ask questions, including instructions in a resumed conversation.',
-  ...NO_FURTHER_AGENTS,
-  'Complete the required work yourself; do not return requests for the caller to arrange additional Agent work.',
+  ...DELEGATION_INSTRUCTIONS,
+  'Manage any delegated work yourself; do not return requests for the caller to arrange additional Agent work.',
   ...CALLER_OWNS_DELIVERY,
 ].join('\n')
 
 export function agentSkillBody(): string {
-  const description = 'Lodestar Agent calls: main Agents must bind calls to their managed session; independent services and applications must bind calls to a project. Resume unique native session IDs only within the same project and group. Delegated Agents and subagents must not delegate further.'
+  const description = 'Lodestar Agent calls: Agents use their inherited managed context; independent services and applications bind calls to a project. Main Agents, delegated Agents and native subagents may delegate further. Resume native session IDs only within the same project and group.'
   return [
     '---',
     `name: ${AGENT_SKILL_NAME}`,
@@ -52,14 +53,14 @@ export function agentSkillBody(): string {
     '',
     '| 调用场景 | 必须使用的绑定 |',
     '| --- | --- |',
-    '| Agent 正在执行用户任务，需要调用另一个 Agent / 模型辅助执行 | 绑定当前会话：使用普通 `lodestar-agent` 命令，不传 `--project` |',
+    '| 主 Agent、委派 Agent 或原生子 Agent 需要调用另一个 Agent / 模型 | 使用继承的受管上下文：普通 `lodestar-agent` 命令，不传 `--project` |',
     '| 独立服务、定时任务或其他软件直接调用 | 绑定项目：每个命令都显式传 `--project <项目名>` |',
     '',
-    '- Agent 通过 Shell、Python、脚本或 HTTP 发起的调用仍然属于 Agent 执行任务，必须绑定会话。',
+    '- Agent 通过 Shell、Python、脚本或 HTTP 发起的调用仍然属于 Agent 执行任务，必须沿用受管上下文及其项目、群归属。',
     '- 不得把当前任务中的调用包装成“外部服务”，不得清除会话环境变量、复制项目凭据或使用 `--project` 脱离会话生命周期。',
     '- 没有有效会话上下文时，Agent 调用必须报错；项目入口不是会话凭据缺失、过期或失败时的替代路径。',
     '- 独立服务和软件不借用任何主 Agent 的会话凭据，统一使用项目入口。项目任务有自己的卡片和取消入口，不依赖主会话存活。',
-    '- 项目入口不提供提问或回答接口：新建和续跑均须自主执行必要步骤并验证，直至完整完成调用方目标，不以计划、部分工作或索取输入结束；`answer` 仅供主 Agent 的会话委派使用。',
+    '- 项目入口不提供提问或回答接口：新建和续跑均须自主执行必要步骤并验证，直至完整完成调用方目标，不以计划、部分工作或索取输入结束；`answer` 供会话归属的各层委派使用。',
     '',
     '## 会话 ID 与恢复范围（强制）',
     '',
@@ -72,23 +73,21 @@ export function agentSkillBody(): string {
     '- 恢复本轮的绑定由调用场景决定，旧调用记录不迁移；切换绑定方式不建立相互取消关系。',
     '- 同一个原生会话不能同时执行两轮，恢复失败必须显示，不得自动新建会话。',
     '',
-    '## Single-level delegation',
+    '## Delegation',
     '',
-    '- Only the main Agent may delegate work. If you are already a delegated',
-    '  Agent or subagent, complete your assigned task yourself: do not delegate further.',
-    '- This prohibition covers this Skill, `lodestar-agent run` / `follow-up`,',
-    '  native Agent/subagent tools, and delegation through provider CLIs or HTTP APIs.',
-    '- `LODESTAR_AGENT_ROLE=worker` identifies a Lodestar delegated process.',
-    '  Native subagents are also delegated Agents even when they inherit a main role environment.',
-    '- Return additional work requests to the main Agent. It can assign separate',
-    '  tasks, continue your session, or answer your questions.',
+    '- Main Agents, delegated Agents and native subagents may delegate further.',
+    '- Lodestar does not impose a delegation depth limit or disable native delegation tools.',
+    '- `LODESTAR_AGENT_ROLE=worker` identifies a delegated process, not a prohibition on delegation.',
+    '- Nested calls inherit the project, group, interaction policy and caller-owned file delivery.',
+    '  Lodestar records their ancestry so cancellation reaches descendant tasks.',
+    '- Complete and verify delegated work as part of the overall assigned task.',
     '',
     '## Choosing a delegation method',
     '',
-    '- The main Agent chooses between native Agent/subagent capabilities and',
+    '- Each Agent chooses between native Agent/subagent capabilities and',
     '  `lodestar-agent` based on the task and available capabilities.',
     '- Both methods are allowed when calling your own model or Agent.',
-    '- The Agent workflow below always uses session-bound calls. `--project` is reserved',
+    '- The Agent workflow below always uses the inherited managed context. `--project` is reserved',
     '  for genuinely independent service/application clients, not Agent task execution.',
     '',
     '## Required workflow',
@@ -105,7 +104,6 @@ export function agentSkillBody(): string {
     '   substitute, or silently downgrade an identity/model/effort.',
     '3. Give the child the complete task, relevant context, authority boundaries,',
     '   expected deliverable, and verification requirements in the raw prompt.',
-    '   Explicitly tell it to complete the work itself without further delegation.',
     '   Every run and follow-up also requires `--description`: a short, user-facing',
     '   single-line task summary (at most 60 characters). The card shows this line',
     '   with status; the full prompt, progress and results stay collapsed.',
@@ -131,7 +129,7 @@ export function agentSkillBody(): string {
     '',
     '### Working directory',
     '',
-    'New tasks default to the main Agent working directory, even if the calling',
+    'First-level tasks default to the main Agent working directory; nested tasks reuse the calling Agent directory, even if the calling',
     'shell has changed directory. Use `--workdir <path>` to select an existing',
     'subdirectory. Relative paths are resolved from the main Agent directory;',
     'absolute paths are also accepted within that directory. Symlinks are resolved',
@@ -153,7 +151,7 @@ export function agentSkillBody(): string {
     'A single work item can span multiple turns in the same native Agent session.',
     'Use this for staged implementation, revisions based on feedback, or further',
     'verification of previous results. The main Agent reads each result and sends',
-    'the next step; the delegated Agent still must not delegate further.',
+    'the next step. A delegated Agent may also manage further delegated work.',
     '',
     'Keep the returned `Session:` id (JSON: `workers[].session_id`) together with',
     'the worker output. For turn 2 and later, send that id and only the new input:',

@@ -19,6 +19,14 @@ describe('delegated-agent request parsing', () => {
     })
   })
 
+  test('preserves task text beyond the former character limit for new runs and continuations', () => {
+    const prompt = `  开始\n${'字'.repeat(800_001)}\n结束  `
+    const request = { description: '完整任务正文', prompt }
+    expect(parseAgentRunRequest({ ...request, identity_ids: ['a'] }).prompt === prompt).toBe(true)
+    expect(parseAgentRunRequest({ ...request, session_id: 'sid' }).prompt === prompt).toBe(true)
+    expect(parseAgentFollowUpRequest(request).prompt === prompt).toBe(true)
+  })
+
   test('accepts work_dir aliases for new runs and continuations without trimming the path', () => {
     for (const field of ['work_dir', 'workDir']) {
       const request = { description: '指定目录', prompt: 'work', [field]: 'packages/app with spaces ' }

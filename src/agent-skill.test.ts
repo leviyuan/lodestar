@@ -18,13 +18,15 @@ describe('lodestar-agent managed Skill', () => {
     expect(body.toLowerCase()).not.toContain('read-only')
   })
 
-  test('makes the worker prohibition apply to native tools', () => {
+  test('allows nested delegation while retaining inherited task ownership', () => {
     const body = agentSkillBody()
-    expect(body).toContain('Only the main Agent may delegate work')
-    expect(body).toContain('do not delegate further')
-    expect(body).toContain('Native subagents are also delegated Agents')
-    expect(DELEGATED_AGENT_INSTRUCTIONS).toContain('must not create or invoke any further Agents or subagents')
-    expect(DELEGATED_AGENT_INSTRUCTIONS).toContain('report the need to the main Agent')
+    expect(body).toContain('Main Agents, delegated Agents and native subagents may delegate further')
+    expect(body).toContain('Lodestar does not impose a delegation depth limit')
+    expect(body).toContain('Nested calls inherit the project, group, interaction policy')
+    for (const instructions of [DELEGATED_AGENT_INSTRUCTIONS, PROJECT_AGENT_INSTRUCTIONS]) {
+      expect(instructions).toContain('You may delegate work through Lodestar or provider-native Agent/subagent tools')
+      expect(instructions).toContain('replaces earlier Lodestar instructions prohibiting further delegation')
+    }
   })
 
   test('distinguishes interactive delegation from non-interactive software execution', () => {

@@ -92,7 +92,7 @@ Agent 运行依赖由 `src/agent-updates.ts` 独立安装，daemon 启动时不�
 - 每个进程默认读取项目 `.mcp.json` 的 stdio/HTTP MCP，并加载 `.agents/skills`、`.dsh/skills` 和 Lodestar 管理的 Skill。项目 `tools` 和 `load_project_mcp` 对 DSH 生效。
 - 图片 MIME 由文件字节识别。飞书下载的 JPEG 可能使用 `.png` 文件名，不能据扩展名声明编码；无法识别的图片明确报错。
 - 运行状态保存在 `src/paths.ts` 的 `DSH_HOME_DIR`。不读取用户 DSH settings 或凭据文件；`DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL` 由选定账号显式注入。默认 telemetry 插件不加载。
-- 委派 worker 与原生子 Agent 均禁止继续派工。主 Agent 的 Lodestar capability 通过原生 ShellEnv 按执行者注入，子 Agent 的 shell 不继承它；Agent CLI 识别这一专用上下文。
+- 委派 worker 与原生子 Agent 均保留继续派工能力。Lodestar 调用上下文通过原生 ShellEnv 传给当前 Agent 及其后代，Agent CLI 使用它保留项目、群和任务归属。
 - 中断使用不可变原因对象，避免 Node fetch 附加 `stack` 属性后破坏 DSH 的无损 JSON 日志校验。关闭先回收 Agent，再通过协议、stdin EOF 与精确子进程终止确认退出。
 
 需要 Node 22.19+（22.x）或 Node 24+；`[token_source.deepseek-harness].bin` 指定 Node 路径。DSH 是开发者预览版，升级依赖时须同步检查桥接协议并运行原生集成测试。`src/dsh-process.test.ts` 使用真实运行时和本地模拟模型/MCP，不连接飞书或付费 API。
@@ -103,7 +103,7 @@ Agent 运行依赖由 `src/agent-updates.ts` 独立安装，daemon 启动时不�
 
 各进程类将原生文本、工具、结果、用量、压缩和后台任务转换成 `AgentProcess` 事件。共享事件由 Session 和卡片消费，保留各后端在初始化、上下文和后台任务上的差异。
 
-委派只有一层：主 Agent 可以并行派工、回答问题和续跑原生会话，被委派的 Agent 不得继续调用其他 Agent。Skill、worker 提示词及运行时入口共同遵循该规则；worker 关闭 Codex `multi_agent` 或 Claude `Agent`/`Task`，保留其余代码工具、项目 MCP 和独立调用凭据。历史父子记录仍保留以便读取与清理。运行状态原子落盘，大段输入输出单独存放；委派会话登记后从主群的历史列表中排除。
+主 Agent、委派 Agent 和原生子 Agent 均可继续派工，不设置 Lodestar 委派层数上限，也不禁用各后端原生委派工具。Skill、worker 提示词和运行时入口保持一致；项目调用的非交互要求及调用方负责交付的规则沿委派链继承。Lodestar 后续任务记录当前调用方作为父任务，续跑来源单独记录，取消沿父子关系传播。运行状态原子落盘，大段输入输出单独存放；委派会话登记后从主群的历史列表中排除。
 
 委派、原生子 Agent 和后台任务由同一个 `AgentCards` 实例展示。每项仅显示状态和一句说明，类型、进度、任务正文、结果、待回答问题及失败原因放在折叠体内，动作只展示最近三步。原生子 Agent 启动即展示，普通前台命令仍在观察池中；启动工具和 SDK task id 关联后只保留一项。
 

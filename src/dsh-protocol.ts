@@ -17,7 +17,6 @@ export interface DshOpenOptions {
   model: string
   effort: DshReasoningEffort
   launch: ConversationLaunch
-  allowDelegation: boolean
   allowUserInput: boolean
   developerInstructions: string
   allowedTools?: string[]

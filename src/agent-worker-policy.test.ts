@@ -8,7 +8,7 @@ function runIsolated(script: string): any {
   return JSON.parse(result.stdout.toString().trim().split('\n').at(-1)!)
 }
 
-test('the Claude SDK receives worker-only delegation restrictions while retaining normal coding tools', () => {
+test('the Claude SDK retains native delegation while enforcing the invocation input policy', () => {
   const captured = runIsolated(`
     import { mock } from 'bun:test'
     const captured = []
@@ -20,7 +20,7 @@ test('the Claude SDK receives worker-only delegation restrictions while retainin
       },
     }))
     const { ClaudeAgentProcess } = await import('./src/claude-agent-process')
-    for (const policy of [{}, { allowDelegation: false }, { allowDelegation: false, allowUserInput: false }]) {
+    for (const policy of [{}, { allowUserInput: false }]) {
       const proc = new ClaudeAgentProcess({ workDir: process.cwd(), effort: 'high', appendSystemPrompt: 'current invocation policy', ...policy })
       const closed = new Promise(resolve => proc.once('exit', resolve))
       proc.sendInitialize()
@@ -31,9 +31,7 @@ test('the Claude SDK receives worker-only delegation restrictions while retainin
   expect(captured).toEqual([
     { disallowedTools: null, tools: { type: 'preset', preset: 'claude_code' }, effort: 'high',
       systemPrompt: { type: 'preset', preset: 'claude_code', append: 'current invocation policy', snapshot: false } },
-    { disallowedTools: ['Agent', 'Task', 'Workflow'], tools: { type: 'preset', preset: 'claude_code' }, effort: 'high',
-      systemPrompt: { type: 'preset', preset: 'claude_code', append: 'current invocation policy', snapshot: false } },
-    { disallowedTools: ['Agent', 'Task', 'Workflow', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'], tools: { type: 'preset', preset: 'claude_code' }, effort: 'high',
+    { disallowedTools: ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'], tools: { type: 'preset', preset: 'claude_code' }, effort: 'high',
       systemPrompt: { type: 'preset', preset: 'claude_code', append: 'current invocation policy', snapshot: false } },
   ])
 })
@@ -46,7 +44,7 @@ test('new and resumed workers use caller-owned delivery and binding-specific inp
     mock.module('./src/token-source', () => ({ getTokenSourceForAccount: () => ({ id: 'test-source' }) }))
     mock.module('./src/agent-session-registry', () => ({ rememberAgentSession() {} }))
     mock.module('./src/agent-launch', () => ({ createAgentProcess: options => {
-      captured.push({ allowDelegation: options.allowDelegation, allowUserInput: options.allowUserInput, instructions: options.developerInstructions,
+      captured.push({ allowUserInput: options.allowUserInput, instructions: options.developerInstructions,
         role: options.hostEnv.LODESTAR_AGENT_ROLE, model: options.model, effort: options.effort,
         codexAccountId: options.codexAccountId, launch: options.launch })
       const proc = new EventEmitter()
@@ -75,13 +73,12 @@ test('new and resumed workers use caller-owned delivery and binding-specific inp
   ])
   expect(captured.filter((launch: any) => launch.launch.kind === 'resume')).toHaveLength(6)
   for (const launch of captured) {
-    expect(launch.allowDelegation).toBe(false)
     expect(launch.role).toBe('worker')
     expect(launch.model).toBe('worker-model')
     expect(launch.effort).toBe('high')
     expect(launch.codexAccountId).toBe('named-work')
     expect(launch.instructions).toContain('project rule')
-    expect(launch.instructions).toContain('must not create or invoke any further Agents or subagents')
+    expect(launch.instructions).toContain('You may delegate work through Lodestar or provider-native Agent/subagent tools')
     expect(launch.instructions).toContain('Return task results and local artifact paths to the caller')
     expect(launch.instructions).toContain('Do not emit file-delivery markers')
     expect(launch.instructions).toContain('replace any earlier Lodestar file-delivery instructions')

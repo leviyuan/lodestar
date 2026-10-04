@@ -26,7 +26,6 @@ export const name = 'lodestar-bridge'
 export const inject = ['agents', 'llm', 'agentDefaultModel', 'sessionPersistence', 'tools', 'systemPrompt', 'userQuestions', 'compaction', 'shellEnv', 'attachments', 'sdkAppStartup']
 const PROVIDER = process.env.LODESTAR_DSH_PROVIDER ?? 'deepseek-official'
 if (!['deepseek-official', 'zai-coding-cn', 'zai'].includes(PROVIDER)) throw new Error(`Unsupported DSH provider: ${PROVIDER}`)
-const DELEGATION_TOOLS = ['subagent', 'subagent_fork', 'workflow', 'ralph', 'send_message']
 
 function nativeErrorMessage(error: unknown, depth = 0): string {
   if (!(error instanceof Error)) return String(error)
@@ -63,8 +62,8 @@ export function apply(ctx: Context): void {
   const delegationContext = process.env.DSH_LODESTAR_AGENT_CONTEXT
   delete process.env.DSH_LODESTAR_AGENT_CONTEXT
   ctx.shellEnv.register({ name: 'lodestar-agent',
-    variables: { DSH_LODESTAR_AGENT_CONTEXT: { description: 'Lodestar delegation context for the current root agent only.' } },
-    resolve: execution => delegationContext && execution.agent === root?.agent
+    variables: { DSH_LODESTAR_AGENT_CONTEXT: { description: 'Inherited Lodestar task context for this agent and its native descendants.' } },
+    resolve: () => delegationContext
       ? { DSH_LODESTAR_AGENT_CONTEXT: delegationContext } : {},
   })
   const settle = (): void => {
@@ -109,8 +108,6 @@ export function apply(ctx: Context): void {
   })
   ctx.on('agent/created', ({ agent }) => {
     if (agent.session.id === rootId) return
-    // Native descendants retain coding tools but can never delegate again.
-    agent.ctx.tools.restrict({ deny: DELEGATION_TOOLS })
     notify('subagent.started', { sessionId: agent.session.id, parentSessionId: agent.session.header.parentSession })
   })
   ctx.on('agent/disposed', ({ agent }) => {
@@ -177,7 +174,6 @@ export function apply(ctx: Context): void {
         const resolved = await next()
         return payload.agent === agent ? { ...resolved, ...turnRoute } : resolved
       })
-      if (!input.allowDelegation) agentCtx.tools.restrict({ deny: DELEGATION_TOOLS })
       if (input.allowUserInput === false) agentCtx.tools.restrict({ deny: ['ask_user_question'] })
       if (input.allowedTools) agentCtx.tools.restrict({ allow: input.allowedTools })
       if (input.developerInstructions) {

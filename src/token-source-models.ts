@@ -39,7 +39,7 @@ export async function fetchNativeClaudeModels(options: Pick<ClaudeSpawnOpts,
   'settingSources' | 'settings' | 'transformEnv' | 'validateAccount' | 'tokenSourceId'> = {}): Promise<TokenSourceModel[]> {
   const { ClaudeAgentProcess } = await import('./claude-agent-process')
   const proc = new ClaudeAgentProcess({ workDir: homedir(), effort: 'high',
-    settingSources: ['user'], allowDelegation: false, profile: { loadProjectMcp: false }, ...options })
+    settingSources: ['user'], profile: { loadProjectMcp: false }, ...options })
   proc.on('error', error => log(`Claude model catalog MISS: ${error.message}`))
   try {
     const catalog = await withTimeout(proc.listModels())

@@ -98,7 +98,7 @@ try {
       const { process: proc } = createAgentProcess({
         provider: 'claude', tokenSourceId: source.id, workDir: dir, model: entry.model, effort: entry.effort,
         ...(previousSessionId ? { launch: { kind: 'resume', source: { provider: 'claude', sessionId: previousSessionId, cwd: dir } } as const } : {}),
-        profile: { tools: 'Read', loadProjectMcp: false }, allowDelegation: false,
+        profile: { tools: 'Read', loadProjectMcp: false },
         hostEnv: { CLAUDE_CONFIG_DIR: join(dir, 'claude-state'), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
           CLAUDE_CODE_MAX_OUTPUT_TOKENS: '2048' },
       })

@@ -476,15 +476,15 @@ describe('codex JSON-RPC lifecycle reliability', () => {
   })
 
   for (const resume of [false, true]) {
-    test(`delegated Codex workers disable native delegation at process and thread launch (resume=${resume})`, async () => {
-      expect(codexAppServerArgs(false)).toEqual(['app-server', '--listen', 'stdio://', '--disable', 'multi_agent'])
+    test(`delegated Codex workers retain native delegation at process and thread launch (resume=${resume})`, async () => {
+      expect(codexAppServerArgs()).toEqual(['app-server', '--listen', 'stdio://'])
       const { proc, calls } = makeCodexProtocolHarness({
-        allowDelegation: false, model: 'worker-model', effort: 'xhigh',
+        model: 'worker-model', effort: 'xhigh',
         ...(resume ? { launch: { kind: 'resume', source: { provider: 'codex', sessionId: 'worker-thread', cwd: '/repo' } } } : {}),
       })
       await proc.initializeAndStartThread()
       const launch = calls.find(call => call.method === (resume ? 'thread/resume' : 'thread/start'))!
-      expect(launch.params.config['features.multi_agent']).toBe(false)
+      expect(launch.params.config).not.toHaveProperty('features.multi_agent')
       expect(launch.params.config.model_reasoning_effort).toBe('xhigh')
       expect(launch.params.sandbox).toBe('danger-full-access')
       expect(launch.params.model).toBe('worker-model')

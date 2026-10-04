@@ -44,7 +44,8 @@ writeFileSync(join(nativeHome, 'config.toml'), [
   'cli_auth_credentials_store = "file"', 'web_search = "disabled"',
   'sandbox_mode = "danger-full-access"',
   `model = ${JSON.stringify(model)}`, `model_reasoning_effort = ${JSON.stringify(effort)}`,
-  '[features]', 'multi_agent = false', ...(codeMode ? ['code_mode = true', 'code_mode_host = true'] : []),
+  // Enable the native capability in this fixture; Lodestar must preserve it.
+  '[features]', 'multi_agent = true', ...(codeMode ? ['code_mode = true', 'code_mode_host = true'] : []),
   `[projects.${JSON.stringify(workDir)}]`, 'trust_level = "trusted"', '',
 ].join('\n'), { mode: 0o600 })
 
@@ -106,6 +107,10 @@ const modelServer = Bun.serve({ hostname: '127.0.0.1', port: 0, error(error) {
   const instructions = instructionBlocks.join('\n')
   const currentPolicy = instructionBlocks.filter(block => /no question or answer interface|you may use question tools to ask the main Agent/.test(block)).at(-1)
   active.summaries.push({ request: index, toolNames: names, model: body.model, reasoning: body.reasoning,
+    // Classic models discover multi-agent tools through tool_search; Code Mode
+    // exposes them directly in additional_tools. Both are native declarations.
+    delegationToolsPresent: names.some(name => /(?:^|\.)spawn_agent$/.test(name))
+      || declarations.some(tool => tool.type === 'tool_search' && String(tool.description).includes('Multi-agent tools:')),
     userInteractionTools: names.filter(name => /(?:^|\.)(?:request_user_input(?:_async)?|send_user_message_async|send_message_to_user_async)$/.test(name)),
     questionToolPresent: names.some(name => /(?:^|\.)request_user_input(?:_async)?$/.test(name)),
     questionSchemaPresent: JSON.stringify(declarations).includes('request_user_input'),
@@ -258,6 +263,7 @@ async function runCase(name: string, projectBound: boolean, resumeSessionId?: st
     assert.equal(lastContext?.collaboration_mode?.mode, 'default')
     assert(lastContext.collaboration_mode.settings.developer_instructions.includes('no question or answer interface'))
   }
+  assert(active.summaries.every(item => item.delegationToolsPresent === true), 'native delegation tools were lost')
   if (codeMode) assert(active.summaries.every(item => (item.toolNames as string[]).includes('functions.exec')), 'Code Mode was lost')
   assert(active.wire.length >= 3 && JSON.stringify(native.records).includes(proof), 'missing native execution evidence')
   if (name === 'plan_to_session') assert.equal(lastContext?.collaboration_mode?.mode, 'plan')
@@ -275,6 +281,8 @@ async function seedPlan(sessionId: string): Promise<void> {
     await client.initialize('lodestar-boundary-plan-seed')
     const restored = await client.request('thread/resume', { threadId: sessionId, cwd: workDir, model, modelProvider: apiProvider.id,
       approvalPolicy: 'never', sandbox: 'danger-full-access', developerInstructions: DELEGATED_AGENT_INSTRUCTIONS,
+      // Persist the former worker policy to verify that a later Lodestar launch
+      // restores native delegation as well as the current interaction policy.
       config: { 'features.default_mode_request_user_input': true, 'features.multi_agent': false } })
     assert.equal(restored.thread.id, sessionId)
     const done = new Promise<any>((resolve, reject) => {
