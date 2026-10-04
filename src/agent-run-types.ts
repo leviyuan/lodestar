@@ -1,5 +1,6 @@
 export const MAX_AGENT_PROMPT_CHARS = 800_000
 export const MAX_AGENT_DESCRIPTION_CHARS = 60
+export const PROJECT_AGENT_INPUT_ERROR = 'project Agent calls are non-interactive and have no question or answer interface; complete the supplied goal autonomously'
 
 /** Ownership is independent of the chat used to display a run. */
 export interface AgentRunOwner {

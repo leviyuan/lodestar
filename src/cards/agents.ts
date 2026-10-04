@@ -83,7 +83,6 @@ export function agentRunElement(run: AgentRunSnapshot): object {
         agentRunFooterElement(run).content,
         `**任务说明**\n${sanitizeMarkdownForCardKit(compactTaskContent(run.prompt))}`,
         ...run.workers.map(worker => agentWorkerElement(worker, WORKER_MAX_PREVIEW_CHARS, project).content),
-        ...(project && run.status === 'needs_input' ? ['通过调用端的 `answer` 命令回答，普通群消息仍发送给主会话。'] : []),
       ].join('\n\n'),
     }, ...(project && !isTerminal(run.status) ? [{
       tag: 'button', text: { tag: 'plain_text', content: '停止本次任务' }, type: 'danger',
@@ -127,7 +126,7 @@ export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars
   if (worker.durationMs != null) body.push(`用时 ${formatDuration(worker.durationMs / 1000)}`)
   if (worker.status === 'queued' && worker.queuedReason) body.push('', escapeMarkdown(worker.queuedReason))
   if (worker.pendingInput) {
-    body.push('', project ? '**等待调用方回答**' : '**等待主 Agent 回答**')
+    body.push('', project ? '**项目任务不支持交互提问**' : '**等待主 Agent 回答**')
     for (const question of worker.pendingInput.questions) {
       body.push(`- ${escapeMarkdown(question.question)}`)
       if (question.options.length) body.push(`  选项：${question.options.map(option => inlineCode(option.label)).join(' / ')}`)
@@ -247,7 +246,7 @@ function runStatusLabel(run: AgentRunSnapshot): string {
     case 'completed': return `✅ ${kindLabel}完成`
     case 'failed': return `❌ ${kindLabel}失败`
     case 'cancelled': return `🛑 ${kindLabel}已取消`
-    case 'needs_input': return `❓ ${kindLabel}等待${run.owner?.kind === 'project' ? '调用方' : '主 Agent '}回复`
+    case 'needs_input': return run.owner?.kind === 'project' ? '❗ 项目任务不支持交互提问' : `❓ ${kindLabel}等待主 Agent 回复`
     case 'queued': return `⏳ ${kindLabel}等待执行`
     case 'running': return run.workers.length > 0 && run.workers.every(worker => isTerminal(worker.status))
       ? `⏳ ${kindLabel}正在收尾` : `⏳ ${kindLabel}正在执行`

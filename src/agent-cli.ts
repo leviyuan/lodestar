@@ -1,7 +1,7 @@
 import { localFetch } from './network'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { requireAgentDescription } from './agent-run-types'
+import { requireAgentDescription, PROJECT_AGENT_INPUT_ERROR } from './agent-run-types'
 import { readAgentProjectClient } from './agent-project-client'
 
 interface CliContext {
@@ -103,6 +103,7 @@ async function followUpCommand(context: CliContext, argv: string[]): Promise<voi
 }
 
 async function answerCommand(context: CliContext, argv: string[]): Promise<void> {
+  if (context.project) throw new Error(PROJECT_AGENT_INPUT_ERROR)
   const runId = requiredArg(argv.shift(), 'answer requires run_id')
   let identityId = ''
   let requestId = ''
@@ -388,6 +389,7 @@ function usage(): string {
     'Agent task calls must use the managed-session context. --project is only for independent services and applications.',
     'Without --project, the existing managed-session context is required; invalid contexts never switch modes.',
     'Project run/follow-up: --request-id <unique-key> deduplicates retries; --requester <open_id> records the requester only.',
+    'Project calls are non-interactive and never wait for answers. The answer command is only for session-bound delegation.',
     'Agent results and local artifact paths return to the caller. File-delivery markers are not executed.',
     '--session resumes the unique native conversation id only within its registered project and group.',
     'Unknown ownership and cross-project/group resumes are rejected, even with an explicit identity.',

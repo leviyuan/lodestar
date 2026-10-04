@@ -14,13 +14,14 @@ test('the Claude SDK receives worker-only delegation restrictions while retainin
     const captured = []
     mock.module('@anthropic-ai/claude-agent-sdk', () => ({
       query: ({ options }) => {
-        captured.push({ disallowedTools: options.disallowedTools ?? null, tools: options.tools, effort: options.effort })
+        captured.push({ disallowedTools: options.disallowedTools ?? null, tools: options.tools, effort: options.effort,
+          systemPrompt: options.systemPrompt })
         return { async *[Symbol.asyncIterator]() {}, close() {} }
       },
     }))
     const { ClaudeAgentProcess } = await import('./src/claude-agent-process')
-    for (const allowDelegation of [undefined, false]) {
-      const proc = new ClaudeAgentProcess({ workDir: process.cwd(), effort: 'high', allowDelegation })
+    for (const policy of [{}, { allowDelegation: false }, { allowDelegation: false, allowUserInput: false }]) {
+      const proc = new ClaudeAgentProcess({ workDir: process.cwd(), effort: 'high', appendSystemPrompt: 'current invocation policy', ...policy })
       const closed = new Promise(resolve => proc.once('exit', resolve))
       proc.sendInitialize()
       await closed
@@ -28,12 +29,16 @@ test('the Claude SDK receives worker-only delegation restrictions while retainin
     console.log(JSON.stringify(captured))
   `)
   expect(captured).toEqual([
-    { disallowedTools: null, tools: { type: 'preset', preset: 'claude_code' }, effort: 'high' },
-    { disallowedTools: ['Agent', 'Task'], tools: { type: 'preset', preset: 'claude_code' }, effort: 'high' },
+    { disallowedTools: null, tools: { type: 'preset', preset: 'claude_code' }, effort: 'high',
+      systemPrompt: { type: 'preset', preset: 'claude_code', append: 'current invocation policy', snapshot: false } },
+    { disallowedTools: ['Agent', 'Task', 'Workflow'], tools: { type: 'preset', preset: 'claude_code' }, effort: 'high',
+      systemPrompt: { type: 'preset', preset: 'claude_code', append: 'current invocation policy', snapshot: false } },
+    { disallowedTools: ['Agent', 'Task', 'Workflow', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'], tools: { type: 'preset', preset: 'claude_code' }, effort: 'high',
+      systemPrompt: { type: 'preset', preset: 'claude_code', append: 'current invocation policy', snapshot: false } },
   ])
 })
 
-test('new and resumed workers use caller-owned delivery across all backends and bindings', () => {
+test('new and resumed workers use caller-owned delivery and binding-specific input policy across all backends', () => {
   const captured = runIsolated(`
     import { mock } from 'bun:test'
     import { EventEmitter } from 'node:events'
@@ -41,7 +46,7 @@ test('new and resumed workers use caller-owned delivery across all backends and 
     mock.module('./src/token-source', () => ({ getTokenSourceForAccount: () => ({ id: 'test-source' }) }))
     mock.module('./src/agent-session-registry', () => ({ rememberAgentSession() {} }))
     mock.module('./src/agent-launch', () => ({ createAgentProcess: options => {
-      captured.push({ allowDelegation: options.allowDelegation, instructions: options.developerInstructions,
+      captured.push({ allowDelegation: options.allowDelegation, allowUserInput: options.allowUserInput, instructions: options.developerInstructions,
         role: options.hostEnv.LODESTAR_AGENT_ROLE, model: options.model, effort: options.effort,
         codexAccountId: options.codexAccountId, launch: options.launch })
       const proc = new EventEmitter()
@@ -65,6 +70,9 @@ test('new and resumed workers use caller-owned delivery across all backends and 
     console.log(JSON.stringify(captured))
   `)
   expect(captured).toHaveLength(12)
+  expect(captured.map((launch: any) => launch.allowUserInput)).toEqual([
+    true, true, false, false, true, true, false, false, true, true, false, false,
+  ])
   expect(captured.filter((launch: any) => launch.launch.kind === 'resume')).toHaveLength(6)
   for (const launch of captured) {
     expect(launch.allowDelegation).toBe(false)
@@ -78,5 +86,14 @@ test('new and resumed workers use caller-owned delivery across all backends and 
     expect(launch.instructions).toContain('Do not emit file-delivery markers')
     expect(launch.instructions).toContain('replace any earlier Lodestar file-delivery instructions')
     expect(launch.instructions).not.toMatch(/\[\[send:|30 MB|files on|需要交付文件时直接提交/)
+    if (!launch.allowUserInput) {
+      expect(launch.instructions).toContain('nobody is available to answer questions')
+      expect(launch.instructions).toContain('no question or answer interface')
+      expect(launch.instructions).toContain('keep working until the entire goal is achieved')
+      expect(launch.instructions).toContain('return an explicit failure reason')
+      expect(launch.instructions).toContain('including instructions in a resumed conversation')
+    } else {
+      expect(launch.instructions).toContain('you may use question tools to ask the main Agent')
+    }
   }
 })

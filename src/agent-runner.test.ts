@@ -140,6 +140,35 @@ describe('full delegated Agent runner', () => {
     await expect(handle.done).resolves.toMatchObject({ output: '', sessionId: 'sid-1' })
   })
 
+  for (const provider of ['codex', 'claude', 'dsh']) {
+    for (const resume of [false, true]) {
+      test(`non-interactive ${provider} calls fail on input without waiting or inventing answers (resume=${resume})`, async () => {
+        const proc = new FakeProcess() as any
+        proc.provider = provider
+        const waiting: unknown[] = []
+        const handle = collectAgentTurn(proc, 'execute task', {
+          onNeedsInput: request => waiting.push(request),
+        }, () => {}, resume ? 'sid-1' : undefined, false)
+        proc.emit('assistant_text', { text: 'work already performed' })
+        proc.emit('can_use_tool', { request_id: 'work', tool_name: 'Bash', input: { command: 'pwd' } })
+        proc.emit('can_use_tool', {
+          request_id: 'ask', tool_name: 'AskUserQuestion',
+          input: { questions: [{ id: 'q', question: 'Missing execution target?' }] },
+        })
+        const failure = await handle.done.catch(error => error)
+        expect(failure).toBeInstanceOf(AgentWorkerFailure)
+        expect(failure.message).toContain('non-interactive')
+        expect(failure.message).toContain('Missing execution target?')
+        expect(failure.output).toBe('work already performed')
+        expect(failure.sessionId).toBe('sid-1')
+        expect(waiting).toEqual([])
+        expect(handle.pendingInput()).toBeNull()
+        expect(proc.permissionResponses).toEqual([['work', 'allow', { updatedInput: { command: 'pwd' } }]])
+        expect(proc.isAlive()).toBe(false)
+      })
+    }
+  }
+
   test('queues simultaneous questions without killing the task or losing answers', async () => {
     const proc = new FakeProcess() as any
     const questions: string[] = []

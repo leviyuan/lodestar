@@ -489,6 +489,33 @@ describe('codex JSON-RPC lifecycle reliability', () => {
       expect(launch.params.sandbox).toBe('danger-full-access')
       expect(launch.params.model).toBe('worker-model')
     })
+    for (const allowUserInput of [true, false]) {
+      test(`Codex input tools follow the current invocation policy (resume=${resume}, allowUserInput=${allowUserInput})`, async () => {
+        const { proc, calls } = makeCodexProtocolHarness({
+          allowUserInput, model: 'worker-model', effort: 'xhigh', appendSystemPrompt: 'complete the goal without questions',
+          ...(resume ? { launch: { kind: 'resume', source: { provider: 'codex', sessionId: 'worker-thread', cwd: '/repo' } } } : {}),
+        }, async (method, params) => {
+          if (method === 'initialize') return {}
+          if (method === 'thread/start' || method === 'thread/resume') {
+            return { thread: { id: params.threadId ?? 'worker-thread', cwd: '/repo' } }
+          }
+          if (method === 'turn/start') return { turn: { id: 'execution-turn', status: 'inProgress' } }
+          throw new Error(`unexpected request ${method}`)
+        })
+        proc.readyPromise = proc.initializeAndStartThread()
+        await proc.startTurn('complete the goal')
+        const launch = calls.find(call => call.method === (resume ? 'thread/resume' : 'thread/start'))!
+        expect(launch.params.config['features.default_mode_request_user_input']).toBe(allowUserInput)
+        expect(launch.params.config['tools.experimental_request_user_input.enabled']).toBe(allowUserInput)
+        expect(launch.params.config.model_reasoning_effort).toBe('xhigh')
+        expect(launch.params.model).toBe('worker-model')
+        const turn = calls.find(call => call.method === 'turn/start')!
+        expect(turn.params.collaborationMode).toEqual(allowUserInput ? undefined : {
+          mode: 'default',
+          settings: { model: 'worker-model', reasoning_effort: 'xhigh', developer_instructions: 'complete the goal without questions' },
+        })
+      })
+    }
   }
 
   test('keeps Windows-compatible Codex spawning shell-free so TOML argv stays literal', () => {

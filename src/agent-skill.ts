@@ -17,13 +17,20 @@ export const DELEGATED_AGENT_INSTRUCTIONS = [
   'You are a delegated Agent working on a task assigned by the main Agent.',
   ...NO_FURTHER_AGENTS,
   'If additional Agent work is needed, report the need to the main Agent so it can assign that work.',
+  'If clarification is necessary, you may use question tools to ask the main Agent. This session-bound interaction policy replaces any non-interactive project-call policy from earlier turns.',
   ...CALLER_OWNS_DELIVERY,
 ].join('\n')
 
 export const PROJECT_AGENT_INSTRUCTIONS = [
   'You are executing a project task for the calling service or application through Lodestar.',
+  'This is a non-interactive execution entry point with no question or answer interface. The caller is traditional software; nobody is available to answer questions.',
+  'Do not ask the user or caller questions, request clarification or confirmation, or wait for input. Do not use question tools or other channels to solicit a reply.',
+  'The supplied goal is your completion requirement. Execute every necessary step and verify the result; keep working until the entire goal is achieved within the authorized scope. A plan, partial work, or a request for another turn is not completion.',
+  'Resolve missing context by inspecting the available project, files, tools, and task inputs. Make routine implementation decisions yourself. Do not stop merely because you would prefer clarification or more instructions.',
+  'Only when a concrete blocker prevents further authorized progress, return an explicit failure reason with evidence of the blocker and the work already performed. Never invent missing facts or claim an incomplete goal is complete.',
+  'These non-interactive rules apply to this invocation and replace earlier instructions to ask questions, including instructions in a resumed conversation.',
   ...NO_FURTHER_AGENTS,
-  'If additional Agent work is needed, report the need to the caller.',
+  'Complete the required work yourself; do not return requests for the caller to arrange additional Agent work.',
   ...CALLER_OWNS_DELIVERY,
 ].join('\n')
 
@@ -52,6 +59,7 @@ export function agentSkillBody(): string {
     '- 不得把当前任务中的调用包装成“外部服务”，不得清除会话环境变量、复制项目凭据或使用 `--project` 脱离会话生命周期。',
     '- 没有有效会话上下文时，Agent 调用必须报错；项目入口不是会话凭据缺失、过期或失败时的替代路径。',
     '- 独立服务和软件不借用任何主 Agent 的会话凭据，统一使用项目入口。项目任务有自己的卡片和取消入口，不依赖主会话存活。',
+    '- 项目入口不提供提问或回答接口：新建和续跑均须自主执行必要步骤并验证，直至完整完成调用方目标，不以计划、部分工作或索取输入结束；`answer` 仅供主 Agent 的会话委派使用。',
     '',
     '## 会话 ID 与恢复范围（强制）',
     '',
@@ -207,7 +215,8 @@ export function agentSkillBody(): string {
     '',
     '## Answer a child question',
     '',
-    'When a run returns `Status: needs_input`, answer the exact request id. JSON',
+    'Only session-bound delegation can return `Status: needs_input`; project-bound service calls never ask for input and do not support `answer`.',
+    'When a session-bound run returns `Status: needs_input`, answer the exact request id. JSON',
     'keys may be the question id or the full question text:',
     '',
     '```bash',

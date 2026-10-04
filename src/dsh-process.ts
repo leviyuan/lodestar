@@ -19,6 +19,7 @@ export interface DshSpawnOptions {
   launch?: ConversationLaunch
   developerInstructions?: string
   allowDelegation?: boolean
+  allowUserInput?: boolean
   profile?: ProjectProfile
   managedSkillPluginPath?: string
   hostEnv?: Record<string, string | undefined>
@@ -105,6 +106,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         launch: this.opts.launch ?? { kind: 'fresh' },
         developerInstructions: this.opts.developerInstructions ?? '',
         allowDelegation: this.opts.allowDelegation !== false,
+        allowUserInput: this.opts.allowUserInput !== false,
         ...(this.opts.profile?.tools ? { allowedTools: this.opts.profile.tools.split(',').map(t => {
           const name = t.trim(); return Object.keys(toolAliases).find(key => toolAliases[key] === name) ?? name
         }) } : {}),

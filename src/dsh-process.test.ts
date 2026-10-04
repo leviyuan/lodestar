@@ -256,6 +256,25 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(JSON.stringify(f.requests[1].messages)).toContain('Blue')
   }, 30_000)
 
+  test('fresh and resumed DSH input tools follow the current invocation policy', async () => {
+    const f = await fixture(() => completion({ content: 'task finished' }))
+    let sessionId: string | undefined
+    for (const allowUserInput of [false, true, false]) {
+      const proc = f.processFor(sessionId ? {
+        kind: 'resume', source: { provider: 'dsh', sessionId, cwd: f.dir },
+      } : undefined, { allowUserInput })
+      await proc.initializationPromise()
+      const result = nextResult(proc)
+      proc.sendUserText('execute without further input')
+      expect(await result).toMatchObject({ is_error: false })
+      const tools = f.requests.at(-1).tools.map((tool: any) => tool.function.name)
+      expect(tools).toContain('bash')
+      expect(tools.includes('ask_user_question')).toBe(allowUserInput)
+      sessionId = proc.sessionId!
+      await proc.kill()
+    }
+  }, 60_000)
+
   test('cancels a live model request without losing the process or conversation', async () => {
     let seen!: () => void
     const received = new Promise<void>(resolve => { seen = resolve })

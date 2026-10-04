@@ -3,6 +3,7 @@ import type { AgentIdentity } from './agent-identities'
 import { createAgentProcess } from './agent-launch'
 import { rememberAgentSession } from './agent-session-registry'
 import type { AgentInputQuestion, AgentInputRequest, AgentStep } from './agent-run-types'
+import { PROJECT_AGENT_INPUT_ERROR } from './agent-run-types'
 import type { ConversationLaunch } from './conversation'
 import type { ProjectProfile } from './config'
 import { getTokenSourceForAccount } from './token-source'
@@ -79,12 +80,13 @@ export function startAgentWorker(opts: {
     launch,
     developerInstructions: [opts.developerInstructions, opts.projectBound ? PROJECT_AGENT_INSTRUCTIONS : DELEGATED_AGENT_INSTRUCTIONS].filter(Boolean).join('\n\n'),
     allowDelegation: false,
+    allowUserInput: !opts.projectBound,
     profile: opts.profile,
     managedSkillPluginPath: opts.managedSkillPluginPath,
     hostEnv: { ...opts.hostEnv, LODESTAR_AGENT_ROLE: 'worker' },
     serviceName: 'lodestar-agent',
   })
-  return collectAgentTurn(proc, opts.prompt, opts.callbacks, undefined, opts.resumeSessionId)
+  return collectAgentTurn(proc, opts.prompt, opts.callbacks, undefined, opts.resumeSessionId, !opts.projectBound)
 }
 
 export function collectAgentTurn(
@@ -93,6 +95,7 @@ export function collectAgentTurn(
   callbacks: AgentWorkerCallbacks = {},
   remember: typeof rememberAgentSession = rememberAgentSession,
   expectedSessionId?: string,
+  allowUserInput = true,
 ): AgentWorkerHandle {
   const output: string[] = []
   let lastError: Error | null = null
@@ -205,7 +208,12 @@ export function collectAgentTurn(
       return
     }
     let normalized: AgentInputRequest
-    try { normalized = normalizeInputRequest(request) }
+    try {
+      normalized = normalizeInputRequest(request)
+      if (!allowUserInput) {
+        throw new Error(`${PROJECT_AGENT_INPUT_ERROR}: ${normalized.questions.map(question => question.question).join('; ')}`)
+      }
+    }
     catch (error) {
       void finish(error instanceof Error ? error : new Error(String(error)))
       return

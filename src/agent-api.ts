@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Session } from './session'
 import type { AgentService, AgentPrincipal } from './agent-service'
 import { agentPrincipalContext } from './agent-context'
-import { agentRunOwner } from './agent-run-types'
+import { agentRunOwner, PROJECT_AGENT_INPUT_ERROR } from './agent-run-types'
 import { getAgentSkillIdentityCatalog, type AgentIdentityCatalog } from './agent-identities'
 import {
   parseAgentAnswerRequest,
@@ -75,6 +75,7 @@ export async function handleAgentRequest(
       return send(202, serializeRun(run))
     }
     if (action === 'answer' && req.method === 'POST') {
+      if (principal.kind === 'project') return send(409, { error: PROJECT_AGENT_INPUT_ERROR })
       const run = await context.service.answer(principal, runId, parseAgentAnswerRequest(await readJsonBody(req)))
       return send(200, serializeRun(run))
     }

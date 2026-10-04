@@ -13,6 +13,8 @@
 | `test-codex-quota-recovery.ts` | 私有目录、模拟额度与 localhost 模型，真实 Codex 执行一次文件追加后连续两次额度耗尽，验证自动换号、同 thread 续跑和操作不重复；不接触真实账号或 daemon |
 | `seed-debug-ctx.ts` | 查询群成员，将指定成员写入本机 debug context |
 | `test-openrouter.ts` | 使用明确提供的私有 Key 和 `--agent-runtimes` 目录做付费 API/SDK Read 实测；不连接飞书或 daemon，支持请求参数核验与原生 resume 序列 |
+| `test-agent-input-boundary.ts` | 指定已安装运行时与新建私有输出目录，通过隔离项目 API → AgentService → 原生 Claude SDK 捕获实际 tools/system/messages，强制注入提问调用并检查原生拒绝、会话记录和五种新建/续跑/归属切换；仅用本地模拟模型，不调用真实模型、不读取生产凭据、不连接飞书或 live daemon |
+| `test-codex-input-boundary.ts` | 用同样的隔离入口捕获 Codex 实际工具声明、当前指令和原生 thread/read 返回路径上的会话记录，注入同步/异步提问并实际执行文件读取；`--model`/`--effort`/`--code-mode` 检查代码模式，`--fresh-only` 只测外部新建与主 Agent 委派对照，省略时增加续跑和旧 Plan 恢复。只用本地 Responses 模拟端点，不使用真实凭据；验收失败退出非零并在报告明确标记 |
 | `test-dsh-glm.ts` | 使用已配置 GLM Coding Plan 做 DSH Read 与原生 resume 实测，只操作私有临时目录；不连接飞书或控制 daemon |
 | `test-model-panel-live.ts` | 使用现有 daemon，在明确目标群验证分组、隐藏/显示、补录/删除、无效补录拒绝及真实回复；等待最终 footer 后检查模型/effort 与余额/额度，恢复原设置。`--routes-only` 可单测指定模型路由；不自行创建 Session 或控制 daemon |
 | `postinstall.cjs` | 安装/更新时清理旧 `lodestar-files` 的三处受管副本，并提示安装步骤；不读凭据或启动 Agent/daemon，清理失败退出非零 |

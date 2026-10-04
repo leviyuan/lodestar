@@ -666,6 +666,10 @@ export class ClaudeAgentProcess extends EventEmitter {
       this.opts.managedSkillPluginPath,
     )
     const toolsOption = toolsFromProfile(profile)
+    const disallowedTools = [
+      ...(this.opts.allowDelegation === false ? ['Agent', 'Task', 'Workflow'] : []),
+      ...(this.opts.allowUserInput === false ? ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'] : []),
+    ]
     const strictMcpConfig = profile?.strictMcp === true
     // Default true (CLI parity): discover <cwd>/.mcp.json like bare `claude`.
     // readProjectMcpServers returns undefined when no .mcp.json is present, so
@@ -709,7 +713,7 @@ export class ClaudeAgentProcess extends EventEmitter {
           ...(this.opts.settings ? { settings: this.opts.settings } : {}),
           ...managedSkillOptions,
           tools: toolsOption,
-          ...(this.opts.allowDelegation === false ? { disallowedTools: ['Agent', 'Task'] } : {}),
+          ...(disallowedTools.length ? { disallowedTools } : {}),
           ...(strictMcpConfig ? { strictMcpConfig: true } : {}),
           ...(mcpServers ? { mcpServers } : {}),
           toolConfig: {
@@ -720,7 +724,9 @@ export class ClaudeAgentProcess extends EventEmitter {
           systemPrompt: {
             type: 'preset',
             preset: 'claude_code',
-            ...(this.opts.appendSystemPrompt ? { append: this.opts.appendSystemPrompt } : {}),
+            // Native prompt snapshots otherwise keep an earlier host's append
+            // verbatim on resume, including a different invocation's input policy.
+            ...(this.opts.appendSystemPrompt ? { append: this.opts.appendSystemPrompt, snapshot: false } : {}),
           },
           stderr: data => {
             const text = data.trim()

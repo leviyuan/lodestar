@@ -1297,24 +1297,27 @@ describe('project-owned Agent runs', () => {
     expect(starts).toBe(2)
   })
 
-  test('answers project questions without a Session and validates the exact input request', async () => {
+  test('project calls reject input requests without entering needs_input or accepting answers', async () => {
     const input: AgentInputRequest = { requestId: 'question-1', toolUseId: 'tool-1', questions: [{ id: 'q', header: '选择', question: '哪一个？', options: [] }] }
     const control = controlledHandle()
-    let pending: AgentInputRequest | null = input
-    control.handle.pendingInput = () => pending
-    control.handle.answer = (id, answers) => {
-      expect(id).toBe(input.requestId)
-      expect(answers).toEqual({ q: 'first' })
-      pending = null
-      control.resolve(result('answered'))
-    }
-    const h = harness({ startWorker: opts => { queueMicrotask(() => opts.callbacks!.onNeedsInput!(input)); return control.handle } })
+    const h = harness({ startWorker: opts => {
+      expect(opts.projectBound).toBe(true)
+      queueMicrotask(() => {
+        try {
+          opts.callbacks!.onNeedsInput!(input)
+          control.resolve(result('unexpected-input-accepted'))
+        } catch (error) { control.reject(error as Error) }
+      })
+      return control.handle
+    } })
     const principal = h.service.projectPrincipal(context())
     const run = await h.service.startRun(principal, request)
-    await waitFor(h.service, principal, run.runId, 'needs_input')
-    await expect(h.service.answer(principal, run.runId, { requestId: 'stale', answers: { q: 'first' } })).rejects.toThrow('mismatch')
-    await h.service.answer(principal, run.runId, { requestId: input.requestId, answers: { q: 'first' } })
-    await waitFor(h.service, principal, run.runId, 'completed')
+    const failed = await waitFor(h.service, principal, run.runId, 'failed')
+    expect(failed.workers[0]!.error).toContain('non-interactive')
+    expect(failed.workers[0]!.pendingInput).toBeUndefined()
+    expect(h.artifacts.some((record: any) => record.status === 'needs_input'
+      || record.workers.some((worker: any) => worker.status === 'needs_input' || worker.pendingInput))).toBe(false)
+    await expect(h.service.answer(principal, run.runId, { requestId: input.requestId, answers: { q: 'first' } })).rejects.toThrow('non-interactive')
   })
 
   test('project card cancellation validates the stored chat, message and project ownership', async () => {

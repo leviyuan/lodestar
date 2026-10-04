@@ -211,7 +211,8 @@ test('project API authenticates independently and never upgrades session or work
       method: 'POST', headers: headers('project-secret'),
       body: JSON.stringify(action === 'follow-up' ? { description: '继续', prompt: 'next' } : { request_id: 'q', answers: { q: 'yes' } }),
     })
-    expect(response.status).toBe(action === 'follow-up' ? 202 : 200)
+    expect(response.status).toBe(action === 'follow-up' ? 202 : 409)
+    if (action === 'answer') expect((await response.json() as any).error).toContain('non-interactive')
   }
   expect((await fetch(`${base}/agents/runs/agent_1?project=project`, { method: 'DELETE', headers: headers('project-secret') })).status).toBe(200)
 })

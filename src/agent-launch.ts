@@ -28,6 +28,8 @@ export interface AgentLaunchOptions {
   developerInstructions?: string
   /** Only delegated workers disable delegation; main Sessions keep native capabilities. */
   allowDelegation?: boolean
+  /** Service/application calls cannot wait for a human or another Agent to answer. */
+  allowUserInput?: boolean
   profile?: ProjectProfile
   managedSkillPluginPath?: string
   hostEnv?: Record<string, string | undefined>
@@ -107,6 +109,7 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
             }),
         ...(opts.developerInstructions ? { appendSystemPrompt: opts.developerInstructions } : {}),
         ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
+        ...(opts.allowUserInput === false ? { allowUserInput: false } : {}),
         ...(opts.profile ? { profile: opts.profile } : {}),
         ...(source ? { settingSources: source.settingSources ?? ['project', 'local'] } : {}),
         ...(source?.claudeSettings ? { settings: source.claudeSettings } : {}),
@@ -128,6 +131,7 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
     launch: opts.launch,
     ...(opts.developerInstructions ? { appendSystemPrompt: opts.developerInstructions } : {}),
     ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
+    ...(opts.allowUserInput === false ? { allowUserInput: false } : {}),
     tokenSourceId: source?.id ?? null,
     transformEnv,
     hostEnv: opts.hostEnv,

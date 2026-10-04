@@ -178,6 +178,7 @@ export function apply(ctx: Context): void {
         return payload.agent === agent ? { ...resolved, ...turnRoute } : resolved
       })
       if (!input.allowDelegation) agentCtx.tools.restrict({ deny: DELEGATION_TOOLS })
+      if (input.allowUserInput === false) agentCtx.tools.restrict({ deny: ['ask_user_question'] })
       if (input.allowedTools) agentCtx.tools.restrict({ allow: input.allowedTools })
       if (input.developerInstructions) {
         agentCtx.systemPrompt.section({ name: 'lodestar:instructions', order: 999, text: input.developerInstructions })

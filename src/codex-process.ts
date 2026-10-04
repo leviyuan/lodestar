@@ -21,6 +21,7 @@ import { spawn as crossSpawn } from 'cross-spawn'
 import { config } from './config'
 import { log } from './log'
 import { agentBin } from './agent-updates'
+import { prepareCodexInputPolicyCatalog, type CodexInputPolicyCatalog } from './codex-input-policy'
 import {
   contextCompactionNoticeFromMessage,
   contextCompactionNoticeFromNotification,
@@ -86,6 +87,7 @@ export interface SpawnOpts {
   effort?: CodexReasoningEffort
   appendSystemPrompt?: string
   allowDelegation?: boolean
+  allowUserInput?: boolean
   /** Host-owned environment injected before token-source credential routing. */
   hostEnv?: Record<string, string | undefined>
   /** App-server conversation source label. Delegated agents use a distinct
@@ -315,7 +317,10 @@ export class CodexProcess extends EventEmitter {
   readonly provider = 'codex' as const
   readonly tokenSourceId: string | null
   readonly launchKind: ConversationLaunch['kind']
-  private proc: ChildProcessByStdio<Writable, Readable, Readable>
+  private proc: ChildProcessByStdio<Writable, Readable, Readable> | null = null
+  private startupPromise: Promise<void> | null = null
+  private inputPolicyAbort = new AbortController()
+  private inputPolicyCatalog: CodexInputPolicyCatalog | null = null
   private stdoutBuf = ''
   private stderrBuf = ''
   private requestCounter = 0
@@ -329,6 +334,7 @@ export class CodexProcess extends EventEmitter {
   private readonly exitPromise: Promise<void>
   private resolveExit!: () => void
   private opts: SpawnOpts
+  private usesCustomDefaultModeInstructions = false
   private readyPromise: Promise<void> | null = null
   private initializePromise: Promise<void> | null = null
   /** Fresh thread/start returns an id before Codex creates its rollout. A
@@ -399,11 +405,9 @@ export class CodexProcess extends EventEmitter {
     this.tokenSourceId = opts.tokenSourceId ?? null
     this.launchKind = (opts.launch ?? { kind: 'fresh' }).kind
     const codexBin = resolveCodexBin()
-    const args = [...codexAppServerArgs(opts.allowDelegation !== false),
-      ...(opts.apiProvider ? codexApiProviderArgs(opts.apiProvider)
+    const providerArgs = opts.apiProvider ? codexApiProviderArgs(opts.apiProvider)
         : [...(opts.tokenSourceId === 'codex-sub' ? ['-c', 'model_provider="openai"'] : []),
-          ...codexAccounts.cliArgs(opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)])]
-    log(`codex-process: spawn ${codexBin} app-server (cwd=${opts.workDir})`)
+          ...codexAccounts.cliArgs(opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)]
     const baseEnv = {
       ...(process.env as Record<string, string>),
       NPM_CONFIG_LOGLEVEL: 'error',
@@ -415,12 +419,39 @@ export class CodexProcess extends EventEmitter {
     const spawnEnv = opts.apiProvider
       ? { ...routedEnv, CODEX_HOME: codexAccounts.defaultHome }
       : codexAccounts.env(opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT, routedEnv)
+    const start = (catalog?: CodexInputPolicyCatalog) => {
+      if (this.expectedExit) throw new Error('Codex startup cancelled')
+      this.inputPolicyCatalog = catalog ?? null
+      this.spawnNative(codexBin, [...codexAppServerArgs(opts.allowDelegation !== false), ...providerArgs,
+        ...(catalog ? ['-c', `model_catalog_json=${JSON.stringify(catalog.path)}`,
+          ...catalog.disabledFeatures.flatMap(feature => ['--disable', feature])] : []),
+      ], spawnEnv)
+    }
+    if (opts.allowUserInput === false) {
+      this.startupPromise = prepareCodexInputPolicyCatalog({ binary: codexBin, configArgs: providerArgs,
+        env: spawnEnv, workDir: opts.workDir, signal: this.inputPolicyAbort.signal,
+      }).then(async catalog => {
+        if (this.expectedExit) { await catalog.dispose(); throw new Error('Codex startup cancelled') }
+        start(catalog)
+      }).catch(error => {
+        this.alive = false
+        this.emit('error', error instanceof Error ? error : new Error(String(error)))
+        this.emitProcessExit(this.expectedExit ? null : 1, this.expectedExit ? 'SIGTERM' : null)
+        throw error
+      })
+      void this.startupPromise.catch(() => {}) // initialization observes the original failure
+    } else start()
+    if (!opts.apiProvider) bindProcessCodexAccount(this, opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)
+  }
+
+  private spawnNative(binary: string, args: string[], env: Record<string, string | undefined>): void {
+    log(`codex-process: spawn ${binary} app-server (cwd=${this.opts.workDir})`)
     // cross-spawn resolves Windows .cmd shims without `shell:true`; keeping an
     // argv vector preserves quoted TOML values passed through --config.
     this.proc = crossSpawn(
-      codexBin,
+      binary,
       args,
-      codexAppServerSpawnOptions(opts.workDir, spawnEnv),
+      codexAppServerSpawnOptions(this.opts.workDir, env),
     ) as ChildProcessByStdio<Writable, Readable, Readable>
 
     this.proc.stdout.on('data', (chunk: Buffer) => this.onStdout(chunk))
@@ -429,7 +460,6 @@ export class CodexProcess extends EventEmitter {
     this.proc.on('exit', (code, signal) => this.handleChildExit(code, signal))
     this.proc.on('close', (code, signal) => this.handleChildClose(code, signal))
     this.proc.on('error', err => this.handleChildProcessError(err))
-    if (!opts.apiProvider) bindProcessCodexAccount(this, opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)
   }
 
   private handleStdinError(reason: unknown): void {
@@ -493,7 +523,7 @@ export class CodexProcess extends EventEmitter {
     // would make Session's precise cleanup block forever on an OS process that
     // never existed. Other ChildProcess errors may still have a real PID and
     // must keep the ordinary exit/kill confirmation path.
-    const spawnFailed = typeof this.proc.pid !== 'number'
+    const spawnFailed = typeof this.proc?.pid !== 'number'
     let terminalized = false
     if (spawnFailed && this.alive) {
       this.alive = false
@@ -650,6 +680,8 @@ export class CodexProcess extends EventEmitter {
         const settings = params.threadSettings
         if (typeof settings?.model === 'string') this.lastModel = settings.model
         if (isCodexReasoningEffort(settings?.effort)) this.lastEffort = settings.effort
+        if (settings?.collaborationMode) this.usesCustomDefaultModeInstructions = settings.collaborationMode.mode === 'default'
+          && typeof settings.collaborationMode.settings?.developer_instructions === 'string'
         return
       }
       case 'thread/tokenUsage/updated': {
@@ -1351,7 +1383,7 @@ export class CodexProcess extends EventEmitter {
     if (!this.alive) {
       return fail(new Error(`write to dead process: ${JSON.stringify(obj).slice(0, 200)}`))
     }
-    if (this.proc.stdin.destroyed || this.proc.stdin.writableEnded || !this.proc.stdin.writable) {
+    if (!this.proc || this.proc.stdin.destroyed || this.proc.stdin.writableEnded || !this.proc.stdin.writable) {
       return fail(new Error('stdin is not writable'))
     }
     try {
@@ -1471,6 +1503,7 @@ export class CodexProcess extends EventEmitter {
   /** Initialize this app-server transport exactly once, then complete the
    * JSON-RPC handshake before any catalog or thread request is sent. */
   private async ensureInitialized(): Promise<void> {
+    if (this.startupPromise) await this.startupPromise
     if (!this.initializePromise) {
       this.initializePromise = this.request('initialize', this.initializeParams()).then(() => {
         if (!this.write({ method: 'initialized' })) {
@@ -1544,6 +1577,8 @@ export class CodexProcess extends EventEmitter {
       this.conversationResumable = true
     }
     if (res?.model) this.lastModel = res.model
+    this.usesCustomDefaultModeInstructions = res?.collaborationMode?.mode === 'default'
+      && typeof res.collaborationMode.settings?.developer_instructions === 'string'
     if (isCodexReasoningEffort(res?.reasoningEffort)) this.lastEffort = res.reasoningEffort
     else this.lastEffort = this.opts.effort ?? null
     log(`codex-process: thread=${this.sessionId}`)
@@ -1662,7 +1697,10 @@ export class CodexProcess extends EventEmitter {
       // (下发任何值都被无视、回落 ~/.codex/config.toml),config 键才真生效
       // (2026-08-18 探针:effort=ultra 顶层回包 xhigh,config 路径回包 ultra)。
       config: {
-        'features.default_mode_request_user_input': true,
+        // The feature flag only controls whether the handler may run in Default
+        // mode; the native tool switch controls exposure in the model's catalog.
+        'tools.experimental_request_user_input.enabled': this.opts.allowUserInput !== false,
+        'features.default_mode_request_user_input': this.opts.allowUserInput !== false,
         ...(this.opts.allowDelegation === false ? { 'features.multi_agent': false } : {}),
         ...(this.opts.effort ? { model_reasoning_effort: this.opts.effort } : {}),
       },
@@ -1961,6 +1999,12 @@ export class CodexProcess extends EventEmitter {
       await this.readyPromise
       if (attempt.interrupted || this.expectedExit || !this.alive) return
       if (!this.sessionId) throw new Error('codex thread not initialized')
+      const refreshMode = this.opts.allowUserInput === false
+        || (this.usesCustomDefaultModeInstructions && !!this.opts.appendSystemPrompt)
+      const modeModel = this.opts.model ?? this.lastModel
+      if (refreshMode && !modeModel) {
+        throw new Error('Codex model is missing while applying the current invocation policy')
+      }
       const res = await this.request('turn/start', {
         threadId: this.sessionId,
         input: [{ type: 'text', text, text_elements: [] }],
@@ -1968,6 +2012,19 @@ export class CodexProcess extends EventEmitter {
         runtimeWorkspaceRoots: [this.opts.workDir],
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'dangerFullAccess' },
+        // Services cannot inherit Plan mode. Returning to an interactive caller
+        // must also replace a previous service's custom Default-mode instructions.
+        // An interactive caller's existing Plan mode remains native.
+        ...(refreshMode ? {
+          collaborationMode: {
+            mode: 'default',
+            settings: {
+              model: modeModel,
+              reasoning_effort: this.opts.effort ?? this.lastEffort ?? null,
+              developer_instructions: this.opts.appendSystemPrompt ?? null,
+            },
+          },
+        } : {}),
       })
       this.recordTurnStarted(res?.turn, this.sessionId, 'turn/start response', attempt)
     } catch (e) {
@@ -2107,19 +2164,32 @@ export class CodexProcess extends EventEmitter {
   async kill(timeoutMs = 5000): Promise<void> {
     this.capacityRetryEnabled = false
     this.cancelCapacityRetry()
+    this.inputPolicyAbort?.abort(new Error('Codex process cancelled'))
+    if (this.startupPromise) {
+      this.expectedExit = true
+      let startupTimer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          this.startupPromise.catch(() => {}), // startup error is reported by initialization/exit
+          new Promise<never>((_resolve, reject) => {
+            startupTimer = setTimeout(() => reject(new Error(`Codex model catalog preparation did not exit within ${timeoutMs * 2}ms`)), timeoutMs * 2)
+          }),
+        ])
+      } finally { if (startupTimer) clearTimeout(startupTimer) }
+    }
     if (!this.alive) {
-      if (await this.waitForExit(timeoutMs)) return
+      if (await this.waitForExit(timeoutMs)) { await this.disposeInputPolicy(); return }
       throw new Error(`codex app-server exited but stdio did not close within ${timeoutMs}ms`)
     }
     this.expectedExit = true
     log(`codex-process: SIGTERM (timeout=${timeoutMs}ms)`)
     const signalErrors: string[] = []
     this.sendSignal('SIGTERM', signalErrors)
-    if (await this.waitForExit(timeoutMs)) return
+    if (await this.waitForExit(timeoutMs)) { await this.disposeInputPolicy(); return }
 
     log(`codex-process: SIGKILL (lifecycle not closed after ${timeoutMs}ms)`)
     if (this.alive) this.sendSignal('SIGKILL', signalErrors)
-    if (await this.waitForExit(timeoutMs)) return
+    if (await this.waitForExit(timeoutMs)) { await this.disposeInputPolicy(); return }
 
     const details = signalErrors.length ? `; ${signalErrors.join('; ')}` : ''
     const error = new Error(`codex app-server did not exit after SIGTERM and SIGKILL (${timeoutMs}ms each)${details}`)
@@ -2127,9 +2197,15 @@ export class CodexProcess extends EventEmitter {
     throw error
   }
 
+  private async disposeInputPolicy(): Promise<void> {
+    if (!this.inputPolicyCatalog) return
+    await this.inputPolicyCatalog.dispose()
+    this.inputPolicyCatalog = null
+  }
+
   private sendSignal(signal: NodeJS.Signals, errors: string[]): void {
     try {
-      if (!this.proc.kill(signal) && this.alive) errors.push(`${signal} was not delivered`)
+      if (!this.proc?.kill(signal) && this.alive) errors.push(`${signal} was not delivered`)
     } catch (e) {
       errors.push(`${signal} failed: ${e instanceof Error ? e.message : String(e)}`)
     }

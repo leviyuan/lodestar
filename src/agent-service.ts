@@ -3,7 +3,7 @@ import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'n
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { AgentCards, type AgentCardsDeps } from './agent-cards'
 import { agentCardsDeps } from './agent-cards-runtime'
-import { agentOwnerKey, agentRunOwner, requireAgentDescription, requireAgentWorkDir } from './agent-run-types'
+import { agentOwnerKey, agentRunOwner, requireAgentDescription, requireAgentWorkDir, PROJECT_AGENT_INPUT_ERROR } from './agent-run-types'
 import * as feishu from './feishu'
 import { config } from './config'
 import { getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
@@ -215,6 +215,7 @@ export class AgentService {
     runId: string,
     request: AgentAnswerRequest,
   ): Promise<AgentRunSnapshot> {
+    if (principal.kind === 'project') throw new Error(PROJECT_AGENT_INPUT_ERROR)
     const run = this.requireMutableDescendant(principal, runId)
     const worker = selectWorker(run.snapshot, request.identityId)
     if (worker.status !== 'needs_input' || !worker.pendingInput) {
@@ -514,6 +515,7 @@ export class AgentService {
         callbacks: {
           onNeedsInput: request => {
             if (run.cancelled) return
+            if (run.context!.owner.kind === 'project') throw new Error(PROJECT_AGENT_INPUT_ERROR)
             worker.status = 'needs_input'
             worker.pendingInput = request
             this.refreshNonterminalStatus(run)

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { agentSkillBody, DELEGATED_AGENT_INSTRUCTIONS } from './agent-skill'
+import { agentSkillBody, DELEGATED_AGENT_INSTRUCTIONS, PROJECT_AGENT_INSTRUCTIONS } from './agent-skill'
 
 describe('lodestar-agent managed Skill', () => {
   test('describes a selected identity as its corresponding Agent call', () => {
@@ -25,5 +25,20 @@ describe('lodestar-agent managed Skill', () => {
     expect(body).toContain('Native subagents are also delegated Agents')
     expect(DELEGATED_AGENT_INSTRUCTIONS).toContain('must not create or invoke any further Agents or subagents')
     expect(DELEGATED_AGENT_INSTRUCTIONS).toContain('report the need to the main Agent')
+  })
+
+  test('distinguishes interactive delegation from non-interactive software execution', () => {
+    expect(agentSkillBody()).toContain('project-bound service calls never ask for input and do not support `answer`')
+    expect(PROJECT_AGENT_INSTRUCTIONS).toContain('nobody is available to answer questions')
+    expect(PROJECT_AGENT_INSTRUCTIONS).toContain('no question or answer interface')
+    expect(PROJECT_AGENT_INSTRUCTIONS).toContain('keep working until the entire goal is achieved')
+    expect(PROJECT_AGENT_INSTRUCTIONS).toContain('Execute every necessary step and verify the result')
+    expect(PROJECT_AGENT_INSTRUCTIONS).toContain('Do not stop merely because you would prefer clarification')
+    expect(PROJECT_AGENT_INSTRUCTIONS).not.toContain('report the need to the caller')
+    expect(PROJECT_AGENT_INSTRUCTIONS).toContain('Do not ask the user or caller questions')
+    expect(PROJECT_AGENT_INSTRUCTIONS).toContain('return an explicit failure reason')
+    expect(PROJECT_AGENT_INSTRUCTIONS).toContain('including instructions in a resumed conversation')
+    expect(DELEGATED_AGENT_INSTRUCTIONS).toContain('you may use question tools to ask the main Agent')
+    expect(DELEGATED_AGENT_INSTRUCTIONS).not.toContain('nobody is available')
   })
 })

@@ -21,7 +21,7 @@
 
 ## 验证
 
-- 项目独立 Agent 调用在 `agent-cards.ts` 使用专属卡，一次 run 一张，不复用共享群尾卡；模板显示“项目任务”，待答显示“等待调用方回答”。取消按钮通过 `agent_project_cancel` 路由，不依赖活跃 Session。
+- 项目独立 Agent 调用在 `agent-cards.ts` 使用专属卡，一次 run 一张，不复用共享群尾卡；模板显示“项目任务”；项目调用不支持交互提问，不提供调用方回答指引。取消按钮通过 `agent_project_cancel` 路由，不依赖活跃 Session。
 
 - 模板、问答、工具和 IDs：`bun test src/cards/turn.test.ts src/cards/elements.test.ts src/cards/shell-command.test.ts`。
 - 统一委派面板与后台任务：`bun test src/agent-cards.test.ts src/cards/agents.test.ts src/cards/task-board.test.ts src/cards/background.test.ts src/session.test.ts`。
