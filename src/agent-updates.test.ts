@@ -37,6 +37,24 @@ test('auto-update is disabled by default and never checks or schedules at startu
   } finally { interval.mockRestore() }
 })
 
+test.each(['codex', 'claude', 'dsh'] as const)('%s installs shared and runtime-specific security fixes without adding Agent-only libraries to the daemon', async agent => {
+  const root = await scratch()
+  let manifest: any
+  const host = JSON.parse(await readFile(join(import.meta.dir, '../package.json'), 'utf8'))
+  await updateAgentRuntime(agent, { root, metadata: async name => ({ name, version: '9.0.0' }),
+    install: async directory => {
+      manifest = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'))
+      await install(directory)
+    },
+  })
+  expect(manifest.overrides['@modelcontextprotocol/sdk']).toBe(host.overrides['@modelcontextprotocol/sdk'])
+  expect(manifest.overrides['proxy-addr']).toBe(host.overrides['proxy-addr'])
+  for (const name of ['@modelcontextprotocol/client', '@modelcontextprotocol/core']) {
+    expect(host.dependencies[name]).toBeUndefined()
+    expect(manifest.overrides[name]).toBe(agent === 'dsh' ? host.agentRuntimeOverrides.dsh[name] : undefined)
+  }
+})
+
 test.each(['codex', 'claude', 'dsh'] as const)('%s auto-update alone starts at the six-hour tick, avoids overlap, and cancels on stop', async agent => {
   let tick!: () => void
   const handle = { unref() {} } as ReturnType<typeof setInterval>

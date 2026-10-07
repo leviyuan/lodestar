@@ -217,7 +217,10 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
     options.report?.(`${agent}: 检查 upstream latest`)
     const versions = await resolveAgentPackages(agent, options.metadata ?? ((name, version) => metadata(name, version, options.signal)))
     options.signal?.throwIfAborted()
-    const security = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')).overrides ?? {}
+    const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+    // Runtime-only fixes must not install a Node 20+ dependency into the
+    // Node 18-compatible daemon. DSH already owns a separate Node 22+ tree.
+    const security = { ...manifest.overrides, ...manifest.agentRuntimeOverrides?.[agent] }
     const fingerprint = createHash('sha256').update(JSON.stringify({ installFormat: agent === 'dsh' ? 3 : 2, versions: Object.entries(versions).sort(), security,
       platform: process.platform, arch: process.arch })).digest('hex').slice(0, 20)
     const destination = join(directory, fingerprint)

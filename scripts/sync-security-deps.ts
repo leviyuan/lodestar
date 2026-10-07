@@ -1,4 +1,5 @@
-/** 消费者不会继承 overrides：同步普通安全依赖，Agent 独立自动更新。 */
+/** 消费者不会继承 overrides：同步普通安全依赖，Agent 独立自动更新。
+ * agentRuntimeOverrides 仅应用于指定 Agent 的独立依赖树，避免提高 daemon 的 Node 要求。 */
 import assert from 'node:assert/strict'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -10,6 +11,12 @@ const manifest = JSON.parse(original)
 for (const [name, version] of Object.entries(manifest.overrides)) {
   assert.equal(typeof version, 'string', `安全依赖必须使用显式版本：${name}`)
   manifest.dependencies[name] = version
+}
+for (const [agent, overrides] of Object.entries(manifest.agentRuntimeOverrides ?? {})) {
+  assert.ok(['codex', 'claude', 'dsh'].includes(agent), `未知 Agent 安全依赖范围：${agent}`)
+  for (const [name, version] of Object.entries(overrides as Record<string, unknown>)) {
+    assert.equal(typeof version, 'string', `运行时安全依赖必须使用显式版本：${agent}/${name}`)
+  }
 }
 manifest.dependencies = Object.fromEntries(Object.entries(manifest.dependencies).sort(([a], [b]) => a.localeCompare(b)))
 const output = JSON.stringify(manifest, null, 2) + '\n'
