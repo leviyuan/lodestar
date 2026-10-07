@@ -122,6 +122,10 @@ export interface AgentProcess extends EventEmitter {
   conversationMaterializationBarrier?(): Promise<void> | null
   conversationMaterializationFailure?(): Error | null
   sendUserText(text: string, files?: string[]): void
+  /** Append guidance without interrupting the running task. False means no
+   * native turn can accept it yet and nothing was submitted. Rejections must
+   * surface to the caller; an uncertain submission must never be replayed. */
+  steerUserText?(text: string, files?: string[], inputId?: string): Promise<boolean>
   sendInterrupt(): void
   sendPermissionResponse(
     requestId: string | number,
@@ -161,6 +165,15 @@ export type AgentProcessEventMap = {
   }
   turn_started: { turn_id?: string | null; thread_id?: string | null; retry?: boolean }
   turn_retry: AgentTurnRetry
+  /** Native input consumption, continuation, or cancellation failed. */
+  turn_input_error: { error: string }
+  /** Native execution reached this submitted input. Emitted in output order;
+   * the transport acknowledgement alone is not a consumption boundary. */
+  user_input_consumed: { inputId: string }
+  /** The next native non-user item starts. Consecutive consumed inputs before
+   * this boundary share one card, even when delivered in separate RPC frames. */
+  input_batch_end: { itemId: string }
+  thinking_progress: { estimatedTokens: number }
   /** Selection succeeded; diagnostics describe unused accounts and are for logs, not proactive alerts. */
   codex_account_changed: { accountId: string; previousAccountId: string | null; diagnostics: string[] }
   token_usage: TokenUsageUpdated

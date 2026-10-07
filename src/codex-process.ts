@@ -15,6 +15,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, stat
 import { homedir } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
 import { EventEmitter } from 'node:events'
+import { randomUUID } from 'node:crypto'
 import { StringDecoder } from 'node:string_decoder'
 import type { Readable, Writable } from 'node:stream'
 import { spawn as crossSpawn } from 'cross-spawn'
@@ -348,6 +349,8 @@ export class CodexProcess extends EventEmitter {
   private conversationMaterializationRetrySource: string | null = null
   private lastConversationMaterializationFailure: Error | null = null
   private currentTurnId: string | null = null
+  private steeringInputs = new Map<string, string>()
+  private inputConsumptionOpen = false
   private turnStartGeneration = 0
   private turnStartOwner: TurnStartAttempt | null = null
   private turnStartOwnersByTurnId = new Map<string, TurnStartAttempt>()
@@ -753,6 +756,7 @@ export class CodexProcess extends EventEmitter {
         // interrupted, or malformed terminal notification.
         this.lastCompletedTurnId = isCheckpointable ? completedTurnId : null
         this.currentTurnId = null
+        this.inputConsumptionOpen = false
         if (status === 'failed' && completedTurnId && isModelCapacityError(error?.message)
           && this.scheduleCapacityRetry(error.message, CODEX_CAPACITY_CONTINUATION)) return
         this.cancelCapacityRetry()
@@ -767,6 +771,9 @@ export class CodexProcess extends EventEmitter {
           usage: this.lastUsage,
           subtype,
           is_error: isError,
+        }
+        for (const [inputId, turnId] of this.steeringInputs ?? []) {
+          if (turnId === completedTurnId) this.steeringInputs.delete(inputId)
         }
         this.emit('result', {
           subtype,
@@ -867,6 +874,20 @@ export class CodexProcess extends EventEmitter {
       logUnhandledAppServerPayload('ITEM_STARTED_MISSING_ID', { method: 'item/started', params })
       return
     }
+    if (item.type === 'userMessage') {
+      const inputId = item.clientId
+      if (typeof inputId === 'string' && params.threadId === this.sessionId
+        && this.steeringInputs?.get(inputId) === params.turnId) {
+        this.steeringInputs.delete(inputId)
+        this.inputConsumptionOpen = true
+        this.emit('user_input_consumed', { inputId })
+      }
+      return
+    }
+    if (this.inputConsumptionOpen && params.turnId === this.currentTurnId) {
+      this.inputConsumptionOpen = false
+      this.emit('input_batch_end', { itemId: item.id })
+    }
     // 多 agent 编排 item 不走通用 tool_use 映射,先喂给 collab 状态机。
     if (this.feedCollabItem(item, 'started')) return
     const mapped = mapStartedItem(item, this.opts.workDir)
@@ -910,6 +931,7 @@ export class CodexProcess extends EventEmitter {
       logUnhandledAppServerPayload('ITEM_COMPLETED_MISSING_ID', { method: 'item/completed', params })
       return
     }
+    if (item.type === 'userMessage') return
     if (item.type === 'agentMessage') {
       this.lastAssistantUuid = item.id
       this.emit('assistant_block_stop', { index: item.id, parentToolUseId: null })
@@ -1721,6 +1743,31 @@ export class CodexProcess extends EventEmitter {
     void this.startTurn(fileHints + text, attempt).catch(e => this.failTurnStart(e, attempt))
   }
 
+  async steerUserText(text: string, files: string[] = [], inputId = randomUUID()): Promise<boolean> {
+    if (!this.alive || this.expectedExit) throw new Error('Codex 进程已关闭')
+    const turnId = this.currentTurnId
+    if (!turnId) return false
+    const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
+    this.steeringInputs ??= new Map()
+    this.steeringInputs.set(inputId, turnId)
+    let result: any
+    try {
+      result = await this.request('turn/steer', {
+        threadId: this.sessionId,
+        expectedTurnId: turnId,
+        clientUserMessageId: inputId,
+        input: [{ type: 'text', text: fileHints + text, text_elements: [] }],
+      })
+    } catch (error) {
+      // A definite RPC rejection did not admit this input. A transport error
+      // may still be followed by its authoritative item notification.
+      if (error instanceof CodexRpcResponseError) this.steeringInputs.delete(inputId)
+      throw error
+    }
+    if (result?.turnId !== turnId) throw new Error('Codex turn/steer 未确认目标回合，追加消息的接收状态未知')
+    return true
+  }
+
   async listModels(): Promise<CodexModel[]> {
     await this.ensureInitialized()
     const models: CodexModel[] = []
@@ -2035,6 +2082,8 @@ export class CodexProcess extends EventEmitter {
   }
 
   sendInterrupt(): void {
+    this.inputConsumptionOpen = false
+    this.steeringInputs?.clear()
     this.capacityRetryEnabled = false
     const wasWaiting = !!this.turnRetry && !this.currentTurnId
     this.cancelCapacityRetry()

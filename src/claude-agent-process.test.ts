@@ -26,6 +26,127 @@ const agentUpdates = await import('./agent-updates')
 // 每个用例前重置,避免互相污染。
 beforeEach(() => resetClaudeContextWindowCache())
 
+describe('Claude native steering', () => {
+  function running() {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high' }) as any
+    proc.started = true
+    const events: any[] = []
+    proc.on('result', (result: any) => events.push(result))
+    proc.handleMessage({ type: 'system', subtype: 'session_state_changed', state: 'running', uuid: 'turn-1' })
+    return { proc, events }
+  }
+  function result(proc: any, ids: string[], extra = {}) {
+    proc.handleMessage({ type: 'result', subtype: 'success', uuid: 'result',
+      user_message_uuids: ids, queued_turn_count: 0,
+      usage: { input_tokens: 10, output_tokens: 2 }, duration_ms: 100, num_turns: 1, ...extra })
+  }
+
+  test('streams guidance at the next native input boundary, with an independent input id', async () => {
+    const { proc, events } = running()
+    const consumed: any[] = []
+    proc.on('user_input_consumed', (event: any) => consumed.push(event))
+    expect(await proc.steerUserText('extra context', ['/tmp/input.txt'], 'input-1')).toBe(true)
+    const { value } = await proc.input.next()
+    expect(value.priority).toBe('next')
+    expect(value.message.content).toEqual([{ type: 'text', text: '[file: /tmp/input.txt]\n\nextra context' }])
+    expect(value.uuid).toBeString()
+    expect(events).toEqual([])
+    expect(consumed).toEqual([])
+    proc.handleMessage({ type: 'command_lifecycle', command_uuid: value.uuid, state: 'queued' })
+    expect(consumed).toEqual([])
+    proc.handleMessage({ type: 'command_lifecycle', command_uuid: 'unknown-input', state: 'started' })
+    proc.handleMessage({ type: 'command_lifecycle', command_uuid: value.uuid, state: 'started' })
+    proc.handleMessage({ type: 'command_lifecycle', command_uuid: value.uuid, state: 'completed' })
+    expect(consumed).toEqual([{ inputId: 'input-1' }])
+    result(proc, [value.uuid])
+    expect(events).toHaveLength(1)
+    expect(proc.steeringInputs.size).toBe(0)
+  })
+
+  test('headless input can be steered without session_state_changed and lifecycle receipts consume every input', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high' }) as any
+    proc.started = true
+    const events: any[] = []
+    proc.on('result', (event: any) => events.push(event))
+    proc.sendUserText('original request')
+    await proc.input.next()
+    expect(proc.turnActive).toBe(false)
+    for (let i = 0; i < 65; i++) {
+      expect(await proc.steerUserText(`guidance ${i}`)).toBe(true)
+      const { value } = await proc.input.next()
+      proc.handleMessage({ type: 'command_lifecycle', command_uuid: value.uuid, state: 'started' })
+    }
+    // Native result uuid lists are capped; per-command receipts must suffice.
+    result(proc, [])
+    expect(events).toHaveLength(1)
+    expect(proc.steeringInputs.size).toBe(0)
+  })
+
+  test('a result preceding consumption keeps one logical task and aggregates native turns', async () => {
+    const { proc, events } = running()
+    const starts: any[] = []
+    proc.on('turn_started', (event: any) => starts.push(event))
+    await proc.steerUserText('arrived at boundary')
+    const { value } = await proc.input.next()
+    result(proc, ['original'], { queued_turn_count: 1 })
+    expect(events).toEqual([])
+    proc.handleMessage({ type: 'system', subtype: 'session_state_changed', state: 'running', uuid: 'turn-2' })
+    expect(starts[0].retry).toBe(true)
+    result(proc, [value.uuid])
+    expect(events).toHaveLength(1)
+    expect(events[0].duration_ms).toBe(200)
+    expect(proc.lastUsage.input_tokens).toBe(20)
+    expect(proc.lastResult.num_turns).toBe(2)
+    expect(proc.steeringResults).toEqual([])
+  })
+
+  test('intermediate failures remain visible and cannot become a successful aggregate', async () => {
+    const { proc, events } = running()
+    const failures: any[] = []
+    proc.on('turn_input_error', (event: any) => failures.push(event))
+    await proc.steerUserText('follow-up')
+    const { value } = await proc.input.next()
+    result(proc, [], { is_error: true, subtype: 'error_during_execution', errors: ['upstream failed'] })
+    expect(failures).toEqual([{ error: 'upstream failed' }])
+    result(proc, [value.uuid])
+    expect(events[0].is_error).toBe(true)
+    expect(events[0].error).toBe('upstream failed')
+  })
+
+  test('stop clears unwritten guidance and requests native cancellation of queued inputs', async () => {
+    const { proc, events } = running()
+    const interruptions: any[] = []
+    proc.query = { interrupt: async (options: any) => { interruptions.push(options); return { still_queued: [], cancelled: [] } } }
+    await proc.steerUserText('must be cancelled')
+    proc.sendInterrupt()
+    expect(interruptions).toEqual([{ cancelQueued: true }])
+    expect(proc.input.items).toEqual([])
+    expect(proc.steeringInputs.size).toBe(0)
+    result(proc, [], { is_error: true, subtype: 'interrupted' })
+    expect(events).toHaveLength(1)
+    expect(await proc.steerUserText('idle')).toBe(false)
+    proc.alive = false
+    await expect(proc.steerUserText('closed')).rejects.toThrow('已关闭')
+  })
+
+  test('an upstream cancellation after a deferred result fails visibly without waiting forever', async () => {
+    const { proc, events } = running()
+    const failures: any[] = []
+    proc.on('turn_input_error', (event: any) => failures.push(event))
+    await proc.steerUserText('cancelled upstream')
+    const { value } = await proc.input.next()
+    result(proc, [])
+    expect(events).toEqual([])
+    proc.handleMessage({ type: 'command_lifecycle', command_uuid: value.uuid, state: 'cancelled' })
+    expect(events).toHaveLength(1)
+    expect(events[0].is_error).toBe(true)
+    expect(events[0].error).toContain('取消')
+    expect(failures).toHaveLength(1)
+    expect(proc.steeringInputs.size).toBe(0)
+    expect(proc.steeringResults).toEqual([])
+  })
+})
+
 describe('Claude model profiles', () => {
   test('SDK launches opt into task tracking while preserving routing and project tool restrictions', async () => {
     const captured: any[] = []

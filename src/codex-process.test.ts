@@ -78,6 +78,70 @@ test('returning to a Codex subscription overrides a previous API provider on res
 
 type ProtocolCall = { method: string; params: any }
 
+test('steering targets the active Codex turn without starting or interrupting it', async () => {
+  const { proc, calls, events } = makeCodexProtocolHarness({}, (method, params) => {
+    expect(method).toBe('turn/steer')
+    return { turnId: params.expectedTurnId }
+  })
+  proc.sessionId = 'thread'
+  proc.currentTurnId = 'active-turn'
+  await expect(proc.steerUserText('focus on tests', ['/tmp/input.txt'], 'input-1')).resolves.toBe(true)
+  expect(calls).toEqual([{ method: 'turn/steer', params: {
+    threadId: 'thread', expectedTurnId: 'active-turn', clientUserMessageId: 'input-1',
+    input: [{ type: 'text', text: '[file: /tmp/input.txt]\n\nfocus on tests', text_elements: [] }],
+  } }])
+  expect(events).toEqual([])
+  expect(proc.currentTurnId).toBe('active-turn')
+  const notification = { threadId: 'thread', turnId: 'active-turn', item: { type: 'userMessage', id: 'native-item', clientId: 'input-1', content: [] } }
+  proc.handleNotification('item/started', { ...notification, threadId: 'child-thread' })
+  proc.handleNotification('item/started', { ...notification, turnId: 'old-turn' })
+  proc.handleNotification('item/started', { ...notification, item: { ...notification.item, clientId: 'unknown-input' } })
+  expect(events.filter(([name]) => name === 'user_input_consumed')).toEqual([])
+  proc.handleNotification('item/started', notification)
+  proc.handleNotification('item/started', notification)
+  proc.handleNotification('item/completed', notification)
+  expect(events.filter(([name]) => name === 'user_input_consumed')).toEqual([['user_input_consumed', { inputId: 'input-1' }]])
+  expect(events.filter(([name]) => name === 'input_batch_end')).toEqual([])
+  proc.handleNotification('item/started', { threadId: 'child-thread', turnId: 'child-turn', item: { type: 'reasoning', id: 'child-reasoning' } })
+  expect(events.filter(([name]) => name === 'input_batch_end')).toEqual([])
+  proc.handleNotification('item/started', { threadId: 'thread', turnId: 'active-turn', item: { type: 'reasoning', id: 'main-reasoning' } })
+  proc.handleNotification('item/started', { threadId: 'thread', turnId: 'active-turn', item: { type: 'reasoning', id: 'main-reasoning-2' } })
+  expect(events.filter(([name]) => name === 'input_batch_end')).toEqual([['input_batch_end', { itemId: 'main-reasoning' }]])
+})
+
+test('Codex consumption can precede its RPC receipt and remains in native event order', async () => {
+  let proc: any
+  const h = makeCodexProtocolHarness({}, async (_method, params) => {
+    proc.handleNotification('item/started', { threadId: 'thread', turnId: 'turn',
+      item: { type: 'userMessage', id: 'native-item', clientId: params.clientUserMessageId, content: [] } })
+    expect(h.events.map(([name]) => name)).toEqual(['user_input_consumed'])
+    return { turnId: 'turn' }
+  })
+  proc = h.proc
+  proc.sessionId = 'thread'; proc.currentTurnId = 'turn'
+  await proc.steerUserText('guidance', [], 'before-ack')
+  expect(h.events).toEqual([['user_input_consumed', { inputId: 'before-ack' }]])
+})
+
+test('idle steering submits nothing; rejection and unknown receipts never start another turn', async () => {
+  for (const outcome of ['rejected', 'malformed', 'late-success']) {
+    const { proc, calls, events } = makeCodexProtocolHarness({}, () => {
+      proc.currentTurnId = null
+      if (outcome === 'rejected') throw new Error('no active turn')
+      return outcome === 'malformed' ? {} : { turnId: 'active-turn' }
+    })
+    expect(await proc.steerUserText('idle')).toBe(false)
+    expect(calls).toEqual([])
+    proc.sessionId = 'thread'
+    proc.currentTurnId = 'active-turn'
+    if (outcome === 'late-success') await expect(proc.steerUserText('more')).resolves.toBe(true)
+    else await expect(proc.steerUserText('more')).rejects.toThrow(outcome === 'rejected' ? 'no active turn' : '未确认')
+    expect(calls.map(call => call.method)).toEqual(['turn/steer'])
+    expect(events).toEqual([])
+    expect(proc.currentTurnId).toBeNull()
+  }
+})
+
 test('model discovery rejects repeated or malformed pagination instead of looping or returning a partial catalog', async () => {
   for (const nextCursor of ['repeated-page', 42, undefined]) {
     let pages = 0

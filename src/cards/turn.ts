@@ -267,14 +267,14 @@ interface MainCardOpts {
    *   'card_full'      — 同一 turn 的续卡：前卡体积或组件数量超限后创建，
    *                     (banner `📨 接续上一张`,无 panel,turn 号跟旧卡
    *                     相同)
+   *   'user_steering'  — 同一任务收到补充消息后续卡，顶部显示补充内容
    *   'bg_task_resume' — 后台任务结算后 SDK 自发的恢复轮(无用户消息,
    *                     banner `🔁 后台任务完成`,无 panel)
    *   'scheduled_wakeup' — Claude SDK Cron 定时唤醒轮
    *                        (banner `⏰ 定时任务触发`,无 prompt panel) */
-  kind?: 'user_message' | 'card_full' | 'bg_task_resume' | 'scheduled_wakeup'
-  /** 本轮 Codex 收到的 user wireText 列表。boot turn 通常是 1 条;mid-turn
-   * 用户连发的 N 条会在下一 turn 一并塞进。空数组 / undefined 时不渲染
-   * userInput panel。 */
+  kind?: 'user_message' | 'user_steering' | 'card_full' | 'bg_task_resume' | 'scheduled_wakeup'
+  /** 本卡对应的用户输入；追加续卡只显示本批补充消息。
+   * 空数组 / undefined 时不渲染 userInput panel。 */
   userInputs?: string[]
   /** Initial stable footer text. Session replaces it with a live timer
    * after it has converted message_id → card_id, but this value is what
@@ -297,7 +297,7 @@ export function mainConversationCard(opts: MainCardOpts): object {
         ? [{ tag: 'markdown', content: `⏰ 定时任务触发，${providerLabel} 正在执行巡检 #${opts.turn}` }]
       : []
   const inputs = opts.userInputs ?? []
-  const userInputHeader = `📥 收到 (${inputs.length}) ${opts.directStart ? '🚀' : `#${opts.turn}`}`
+  const userInputHeader = `📥 ${opts.kind === 'user_steering' ? '追加' : '收到'} (${inputs.length}) ${opts.directStart ? '🚀' : `#${opts.turn}`}`
   const userInputPanel = inputs.length > 0
     ? [{
         tag: 'collapsible_panel',

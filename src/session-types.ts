@@ -20,6 +20,8 @@ export interface TurnState {
    * urgent_app push so only the initiator gets pinged (in case there
    * are other members in the group). Empty string → skip the ping. */
   userOpenId: string
+  /** Input receipts and their card handoffs must settle before closing this turn. */
+  steeringInflight?: Set<Promise<void>>
   /** What kicked off this turn. Kept explicit for turn lifecycle logic.
    *   'user_message'   — 用户消息批次
    *   'bg_task_resume' — 后台任务结算后 SDK 自发的恢复轮(无用户消息;
@@ -157,8 +159,8 @@ export interface TurnState {
    * don't all queue duplicate rotation attempts. null means "no rotation
    * in flight". */
   rotating: Promise<void> | null
-  /** How many times this turn has rotated to a fresh card, proactive and
-   * reactive combined. Informational only; pagination has no turn-wide cap.
+  /** How many times this turn has rotated for capacity or supplemental input.
+   * Informational only; pagination has no turn-wide cap.
    * Reset per turn (a fresh TurnState starts at 0). */
   rotateCount: number
   /** 仅统计容量错误触发的换卡，不限制次数。

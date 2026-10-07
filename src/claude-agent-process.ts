@@ -3,6 +3,7 @@ import { homedir } from 'node:os'
 import { spawn as crossSpawn } from 'cross-spawn'
 import { delimiter, join } from 'node:path'
 import { EventEmitter } from 'node:events'
+import { randomUUID } from 'node:crypto'
 import {
   type AccountInfo,
   type EffortLevel,
@@ -64,9 +65,11 @@ class AsyncQueue<T> implements AsyncIterableIterator<T> {
   }
 
   abort(): void {
-    this.items = []
+    this.clear()
     this.close()
   }
+
+  clear(): void { this.items = [] }
 
   [Symbol.asyncIterator](): AsyncIterableIterator<T> {
     return this
@@ -609,6 +612,15 @@ export class ClaudeAgentProcess extends EventEmitter {
   private requestCounter = 0
   private cumulativeUsageFromResults: CodexUsage | null = null
   private turnActive = false
+  /** Headless SDK streams do not always emit session_state_changed. A
+   * submitted prompt also owns the task until its authoritative result. */
+  private inputTurnPending = false
+  private steeringInputs = new Set<string>()
+  /** A native result can beat a streaming-input write. Keep that native
+   * continuation in the same visible task, and retain all result metadata. */
+  private steeringResults: Array<{ usage: CodexUsage | null; duration: number | null; turns: number; error: string | null }> = []
+  private steeringFailures: string[] = []
+  private deferredSteeringResult: { raw: any; subtype: string; error: string | null } | null = null
   private emittedToolUseIds = new Set<string>()
   private emittedToolResultIds = new Set<string>()
   private pendingServerToolInputs: PendingServerToolInput[] = []
@@ -760,6 +772,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (!this.started) this.sendInitialize()
     const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
     try {
+      this.inputTurnPending = true
       this.input.push({
         type: 'user',
         session_id: this.sessionId ?? '',
@@ -777,8 +790,44 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
   }
 
+  async steerUserText(text: string, files: string[] = [], inputId = randomUUID()): Promise<boolean> {
+    if (!this.alive || this.expectedExit) throw new Error('Claude 进程已关闭')
+    if (!this.turnActive && !this.inputTurnPending && this.steeringResults.length === 0) return false
+    const uuid = inputId
+    const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
+    this.steeringInputs.add(uuid)
+    try {
+      this.input.push({ type: 'user', uuid, session_id: this.sessionId ?? '',
+        message: { role: 'user', content: [{ type: 'text', text: fileHints + text }] },
+        // `now` aborts the current native request. `next` is folded in at
+        // a tool boundary, or starts the next native turn if this one ended.
+        parent_tool_use_id: null, priority: 'next' })
+    } catch (error) {
+      this.steeringInputs.delete(uuid)
+      throw error
+    }
+    return true
+  }
+
   sendInterrupt(): void {
-    void this.query?.interrupt().catch(e => log(`claude-agent-process: interrupt failed: ${e}`))
+    this.input.clear()
+    this.inputTurnPending = false
+    this.steeringInputs.clear()
+    this.steeringResults = []
+    this.steeringFailures = []
+    this.deferredSteeringResult = null
+    // The runtime supports cancel_queued, while the SDK public declaration
+    // still omits the options argument. Cancel both already-written messages
+    // and the local stream backlog so stop cannot wake another user turn.
+    const query = this.query as (Query & { interrupt(options: { cancelQueued: true }): ReturnType<Query['interrupt']> }) | null
+    void query?.interrupt({ cancelQueued: true }).then(receipt => {
+      if (!receipt || !Array.isArray(receipt.still_queued) || receipt.still_queued.length > 0) {
+        throw new Error('停止请求未确认全部追加消息已取消')
+      }
+    }).catch(e => {
+      log(`claude-agent-process: interrupt failed: ${e}`)
+      this.emit('turn_input_error', { error: `停止请求失败：${e instanceof Error ? e.message : String(e)}` })
+    })
   }
 
   sendPermissionResponse(
@@ -1023,6 +1072,11 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (!this.alive) return
     this.alive = false
     this.turnActive = false
+    this.inputTurnPending = false
+    this.steeringInputs.clear()
+    this.steeringResults = []
+    this.steeringFailures = []
+    this.deferredSteeringResult = null
     this.denyPendingPermissions('claude process exited')
     this.resolveExit()
     log(`claude-agent-process: exited code=${code} signal=${signal} expected=${this.expectedExit}`)
@@ -1068,6 +1122,29 @@ export class ClaudeAgentProcess extends EventEmitter {
       case 'result':
         this.handleResultMessage(raw)
         return
+      case 'command_lifecycle':
+        if (typeof raw.command_uuid !== 'string' || !['queued', 'started', 'completed', 'cancelled'].includes(raw.state)) {
+          log(`claude-agent-process: malformed command lifecycle ${JSON.stringify(raw)}`)
+          return
+        }
+        if (raw.state === 'started' || raw.state === 'completed') {
+          if (this.steeringInputs.delete(raw.command_uuid)) {
+            this.inputTurnPending = true
+            if (raw.state === 'started') this.emit('user_input_consumed', { inputId: raw.command_uuid })
+          }
+        }
+        if (raw.state === 'cancelled' && this.steeringInputs.delete(raw.command_uuid)) {
+          const error = '原生 Claude 取消了一条尚未处理的追加消息，请重新发送。'
+          this.steeringFailures.push(error)
+          this.emit('turn_input_error', { error })
+          // Cancellation outside our own stop path must not leave an already
+          // completed native turn waiting forever for the discarded input.
+          if (!this.steeringInputs.size && !this.inputTurnPending && !this.turnActive && this.deferredSteeringResult) {
+            const deferred = this.deferredSteeringResult
+            this.finishInputResult(deferred.raw, deferred.subtype, deferred.error)
+          }
+        }
+        return
       case 'rate_limit_event':
         this.emit('rate_limits_updated', raw.rate_limit_info)
         return
@@ -1092,7 +1169,8 @@ export class ClaudeAgentProcess extends EventEmitter {
           // A checkpoint belongs to exactly one clean turn. Clear the prior
           // assistant UUID at the authoritative SDK turn boundary.
           this.lastAssistantUuid = null
-          this.emit('turn_started', { turn_id: raw.uuid, thread_id: this.sessionId })
+          this.emit('turn_started', { turn_id: raw.uuid, thread_id: this.sessionId,
+            ...(this.steeringResults.length ? { retry: true } : {}) })
         } else if (raw.state === 'idle') {
           this.turnActive = false
         }
@@ -1178,6 +1256,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   private handleAssistantMessage(raw: any): void {
+    this.confirmSteeringInputs(raw)
     if (!raw.parent_tool_use_id) this.lastThinkingTokens = null
     const message = raw.message
     const parentToolUseId = typeof raw.parent_tool_use_id === 'string' && raw.parent_tool_use_id
@@ -1301,6 +1380,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   private handleResultMessage(raw: any): void {
     if (typeof raw.session_id === 'string' && raw.session_id) this.sessionId = raw.session_id
     this.turnActive = false
+    this.inputTurnPending = false
     const usage = usageFromSdk(raw.usage)
     const modelUsageRaw = raw.modelUsage ?? raw.model_usage
     const total = totalUsageFromModelUsage(modelUsageRaw)
@@ -1356,24 +1436,53 @@ export class ClaudeAgentProcess extends EventEmitter {
       })
     }
     const subtype = typeof raw.subtype === 'string' ? raw.subtype : raw.is_error ? 'error' : 'success'
+    this.confirmSteeringInputs(raw)
+    const resultError = raw.is_error === true || subtype !== 'success'
+      ? Array.isArray(raw.errors) && raw.errors.length
+        ? raw.errors.map(String).join('\n')
+        : String(raw.result ?? raw.error ?? raw.api_error_message ?? subtype)
+      : null
+    if (this.steeringInputs.size || this.steeringResults.length) {
+      this.steeringResults.push({ usage, duration: typeof raw.duration_ms === 'number' ? raw.duration_ms : null,
+        turns: typeof raw.num_turns === 'number' ? raw.num_turns : 1, error: resultError })
+      if (this.steeringInputs.size) {
+        this.deferredSteeringResult = { raw, subtype, error: resultError }
+        if (resultError) this.emit('turn_input_error', { error: resultError })
+        log(`claude-agent-process: native result has ${this.steeringInputs.size} unconsumed steering inputs`)
+        return
+      }
+    }
+    this.finishInputResult(raw, subtype, resultError)
+  }
+
+  private finishInputResult(raw: any, subtype: string, resultError: string | null): void {
+    this.deferredSteeringResult = null
+    const continued = this.steeringResults.splice(0)
+    const errors = continued.length ? continued.flatMap(r => r.error ? [r.error] : []) : resultError ? [resultError] : []
+    errors.push(...this.steeringFailures.splice(0))
+    if (continued.length) {
+      this.lastUsage = continued.every(r => r.usage !== null)
+        ? continued.reduce<CodexUsage | null>((total, r) => addUsageTotals(total, r.usage!), null) : null
+    }
     // A context-length error proves this request was too large, not that the
     // endpoint has a 200K window. Keep the reported capacity and requested model.
     this.lastResult = {
       cost_usd: null,
       cost_delta_usd: null,
-      duration_ms: typeof raw.duration_ms === 'number' ? raw.duration_ms : null,
-      num_turns: typeof raw.num_turns === 'number' ? raw.num_turns : 1,
+      duration_ms: continued.length ? continued.every(r => r.duration !== null)
+        ? continued.reduce((total, r) => total + r.duration!, 0) : null
+        : typeof raw.duration_ms === 'number' ? raw.duration_ms : null,
+      num_turns: continued.length ? continued.reduce((total, r) => total + r.turns, 0)
+        : typeof raw.num_turns === 'number' ? raw.num_turns : 1,
       usage: this.lastUsage,
-      subtype,
-      is_error: raw.is_error === true || subtype !== 'success',
+      subtype: errors.length && subtype === 'success' ? 'claude_steering_failed' : subtype,
+      is_error: errors.length > 0,
     }
     this.emit('result', {
-      subtype,
+      subtype: this.lastResult.subtype,
       is_error: this.lastResult.is_error,
       ...(this.lastResult.is_error ? {
-        error: Array.isArray(raw.errors) && raw.errors.length
-          ? raw.errors.map(String).join('\n')
-          : String(raw.result ?? raw.error ?? raw.api_error_message ?? subtype),
+        error: errors.join('\n'),
       } : {}),
       duration_ms: this.lastResult.duration_ms,
       usage: this.lastUsage,
@@ -1388,8 +1497,17 @@ export class ClaudeAgentProcess extends EventEmitter {
     })
   }
 
+  private confirmSteeringInputs(raw: any): void {
+    if (raw.parent_tool_use_id) return
+    const ids = Array.isArray(raw.user_message_uuids) ? raw.user_message_uuids : []
+    for (const id of [...ids, raw.user_message_uuid]) {
+      if (typeof id === 'string' && this.steeringInputs.delete(id) && raw.type !== 'result') this.inputTurnPending = true
+    }
+  }
+
   private failTurnStart(e: Error): void {
     this.turnActive = false
+    this.inputTurnPending = false
     this.lastAssistantUuid = null
     this.lastResult = {
       cost_usd: null,

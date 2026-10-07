@@ -64,6 +64,27 @@ function harness(choices: Array<CodexAccountDecision | Promise<CodexAccountDecis
 }
 
 describe('Codex account process ownership and recovery', () => {
+  test('steering uses only the current ready child and is not retained for account recovery', async () => {
+    const h = harness()
+    expect(await h.proc.steerUserText('before init')).toBe(false)
+    await h.proc.initializationPromise()
+    const sent: any[] = []
+    const child = h.children[0] as any
+    child.steerUserText = async (...args: any[]) => { sent.push(args); return true }
+    expect(await h.proc.steerUserText('during work', ['/tmp/context.txt'], 'input-1')).toBe(true)
+    expect(sent).toEqual([['during work', ['/tmp/context.txt'], 'input-1']])
+    const consumed: any[] = []
+    h.proc.on('user_input_consumed', event => consumed.push(event))
+    child.emit('user_input_consumed', { inputId: 'input-1' })
+    expect(consumed).toEqual([{ inputId: 'input-1' }])
+    ;(h.proc as any).starting = true
+    expect(await h.proc.steerUserText('waiting')).toBe(false)
+    expect((h.proc as any).inputs).toEqual([])
+    ;(h.proc as any).starting = false
+    child.steerUserText = async () => { throw new Error('steering refused') }
+    await expect(h.proc.steerUserText('rejected')).rejects.toThrow('steering refused')
+    expect(child.sent).toEqual([])
+  })
   test('only actual current-turn usage suppresses redundant background activation', async () => {
     const h = harness()
     await h.proc.initializationPromise()

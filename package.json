@@ -1,6 +1,6 @@
 {
   "name": "@leviyuan/lodestar",
-  "version": "0.19.14",
+  "version": "0.20.0",
   "publishConfig": {
     "access": "public"
   },
@@ -69,7 +69,7 @@
   "dependencies": {
     "@hono/node-server": "1.19.15",
     "@larksuiteoapi/node-sdk": "^1.73.0",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "1.32.1",
     "@resvg/resvg-js": "^2.6.2",
     "@xmldom/xmldom": "0.9.12",
     "axios": "1.20.0",
@@ -83,6 +83,7 @@
     "mathjax-full": "^3.2.2",
     "node-fetch": "^3.3.2",
     "protobufjs": "7.6.5",
+    "proxy-addr": "2.0.8",
     "qs": "6.16.0",
     "ws": "8.21.3",
     "zod": "^4.4.3"
@@ -92,6 +93,7 @@
   ],
   "overrides": {
     "@hono/node-server": "1.19.15",
+    "@modelcontextprotocol/sdk": "1.32.1",
     "@xmldom/xmldom": "0.9.12",
     "axios": "1.20.0",
     "fast-uri": "3.1.8",
@@ -99,6 +101,7 @@
     "hono": "4.13.12",
     "ip-address": "10.7.2",
     "protobufjs": "7.6.5",
+    "proxy-addr": "2.0.8",
     "qs": "6.16.0",
     "ws": "8.21.3"
   },

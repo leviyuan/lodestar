@@ -17,7 +17,7 @@ import { isDshReasoningEffort } from './agent-process'
  */
 
 import { existsSync } from 'node:fs'
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import {
   CODEX_EFFORT,
@@ -29,6 +29,7 @@ import {
   type CanUseToolRequest,
   type CodexReasoningEffort,
   type CodexUsage,
+  type CodexResultMeta,
   type ContextCompactedNotification,
   type HookCallbackRequest,
   type PlanDelta,
@@ -369,29 +370,37 @@ export class Session {
 
   // ── strictly private state ──
   /** Number of daemon writes handed to the backend but not yet claimed by an
-   * authoritative backend turn boundary (`init`/`turn_started`). Mid-turn
-   * user messages stay in `pendingMidTurnMsgs` and are joined into exactly one
-   * `sendUserText`, so production keeps this at 0 or 1. A boundary belonging
+   * authoritative backend turn boundary (`init`/`turn_started`). Next-turn
+   * batches use one `sendUserText`; native steering does not claim a new
+   * turn, so production keeps this at 0 or 1. A boundary belonging
    * to an already eager-opened card must still consume the claim before the
    * currentTurn/openingTurn guard returns; otherwise the next Claude
    * task-notification init is misclassified as a user batch and opens an empty
    * `trigger=user_message inputs=0` card. */
   pendingUserMessageCount = 0
-  /** Mid-turn user messages buffered DAEMON-SIDE (not yet sendUserText'd
-   * to the SDK). Drained in the `result` handler by writing each to SDK
-   * stdin, which doubles as the wake signal the Codex app-server needs
-   * to start the next batch turn (it won't auto-dequeue queued
-   * type-ahead msgs after `result` — confirmed in dogfood testing).
-   * Buffering also keeps mid-turn msgs out
-   * of any AskUserQuestion `QUEUE remove` storm, since they were never
-   * in the SDK queue to begin with. */
+  /** Not yet submitted: drained into a native active turn when supported,
+   * otherwise submitted together at the next turn boundary. */
   pendingMidTurnMsgs: Array<{ text: string; wireText: string; userOpenId: string; msgId: string }> = []
+  private steeringSend: Promise<void> | null = null
+  private steeringGeneration = 0
+  private submittedSteering = new Map<string, {
+    proc: AgentProcess; epoch: number; generation: number; turn: TurnState
+    consumed: boolean
+    batch: Array<{ text: string; wireText: string; userOpenId: string; msgId: string }>
+    reactions: Map<string, string>
+  }>()
+  private steeringBoundary: {
+    turn: TurnState; proc: AgentProcess; epoch: number; generation: number
+    inputs: string[]; inputIds: string[]; collecting: boolean; start: () => void
+    reactionOwners: Array<{ batch: Array<{ msgId: string }>; reactions: Map<string, string> }>
+    events: Array<() => void>
+  } | null = null
   /** 下一个 turn 的 user inputs 暂存区。所有 sendUserText 的 wireText 在
    * sendUserText 之前 push 这里;openTurnCard 创建 turn 时一次性取走 + clear。
    * mainConversationCard 把这些 wireText 渲染成顶部"📥 收到 (N)"折叠面板,
    * 让用户在卡片自己里就能看到这一轮触发了什么(不必滚群里找原消息)。
-   * mid-turn buffer 的消息不在这里 push —— 它们走 drainMidTurnAndOpen 那条
-   * 路径,drain 时统一 push。 */
+   * 已追加的消息触发续卡并显示在新卡顶部；仍待下一轮的消息由
+   * drainMidTurnAndOpen 在开卡前统一 push。 */
   pendingTurnInputs: string[] = []
   /** 用户用 `>>>`(≥3 个 >)主动开启的多条消息缓冲。null = 当前不在多条
    *  收集模式;非 null = 正在累积,直到 `<<<`(≥3 个 <)收尾合并成一条
@@ -411,9 +420,9 @@ export class Session {
   /** Feishu message_ids of user messages that arrived while the daemon
    * was busy (turn in flight or mid-open), mapped to the `reaction_id`
    * of the `OneSecond` reaction placed at arrival. The reaction_id is
-   * what `deleteReaction` needs to *remove* the OneSecond once the
-   * message has been absorbed by the SDK (either system-reminder
-   * injection mid-turn or a merged-batch dequeue on next turn).
+   * removed when the supplemental card is successfully sent. Native
+   * consumption and submit ACKs keep it visible while the card is pending.
+   * Stop/exit and terminal cleanup also release their owned reactions.
    * User feedback (2026-05-15): replacing OneSecond with a second
    * CheckMark stacked two emojis on the same row; cleaner UX is
    * "queued → released" via removal, not "queued → done" via
@@ -1316,6 +1325,7 @@ export class Session {
     this.openingTurnOwner = null
     this.openingTurn = false
     owner.resolveDone()
+    this.steerPendingInputs()
   }
 
   private invalidateTurnOpen(): void {
@@ -1339,6 +1349,9 @@ export class Session {
   }
 
   private attachProc(proc: AgentProcess): void {
+    this.submittedSteering.clear()
+    this.steeringBoundary?.start()
+    this.steeringBoundary = null
     this.modelSettingsChange?.cancel('原进程已更换')
     this.modelSettingsChange = null
     this.invalidateTurnOpen()
@@ -1352,6 +1365,9 @@ export class Session {
 
   private detachProc(proc: AgentProcess): boolean {
     if (this.proc !== proc) return false
+    this.submittedSteering.clear()
+    this.steeringBoundary?.start()
+    this.steeringBoundary = null
     this.modelSettingsChange?.cancel('原进程已退出')
     this.modelSettingsChange = null
     this.invalidateTurnOpen()
@@ -1367,6 +1383,10 @@ export class Session {
   }
 
   private beginProcStop(proc: AgentProcess): void {
+    this.steeringGeneration++
+    this.submittedSteering.clear()
+    this.steeringBoundary?.start()
+    this.steeringBoundary = null
     if (this.modelSettingsChange?.proc === proc) {
       this.modelSettingsChange.cancel('原进程正在停止')
       this.modelSettingsChange = null
@@ -2837,6 +2857,10 @@ export class Session {
   }
 
   interrupt(): void {
+    this.steeringGeneration++
+    this.submittedSteering.clear()
+    this.steeringBoundary?.start()
+    this.steeringBoundary = null
     if (!this.proc) return
     log(`session "${this.sessionName}": interrupt`)
     this.proc.sendInterrupt()
@@ -2934,15 +2958,9 @@ export class Session {
   }
 
   // ── Inbound from Feishu ────────────────────────────────────────────
-  /** Inbound user message. Starts a Codex turn immediately when idle —
-   * the SDK queues internally if a turn is in flight (FIFO, exactly the
-   * type-ahead semantics of the native Codex UI). Card opening:
-   *   - First msg of session OR no turn in flight  → open card eagerly here
-   *   - Mid-flight msg                              → defer; the `init`
-   *     handler opens its card when the SDK actually starts the turn
-   * This is what lets a single subprocess host both user-typed turns and
-   * cron-fired wakeups without the daemon ever calling `sendInterrupt` —
-   * `kill`/`stop` are the only paths that interrupt now. */
+  /** Idle input starts a turn. Running Codex/Claude tasks receive native
+   * steering input without interruption; opening/recovering processes and
+   * backends without steering retain the explicit pending batch. */
   async onUserMessage(text: string, files: string[] = [], userOpenId = '', msgId = ''): Promise<void> {
     await this.runLifecycle('user-message', () => this.onUserMessageUnlocked(text, files, userOpenId, msgId))
   }
@@ -2985,6 +3003,7 @@ export class Session {
       this.proc?.isAlive() &&
       !this.currentTurn &&
       !this.openingTurn &&
+      !this.steeringSend &&
       this.pendingUserMessageCount === 0 &&
       this.pendingMidTurnMsgs.length === 0
     ) {
@@ -3045,15 +3064,10 @@ export class Session {
       return
     }
 
-    if (this.currentTurn !== null) {
-      // Mid-turn — BUFFER instead of immediate sendUserText. The SDK polling
-      // loop will not auto-dequeue queued type-ahead msgs after `result`
-      // (we explicitly write again to wake the Codex app-server),
-      // so writing here would leave the msg stuck until the next user msg
-      // arrives. Drain happens in the `result` handler, which both wakes
-      // the SDK and opens a fresh card for the new batch turn.
+    if (this.currentTurn !== null || this.steeringSend) {
       this.pendingMidTurnMsgs.push({ text, wireText, userOpenId, msgId })
       if (msgId) trackReaction(msgId)
+      this.steerPendingInputs()
       return
     }
 
@@ -3502,7 +3516,7 @@ export class Session {
     // attachProc() and passes the already-incremented generation.
     if (wiredEpoch === undefined) {
       this.invalidateTurnOpen()
-      }
+    }
     const epoch = wiredEpoch ?? ++this.procEpoch
     if (wiredEpoch === undefined && this.proc !== p) this.proc = p
     const isCurrent = (): boolean => this.proc === p && this.procEpoch === epoch
@@ -3510,24 +3524,52 @@ export class Session {
     let stoppedEventLogged = false
     const on = <K extends keyof AgentProcessEventMap>(
       event: K,
-      handler: (payload: AgentProcessEventMap[K]) => void,
+      handler: (payload: AgentProcessEventMap[K], snapshot: { result: CodexResultMeta; totalUsage: CodexUsage | null }) => void,
     ): void => {
       p.on(event, (payload: AgentProcessEventMap[K]) => {
-        if (!isCurrent()) {
-          if (!staleEventLogged) {
-            staleEventLogged = true
-            log(`session "${this.sessionName}": ignore stale ${p.provider} event=${String(event)} epoch=${epoch} currentEpoch=${this.procEpoch}`)
+        const generation = this.steeringGeneration
+        const snapshot = { result: { ...p.lastResult }, totalUsage: p.lastTotalUsage ? { ...p.lastTotalUsage } : null }
+        const dispatch = (): void => {
+          if (!isCurrent()) {
+            if (!staleEventLogged) {
+              staleEventLogged = true
+              log(`session "${this.sessionName}": ignore stale ${p.provider} event=${String(event)} epoch=${epoch} currentEpoch=${this.procEpoch}`)
+            }
+            return
           }
-          return
-        }
-        if (event !== 'exit' && (this.stoppingProc === p || this.blockedProc === p)) {
-          if (!stoppedEventLogged) {
-            stoppedEventLogged = true
-            log(`session "${this.sessionName}": ignore ${p.provider} event=${String(event)} while process stop is pending`)
+          if (generation !== this.steeringGeneration && event !== 'exit' && event !== 'error') return
+          const boundary = this.steeringBoundary
+          if (boundary && boundary.proc === p && boundary.epoch === epoch
+            && event !== 'error' && !(event === 'exit' && (this.stoppingProc === p || this.blockedProc === p))) {
+            if (event === 'user_input_consumed' && boundary.collecting) {
+              handler(payload, snapshot)
+              return
+            }
+            boundary.events.push(dispatch)
+            // Native user items can span multiple stdio frames. Finish the
+            // input run on actual Agent activity, never an elapsed debounce
+            // interval, an RPC receipt, or a quota/usage notification.
+            const mainThread = !payload || typeof payload !== 'object'
+              || !('parentToolUseId' in payload) || !payload.parentToolUseId
+            if (mainThread && (event === 'input_batch_end' || event === 'assistant_text' || event === 'assistant_block_stop'
+              || event === 'tool_use' || event === 'tool_result' || event === 'can_use_tool'
+              || event === 'hook_callback' || event === 'turn_retry' || event === 'codex_account_changed'
+              || event === 'thinking_progress' || event === 'plan_delta' || event === 'turn_plan_updated'
+              || event === 'context_compacted' || event === 'turn_started' || event === 'result' || event === 'exit')) {
+              boundary.start()
+            }
+            return
           }
-          return
+          if (event !== 'exit' && (this.stoppingProc === p || this.blockedProc === p)) {
+            if (!stoppedEventLogged) {
+              stoppedEventLogged = true
+              log(`session "${this.sessionName}": ignore ${p.provider} event=${String(event)} while process stop is pending`)
+            }
+            return
+          }
+          handler(payload, snapshot)
         }
-        handler(payload)
+        dispatch()
       })
     }
 
@@ -3571,6 +3613,7 @@ export class Session {
           log(`session "${this.sessionName}": SDK init claimed eager input pendingCount=${this.pendingUserMessageCount}`)
           this.pendingUserMessageCount = 0
         }
+        this.steerPendingInputs()
         return
       }
       const isUserBatch = this.pendingUserMessageCount > 0
@@ -3710,7 +3753,7 @@ export class Session {
         log(`session "${this.sessionName}": Codex 未参与选号的账号: ${diagnostics.join('；')}`)
       }
     })
-    on('turn_started', ({ retry }) => {
+    on('turn_started', ({ retry }, snapshot) => {
       // Codex app-server emits init only at process startup, not for every
       // turn. turn_started is its authoritative claim for an input that was
       // already given an eager-opened card. Claude normally consumed it in
@@ -3720,13 +3763,14 @@ export class Session {
         this.pendingUserMessageCount = 0
       }
       this.persistResumableSessionId()
+      this.steerPendingInputs()
       if (retry) {
         if (this.currentTurn) this.startThinkingFooter(this.currentTurn)
         // Capacity retries belong to the same visible task. Keep its original
         // usage baseline so work preceding the capacity error is still counted.
         return
       }
-      const total = this.proc?.lastTotalUsage
+      const total = snapshot.totalUsage
       if (this.usageTotalsSeedUnknown && !total) {
         this.currentTurnUsageBaseline = null
         this.currentTurnUsageBaselineKnown = false
@@ -3735,6 +3779,13 @@ export class Session {
       this.currentTurnUsageBaseline = total ? { ...total } : null
       this.currentTurnUsageBaselineKnown = true
     })
+    on('turn_input_error', ({ error }) => {
+      log(`session "${this.sessionName}": native input processing failed: ${error}`)
+      void feishu.sendTextRaw(this.chatId, `⚠️ ${this.backendLabel(p.provider)} 输入处理错误：${error}`)
+    })
+    on('user_input_consumed', ({ inputId }) => this.onSteeringInputConsumed(p, epoch, inputId))
+    on('input_batch_end', () => {})
+    on('thinking_progress', () => {})
     on('token_usage', ({ totalUsage }: TokenUsageUpdated) => {
       this.persistResumableSessionId()
       if (totalUsage) this.usageTotalsSeedUnknown = false
@@ -3868,13 +3919,14 @@ export class Session {
       // No hooks registered → fail-safe ack.
       this.proc?.sendHookResponse(req.request_id, {})
     })
-    on('result', (result: any) => {
+    on('result', (result: any, snapshot) => {
+      this.releaseUnconsumedSteering(p)
       const resumePersistenceError = this.persistResumableSessionId()
       const pendingPersistenceError = resumePersistenceError
         ? null
         : this.consumePendingConversationMaterialization()
       const persistenceError = [resumePersistenceError, pendingPersistenceError].filter(Boolean).join('；') || null
-      this.accumulateResultStats()
+      this.accumulateResultStats(snapshot)
       // result 抢在 openTurnCard 的 await 窗口内到达:标记给开卡 IIFE,
       // 它落地后据此立即收尾(否则卡片悬挂、session 卡在 working)。
       if (this.openingTurnOwner) this.openingTurnOwner.sawResult = true
@@ -3903,8 +3955,8 @@ export class Session {
       // 避免又推一遍。有卡的轮次已在开卡时并入,这里 flush 为 no-op。
       if (!this.currentTurn && !this.openingTurn) this.flushOrphanAssistantToChat('result with no turn card')
       const hasMidTurn = this.pendingMidTurnMsgs.length > 0
-      const isError = this.proc?.lastResult.is_error === true
-      const subtype = this.proc?.lastResult.subtype ?? 'success'
+      const isError = snapshot.result.is_error === true
+      const subtype = snapshot.result.subtype ?? 'success'
       const failureDetail = typeof result?.error === 'string' && result.error.trim()
         ? result.error.trim() : subtype
 
@@ -4083,14 +4135,14 @@ export class Session {
    * `turn_started`, so a multi-request turn is aggregated correctly
    * instead of inheriting only the final request's `last` snapshot.
    * Called exactly once per result event, right before closeTurnCard. */
-  private accumulateResultStats(): void {
-    const r = this.proc?.lastResult
+  private accumulateResultStats(snapshot?: { result: CodexResultMeta; totalUsage: CodexUsage | null }): void {
+    const r = snapshot?.result ?? this.proc?.lastResult
     if (!r) return
     // Claude result.usage is scoped to the just-finished SDK query; after a
     // resumed session starts with no local total baseline, this is the only
     // accurate per-turn figure we have.
     const u = this.currentTurnUsageBaselineKnown
-      ? diffUsageTotals(this.proc?.lastTotalUsage, this.currentTurnUsageBaseline)
+      ? diffUsageTotals(snapshot ? snapshot.totalUsage : this.proc?.lastTotalUsage, this.currentTurnUsageBaseline)
       : this.proc?.provider === 'claude' && r.usage
         ? { ...r.usage }
         : null
@@ -4129,6 +4181,147 @@ export class Session {
     return contextLimitFromAppServer(proc?.lastContextWindow)
   }
 
+  /** Submit without holding the actor: stop and tool answers stay available
+   * while the backend acknowledges the write. A rejected/uncertain write is
+   * reported, never replayed as a new task. */
+  private steerPendingInputs(): void {
+    const proc = this.proc
+    const turn = this.currentTurn
+    if (!proc?.steerUserText || !turn || this.openingTurn
+      || this.steeringSend || this.pendingMidTurnMsgs.length === 0 || this.modelSettingsBlockReason()) return
+    const epoch = this.procEpoch
+    const generation = this.steeringGeneration
+    const batch = this.pendingMidTurnMsgs.splice(0)
+    const reactions = this.pendingReactionIds
+    const inputId = randomUUID()
+    const input = { proc, epoch, generation, turn, batch, reactions, consumed: false }
+    this.submittedSteering.set(inputId, input)
+    let retained = false
+    let accepted = false
+    const ownsInput = () => this.proc === proc && this.procEpoch === epoch
+      && this.steeringGeneration === generation && proc.isAlive()
+    const operation = Promise.resolve().then(async () => {
+      if (!ownsInput()) return
+      const blocked = this.disabledSubscriptionMessage(proc.tokenSourceId)
+      if (blocked) throw new Error(blocked)
+      accepted = await proc.steerUserText!(batch.map(msg => msg.wireText).join('\n\n'), [], inputId)
+      if (!ownsInput()) return
+      if (!accepted) {
+        // No request was sent (startup, quota recovery, or native turn ended
+        // before dispatch). Preserve FIFO order for the next ready boundary.
+        this.pendingMidTurnMsgs.unshift(...batch)
+        this.submittedSteering.delete(inputId)
+        retained = true
+        return
+      }
+      // Only user_input_consumed owns the rendering boundary. The backend
+      // can acknowledge a queued message well before the model sees it.
+    }).catch(async error => {
+      log(`session "${this.sessionName}": steering input failed: ${messageOf(error)}`)
+      await feishu.sendTextRaw(this.chatId, `❌ 追加消息${input.consumed ? '已确认进入执行流，但提交回执异常' : '提交未获确认，未自动重发'}：${messageOf(error)}`)
+    }).finally(() => {
+      turn.steeringInflight?.delete(operation)
+      if (this.steeringSend === operation) this.steeringSend = null
+      if (!ownsInput()) this.submittedSteering.delete(inputId)
+      // Consumption transfers reaction ownership to the supplemental card.
+      // A late submit ACK must not clear its waiting marker before that card.
+      if (!retained && !input.consumed && !this.submittedSteering.has(inputId)) {
+        this.releaseSteeringReactions(input)
+      }
+      if (!ownsInput()) return
+      if (!this.currentTurn && !this.openingTurn && this.pendingMidTurnMsgs.length) {
+        void this.drainMidTurnAndOpen().catch(error => log(`session "${this.sessionName}": input drain failed: ${messageOf(error)}`))
+      } else if (accepted) this.steerPendingInputs()
+    })
+    this.steeringSend = operation
+    ;(turn.steeringInflight ??= new Set()).add(operation)
+  }
+
+  private releaseSteeringReactions(input: { batch: Array<{ msgId: string }>; reactions: Map<string, string> }): void {
+    for (const msg of input.batch) {
+      const rid = input.reactions.get(msg.msgId)
+      input.reactions.delete(msg.msgId)
+      if (rid) void feishu.deleteReaction(msg.msgId, rid)
+    }
+  }
+
+  private releaseUnconsumedSteering(proc: AgentProcess): void {
+    let count = 0
+    for (const [id, input] of this.submittedSteering) {
+      if (input.proc !== proc) continue
+      this.submittedSteering.delete(id)
+      this.releaseSteeringReactions(input)
+      count += input.batch.length
+    }
+    if (count) {
+      const message = `本轮已结束，但 ${count} 条追加消息缺少原生处理位置确认，未据此换卡或自动重发。`
+      log(`session "${this.sessionName}": ${message}`)
+      void feishu.sendTextRaw(this.chatId, `⚠️ ${message}`)
+    }
+  }
+
+  /** Freeze the presentation at the native input item, not at request ACK.
+   * Events after this point retain FIFO order while Feishu creates the card. */
+  private onSteeringInputConsumed(proc: AgentProcess, epoch: number, inputId: string): void {
+    const input = this.submittedSteering.get(inputId)
+    if (!input || input.proc !== proc || input.epoch !== epoch) return
+    this.submittedSteering.delete(inputId)
+    input.consumed = true
+    const { turn, generation } = input
+    if (this.currentTurn !== turn || generation !== this.steeringGeneration) {
+      this.releaseSteeringReactions(input)
+      return
+    }
+    log(`session "${this.sessionName}": steering consumed input=${inputId} messages=${input.batch.length}`)
+    const pending = this.steeringBoundary
+    if (pending?.collecting && pending.turn === turn && pending.proc === proc && pending.epoch === epoch) {
+      pending.inputs.push(...input.batch.map(msg => msg.text))
+      pending.inputIds.push(inputId)
+      pending.reactionOwners.push(input)
+      return
+    }
+    let start!: () => void
+    const batchEnd = new Promise<void>(resolve => { start = resolve })
+    const boundary = { turn, proc, epoch, generation, events: [] as Array<() => void>,
+      inputs: input.batch.map(msg => msg.text), inputIds: [inputId], collecting: true,
+      reactionOwners: [input],
+      start: () => { boundary.collecting = false; start() },
+    }
+    this.steeringBoundary = boundary
+    const ownsBoundary = () => this.steeringBoundary === boundary && this.proc === proc
+      && this.procEpoch === epoch && this.steeringGeneration === generation && this.currentTurn === turn
+    // Finish the old segment before any following native delta can arrive.
+    // An existing capacity rotation is allowed to finish first; its incoming
+    // events are now fenced too, so this text still belongs before the input.
+    if (!turn.rotating) this.finalizeCurrentAssistantSegment()
+    const operation = Promise.resolve().then(async () => {
+      await batchEnd
+      if (turn.rotating) await turn.rotating
+      if (!ownsBoundary()) return
+      this.finalizeCurrentAssistantSegment()
+      log(`session "${this.sessionName}": steering input batch inputs=${boundary.inputs.length} receipts=${boundary.inputIds.length} — rotate at native boundary`)
+      this.startMidTurnRotate(turn, {
+        userInputs: boundary.inputs,
+        onCardSent: () => {
+          if (!ownsBoundary()) return
+          for (const owner of boundary.reactionOwners) this.releaseSteeringReactions(owner)
+        },
+      })
+      await turn.rotating
+    }).catch(async error => {
+      log(`session "${this.sessionName}": input-boundary card handoff failed: ${messageOf(error)}`)
+      await feishu.sendTextRaw(this.chatId, `⚠️ 追加消息已进入执行流，但换卡失败：${messageOf(error)}`)
+    }).finally(() => {
+      turn.steeringInflight?.delete(operation)
+      if (this.steeringBoundary !== boundary) return
+      this.steeringBoundary = null
+      // Dispatch checks ownership again and will enqueue behind a later
+      // boundary encountered in this same batch, preserving native order.
+      for (const dispatch of boundary.events) dispatch()
+    })
+    ;(turn.steeringInflight ??= new Set()).add(operation)
+  }
+
   /** Drain `pendingMidTurnMsgs` to the SDK and open a fresh card for the
    * resulting batch turn. Called from the `result` handler when buffered
    * mid-turn messages need to start their own turn. The `sendUserText`
@@ -4150,6 +4343,7 @@ export class Session {
    * commit 2258af4 当年用累加保护 spurious 第二 turn 的逻辑不再需要 —
    * SDK 不会自发开 user_batch 子 turn。 */
   private async drainMidTurnAndOpen(): Promise<void> {
+    if (this.steeringSend) await this.steeringSend
     if (this.pendingMidTurnMsgs.length === 0) return
     if (this.modelSettingsBlockReason()) return
     const proc = this.proc
@@ -4505,8 +4699,8 @@ export class Session {
     this.startMidTurnRotate(turn)
   }
 
-  /** Open a fresh card under the **same** SDK turn number to dodge
-   * Feishu's per-card size or element limit. The old card stays in the chat —
+  /** Open a fresh card under the **same** SDK turn number for additional
+   * user guidance or Feishu's per-card size/element limit. The old card stays in the chat —
    * we flip its footer to "📨 已续至下一张卡", turn streaming off, and
    * dispose its cardkit state — but it never becomes the writable one
    * again. Turn state is reset so subsequent stream handlers wire up
@@ -4515,8 +4709,9 @@ export class Session {
    * continued) and any unfinished / failed tools (rebuildToolsOnRotate
    * moves them, file-tool batches split out), while already-finished tools stay on
    * the old card. */
-  private startMidTurnRotate(turn: TurnState): void {
+  private startMidTurnRotate(turn: TurnState, opts: { userInputs?: string[]; onCardSent?: () => void } = {}): void {
     if (turn.rotating) return
+    const forSteering = opts.userInputs !== undefined
     turn.rotateCount++
     const oldCardId = turn.cardId
     // 同步快照 tool 簿子 —— swap 会把这俩 Map 换成新的空 Map,旧对象仍被这俩
@@ -4551,39 +4746,45 @@ export class Session {
           provider: turn.provider,
           model: turn.model ?? undefined,
           effort: turn.effort ?? 'MISS',
-          kind: 'card_full',
-          userInputs: [],
+          kind: forSteering ? 'user_steering' : 'card_full',
+          userInputs: opts.userInputs ?? [],
         })
         let sendFailure: unknown
         const newMessageId = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
         if (!newMessageId) {
-          log(`session "${this.sessionName}": mid-turn rotate sendCard failed — retry on the next content event`)
-          if (this.currentTurn === turn) {
+          log(`session "${this.sessionName}": mid-turn rotate sendCard failed reason=${forSteering ? 'user_steering' : 'capacity'}`)
+          if (!forSteering && this.currentTurn === turn) {
             turn.cardRotationFailed = true
             this.stopFooterStatus(turn)
           }
           await feishu.sendTextRaw(
             this.chatId,
-            `⚠️ 续卡发送失败，后续内容到达时会再次尝试。\n${formatFeishuError(sendFailure)}`,
+            `${forSteering ? '⚠️ 追加消息已交给 Agent，但新卡片发送失败。' : '⚠️ 续卡发送失败，后续内容到达时会再次尝试。'}\n${formatFeishuError(sendFailure)}`,
           )
           return
         }
+        // The new input panel is now visible in chat. Remove its waiting
+        // reactions here, without waiting for conversion/migration/old close.
+        opts.onCardSent?.()
         let newCardId: string
         try { newCardId = await cardkit.convertMessageToCard(newMessageId) }
         catch (e) {
           log(`session "${this.sessionName}": mid-turn rotate id_convert failed: ${e}`)
-          if (this.currentTurn === turn) {
-            turn.cardRotationFailed = true
-            this.stopFooterStatus(turn)
+          if (forSteering || this.currentTurn === turn) {
+            if (!forSteering) {
+              turn.cardRotationFailed = true
+              this.stopFooterStatus(turn)
+            }
             await feishu.sendTextRaw(
               this.chatId,
-              `⚠️ 续卡已发送，但 Card Kit 初始化失败；后续内容到达时会再次尝试。\n${formatFeishuError(e)}`,
+              `${forSteering ? '⚠️ 追加消息已交给 Agent，但新卡片初始化失败。' : '⚠️ 续卡已发送，但 Card Kit 初始化失败；后续内容到达时会再次尝试。'}\n${formatFeishuError(e)}`,
             )
           }
           return
         }
-        // card_full body has banner(1) + footer(1) = 2 elements.
-        cardkit.recordCardCreated(newCardId, 2, (code, failure) => {
+        // Capacity pages have a banner; steering pages have the new inputs.
+        const initialElements = 1 + (forSteering ? (opts.userInputs!.length > 0 ? 1 : 0) : 1)
+        cardkit.recordCardCreated(newCardId, initialElements, (code, failure) => {
           if (turn.rotating) {
             rememberDeferredWriteFailure(code, failure)
             return
@@ -5708,6 +5909,7 @@ export class Session {
     // off the table BEFORE their first await.
     const turn = this.currentTurn
     if (!turn) return this.waitForTurnCloses()
+    if (this.steeringBoundary?.turn === turn) this.steeringBoundary.start()
     // A terminal label (including a queued-input handoff or Agent error) only
     // describes the conversation card. Admitted uploads keep their turn owner
     // and finish below; stop/restart cancel them through the session registry.
@@ -5752,6 +5954,7 @@ export class Session {
     opts: { forcePush?: boolean; hasFreshResult?: boolean } = {},
   ): Promise<void> {
     const { turn } = snapshot
+    if (turn.steeringInflight?.size) await Promise.all([...turn.steeringInflight])
     // 竞态修复:mid-turn rotation 的 swap 阶段(sendCard / id_convert 的 await
     // 之后,见 startMidTurnRotate)会切 turn.cardId 到新卡并 startWritingFooter
     // 重启一个 footer 计时 interval。若 result 在那个 await 窗口里抢先到达,

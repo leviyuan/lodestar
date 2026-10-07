@@ -147,6 +147,15 @@ describe('main conversation card rendering', () => {
     expect(card.body.elements.map((element: any) => element.element_id).filter(Boolean)).toEqual(['footer'])
   })
 
+  test('a supplemental card shows its new inputs without claiming a new task or capacity overflow', () => {
+    const card = mainConversationCard({ sessionName: 'probe', turn: 3, kind: 'user_steering',
+      userInputs: ['补充第一点', '补充第二点'] }) as any
+    expect(card.body.elements[0].header.title.content).toBe('📥 追加 (2) #3')
+    expect(card.body.elements[0].elements.map((element: any) => element.content)).toEqual(['补充第一点', '补充第二点'])
+    expect(card.body.elements.map((element: any) => element.element_id)).toEqual(['user_input', 'footer'])
+    expect(JSON.stringify(card)).not.toContain('前卡写满')
+  })
+
   test('user input panel neutralizes markdown image syntax that would break card creation', () => {
     // Card Kit 把 `![alt](url)` 解析成 image 并拿 url 当 img_key;外链 URL
     // 被服务端拒(ErrCode 200570 invalid image keys),整张卡 create 失败。

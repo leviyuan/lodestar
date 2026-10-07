@@ -10,6 +10,7 @@ import { log } from './log'
 
 const CONTINUE_TASK = '上一轮因当前账号额度耗尽而中断，现已切换账号。请基于本会话已有记录继续完成用户尚未完成的任务，保留已完成的修改和工具结果。执行有副作用的操作前先确认现状，不要重复已完成的操作。'
 const FORWARDED_EVENTS = ['error', 'conversation_materialized', 'conversation_materialization_failed',
+  'user_input_consumed', 'input_batch_end',
   'token_usage', 'turn_plan_updated', 'plan_delta', 'context_compacted', 'rate_limits_updated',
   'thread_goal_updated', 'thread_goal_cleared', 'assistant_text', 'assistant_block_stop',
   'tool_use', 'tool_result', 'can_use_tool', 'hook_callback', 'bg_task_started', 'bg_task_progress',
@@ -258,6 +259,13 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
     this.inputs.push({ text, files: [...files] })
     if (!this.ready) this.sendInitialize()
     if (!this.starting && !this.recovery) this.drainInputs()
+  }
+  async steerUserText(text: string, files: string[] = [], inputId?: string): Promise<boolean> {
+    if (this.fault) throw this.fault
+    if (this.closed || this.lifetime.signal.aborted) throw new Error('Codex 进程已关闭')
+    if (this.starting || this.recovery || !this.inner) return false
+    if (!this.inner.steerUserText) throw new Error('Codex 进程未提供追加输入接口')
+    return this.inner.steerUserText(text, files, inputId)
   }
   private drainInputs(): void {
     if (!this.inner || this.starting || this.recovery || this.lifetime.signal.aborted) return

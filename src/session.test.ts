@@ -263,6 +263,457 @@ async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<vo
   }
 }
 
+describe('Session in-flight user guidance', () => {
+  function running(provider: 'codex' | 'claude' | 'dsh' = 'codex') {
+    const session = new Session('steering', 'chat_id') as any
+    const proc = new FakeAgentProc(provider, 'steering-session') as any
+    session.proc = proc
+    session.selectedProvider = provider
+    session.wireProc(proc)
+    session.initCount = 1
+    session.turnCounter = 1
+    session.status = 'working'
+    const turn = turnState('card_steering')
+    turn.provider = provider
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 2)
+    return { session, proc, turn }
+  }
+
+  for (const provider of ['codex', 'claude'] as const) {
+    test(`${provider} waits for native consumption before changing the presentation card`, async () => {
+      const { session, proc, turn } = running(provider)
+      const steered: any[] = []
+      proc.steerUserText = async (...args: any[]) => { steered.push(args); return true }
+      try {
+        await session.onUserMessage('请先检查这里', ['/tmp/context.txt'], 'ou_user', 'om_guidance')
+        await session.steeringSend
+        expect(steered).toEqual([['[file: /tmp/context.txt]\n请先检查这里', [], expect.any(String)]])
+        expect(proc.sentTexts).toEqual([])
+        expect(session.currentTurn).toBe(turn)
+        expect(session.pendingMidTurnMsgs).toEqual([])
+        expect(session.pendingUserMessageCount).toBe(0)
+        expect(session.pendingReactionIds.size).toBe(1)
+        expect(sentCards).toEqual([])
+        expect(turn.cardId).toBe('card_steering')
+        proc.emit('assistant_text', { text: '提交之后仍未消费的旧任务输出', parentToolUseId: null })
+        proc.emit('user_input_consumed', { inputId: steered[0][2] })
+        proc.emit('input_batch_end', { itemId: 'next-reasoning' })
+        await waitUntil(() => session.steeringBoundary === null)
+        expect(session.pendingReactionIds.size).toBe(0)
+        expect(sentCards).toHaveLength(1)
+        const nextCard = sentCards[0] as any
+        expect(nextCard.body.elements[0].header.title.content).toBe('📥 追加 (1) #1')
+        expect(JSON.stringify(nextCard)).toContain('请先检查这里')
+        expect(JSON.stringify(nextCard)).not.toContain('前卡写满')
+        expect(turn.cardId).not.toBe('card_steering')
+        expect(cardkit.isDisposed('card_steering')).toBe(true)
+        expect(session.turnCounter).toBe(1)
+        expect(calls.some(call => call.path === '/cards/card_steering/elements/footer'
+          && String(call.body.element).includes('已续至下一张'))).toBe(true)
+        proc.emit('assistant_text', { text: '已根据补充调整', parentToolUseId: null })
+        proc.emit('assistant_block_stop', { parentToolUseId: null })
+        await cardkit.flush(turn.cardId)
+        expect(calls.some(call => call.method === 'POST' && call.path === `/cards/${turn.cardId}/elements`
+          && String(call.body.elements).includes('已根据补充调整'))).toBe(true)
+        const oldWrites = JSON.stringify(calls.filter(call => call.path.startsWith('/cards/card_steering/elements')))
+        const newWrites = JSON.stringify(calls.filter(call => call.path.startsWith(`/cards/${turn.cardId}/elements`)))
+        expect(oldWrites).toContain('提交之后仍未消费的旧任务输出')
+        expect(newWrites).not.toContain('提交之后仍未消费的旧任务输出')
+      } finally { await session.closeTurnCard('测试收尾') }
+    })
+  }
+
+  test('consumption before RPC receipt fences trailing events and closes the replacement exactly once', async () => {
+    const { session, proc, turn } = running()
+    let acknowledge!: (accepted: boolean) => void
+    let inputId = ''
+    proc.steerUserText = (_text: string, _files: string[], id: string) => {
+      inputId = id
+      return new Promise<boolean>(resolve => { acknowledge = resolve })
+    }
+    await session.onUserMessage('arriving at completion')
+    await waitUntil(() => !!acknowledge)
+    proc.emit('user_input_consumed', { inputId })
+    proc.emit('assistant_text', { text: 'reply after the boundary', parentToolUseId: null })
+    proc.emit('assistant_block_stop', { parentToolUseId: null })
+    proc.emit('result', { is_error: false })
+    expect(session.currentTurn).toBe(turn)
+    acknowledge(true)
+    await waitUntil(() => session.currentTurn === null)
+    await session.waitForTurnCloses()
+    expect(sentCards).toHaveLength(1)
+    expect(JSON.stringify(sentCards[0])).toContain('arriving at completion')
+    expect(turn.cardId).not.toBe('card_steering')
+    expect(cardkit.isDisposed('card_steering')).toBe(true)
+    expect(cardkit.isDisposed(turn.cardId)).toBe(true)
+    expect(turn.footerStatusHandle).toBeNull()
+    expect(calls.some(call => call.method === 'POST' && call.path === `/cards/${turn.cardId}/elements`
+      && String(call.body.elements).includes('reply after the boundary'))).toBe(true)
+    expect(proc.sentTexts).toEqual([])
+    expect(session.pendingMidTurnMsgs).toEqual([])
+  })
+
+  test('supplemental waiting reactions clear together when the new card is sent, including consumption before ACK', async () => {
+    const { session, proc, turn } = running()
+    const ids: string[] = []
+    let acknowledge!: (accepted: boolean) => void
+    proc.steerUserText = (_text: string, _files: string[], inputId: string) => {
+      ids.push(inputId)
+      return ids.length === 1 ? new Promise<boolean>(resolve => { acknowledge = resolve }) : Promise.resolve(true)
+    }
+    let releaseSend!: () => void
+    const sendGate = new Promise<void>(resolve => { releaseSend = resolve })
+    let releaseConvert!: () => void
+    const convertGate = new Promise<void>(resolve => { releaseConvert = resolve })
+    let sending = false
+    let converting = false
+    const originalSend = feishu.sendCard
+    const originalConvert = cardkit.convertMessageToCard
+    const send = spyOn(feishu, 'sendCard').mockImplementation(async (...args: Parameters<typeof feishu.sendCard>) => {
+      sending = true
+      await sendGate
+      return originalSend(...args)
+    })
+    const convert = spyOn(cardkit, 'convertMessageToCard').mockImplementation(async (...args: Parameters<typeof cardkit.convertMessageToCard>) => {
+      converting = true
+      await convertGate
+      return originalConvert(...args)
+    })
+    try {
+      await session.onUserMessage('first', [], 'ou_user', 'om_first')
+      proc.emit('user_input_consumed', { inputId: ids[0] })
+      expect(deletedReactions).toEqual([])
+      acknowledge(true)
+      await session.steeringSend
+      expect(deletedReactions).toEqual([])
+      await session.onUserMessage('second', [], 'ou_user', 'om_second')
+      await session.steeringSend
+      proc.emit('user_input_consumed', { inputId: ids[1] })
+      expect([...session.pendingReactionIds.keys()]).toEqual(['om_first', 'om_second'])
+      proc.emit('input_batch_end', { itemId: 'next-reasoning' })
+      await waitUntil(() => sending)
+      expect(sentCards).toEqual([])
+      expect(deletedReactions).toEqual([])
+      await session.onUserMessage('later batch', [], 'ou_user', 'om_later')
+      await session.steeringSend
+      releaseSend()
+      await waitUntil(() => converting)
+      expect(sentCards).toHaveLength(1)
+      expect(deletedReactions).toEqual([['om_first', 'reaction_1'], ['om_second', 'reaction_2']])
+      expect([...session.pendingReactionIds.keys()]).toEqual(['om_later'])
+      // Deletion does not wait for Card Kit setup or the old card's close.
+      expect(turn.cardId).toBe('card_steering')
+      releaseConvert()
+      await waitUntil(() => session.steeringBoundary === null)
+      expect(deletedReactions).toHaveLength(2)
+    } finally {
+      acknowledge?.(true)
+      releaseSend(); releaseConvert()
+      send.mockRestore(); convert.mockRestore()
+      await session.closeTurnCard('测试收尾')
+    }
+  })
+
+  test('late reaction creation stays waiting before card visibility and is removed if it arrives afterwards', async () => {
+    const { session, proc } = running()
+    const ids: string[] = []
+    const created = new Map<string, (reactionId: string) => void>()
+    proc.steerUserText = async (_text: string, _files: string[], inputId: string) => { ids.push(inputId); return true }
+    const reaction = spyOn(feishu, 'addReaction').mockImplementation((msgId: string) => new Promise<string>(resolve => { created.set(msgId, resolve) }))
+    let releaseSend!: () => void
+    const gate = new Promise<void>(resolve => { releaseSend = resolve })
+    const originalSend = feishu.sendCard
+    const send = spyOn(feishu, 'sendCard').mockImplementation(async (...args: Parameters<typeof feishu.sendCard>) => { await gate; return originalSend(...args) })
+    try {
+      for (const msgId of ['om_early', 'om_late']) { await session.onUserMessage(msgId, [], 'ou_user', msgId); await session.steeringSend }
+      for (const inputId of ids) proc.emit('user_input_consumed', { inputId })
+      created.get('om_early')!('rid_early')
+      await waitUntil(() => session.pendingReactionIds.get('om_early') === 'rid_early')
+      expect(deletedReactions).toEqual([])
+      proc.emit('input_batch_end', { itemId: 'next-reasoning' })
+      releaseSend()
+      await waitUntil(() => session.steeringBoundary === null)
+      expect(deletedReactions).toEqual([['om_early', 'rid_early']])
+      created.get('om_late')!('rid_late')
+      await waitUntil(() => deletedReactions.length === 2)
+      expect(deletedReactions).toEqual([['om_early', 'rid_early'], ['om_late', 'rid_late']])
+      expect(session.pendingReactionIds.size).toBe(0)
+    } finally { releaseSend(); send.mockRestore(); reaction.mockRestore(); await session.closeTurnCard('测试收尾') }
+  })
+
+  test('startup input stays pending until turn_started, then steers without waiting for result', async () => {
+    const { session, proc } = running()
+    const sent: string[] = []
+    let nativeActive = false
+    proc.steerUserText = async (text: string) => { if (!nativeActive) return false; sent.push(text); return true }
+    try {
+      await session.onUserMessage('during startup')
+      await session.steeringSend
+      expect(session.pendingMidTurnMsgs).toHaveLength(1)
+      nativeActive = true
+      proc.emit('turn_started', { turn_id: 'active' })
+      await session.steeringSend
+      expect(sent).toEqual(['during startup'])
+      expect(session.pendingMidTurnMsgs).toEqual([])
+      expect(proc.sentTexts).toEqual([])
+    } finally { await session.closeTurnCard('测试收尾') }
+  })
+
+  test('uncertain steering failures are visible and are never replayed after result', async () => {
+    const { session, proc } = running()
+    proc.steerUserText = async () => { throw new Error('turn/steer response lost') }
+    await session.onUserMessage('must execute once')
+    await session.steeringSend
+    expect(sentRawTexts.some(text => text.includes('turn/steer response lost') && text.includes('未自动重发'))).toBe(true)
+    proc.emit('result', { is_error: false })
+    await session.waitForTurnCloses()
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(proc.sentTexts).toEqual([])
+    expect(session.currentTurn).toBeNull()
+  })
+
+  test('messages arriving during a steering request remain ordered and are coalesced once', async () => {
+    const { session, proc } = running()
+    const sent: string[] = []
+    const ids: string[] = []
+    let acknowledge!: (accepted: boolean) => void
+    proc.steerUserText = (text: string, _files: string[], id: string) => {
+      sent.push(text)
+      ids.push(id)
+      return sent.length === 1 ? new Promise<boolean>(resolve => { acknowledge = resolve }) : Promise.resolve(true)
+    }
+    try {
+      await session.onUserMessage('first')
+      await session.onUserMessage('second', ['/tmp/second.txt'])
+      await session.onUserMessage('third')
+      expect(sent).toEqual(['first'])
+      acknowledge(true)
+      await waitUntil(() => session.steeringSend === null && sent.length === 2)
+      expect(sent).toEqual(['first', '[file: /tmp/second.txt]\nsecond\n\nthird'])
+      expect(sentCards).toEqual([])
+      proc.emit('user_input_consumed', { inputId: ids[0] })
+      proc.emit('assistant_text', { text: 'between the inputs', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { parentToolUseId: null })
+      proc.emit('user_input_consumed', { inputId: ids[1] })
+      proc.emit('assistant_text', { text: 'after the second input', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { parentToolUseId: null })
+      await waitUntil(() => session.steeringBoundary === null)
+      expect(sentCards).toHaveLength(2)
+      expect(JSON.stringify(sentCards[0])).toContain('first')
+      expect(JSON.stringify(sentCards[1])).toContain('second')
+      expect(JSON.stringify(sentCards[1])).toContain('third')
+      expect(JSON.stringify(sentCards[1])).not.toContain('first')
+    } finally { await session.closeTurnCard('测试收尾') }
+  })
+
+  for (const provider of ['codex', 'claude'] as const) {
+    test(`${provider} combines the consecutive consumed 2–10 messages into one supplemental card`, async () => {
+      const { session, proc, turn } = running(provider)
+      const ids: string[] = []
+      proc.steerUserText = async (_text: string, _files: string[], id: string) => { ids.push(id); return true }
+      try {
+        for (let n = 2; n <= 10; n++) {
+          await session.onUserMessage(String(n))
+          await session.steeringSend
+        }
+        expect(ids).toHaveLength(9)
+        proc.emit('assistant_text', { text: '原消息 1 的回复', parentToolUseId: null })
+        proc.emit('assistant_block_stop', { parentToolUseId: null })
+        for (const inputId of ids) {
+          proc.emit('user_input_consumed', { inputId })
+          // Consumption frames may arrive separately with bookkeeping in
+          // between; neither a timer nor usage traffic defines a new batch.
+          proc.emit('token_usage', { usage: { total_tokens: 1 }, totalUsage: { total_tokens: 1 } })
+          proc.emit('assistant_text', { text: '独立子任务输出', parentToolUseId: 'child-task' })
+          await new Promise(resolve => setTimeout(resolve, 2))
+          expect(sentCards).toEqual([])
+        }
+        if (provider === 'codex') proc.emit('input_batch_end', { itemId: 'reasoning-for-all-inputs' })
+        proc.emit('assistant_text', { text: '收到，测试消息 1–10 均已接收。', parentToolUseId: null })
+        proc.emit('assistant_block_stop', { parentToolUseId: null })
+        await waitUntil(() => session.steeringBoundary === null)
+        await cardkit.flush(turn.cardId)
+        expect(sentCards).toHaveLength(1)
+        const input = (sentCards[0] as any).body.elements[0]
+        expect(input.header.title.content).toBe('📥 追加 (9) #1')
+        expect(input.elements.map((item: any) => item.content)).toEqual(['2', '3', '4', '5', '6', '7', '8', '9', '10'])
+        expect(turn.rotateCount).toBe(1)
+        const newWrites = JSON.stringify(calls.filter(call => call.path.startsWith(`/cards/${turn.cardId}/elements`)))
+        expect(newWrites).toContain('测试消息 1–10 均已接收')
+        expect(newWrites).not.toContain('原消息 1 的回复')
+      } finally { await session.closeTurnCard('测试收尾') }
+    })
+  }
+
+  test('stop releases an input batch waiting for Agent activity without creating a card', async () => {
+    const { session, proc } = running()
+    proc.steerUserText = async () => true
+    await session.onUserMessage('waiting input', [], 'ou_user', 'om_cancelled')
+    await session.steeringSend
+    proc.emit('user_input_consumed', { inputId: [...session.submittedSteering.keys()][0] })
+    expect(session.steeringBoundary.collecting).toBe(true)
+    expect(deletedReactions).toEqual([])
+    await session.runCommand('stop')
+    expect(session.steeringBoundary).toBeNull()
+    expect(session.currentTurn).toBeNull()
+    expect(sentCards).toEqual([])
+    expect(deletedReactions).toEqual([['om_cancelled', 'reaction_1']])
+  })
+
+  test('consecutive input runs remain separate across native Agent work while a card is opening', async () => {
+    const { session, proc } = running()
+    const ids: string[] = []
+    proc.steerUserText = async (_text: string, _files: string[], inputId: string) => { ids.push(inputId); return true }
+    try {
+      for (let n = 2; n <= 7; n++) { await session.onUserMessage(String(n)); await session.steeringSend }
+      for (const inputId of ids.slice(0, 2)) proc.emit('user_input_consumed', { inputId })
+      proc.emit('input_batch_end', { itemId: 'reasoning-between-input-runs' })
+      for (const inputId of ids.slice(2)) proc.emit('user_input_consumed', { inputId })
+      proc.emit('assistant_text', { text: 'final output', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { parentToolUseId: null })
+      await waitUntil(() => session.steeringBoundary === null)
+      expect(sentCards).toHaveLength(2)
+      expect(sentCards.map((card: any) => card.body.elements[0].header.title.content)).toEqual(['📥 追加 (2) #1', '📥 追加 (4) #1'])
+      expect(sentCards.map((card: any) => card.body.elements[0].elements.map((item: any) => item.content))).toEqual([['2', '3'], ['4', '5', '6', '7']])
+    } finally { await session.closeTurnCard('测试收尾') }
+  })
+
+  test('stop remains callable during an outstanding receipt and never requeues its message', async () => {
+    const { session, proc } = running()
+    let acknowledge!: (accepted: boolean) => void
+    let interrupted = false
+    proc.steerUserText = () => new Promise<boolean>(resolve => { acknowledge = resolve })
+    proc.sendInterrupt = () => { interrupted = true }
+    await session.onUserMessage('do not restart after stop')
+    const stop = session.runCommand('stop')
+    await waitUntil(() => interrupted)
+    acknowledge(false)
+    await stop
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(proc.sentTexts).toEqual([])
+    expect(session.currentTurn).toBeNull()
+  })
+
+  test('duplicate and unknown consumption events cannot create additional cards', async () => {
+    const { session, proc } = running()
+    proc.steerUserText = async () => true
+    try {
+      await session.onUserMessage('one boundary')
+      await session.steeringSend
+      const inputId = [...session.submittedSteering.keys()][0]
+      proc.emit('user_input_consumed', { inputId: 'unknown' })
+      expect(sentCards).toEqual([])
+      proc.emit('user_input_consumed', { inputId })
+      proc.emit('user_input_consumed', { inputId })
+      proc.emit('input_batch_end', { itemId: 'next-reasoning' })
+      await waitUntil(() => session.steeringBoundary === null)
+      expect(sentCards).toHaveLength(1)
+    } finally { await session.closeTurnCard('测试收尾') }
+  })
+
+  test('a stopped input cannot rotate on a late native consumption notification', async () => {
+    const { session, proc } = running()
+    proc.steerUserText = async () => true
+    await session.onUserMessage('cancel me')
+    await session.steeringSend
+    const inputId = [...session.submittedSteering.keys()][0]
+    await session.runCommand('stop')
+    proc.emit('user_input_consumed', { inputId })
+    expect(session.steeringBoundary).toBeNull()
+    expect(session.submittedSteering.size).toBe(0)
+    expect(sentCards).toEqual([])
+  })
+
+  test('a terminal result without a consumption boundary reports missing confirmation and does not guess a cut', async () => {
+    const { session, proc } = running()
+    proc.steerUserText = async () => true
+    await session.onUserMessage('no receipt')
+    await session.steeringSend
+    proc.emit('result', { is_error: false })
+    await session.waitForTurnCloses()
+    expect(sentCards).toEqual([])
+    expect(session.submittedSteering.size).toBe(0)
+    expect(sentRawTexts.some(text => text.includes('缺少原生处理位置确认'))).toBe(true)
+  })
+
+  test('backends without steering retain the existing next-turn input batch', async () => {
+    const { session, proc } = running('dsh')
+    try {
+      await session.onUserMessage('next task')
+      expect(session.pendingMidTurnMsgs.map((msg: any) => msg.text)).toEqual(['next task'])
+      expect(proc.sentTexts).toEqual([])
+    } finally { session.pendingMidTurnMsgs = []; await session.closeTurnCard('测试收尾') }
+  })
+
+  test('native consumption seals all earlier text and preserves later output across a slow card handoff', async () => {
+    const { session, proc, turn } = running()
+    proc.steerUserText = async () => true
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const originalSend = feishu.sendCard
+    const send = spyOn(feishu, 'sendCard').mockImplementation(async (...args: Parameters<typeof feishu.sendCard>) => {
+      await gate
+      return originalSend(...args)
+    })
+    try {
+      session.appendAssistant('已经完成的前文')
+      session.finalizeCurrentAssistantSegment()
+      await cardkit.flush(turn.cardId)
+      session.appendAssistant('仍在生成的正文')
+      turn.toolByUseId.set('ongoing-read', { i: 0, name: 'Read', input: { file_path: '/tmp/steering.txt' } })
+      turn.toolCount = 1
+      await session.onUserMessage('补充要求')
+      await session.steeringSend
+      expect(sentCards).toEqual([])
+      expect(turn.currentAssistantText).toBe('仍在生成的正文')
+      const inputId = [...session.submittedSteering.keys()][0]
+      proc.emit('user_input_consumed', { inputId })
+      proc.emit('tool_result', { tool_use_id: 'ongoing-read', content: '文件读取结果', is_error: false, parentToolUseId: null })
+      proc.emit('assistant_text', { text: '从补充位置继续', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { parentToolUseId: null })
+      await Promise.resolve()
+      expect(turn.cardId).toBe('card_steering')
+      expect(turn.toolByUseId.get('ongoing-read').output).toBeUndefined()
+      release()
+      await waitUntil(() => session.steeringBoundary === null)
+      await cardkit.flush(turn.cardId)
+      const newWrites = JSON.stringify(calls.filter(call => call.path.startsWith(`/cards/${turn.cardId}/elements`)))
+      expect(newWrites).toContain('从补充位置继续')
+      expect(newWrites).not.toContain('仍在生成的正文')
+      const oldWrites = JSON.stringify(calls.filter(call => call.path.startsWith('/cards/card_steering/elements')))
+      expect(oldWrites).toContain('仍在生成的正文')
+      expect(oldWrites).not.toContain('从补充位置继续')
+      expect(turn.toolByUseId.get('ongoing-read').output).toBe('文件读取结果')
+      expect(calls.some(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/tool_0`
+        && String(call.body.element).includes('✅'))).toBe(true)
+      expect(newWrites).not.toContain('已经完成的前文')
+    } finally { release(); send.mockRestore(); await session.closeTurnCard('测试收尾') }
+  })
+
+  test('a supplemental card failure reports the accepted input without resending it or starting capacity recovery', async () => {
+    const { session, proc, turn } = running()
+    const steered: string[] = []
+    proc.steerUserText = async (text: string) => { steered.push(text); return true }
+    const sendCard = spyOn(feishu, 'sendCard').mockResolvedValue(null)
+    try {
+      await session.onUserMessage('送达一次即可', [], 'ou_user', 'om_card_failed')
+      await session.steeringSend
+      proc.emit('user_input_consumed', { inputId: [...session.submittedSteering.keys()][0] })
+      proc.emit('input_batch_end', { itemId: 'next-reasoning' })
+      await waitUntil(() => session.steeringBoundary === null)
+      expect(steered).toEqual(['送达一次即可'])
+      expect(turn.cardId).toBe('card_steering')
+      expect(turn.cardRotationFailed).toBe(false)
+      expect(session.pendingMidTurnMsgs).toEqual([])
+      expect(deletedReactions).toEqual([])
+      expect(session.pendingReactionIds.has('om_card_failed')).toBe(true)
+      expect(sentRawTexts.some(text => text.includes('追加消息已交给 Agent，但新卡片发送失败'))).toBe(true)
+    } finally { sendCard.mockRestore(); await session.closeTurnCard('测试收尾') }
+    expect(deletedReactions).toEqual([['om_card_failed', 'reaction_1']])
+  })
+})
+
 describe('Session cloud file receipts', () => {
   for (const provider of ['codex', 'claude', 'dsh'] as const) {
     test(`${provider} BTW uses its workspace mode and updates on the next input while WT stays separate`, async () => {
