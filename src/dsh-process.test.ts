@@ -17,25 +17,59 @@ afterEach(async () => {
   if (failures.length) throw new AggregateError(failures, 'DSH test cleanup failed')
 })
 
-function completion(delta: object, finish = 'stop', model = 'deepseek-v4-flash') {
-  return new Response([
-    `data: ${JSON.stringify({ id: 'test-completion', model, choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`,
-    `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: finish }], usage: {
-      prompt_tokens: 100, completion_tokens: 10, total_tokens: 110, prompt_cache_hit_tokens: 40, prompt_cache_miss_tokens: 60,
-    } })}\n\n`,
-    'data: [DONE]\n\n',
-  ].join(''), { headers: { 'content-type': 'text/event-stream' } })
+type ModelProtocol = 'chat-completions' | 'messages'
+type FixtureResponse = Response | ((protocol: ModelProtocol) => Response)
+
+function completion(delta: { content?: string; tool_calls?: any[] }, finish = 'stop', model = 'deepseek-v4-flash'): FixtureResponse {
+  return protocol => {
+    if (protocol === 'chat-completions') return new Response([
+      `data: ${JSON.stringify({ id: 'test-completion', model, choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: finish }], usage: {
+        prompt_tokens: 100, completion_tokens: 10, total_tokens: 110, prompt_cache_hit_tokens: 40, prompt_cache_miss_tokens: 60,
+      } })}\n\n`,
+      'data: [DONE]\n\n',
+    ].join(''), { headers: { 'content-type': 'text/event-stream' } })
+    const events: any[] = [{ type: 'message_start', message: {
+      id: 'test-completion', type: 'message', role: 'assistant', model, content: [],
+      stop_reason: null, stop_sequence: null,
+      usage: { input_tokens: 60, output_tokens: 0, cache_read_input_tokens: 40 },
+    } }]
+    let index = 0
+    if (delta.content !== undefined) {
+      events.push({ type: 'content_block_start', index, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index, delta: { type: 'text_delta', text: delta.content } },
+        { type: 'content_block_stop', index })
+      index++
+    }
+    for (const call of delta.tool_calls ?? []) {
+      events.push({ type: 'content_block_start', index, content_block: {
+        type: 'tool_use', id: call.id, name: call.function.name, input: {},
+      } }, { type: 'content_block_delta', index, delta: {
+        type: 'input_json_delta', partial_json: call.function.arguments,
+      } }, { type: 'content_block_stop', index })
+      index++
+    }
+    const stopReason = { stop: 'end_turn', tool_calls: 'tool_use', length: 'max_tokens' }[finish]
+    if (!stopReason) throw new Error(`Unsupported fixture finish reason: ${finish}`)
+    events.push({ type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 10 } },
+      { type: 'message_stop' })
+    return new Response(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''),
+      { headers: { 'content-type': 'text/event-stream' } })
+  }
 }
 
-async function fixture(reply: (body: any, count: number) => Response | Promise<Response>) {
+async function fixture(reply: (body: any, count: number) => FixtureResponse | Promise<FixtureResponse>) {
   const dir = await mkdtemp(join(tmpdir(), 'lodestar-dsh-test-'))
   cleanups.push(() => rm(dir, { recursive: true, force: true }))
   const requests: any[] = []
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
-    if (!new URL(req.url).pathname.endsWith('/chat/completions')) return new Response('unexpected endpoint', { status: 404 })
+    const path = new URL(req.url).pathname
+    const protocol = path.endsWith('/chat/completions') ? 'chat-completions' : path.endsWith('/messages') ? 'messages' : null
+    if (!protocol) return new Response('unexpected endpoint', { status: 404 })
     const body = await req.json()
     requests.push(body)
-    return reply(body, requests.length)
+    const response = await reply(body, requests.length)
+    return typeof response === 'function' ? response(protocol) : response
   } })
   cleanups.push(async () => { await server.stop(true) })
   const opts: DshSpawnOptions = {
@@ -236,6 +270,50 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(results[0]).toMatchObject({ tool_use_id: 'call-shell', is_error: false })
     expect(await readFile(join(f.dir, 'proof.txt'), 'utf8')).toBe('native-tool')
   }, 30_000)
+
+  test('native tool-role results preserve call ids, all content blocks, errors and child ownership', async () => {
+    const f = await fixture(() => completion({ content: 'unused' }))
+    const proc = f.processFor()
+    const results: any[] = []
+    proc.on('tool_result', result => results.push(result))
+    await proc.initializationPromise()
+    const content = [{ type: 'text', text: 'read proof' }, { type: 'text', text: 'second block' }]
+    for (const isError of [false, true]) {
+      const sessionId = isError ? 'child-session' : proc.sessionId
+      ;(proc as any).runtime.emit('notification', { method: 'session.event', params: {
+        sessionId, event: { type: 'tool/result', data: { message: {
+          id: 'native-message', role: 'tool', source: { kind: 'tool', callId: 'native-read' },
+          toolCallId: 'native-read', content, isError,
+        } } },
+      } })
+      expect(results.at(-1)).toEqual({ tool_use_id: 'native-read', content, is_error: isError,
+        parentToolUseId: isError ? 'child-session' : null })
+    }
+    expect(results).toHaveLength(2)
+    expect(proc.isAlive()).toBe(true)
+  }, 15_000)
+
+  for (const message of [
+    { role: 'tool', content: [] },
+    { role: 'tool', toolCallId: 'call', content: 'invalid' },
+    { role: 'tool', toolCallId: 'call', content: [], isError: 'false' },
+    { role: 'assistant', toolCallId: 'call', content: [] },
+  ]) test(`malformed native tool result fails visibly: ${JSON.stringify(message)}`, async () => {
+    const f = await fixture(() => completion({ content: 'unused' }))
+    const proc = f.processFor()
+    const errors: string[] = []
+    const results: any[] = []
+    proc.on('error', error => errors.push(error.message))
+    proc.on('tool_result', result => results.push(result))
+    await proc.initializationPromise()
+    const exit = new Promise<any>(resolve => proc.once('exit', resolve))
+    ;(proc as any).runtime.emit('notification', { method: 'session.event', params: {
+      sessionId: proc.sessionId, event: { type: 'tool/result', data: { message } },
+    } })
+    expect(await exit).toMatchObject({ expected: false })
+    expect(errors).toContain('invalid DSH tool result')
+    expect(results).toHaveLength(0)
+  }, 15_000)
 
   for (const answerKey of ['Which colour?', 'colour']) test(`answers a native user question by ${answerKey} and preserves the selected label`, async () => {
     const f = await fixture((_body, count) => count === 1

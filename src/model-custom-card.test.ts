@@ -121,6 +121,10 @@ auth_token = "test-token"
   } = await import('./token-source')
   const { onModelCustomPrompt, consumeModelCustomMessage, onModelPanelCancel } = await import('./session-model')
   const cardkit = await import('./cardkit')
+  const { FeishuRecoveryWindow } = await import('./feishu-retry')
+  // This isolated test checks panel/error content, not real-time waiting. The
+  // retry integration suite separately exercises the full one-minute window.
+  FeishuRecoveryWindow.prototype.waitUntilDeadline = async () => {}
 
   test('isolated model custom card flow', async () => {
     resetTokenSourceRegistry()

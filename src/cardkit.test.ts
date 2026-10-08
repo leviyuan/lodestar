@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 // 注册共享 ./feishu mock(见该文件头注释:多文件各自 mock 会互相覆盖)
 import './feishu-test-mock'
 
 const cardkit = await import('./cardkit')
+const { FeishuRecoveryWindow } = await import('./feishu-retry')
 
 interface FetchCall {
   method: string
@@ -12,8 +13,12 @@ interface FetchCall {
 
 const originalFetch = globalThis.fetch
 let calls: FetchCall[] = []
+let failureNotificationWait: { mockRestore(): void }
 
 beforeEach(() => {
+  // Verify failure propagation without real notification delays. Deadline
+  // behavior is covered independently in cardkit-retry.test.ts.
+  failureNotificationWait = spyOn(FeishuRecoveryWindow.prototype, 'waitUntilDeadline').mockResolvedValue(undefined)
   calls = []
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input))
@@ -30,6 +35,7 @@ beforeEach(() => {
 
 afterEach(() => {
   globalThis.fetch = originalFetch
+  failureNotificationWait.mockRestore()
 })
 
 describe('cardkit card operations', () => {
@@ -248,6 +254,37 @@ describe('cardkit card operations', () => {
 })
 
 describe('checked card writes', () => {
+  let retryTimer: { mockRestore(): void }
+  let retryClock: { mockRestore(): void }
+  let previousProxyEnv: Record<string, string | undefined>
+  beforeEach(() => {
+    // HTTP is mocked; system-proxy probes must not share accelerated timers.
+    const proxyKeys = ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy']
+    previousProxyEnv = Object.fromEntries(proxyKeys.map(key => [key, process.env[key]]))
+    for (const key of proxyKeys) delete process.env[key]
+    process.env.NO_PROXY = process.env.no_proxy = '*'
+    // Exercise the real retry/confirmation paths without waiting through an
+    // outage. Other timers (including summary coalescing) retain their timing.
+    let now = Date.now()
+    retryClock = spyOn(Date, 'now').mockImplementation(() => now)
+    const originalSetTimeout = globalThis.setTimeout
+    retryTimer = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: any, delay: number, ...args: any[]) => {
+      if ([3000, 4000, 5000, 8000, 15000, 60000].includes(delay)) {
+        now += delay
+        return originalSetTimeout(callback, 0, ...args)
+      }
+      return originalSetTimeout(callback, delay, ...args)
+    }) as typeof setTimeout)
+  })
+  afterEach(() => {
+    retryTimer.mockRestore()
+    retryClock.mockRestore()
+    for (const [key, value] of Object.entries(previousProxyEnv)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  })
+
   test('a lost add acknowledgement followed by a duplicate reconciles once with a new PUT identity', async () => {
     const id = 'card_uncertain_add'
     const failures: import('./cardkit').CardWriteFailure[] = []
@@ -555,7 +592,7 @@ describe('checked card writes', () => {
       }, { notifyCardFailure: false })).toBe(false)
       await cardkit.dispose(cardId)
     }
-  }, 10_000) // A persistent HTTP 502 now exhausts the real 1s + 4s retry delays.
+  })
 
   test('a throwing card failure callback cannot poison the write queue', async () => {
     const cardId = 'card_throwing_failure_callback'

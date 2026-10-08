@@ -17,6 +17,7 @@ const sessionTools = await import('./session-tools')
 const { CodexRpcResponseError } = await import('./codex-process')
 const { ClaudeAgentProcess } = await import('./claude-agent-process')
 const cardkit = await import('./cardkit')
+const { FeishuRecoveryWindow } = await import('./feishu-retry')
 const feishu = await import('./feishu')
 const mathRender = await import('./math-render')
 const { config } = await import('./config')
@@ -35,8 +36,12 @@ interface FetchCall {
 
 const originalFetch = globalThis.fetch
 let calls: FetchCall[] = []
+let failureNotificationWait: { mockRestore(): void }
 
 beforeEach(() => {
+  // These tests cover UI state and callbacks; the full recovery deadline is
+  // exercised with a virtual clock in cardkit-retry.test.ts.
+  failureNotificationWait = spyOn(FeishuRecoveryWindow.prototype, 'waitUntilDeadline').mockResolvedValue(undefined)
   calls = []
   resetFeishuMock()
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -205,6 +210,7 @@ class FakeAgentProc extends EventEmitter {
 
 afterEach(() => {
   globalThis.fetch = originalFetch
+  failureNotificationWait.mockRestore()
 })
 
 function turnState(cardId = 'card_session_turn'): any {
@@ -5782,6 +5788,23 @@ describe('Session live_elapsed second mode', () => {  test('second live_elapsed 
     cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
       session.onCardWriteFailure(turn, turn.cardId, code, failure)
     })
+    const proxyEnv = Object.fromEntries([
+      'HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy',
+    ].map(key => [key, process.env[key]]))
+    // Keep the mocked fetch independent of system proxy discovery and Bun's direct dispatcher.
+    for (const key of Object.keys(proxyEnv)) process.env[key] = /no_proxy/i.test(key) ? '*' : ''
+    const retryDelays: number[] = []
+    let now = Date.now()
+    const clockSpy = spyOn(Date, 'now').mockImplementation(() => now)
+    const originalSetTimeout = globalThis.setTimeout
+    const timeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: any, delay: number, ...args: any[]) => {
+      if ([3000, 4000, 5000, 8000, 15000, 60000].includes(delay)) {
+        retryDelays.push(delay)
+        now += delay
+        return originalSetTimeout(callback, 0, ...args)
+      }
+      return originalSetTimeout(callback, delay, ...args)
+    }) as typeof setTimeout)
     let footerAttempts = 0
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input))
@@ -5809,6 +5832,7 @@ describe('Session live_elapsed second mode', () => {  test('second live_elapsed 
       await cardkit.flush(turn.cardId)
       await waitUntil(() => !turn.footerStatusWriteCardId)
       expect(footerAttempts).toBe(consumedUuid ? 3 : 2)
+      expect(retryDelays).toEqual(consumedUuid ? [3000, 8000] : [3000])
       expect(turn.footerStatusFailedCardId).not.toBe(turn.cardId)
       expect(turn.footerStatusHandle).not.toBeNull()
       expect(sentRawTexts).toHaveLength(0)
@@ -5821,7 +5845,15 @@ describe('Session live_elapsed second mode', () => {  test('second live_elapsed 
       expect(turn.cardWriteFailureNotices.size).toBe(0)
     } finally {
       session.stopFooterStatus(turn)
-      await cardkit.dispose(turn.cardId)
+      try { await cardkit.dispose(turn.cardId) }
+      finally {
+        timeoutSpy.mockRestore()
+        clockSpy.mockRestore()
+        for (const [key, value] of Object.entries(proxyEnv)) {
+          if (value === undefined) delete process.env[key]
+          else process.env[key] = value
+        }
+      }
     }
   })
 })
@@ -5872,6 +5904,23 @@ describe('Session card outage backpressure', () => {
     turn.userOpenId = ''
     session.currentTurn = turn
     cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => session.onCardWriteFailure(turn, turn.cardId, code, failure))
+    const proxyEnv = Object.fromEntries([
+      'HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy',
+    ].map(key => [key, process.env[key]]))
+    // Keep the mocked fetch independent of system proxy discovery and Bun's direct dispatcher.
+    for (const key of Object.keys(proxyEnv)) process.env[key] = /no_proxy/i.test(key) ? '*' : ''
+    const retryDelays: number[] = []
+    let now = Date.now()
+    const clockSpy = spyOn(Date, 'now').mockImplementation(() => now)
+    const originalSetTimeout = globalThis.setTimeout
+    const timeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: any, delay: number, ...args: any[]) => {
+      if ([3000, 4000, 5000, 8000, 15000, 60000].includes(delay)) {
+        retryDelays.push(delay)
+        now += delay
+        return originalSetTimeout(callback, 0, ...args)
+      }
+      return originalSetTimeout(callback, delay, ...args)
+    }) as typeof setTimeout)
     const baseFetch = globalThis.fetch
     let rejectFooter = true
     let attempts = 0
@@ -5892,8 +5941,9 @@ describe('Session card outage backpressure', () => {
       session.startThinkingFooter(turn)
       await cardkit.flush(turn.cardId)
       await waitUntil(() => turn.footerStatusFailedCardId === turn.cardId)
-      const failedAttempts = code === 200770 ? 4 : 3
+      const failedAttempts = 6
       expect(attempts).toBe(failedAttempts)
+      expect(retryDelays).toEqual([3000, 8000, 15000, 15000, 15000, 4000])
       expect(turn.footerStatusHandle).toBeNull()
       expect(sentRawTexts).toHaveLength(0)
       expect(turn.cardWriteFailureNotices.size).toBe(0)
@@ -5919,7 +5969,15 @@ describe('Session card outage backpressure', () => {
       session.stopFooterStatus(turn)
       if (previousRuntime === undefined) delete cfg.runtime
       else cfg.runtime = previousRuntime
-      await cardkit.dispose(turn.cardId)
+      try { await cardkit.dispose(turn.cardId) }
+      finally {
+        timeoutSpy.mockRestore()
+        clockSpy.mockRestore()
+        for (const [key, value] of Object.entries(proxyEnv)) {
+          if (value === undefined) delete process.env[key]
+          else process.env[key] = value
+        }
+      }
     }
   }, 15_000)
 

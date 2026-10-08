@@ -12,6 +12,13 @@ test('Feishu sends participate in message ordering and tail reads reject incompl
     const feishu = await import('./src/feishu')
     const { config } = await import('./src/config')
     assert.equal(config.feishu.app_id, 'cli_test')
+    let now = Date.now()
+    Date.now = () => now
+    const originalSetTimeout = globalThis.setTimeout
+    globalThis.setTimeout = (callback, ms, ...args) => originalSetTimeout(() => {
+      now += ms
+      callback(...args)
+    }, 0)
     globalThis.fetch = async () => { throw new Error('unexpected network request') }
     const events = []
     let listResponse = { code: 0, data: { items: [{ message_id: 'user-or-app-message' }] } }
@@ -24,7 +31,9 @@ test('Feishu sends participate in message ordering and tail reads reject incompl
     assert.equal(await feishu.getChatTailMessageId('chat'), null)
     for (const response of [{ code: 999, msg: 'permission denied' }, { code: 0, data: {} }, { code: 0, data: { items: [{}] } }, { code: 0, data: { items: [{ message_id: 42 }] } }]) {
       listResponse = response
+      const startedAt = now
       await assert.rejects(feishu.getChatTailMessageId('chat'))
+      assert.equal(now - startedAt, 60000, 'incomplete reads must not report failure before the recovery deadline')
     }
     feishu.client.im.message.create = async args => {
       events.push(args.data.msg_type)

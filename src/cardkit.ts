@@ -16,12 +16,16 @@ import { networkFetch } from './network'
 
 import { createHash, randomUUID } from 'node:crypto'
 import { getTenantToken } from './feishu'
-import { FeishuRequestError, isTransientFeishuError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
+import { FeishuRequestError, FeishuRecoveryWindow, isTransientFeishuError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
 import { log } from './log'
 import { ELEMENTS, neutralizeMarkdownImagesInCard } from './cards/elements'
 
 const BASE = 'https://open.feishu.cn/open-apis/cardkit/v1'
 const CARDKIT_FETCH_TIMEOUT_MS = 15_000
+// A consumed UUID/duplicate after an ambiguous response can arrive while the
+// upstream service is still recovering. Keep confirmation in the same queue
+// slot, and give the upstream time to recover before confirming the state.
+const MUTATION_CONFIRM_DELAY_MS = 5_000
 
 const ID_CONVERT_RETRY_DELAYS_MS = [0, 250, 750, 1500]
 
@@ -224,7 +228,7 @@ function attemptedContentFingerprint(s: CardState, elementId?: string, fingerpri
   return createHash('sha256').update(contents.sort().join('\n')).digest('hex')
 }
 
-async function call(method: string, path: string, body?: object, onAttemptFailure?: (error: unknown) => void): Promise<any> {
+async function call(method: string, path: string, body: object, recovery: FeishuRecoveryWindow, onAttemptFailure?: (error: unknown) => void): Promise<any> {
   // Mutations carry a sequence; id_convert is a lookup and has no UUID field.
   // Freeze the whole mutation before retrying: a lost acknowledgement must
   // resend the same UUID, sequence and content for Feishu's idempotency check.
@@ -235,8 +239,8 @@ async function call(method: string, path: string, body?: object, onAttemptFailur
   }) : undefined
   const label = `cardkit ${method} ${path}`
   return withFeishuRetry(label, async () => {
-    const token = await getTenantToken()
-    const signal = AbortSignal.timeout(CARDKIT_FETCH_TIMEOUT_MS)
+    const token = await getTenantToken(recovery)
+    const signal = AbortSignal.timeout(recovery.timeoutMs(CARDKIT_FETCH_TIMEOUT_MS))
     let res: Response | undefined
     try {
       res = await networkFetch(`${BASE}${path}`, {
@@ -254,7 +258,7 @@ async function call(method: string, path: string, body?: object, onAttemptFailur
       onAttemptFailure?.(error)
       throw error
     }
-  }, { api: 'cardkit' })
+  }, { api: 'cardkit', recovery })
 }
 
 function isUuidConsumedFailure(error: unknown): boolean {
@@ -274,21 +278,25 @@ function isAmbiguousMutationFailure(error: unknown): boolean {
   return isTransientFeishuError(error, { api: 'cardkit' })
 }
 
-/** PUT and settings PATCH assign an absolute state. If a retry hits a consumed
- * UUID after an uncertain response, confirm that same state once with a new
- * operation identity, inside the original queue slot. A consumed UUID alone
- * is never success. The confirmation retains ordinary transport retries, but
- * cannot recursively renew its UUID. DELETE and POST need separate semantics. */
-async function callStateMutation(cardId: string, method: 'PUT' | 'PATCH', path: string, body: object): Promise<void> {
-  let uncertain = false
-  try {
-    await call(method, path, { ...body, sequence: nextSeq(cardId) }, error => {
-      if (isAmbiguousMutationFailure(error)) uncertain = true
-    })
-  } catch (error) {
-    if (!uncertain || !isUuidConsumedFailure(error)) throw error
-    log(`cardkit confirm ${method} ${path}: ${error}; retrying same state with new UUID and sequence`)
-    await call(method, path, { ...body, sequence: nextSeq(cardId) })
+/** PUT and settings PATCH assign an absolute state. After an ambiguous attempt
+ * followed by a consumed UUID, confirm with a new identity inside the same
+ * queue slot and recovery deadline. Each identity needs its own evidence of an
+ * uncertain response; a consumed UUID alone never authorizes a new write. */
+async function callStateMutation(cardId: string, method: 'PUT' | 'PATCH', path: string, body: object, recovery: FeishuRecoveryWindow): Promise<void> {
+  let confirming = false
+  for (;;) {
+    let uncertain = false
+    try {
+      await call(method, path, { ...body, sequence: nextSeq(cardId) }, recovery, error => {
+        if (isAmbiguousMutationFailure(error)) uncertain = true
+      })
+      if (confirming) log(`cardkit confirmed ${method} ${path}: same state accepted with new UUID and sequence`)
+      return
+    } catch (error) {
+      if (!uncertain || !isUuidConsumedFailure(error)) throw error
+      if (!await recovery.waitForRetry(`cardkit confirm ${method} ${path}`, error, MUTATION_CONFIRM_DELAY_MS)) throw error
+      confirming = true
+    }
   }
 }
 
@@ -296,7 +304,7 @@ async function callStateMutation(cardId: string, method: 'PUT' | 'PATCH', path: 
  * observed ambiguous attempt followed by Duplicate ID or a consumed UUID
  * authorizes this PUT. Consumed UUID evidence is local to this request; an
  * unsolicited duplicate remains a real validation failure. */
-async function addElementMutation(cardId: string, s: CardState, element: object, opts: ElementPlacement): Promise<void> {
+async function addElementMutation(cardId: string, s: CardState, element: object, opts: ElementPlacement, recovery: FeishuRecoveryWindow): Promise<void> {
   const elementId = (element as { element_id?: string }).element_id
   let uncertain = false
   try {
@@ -305,7 +313,7 @@ async function addElementMutation(cardId: string, s: CardState, element: object,
       ...(opts.targetElementId ? { target_element_id: opts.targetElementId } : {}),
       elements: JSON.stringify([element]),
       sequence: nextSeq(cardId),
-    }, error => {
+    }, recovery, error => {
       if (isAmbiguousMutationFailure(error)) {
         uncertain = true
         if (elementId) s.uncertainAdds.add(elementId)
@@ -315,10 +323,11 @@ async function addElementMutation(cardId: string, s: CardState, element: object,
     const failure = error as CardKitRequestError
     const duplicate = elementId && s.uncertainAdds.has(elementId) && isDuplicateElementFailure(failure?.code, failure)
     if (!elementId || !(duplicate || (uncertain && isUuidConsumedFailure(error)))) throw error
-    log(`cardkit reconcile uncertain add ${cardId} element=${elementId}: ${error}; confirming latest content with PUT`)
+    if (!await recovery.waitForRetry(`cardkit reconcile uncertain add ${cardId} element=${elementId}`, error, MUTATION_CONFIRM_DELAY_MS)) throw error
     await callStateMutation(cardId, 'PUT', `/cards/${cardId}/elements/${elementId}`, {
       element: JSON.stringify(element),
-    })
+    }, recovery)
+    log(`cardkit reconciled uncertain add ${cardId} element=${elementId}: latest content accepted with PUT`)
   }
   if (!elementId || !s.confirmedAdds.has(elementId)) s.elementCount++
   if (elementId) {
@@ -345,10 +354,10 @@ function isStreamingClosed(e: unknown): boolean {
  * starts when streaming is opened and fires regardless of activity).
  * Called from inside the per-card queue's catch path, so it allocates
  * its own sequence and runs inline without re-enqueueing. */
-async function reopenStreaming(cardId: string): Promise<void> {
+async function reopenStreaming(cardId: string, recovery: FeishuRecoveryWindow): Promise<void> {
   await callStateMutation(cardId, 'PATCH', `/cards/${cardId}/settings`, {
     settings: JSON.stringify({ config: { streaming_mode: true } }),
-  })
+  }, recovery)
 }
 
 /** Run `op` inside the per-card queue. If it fails with code=300309
@@ -360,17 +369,18 @@ async function reopenStreaming(cardId: string): Promise<void> {
 async function withReopenOnStreamingClosed(
   cardId: string,
   label: string,
-  op: () => Promise<void>,
+  op: (recovery: FeishuRecoveryWindow) => Promise<void>,
   onFailure?: (failure: CardWriteFailure) => void,
   silent: boolean | 'non-capacity' = false,
   meta: Pick<CardWriteFailure, 'elementId' | 'targetElementId'> & { contentFingerprint?: string } = {},
 ): Promise<void> {
+  const recovery = new FeishuRecoveryWindow()
   // 失败统一出口:card-level handler 先(它同步快照当前段/tool 后再异步
   // 换卡),per-call onFailure 后(addElement 的 deadElements.add + session
   // 段游标 reset)。顺序要紧 —— 换卡的同步快照必须在 reset 把
   // currentAssistant* 清空之前跑。silent(deleteElement)跳过 card-level:
   // 删不掉一个元素不影响新内容,不值得为它换卡。
-  const fail = (error: unknown): void => {
+  const fail = async (error: unknown): Promise<void> => {
     const requestError = typeof error === 'object' && error !== null
       ? error as CardKitRequestError
       : null
@@ -390,6 +400,10 @@ async function withReopenOnStreamingClosed(
         state(cardId), meta.elementId, meta.contentFingerprint,
       )
     }
+    // Capacity is immediately handed to the existing pagination mechanism.
+    // Other final errors stay in logs until the recovery window expires.
+    if (!isCardCapacityFailure(failure.code, failure)
+      && !(error instanceof Error && error.name === 'AbortError')) await recovery.waitUntilDeadline()
     try {
       if (!silent || (silent === 'non-capacity' && isCardCapacityFailure(failure.code, failure))) {
         state(cardId).onFailure?.(failure.code, failure)
@@ -404,28 +418,28 @@ async function withReopenOnStreamingClosed(
     }
   }
   try {
-    await op()
+    await op(recovery)
     return
   } catch (e) {
     if (!isStreamingClosed(e)) {
       log(`cardkit ${label} ${cardId}: ${e}`)
-      fail(e)
+      await fail(e)
       return
     }
     log(`cardkit ${label} ${cardId}: streaming closed (code=${(e as any).code}) — reopening`)
   }
   try {
-    await reopenStreaming(cardId)
+    await reopenStreaming(cardId, recovery)
   } catch (re) {
     log(`cardkit STREAMING_REOPEN_FAILED ${cardId}: ${re}`)
-    fail(re)
+    await fail(re)
     return
   }
   try {
-    await op()
+    await op(recovery)
   } catch (e2) {
     log(`cardkit ${label} ${cardId} retry-after-reopen: ${e2}`)
-    fail(e2)
+    await fail(e2)
   }
 }
 
@@ -442,20 +456,31 @@ export async function convertMessageToCard(
   messageId: string,
   opts: IdConvertOptions = {},
 ): Promise<string> {
+  const recovery = new FeishuRecoveryWindow()
   const delays = opts.retryDelaysMs?.length ? opts.retryDelaysMs : ID_CONVERT_RETRY_DELAYS_MS
   let lastErr: unknown = null
   for (let i = 0; i < delays.length; i++) {
     const delay = delays[i] ?? 0
-    if (delay > 0) await sleep(delay)
+    if (delay > 0) await sleep(Math.min(delay, recovery.remainingMs()))
     try {
-      const data = await call('POST', '/cards/id_convert', { message_id: messageId })
+      const data = await call('POST', '/cards/id_convert', { message_id: messageId }, recovery)
       if (typeof data?.card_id !== 'string' || !data.card_id) {
         throw new Error(`cardkit POST /cards/id_convert: missing card_id`)
       }
       return data.card_id
     } catch (e) {
       lastErr = e
-      if (!isIdConvertEmptyResult(e) || i === delays.length - 1) throw e
+      if (!isIdConvertEmptyResult(e)) {
+        await recovery.waitUntilDeadline()
+        throw e
+      }
+      if (i === delays.length - 1) {
+        // The message may take longer than the initial indexing probes to
+        // appear. Continue the same read under the original recovery window.
+        if (!await recovery.waitForRetry(`cardkit id_convert ${messageId}`, e)) throw e
+        i--
+        continue
+      }
       const nextDelay = delays[i + 1] ?? 0
       log(`cardkit id_convert ${messageId}: empty result, retry ${i + 2}/${delays.length} in ${nextDelay}ms`)
     }
@@ -501,8 +526,8 @@ export function addElement(
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `addElement`,
-    async () => {
-      await addElementMutation(cardId, s, safeElement, opts)
+    async recovery => {
+      await addElementMutation(cardId, s, safeElement, opts, recovery)
       // The mutation confirms the POST or reconciliation before recording
       // either the element count or its latest content.
       if (elementId !== ELEMENTS.footer) s.contentFingerprints.set(elementId ?? `#${s.sequence}`, fingerprint)
@@ -544,15 +569,15 @@ export function replaceElement(
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `replaceElement ${elementId}`,
-    async () => {
+    async recovery => {
       const missing = s.failedAdds.get(elementId)
       if (s.deadElements.has(elementId) && !missing && !s.failedReplacements.has(elementId)) return
       if (missing) {
-        await addElementMutation(cardId, s, safeElement, missing)
+        await addElementMutation(cardId, s, safeElement, missing, recovery)
       } else {
         await callStateMutation(cardId, 'PUT', `/cards/${cardId}/elements/${elementId}`, {
           element: JSON.stringify(safeElement),
-        })
+        }, recovery)
       }
       s.deadElements.delete(elementId)
       s.failedAdds.delete(elementId)
@@ -649,12 +674,12 @@ export function deleteElement(
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `deleteElement ${elementId}`,
-    async () => {
+    async recovery => {
       if (deleted()) return
       const seq = nextSeq(cardId)
       await call('DELETE', `/cards/${cardId}/elements/${elementId}`, {
         sequence: seq,
-      })
+      }, recovery)
       s.elementCount = Math.max(0, s.elementCount - 1)
       s.contentFingerprints.delete(elementId)
       s.failedAdds.delete(elementId)
@@ -770,11 +795,11 @@ export async function patchSettingsChecked(
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     'patchSettings',
-    async () => {
+    async recovery => {
       if (isDisposed(cardId)) return
       await callStateMutation(cardId, 'PATCH', `/cards/${cardId}/settings`, {
         settings: JSON.stringify(settings),
-      })
+      }, recovery)
       landed = true
     },
     failure => { failed = true; onFailure?.(failure) },

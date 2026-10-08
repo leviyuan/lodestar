@@ -8,10 +8,13 @@ async function runIsolated(script: string): Promise<void> {
     import assert from 'node:assert/strict'
     const feishu = await import('./src/feishu')
     const delays = []
+    let now = 1800000000000
+    Date.now = () => now
     const originalSetTimeout = globalThis.setTimeout
     globalThis.setTimeout = (fn, ms, ...args) => {
-      assert.ok([1000, 2000, 4000].includes(ms), 'unexpected timer: ' + ms)
+      assert.ok(Number.isFinite(ms) && ms >= 0 && ms <= 60000, 'unexpected timer: ' + ms)
       delays.push(ms)
+      now += ms
       return originalSetTimeout(fn, 0, ...args)
     }
     globalThis.fetch = async () => { throw new Error('unexpected network request') }
@@ -21,6 +24,7 @@ async function runIsolated(script: string): Promise<void> {
     cwd: fileURLToPath(new URL('..', import.meta.url)),
     env: {
       ...process.env,
+      NODE_ENV: 'test',
       HTTP_PROXY: '', http_proxy: '', HTTPS_PROXY: '', https_proxy: '', ALL_PROXY: '', all_proxy: '',
       NO_PROXY: '*', no_proxy: '*',
     }, stdout: 'pipe', stderr: 'pipe',
@@ -139,7 +143,7 @@ test('all message types retry transient SDK failures with the same UUID and reje
       assert.equal(new Set(calls.map(call => call.data.uuid)).size, 1)
       assert.equal(new Set(calls.map(call => call.data.content)).size, 1)
       assert.ok(calls.every(call => call.data.msg_type === type))
-      assert.deepEqual(delays, [1000, 4000])
+      assert.deepEqual(delays, [3000, 8000])
       await send()
       assert.notEqual(calls[3].data.uuid, calls[0].data.uuid, 'new delivery gets a new UUID')
     }
@@ -161,7 +165,7 @@ test('all message types retry transient SDK failures with the same UUID and reje
       }
       assert.equal(await feishu.sendFile('chat', 'key'), null)
       assert.equal(calls, 1)
-      assert.deepEqual(delays, [])
+      assert.deepEqual(delays, failure.name === 'AbortError' ? [] : [60000])
     }
     let calls = 0
     delays.length = 0
@@ -170,7 +174,7 @@ test('all message types retry transient SDK failures with the same UUID and reje
       return { code: 0, data: { message_id: 'after-rate-limit' } }
     }
     assert.equal(await feishu.sendFile('chat', 'key'), 'after-rate-limit')
-    assert.deepEqual(delays, [2000])
+    assert.deepEqual(delays, [3000])
     for (const failure of [
       { code: 230020, msg: 'group rate limit' },
       { code: 99991400, msg: 'application rate limit' },
@@ -184,7 +188,7 @@ test('all message types retry transient SDK failures with the same UUID and reje
       }
       assert.equal(await feishu.sendFile('chat', 'key'), 'after-business-rate-limit')
       assert.equal(calls, 2)
-      assert.deepEqual(delays, [failure instanceof Error ? 2000 : 1000])
+      assert.deepEqual(delays, [3000])
     }
   `)
 })
@@ -200,6 +204,133 @@ test('Drive explicit retryable errors use the shared bounded retry policy', asyn
     assert.equal(value, 'uploaded')
     assert.equal(attempts, 3)
     assert.deepEqual(delays, [1000, 4000])
+  `)
+})
+
+test('outbound SDK requests recover after 55 seconds with their original UUID and remaining transport timeout', async () => {
+  await runIsolated(`
+    const calls = [], failures = []
+    const started = now
+    feishu.client.im.message.create = args => feishu.client.httpInstance.request({
+      url: 'https://example.invalid/output', method: 'POST', data: args.data,
+      adapter: async config => {
+        calls.push(JSON.parse(config.data))
+        assert.equal(config.timeout, calls.length === 1 ? 15000 : 5000)
+        assert.ok(config.signal instanceof AbortSignal)
+        if (calls.length === 1) throw Object.assign(new Error('brief outage'), {
+          response: { status: 503, data: { code: 99991400, msg: 'try later', log_id: 'recoverable' }, headers: { 'retry-after': '55' } },
+        })
+        return { config, data: { code: 0, data: { message_id: 'recovered' } }, status: 200, statusText: 'OK', headers: {} }
+      },
+    })
+    assert.equal(await feishu.sendText('chat', 'pending output', error => failures.push(error)), 'recovered')
+    assert.equal(now - started, 55000)
+    assert.deepEqual(delays, [55000])
+    assert.equal(failures.length, 0)
+    assert.equal(calls.length, 2)
+    assert.equal(calls[0].uuid, calls[1].uuid)
+    assert.equal(calls[0].content, calls[1].content)
+  `)
+})
+
+test('outbound failure callbacks wait one minute and preserve final diagnostics without repeating permanent rejections', async () => {
+  await runIsolated(`
+    for (const permanent of [false, true]) {
+      const started = now, failures = []
+      let attempts = 0
+      delays.length = 0
+      feishu.client.im.message.create = async () => {
+        attempts++
+        assert.equal(failures.length, 0)
+        return { code: permanent ? 230001 : 230020, msg: permanent ? 'invalid receiver' : 'temporary limit', error: { log_id: 'final-' + attempts } }
+      }
+      assert.equal(await feishu.sendCard('chat', {}, error => {
+        assert.equal(now - started, 60000)
+        failures.push(error)
+      }), null)
+      assert.equal(attempts, permanent ? 1 : 6)
+      assert.equal(failures.length, 1)
+      assert.equal(failures[0].logId, 'final-' + attempts)
+      assert.equal(failures[0].apiMessage, permanent ? 'invalid receiver' : 'temporary limit')
+      assert.equal(now - started, 60000)
+    }
+  `)
+})
+
+test('chat-tail reads and ordinary card replacements share the output recovery policy', async () => {
+  await runIsolated(`
+    for (const kind of ['tail', 'patch']) {
+      const started = now
+      let attempts = 0
+      const argsSeen = []
+      const operation = async args => {
+        argsSeen.push(args)
+        if (++attempts === 1) throw Object.assign(new Error('brief outage'), {
+          response: { status: 503, headers: { 'retry-after': '55' } },
+        })
+        return { code: 0, data: { items: [{ message_id: 'actual-tail' }] } }
+      }
+      if (kind === 'tail') {
+        feishu.client.im.message.list = operation
+        assert.equal(await feishu.getChatTailMessageId('chat'), 'actual-tail')
+      } else {
+        feishu.client.im.v1.message.patch = operation
+        await feishu.updateCard('card-message', { schema: '2.0', body: { elements: [] } })
+      }
+      assert.equal(now - started, 55000)
+      assert.equal(attempts, 2)
+      assert.deepEqual(argsSeen[0], argsSeen[1])
+    }
+  `)
+})
+
+test('expired token waiters stop output without cancelling the shared refresh or sending a late upload', async () => {
+  await runIsolated(`
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const { tmpdir } = await import('node:os')
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-token-deadline-'))
+    const png = join(root, 'picture.png')
+    writeFileSync(png, 'image bytes')
+    const originalTimeout = AbortSignal.timeout
+    const timers = [], failures = []
+    let resolveToken, tokenCalls = 0, uploadCalls = 0
+    AbortSignal.timeout = ms => {
+      const controller = new AbortController()
+      timers.push({ ms, controller })
+      return controller.signal
+    }
+    globalThis.fetch = async url => {
+      if (String(url).includes('/tenant_access_token/')) {
+        tokenCalls++
+        return new Promise(resolve => { resolveToken = resolve })
+      }
+      uploadCalls++
+      throw new Error('expired operation must not upload')
+    }
+    try {
+      const started = now
+      const upload = feishu.uploadImageKey(png, error => failures.push(error))
+      while (!resolveToken) await new Promise(resolve => originalSetTimeout(resolve, 0))
+      const shared = feishu.getTenantToken()
+      assert.equal(tokenCalls, 1)
+      const waiter = timers.find(timer => timer.ms === 60000)
+      assert.ok(waiter)
+      now += 60000
+      waiter.controller.abort(new DOMException('waiter expired', 'TimeoutError'))
+      assert.equal(await upload, null)
+      assert.equal(now - started, 60000)
+      assert.equal(failures.length, 1)
+      assert.equal(uploadCalls, 0)
+      assert.equal(timers.find(timer => timer.ms === 15000).controller.signal.aborted, false)
+      resolveToken(Response.json({ code: 0, tenant_access_token: 'shared-token' }))
+      assert.equal(await shared, 'shared-token')
+      await Promise.resolve()
+      assert.equal(uploadCalls, 0)
+    } finally {
+      AbortSignal.timeout = originalTimeout
+      rmSync(root, { recursive: true, force: true })
+    }
   `)
 })
 
@@ -264,7 +395,7 @@ test('uploads retry token failures and rebuild multipart bodies; message retries
       }
       assert.equal(await feishu.uploadImageKey(png), 'token-recovered')
       assert.equal(tokenCalls, 2)
-      assert.deepEqual(delays, [1000])
+      assert.deepEqual(delays, [3000])
 
       for (const [type, extension] of [['file', 'txt'], ['image', 'png']]) {
         const path = join(root, '附件.' + extension)
@@ -302,12 +433,12 @@ test('uploads retry token failures and rebuild multipart bodies; message retries
         assert.equal(new Set(signals).size, 3)
         assert.equal(sends.length, 2)
         assert.equal(sends[0].uuid, sends[1].uuid)
-        assert.deepEqual(delays, [1000, 4000, 1000])
+        assert.deepEqual(delays, [3000, 8000, 3000])
       }
       for (const [failure, delay] of [
-        [() => new Response('busy', { status: 429, headers: { 'Retry-After': '2' } }), 2000],
-        [() => Response.json({ code: 99991400, msg: 'rate limited' }, { status: 400, headers: { 'x-ogw-ratelimit-reset': '2' } }), 2000],
-        [() => { throw new DOMException('upload timed out', 'TimeoutError') }, 1000],
+        [() => new Response('busy', { status: 429, headers: { 'Retry-After': '2' } }), 3000],
+        [() => Response.json({ code: 99991400, msg: 'rate limited' }, { status: 400, headers: { 'x-ogw-ratelimit-reset': '2' } }), 3000],
+        [() => { throw new DOMException('upload timed out', 'TimeoutError') }, 3000],
       ]) {
         let attempts = 0
         delays.length = 0
@@ -336,7 +467,7 @@ test('uploads retry token failures and rebuild multipart bodies; message retries
           }
           assert.equal(await feishu.uploadImageKey(png), 'after-node-timeout')
           assert.equal(attempts, 2)
-          assert.deepEqual(delays, [1000])
+          assert.deepEqual(delays, [3000])
         }
       } finally { AbortSignal.timeout = originalTimeout }
     } finally { rmSync(root, { recursive: true, force: true }) }
@@ -369,14 +500,14 @@ test('upload and send exhaustion produce visible errors; invalid files and perma
     try {
       assert.equal(await feishu.uploadAndSend('chat', path), false)
       assert.equal(uploads, 1)
-      assert.equal(sends.length, 3)
+      assert.equal(sends.length, 6)
       assert.equal(new Set(sends.map(send => send.uuid)).size, 1)
       assert.equal(notices.length, 1)
       assert.match(notices[0], /出站文件发送失败.*report.txt/)
-      assert.deepEqual(delays, [1000, 4000])
+      assert.deepEqual(delays, [3000, 8000, 15000, 15000, 15000, 4000])
 
       for (const [response, expectedAttempts] of [
-        [() => new Response('busy', { status: 503 }), 3],
+        [() => new Response('busy', { status: 503 }), 6],
         [() => Response.json({ code: 234002, msg: 'unauthorized' }, { status: 401 }), 1],
         [() => Response.json({ code: 234001, msg: 'invalid parameters' }), 1],
         [() => Response.json({ code: 0, data: {} }), 1],
@@ -392,7 +523,7 @@ test('upload and send exhaustion produce visible errors; invalid files and perma
         assert.equal(notices.length, 1)
         assert.match(notices[0], /出站文件上传失败.*report.txt/)
         assert.match(notices[0], /code=.*message=.*log_id=/)
-        assert.equal(delays.length, expectedAttempts - 1)
+        assert.equal(delays.reduce((sum, delay) => sum + delay, 0), 60000)
       }
       globalThis.fetch = async () => { throw new Error('invalid file must not upload') }
       const fd = openSync(path, 'w')

@@ -1,5 +1,5 @@
 import { networkFetch } from './network'
-import { FeishuRequestError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
+import { FeishuRecoveryWindow, FeishuRequestError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
 import { feishuErrorDetails, formatFeishuError } from './feishu-errors'
 import { withChatMessageOrder } from './chat-message-order'
 import { AGENT_PROVIDERS, isAgentProvider, isDshReasoningEffort } from './agent-process'
@@ -12,6 +12,7 @@ import { AGENT_PROVIDERS, isAgentProvider, isDshReasoningEffort } from './agent-
  */
 
 import * as lark from '@larksuiteoapi/node-sdk'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { execSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
@@ -139,17 +140,26 @@ export function projectProfileForDirectory(workDir: string): ProjectProfile | un
 // Keep response headers until diagnostics have been extracted. The SDK's
 // default response interceptor otherwise discards header-only request IDs.
 type SdkHttp = NonNullable<ConstructorParameters<typeof lark.Client>[0]['httpInstance']>
+const sdkRecovery = new AsyncLocalStorage<FeishuRecoveryWindow>()
 const sdkRequest: SdkHttp['request'] = async <T = any, R = T, D = any>(options: Parameters<SdkHttp['request']>[0] & { data?: D }): Promise<R> => {
+  const recovery = sdkRecovery.getStore()
+  const timeout = recovery?.timeoutMs(RAW_FETCH_TIMEOUT_MS)
+  const signal = timeout === undefined ? undefined : AbortSignal.timeout(timeout)
   try {
     // Use the original transport so the SDK's default options and request
     // interceptors (including its User-Agent) remain unchanged.
-    const response = await lark.defaultHttpInstance.request({ ...options, $return_headers: true } as any) as any
+    const response = await lark.defaultHttpInstance.request({
+      ...options,
+      ...(timeout === undefined ? {} : { timeout, signal }),
+      $return_headers: true,
+    } as any) as any
     const details = feishuErrorDetails({ data: response.data, headers: response.headers })
     if (details.logId && response.data && typeof response.data === 'object' && !Array.isArray(response.data)) {
       response.data.log_id = details.logId
     }
     return ((options as any).$return_headers ? response : response.data) as R
   } catch (error) {
+    if (signal?.aborted && signal.reason?.name === 'TimeoutError') throw signal.reason
     // Preserve the SDK/Axios object, including permission scopes and retry data.
     if (error instanceof Error) {
       const details = feishuErrorDetails(error)
@@ -182,6 +192,23 @@ function sdkApiError(label: string, raw: unknown): FeishuRequestError {
 
 const RAW_FETCH_TIMEOUT_MS = 15_000
 
+function withOutputRecovery<T>(label: string, operation: (recovery: FeishuRecoveryWindow) => Promise<T>): Promise<T> {
+  const recovery = new FeishuRecoveryWindow()
+  // Generated SDK methods do not accept HTTP timeouts. Keep the deadline in
+  // this async call tree so token acquisition and every transport request use
+  // its remaining budget, without changing concurrent callers' timeouts.
+  return sdkRecovery.run(recovery, async () => {
+    try { return await withFeishuRetry(label, () => operation(recovery), { recovery }) }
+    catch (error) {
+      // A definitive upstream rejection is not retried, but it does not need
+      // to interrupt the group before the output's one-minute grace period.
+      // Caller cancellation remains immediate.
+      if (!(error instanceof Error && error.name === 'AbortError')) await recovery.waitUntilDeadline()
+      throw error
+    }
+  })
+}
+
 function rawFetch(input: string | URL, init: RequestInit = {}): Promise<Response> {
   return networkFetch(input, {
     ...init,
@@ -205,7 +232,8 @@ async function fetchFeishuJson(input: string, init: RequestInit, label: string):
 let cachedToken = ''
 let tokenExpiry = 0
 let tokenInFlight: Promise<string> | null = null
-export async function getTenantToken(): Promise<string> {
+export async function getTenantToken(recovery?: FeishuRecoveryWindow): Promise<string> {
+  recovery?.timeoutMs(RAW_FETCH_TIMEOUT_MS)
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken
   tokenInFlight ??= (async () => {
     const data = await fetchFeishuJson('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
@@ -219,7 +247,29 @@ export async function getTenantToken(): Promise<string> {
     tokenExpiry = Date.now() + Math.max(0, (data.expire ?? 7200) - 60) * 1000
     return cachedToken
   })().finally(() => { tokenInFlight = null })
-  return tokenInFlight
+  if (!recovery) return tokenInFlight
+  // Only stop this caller's read-only wait. The shared refresh retains its own
+  // timeout and may still provide a token to other callers after this deadline.
+  const pending = tokenInFlight
+  const signal = AbortSignal.timeout(recovery.timeoutMs(60_000))
+  return new Promise<string>((resolve, reject) => {
+    const onTimeout = (): void => {
+      try { recovery.timeoutMs(1) }
+      catch (error) { reject(error); return }
+      reject(signal.reason)
+    }
+    signal.addEventListener('abort', onTimeout, { once: true })
+    pending.then(token => {
+      signal.removeEventListener('abort', onTimeout)
+      try {
+        recovery.timeoutMs(1)
+        resolve(token)
+      } catch (error) { reject(error) }
+    }, error => {
+      signal.removeEventListener('abort', onTimeout)
+      reject(error)
+    })
+  })
 }
 
 // ── Chat directory ─────────────────────────────────────────────────────
@@ -1244,7 +1294,7 @@ async function sendViaSdkWithRetry(
   // but-response-lost first attempt doesn't produce a duplicate message.
   const uuid = randomUUID()
   try {
-    return await withFeishuRetry(`send${what} chat=${chatId}`, async () => {
+    return await withOutputRecovery(`send${what} chat=${chatId}`, async () => {
       const res: any = await client.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: { receive_id: chatId, msg_type: msgType, content, uuid },
@@ -1293,25 +1343,28 @@ export async function sendCard(chatId: string, card: object, onFailure?: (error:
 
 /** Read the actual chat tail, including messages sent by users/other apps. */
 export async function getChatTailMessageId(chatId: string): Promise<string | null> {
-  const response = await client.im.message.list({ params: {
-    container_id_type: 'chat', container_id: chatId, sort_type: 'ByCreateTimeDesc', page_size: 1,
-  } })
-  if (response.code !== 0) throw sdkApiError('feishu message.list', response)
-  if (!Array.isArray(response.data?.items)) throw new Error('feishu message.list items MISS')
-  if (response.data.items.length === 0) return null
-  const messageId = response.data.items[0]?.message_id
-  if (typeof messageId !== 'string' || !messageId.trim()) throw new Error('feishu message.list message_id MISS')
-  return messageId
+  return withOutputRecovery(`message.list chat=${chatId}`, async () => {
+    const response = await client.im.message.list({ params: {
+      container_id_type: 'chat', container_id: chatId, sort_type: 'ByCreateTimeDesc', page_size: 1,
+    } })
+    if (response.code !== 0) throw sdkApiError('feishu message.list', response)
+    if (!Array.isArray(response.data?.items)) throw new Error('feishu message.list items MISS')
+    if (response.data.items.length === 0) return null
+    const messageId = response.data.items[0]?.message_id
+    if (typeof messageId !== 'string' || !messageId.trim()) throw new Error('feishu message.list message_id MISS')
+    return messageId
+  })
 }
 
 export async function updateCard(messageId: string, card: object): Promise<void> {
-  const res: any = await client.im.v1.message.patch({
-    path: { message_id: messageId },
-    data: { content: JSON.stringify(neutralizeMarkdownImagesInCard(card)) },
+  const content = JSON.stringify(neutralizeMarkdownImagesInCard(card))
+  await withOutputRecovery(`message.patch message=${messageId}`, async () => {
+    const res: any = await client.im.v1.message.patch({
+      path: { message_id: messageId },
+      data: { content },
+    })
+    if (res?.code !== 0) throw sdkApiError('feishu message.patch', res)
   })
-  if (res?.code !== 0) {
-    throw sdkApiError('feishu message.patch', res)
-  }
 }
 
 /** Last-resort text send that bypasses the lark SDK and uses raw fetch
@@ -1459,13 +1512,19 @@ function looksLikeImage(filePath: string): boolean {
 
 async function uploadMultipart(filePath: string, type: 'image' | 'file'): Promise<string> {
   const label = `upload${type === 'image' ? 'Image' : 'File'}`
-  let file: Blob | undefined
-  return withFeishuRetry(`${label} ${filePath}`, async () => {
-    // Keep the same bytes across retries, even if the local path is overwritten.
-    // Check the bytes as well as stat: the file may have grown since validation.
-    file ??= new Blob([Uint8Array.from(await readFile(filePath))])
+  // Validate local bytes before entering upstream recovery. Local read/size
+  // errors are immediate, and retries use the same immutable content even if
+  // the source path changes while waiting.
+  let file: Blob
+  try {
+    file = new Blob([Uint8Array.from(await readFile(filePath))])
     if (file.size > MAX_UPLOAD_BYTES) throw new Error(`${basename(filePath)} 超过 30 MB`)
-    const token = await getTenantToken()
+  } catch (error) {
+    log(`feishu: ${label} local file validation failed ${filePath}: ${error}`)
+    throw error
+  }
+  return withOutputRecovery(`${label} ${filePath}`, async recovery => {
+    const token = await getTenantToken(recovery)
     // Rebuild the multipart body; the immutable Blob can be reused. Its copied
     // ArrayBuffer-backed view above also preserves Node 18 BlobPart compatibility.
     const form = new FormData()
@@ -1475,11 +1534,13 @@ async function uploadMultipart(filePath: string, type: 'image' | 'file'): Promis
       form.append('file_name', basename(filePath))
     }
     form.append(type, file, basename(filePath))
-    // Every attempt has its own 15s timeout, including response body reads.
+    // Token acquisition, request and response body reads share the recovery
+    // deadline. Each attempt gets at most 15s from the remaining budget.
     const data = await fetchFeishuJson(`https://open.feishu.cn/open-apis/im/v1/${type}s`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
       body: form,
+      signal: AbortSignal.timeout(recovery.timeoutMs(RAW_FETCH_TIMEOUT_MS)),
     }, label)
     const key = data.data?.[`${type}_key`]
     if (typeof key !== 'string' || !key.trim()) throw new Error(`${label} ${type}_key MISS`)

@@ -275,11 +275,20 @@ export class DshProcess extends EventEmitter implements AgentProcess {
           this.toolInputs.set(data.callId, { name, input })
           this.emit('tool_use', { id: data.callId, name, input, parentToolUseId: sub ? params.sessionId : null })
         } else if (e.type === 'tool/result') {
-          const block = data.message?.content?.[0]
-          if (block?.type !== 'tool-result' || typeof block.toolCallId !== 'string') throw new Error('invalid DSH tool result')
-          this.emit('tool_result', { tool_use_id: block.toolCallId, content: block.content,
-            is_error: block.isError === true, parentToolUseId: sub ? params.sessionId : null })
-          this.toolInputs.delete(block.toolCallId)
+          const message = data.message
+          // Native tool-role messages carry correlation directly; the earlier
+          // user-role protocol represents it in one tool-result content block.
+          const result = message?.role === 'tool' ? message
+            : message?.role === 'user' && message.content?.length === 1
+              && message.content[0]?.type === 'tool-result' ? message.content[0] : undefined
+          if (!result || typeof result.toolCallId !== 'string' || !result.toolCallId
+            || !Array.isArray(result.content)
+            || (result.isError !== undefined && typeof result.isError !== 'boolean')) {
+            throw new Error('invalid DSH tool result')
+          }
+          this.emit('tool_result', { tool_use_id: result.toolCallId, content: result.content,
+            is_error: result.isError === true, parentToolUseId: sub ? params.sessionId : null })
+          this.toolInputs.delete(result.toolCallId)
         } else if (e.type === 'todo/write' && !sub) {
           this.emit('turn_plan_updated', { threadId: this.sessionId, explanation: null,
             plan: data.todos.map((item: any) => ({ step: item.content, status: item.status === 'in_progress' ? 'inProgress' : item.status })) })
