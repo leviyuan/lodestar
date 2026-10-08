@@ -16,13 +16,21 @@ describe('compact hi account quota panel', () => {
       rateLimitsByLimitId: { codex: main, spark: { ...main, limitId: 'spark',
         credits: { hasCredits: true, unlimited: false, balance: '999999' } } },
       rateLimitResetCredits: { availableCount: 2 } }))
-    expect(consoleUnifiedUsageContent(usage)).toBe("周 <font color='red'>100%</font>/MISS · 积分 62,500.25 · 重置 2")
-    expect(unifiedUsageSummary(usage)).toBe('额度 周配额 已用 100% · 积分 62,500.25')
+    expect(consoleUnifiedUsageContent(usage)).toBe("周 <font color='red'>100%</font>/MISS · 积分 62.5k · 重置 2")
+    expect(unifiedUsageSummary(usage)).toBe('额度 周配额 已用 100% · 积分 62.5k')
+    for (const [balance, label] of [
+      [62500.25, '62.5k'], [1_250_000, '1.3m'], [1000, '1k'], [1_000_000, '1m'],
+      [999.94, '999.9'], [999.95, '1k'], [999_949, '999.9k'], [999_950, '1m'],
+      [12.34, '12.3'], [12, '12'], [0.0001, '<0.1'], [0.05, '0.1'],
+    ] as const) {
+      const snapshot = { ...usage, credits: { hasCredits: true, unlimited: false, balance } }
+      expect(consoleUnifiedUsageContent(snapshot)).toBe(`周 <font color='red'>100%</font>/MISS · 积分 ${label} · 重置 2`)
+      expect(unifiedUsageSummary(snapshot)).toBe(`额度 周配额 已用 100% · 积分 ${label}`)
+    }
     expect(consoleUnifiedUsageContent({ ...usage, credits: { hasCredits: false, unlimited: false, balance: 0 } })).not.toContain('积分')
     expect(consoleUnifiedUsageContent({ ...usage, credits: null })).toContain('积分 MISS')
     expect(consoleUnifiedUsageContent({ ...usage, credits: { hasCredits: true, unlimited: true, balance: null } })).toContain('积分 无限')
     expect(consoleUnifiedUsageContent({ ...usage, credits: { hasCredits: true, unlimited: false, balance: null } })).toContain('积分 MISS')
-    expect(consoleUnifiedUsageContent({ ...usage, credits: { hasCredits: true, unlimited: false, balance: 0.0001 } })).toContain('积分 0.0001')
   })
 
   test('one account occupies one row and includes main windows plus reset credits', () => {

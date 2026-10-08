@@ -27,7 +27,7 @@ describe('compact Codex account cards', () => {
     const panel = codexAccountPanel({ phase: 'accounts', total: aggregateCodexUsage(rows), scheduling: { candidates, ultra: false } }) as any
     expect(panel.elements[0].header.title.content).toBe('#1·账号 1「积分」 · 重置 0')
     expect(panel.elements[1].header.title.content).toBe('#2·账号 0「积分」 · 重置 0')
-    expect(JSON.stringify(panel.elements[0])).toContain('积分 62,500')
+    expect(JSON.stringify(panel.elements[0])).toContain('积分 62.5k')
     expect(JSON.stringify(panel.elements[0])).not.toContain('耗尽')
     if (rows[0].usage.state !== 'ok') throw new Error('fixture')
     rows[0].usage.credits = null
@@ -163,9 +163,11 @@ describe('compact Codex account cards', () => {
   })
   test('reset receipts show authoritative windows, zero cards, and explicit missing data', () => {
     const view: CodexAccountCardView = { phase: 'success', title: '额度已重置', message: '已使用 1 次重置卡。',
-      resetUsage: { state: 'ok', fiveHour: { percent: 4, resetsAt: null }, weekly: { percent: 7, resetsAt: null }, resetCredits: 0, fetchedAt: 1 } }
+      resetUsage: { state: 'ok', fiveHour: { percent: 4, resetsAt: null }, weekly: { percent: 7, resetsAt: null }, resetCredits: 0, fetchedAt: 1,
+        credits: { hasCredits: true, unlimited: false, balance: 1_250_000 } } }
     const card = JSON.stringify(codexAccountCard(view))
     expect(card).toContain('0 次可用'); expect(card).toContain('5h · 4%'); expect(card).toContain('周 · 7%')
+    expect(card).toContain('积分 1.3m')
     expect(card).not.toContain('登录成功')
     const failed = JSON.stringify(codexAccountCard({ ...view, phase: 'warning', resetUsage: { state: 'network', reason: 'offline' }, details: 'offline' }))
     expect(failed).toContain('额度已重置'); expect(failed).toContain('额度 MISS'); expect(failed).toContain('offline')

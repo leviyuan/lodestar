@@ -5178,7 +5178,7 @@ describe('Session usage cache cross-backend isolation', () => {
       const footer = calls.find(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
       const content = JSON.parse(footer?.body.element ?? '{}').content as string
       expect(content).toContain('12%·[34%]')
-      expect(content).toContain('积分 62,500')
+      expect(content).toContain('积分 62.5k')
       expect(content).not.toContain('缓存')
       expect(content).not.toContain('刷新失败')
       expect(content).not.toContain('MISS')

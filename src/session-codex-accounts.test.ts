@@ -349,7 +349,7 @@ describe('bare Codex account commands', () => {
     await refreshUsageFromConnection(() => proc.readRateLimits(), 'default')
     reads = 0
     const suffix = await s.footerUsageSuffix('codex', proc, 'codex-sub', s.currentTokenSource(), null)
-    expect(suffix).toBe('  |  11%·[23%] · 积分 62,500')
+    expect(suffix).toBe('  |  11%·[23%] · 积分 62.5k')
     expect(reads).toBe(0)
     expect(s.codexAccountId()).toBe('default')
     expect(suffix).not.toContain('账号')

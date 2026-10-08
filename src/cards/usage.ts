@@ -7,7 +7,17 @@ export function codexCreditsSummary(credits: CodexCredits | null | undefined): s
   if (codexCreditAvailability(credits) === 'empty') return null
   if (credits.unlimited) return '积分 无限'
   if (credits.balance === null) return '积分 MISS'
-  return `积分 ${credits.balance.toLocaleString('en-US', { maximumFractionDigits: 20 })}`
+  let amount = credits.balance
+  let unit = ''
+  // Promote after rounding too: 999.95k should display as 1m.
+  for (const nextUnit of ['k', 'm']) {
+    if (Math.round(amount * 10) < 10_000) break
+    amount /= 1000
+    unit = nextUnit
+  }
+  const value = amount > 0 && amount < 0.05 ? '<0.1'
+    : amount.toLocaleString('en-US', { maximumFractionDigits: 1, useGrouping: false })
+  return `积分 ${value}${unit}`
 }
 
 /** Human-readable time until reset; keep the compact footer's h/d precision. */
