@@ -41,7 +41,13 @@ function restoreCatalog(source: TokenSource, previous: TokenSource, cfg: TokenSo
     }
   }
   const hidden = new Set(modelList(cfg.hidden_models))
+  const visibilityKey = selection?.visibilityKey ?? ((model: string) => model)
+  const automatic = new Set(selection?.selectDefaults?.(catalog) ?? [])
+  const shown = new Set(modelList(cfg.shown_models))
+  const configuredModel = source.kind === 'openrouter' ? cfg.model?.trim().replace(/\[1m\]$/, '') : cfg.model?.trim()
   const ids = cfg.models !== undefined ? modelList(cfg.models)
+    : selection?.selectDefaults ? [...new Set([...(configuredModel ? [configuredModel] : []),
+      ...automatic, ...shown])]
     : selection?.modelIds.length ? selection.modelIds : previous.modelSelection?.modelIds ?? []
   const visible = selection?.mode === 'allowlist'
     ? ids.map(id => {
@@ -50,15 +56,17 @@ function restoreCatalog(source: TokenSource, previous: TokenSource, cfg: TokenSo
       return entry ? { ...entry, model: id } : { model: id, display: id, efforts: [], defaultEffort: null,
         unavailableReason: '账号目录缓存未返回该模型' }
     })
-      .filter((model): model is TokenSourceModel => !!model)
+      .filter(model => model.origin === 'custom' || !hidden.has(model.model)
+        && (!automatic.has(model.model) || shown.has(model.model) || !hidden.has(visibilityKey(model.model))))
     : catalog.filter(model => model.origin === 'custom' || !hidden.has(model.model))
   source.models = [...visible, ...catalog.filter(model => model.origin === 'custom' && !visible.some(item => item.model === model.model))]
   if (selection) {
     selection.availableModels = catalog
     selection.modelIds = source.models.map(model => model.model)
   }
-  source.defaultModel = cfg.model?.trim() || (catalog.some(model => model.model === previous.defaultModel)
-    ? previous.defaultModel : source.models[0]?.model ?? '')
+  source.defaultModel = source.kind === 'openrouter' ? cfg.model?.trim() || ''
+    : cfg.model?.trim() || (catalog.some(model => model.model === previous.defaultModel)
+      ? previous.defaultModel : source.models[0]?.model ?? '')
   source.modelCatalogState = { ...previous.modelCatalogState }
 }
 

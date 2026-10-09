@@ -8,7 +8,7 @@ import {
 } from './token-source'
 import { observedContextWindow } from './context-window-observe'
 import { log } from './log'
-import { OPENROUTER_DEFAULT_MODELS, openRouterModelExcluded } from './openrouter-defaults'
+import { openRouterModelExcluded, openRouterModelPreset, openRouterModelVisibilityKey, selectOpenRouterDefaultModels } from './openrouter-defaults'
 import { fetchApiModelData } from './token-source-model-api'
 import { UsageReadCache, usageCredentialKey, usageRetryAfter } from './usage-cache'
 
@@ -96,7 +96,7 @@ export async function fetchOpenRouterModels(base: string, apiKey: string): Promi
       ? ['max', 'xhigh', 'high', 'medium', 'low']
       : Array.isArray(declared) ? [...new Set(declared.filter(e => e !== 'default' && isClaudeReasoningEffort(e)))] as ClaudeReasoningEffort[]
       : ['default']
-    const preset = OPENROUTER_DEFAULT_MODELS.find(preset => preset.model === entry.id)
+    const preset = openRouterModelPreset(entry.id)
     const defaultEffort = preset ? (efforts.includes(preset.effort) ? preset.effort : null)
       : efforts[0] === 'default' ? 'default'
       : isClaudeReasoningEffort(reasoning?.default_effort) && efforts.includes(reasoning.default_effort)
@@ -148,11 +148,15 @@ registerTokenSourceFactory({
     const apiKey = account?.api_key?.trim() || account?.auth_token?.trim() || ''
     const base = account?.base_url?.trim() || DEFAULT_BASE_URL
     const configuredModel = cfg.model?.trim() || ''
-    const modelIds = cfg.models === undefined ? OPENROUTER_DEFAULT_MODELS.map(entry => entry.model) : modelList(cfg.models)
+    const modelIds = cfg.models === undefined ? undefined : modelList(cfg.models)
+    const selectDefaults = (catalog: readonly TokenSourceModel[]) => selectOpenRouterDefaultModels(
+      catalog.filter(entry => entry.origin !== 'custom').map(entry => entry.model),
+    )
     const source: TokenSource = {
       id: 'openrouter', kind: 'openrouter', agent: 'claude', display: cfg.display?.trim() || 'OpenRouter',
       enabled: !!apiKey, models: [], defaultModel: configuredModel,
-      modelSelection: { mode: 'allowlist', modelIds, availableModels: [] },
+      modelSelection: { mode: 'allowlist', modelIds: modelIds ?? [], availableModels: [],
+        ...(modelIds === undefined ? { selectDefaults, visibilityKey: openRouterModelVisibilityKey } : {}) },
       validateCustomModelId(model) {
         if (openRouterModelExcluded(model)) throw new Error(`OpenRouter 已排除此厂商或自动路由: ${model}`)
         if (!model.includes('/')) throw new Error('OpenRouter 模型请填写完整的 作者/模型 ID')
@@ -183,13 +187,17 @@ registerTokenSourceFactory({
             defaultEntry!.defaultEffort = cfg.effort
           }
           // 空字符串是用户删除全部模型后的有效选择，不能重新填回默认列表。
-          const selected = modelIds.map(id => {
+          // 自动列表使用接口 ID；[1m] 等运行注解留在配置与启动路由中，不重复显示一行。
+          const desiredIds = modelIds ?? [...new Set([...(configuredModel ? [modelId(configuredModel)] : []),
+            ...selectDefaults(catalog), ...modelList(cfg.shown_models)])]
+          const selected = desiredIds.map(id => {
             const model = catalog.find(m => m.model === modelId(id))
             if (!model) return { model: id, display: id, efforts: [], defaultEffort: null,
               unavailableReason: openRouterModelExcluded(id) ? '此厂商或自动路由已被排除' : '账号目录未返回该模型' }
             return { ...model, model: id }
           })
           source.models = selected
+          source.modelSelection!.modelIds = selected.map(entry => entry.model)
           source.modelSelection!.availableModels = catalog
           source.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
         } catch (error) {

@@ -41,7 +41,7 @@ GLM Key 可在首次安装时跳过，之后用群命令添加或更换。以下
 | 补录模型 | 添加接口目录外的模型，可选择推理档位并使用 |
 | 删 | 删除补录记录；仍有会话选用时需先切换模型 |
 
-除 OpenRouter 和 PackyAPI 使用内置精选列表外，各来源默认显示接口目录中的模型，新模型会随后台目录刷新出现。隐藏、显示和补录只修改本地列表，不重拉全部来源。所有来源都支持补录，记录保存在 `custom_models`；补录按本地规则检查模型 ID 和请求档位，不在交互中查询上游；实际调用不支持时由后端报告错误。目录未收录不会阻止选择，实际不支持的请求由后端报告错误。接口后来收录同名模型时自动转为接口项，不重复显示。删除补录记录也会清理默认模型和辅助模型中的相关引用。
+OpenRouter 和 PackyAPI 默认按指定家族精选最新数字版本，其他来源默认显示接口目录中的模型；新模型会随后台目录刷新出现。隐藏、显示和补录只修改本地列表，不重拉全部来源。所有来源都支持补录，记录保存在 `custom_models`；补录按本地规则检查模型 ID 和请求档位，不在交互中查询上游；实际调用不支持时由后端报告错误。目录未收录不会阻止选择，实际不支持的请求由后端报告错误。接口后来收录同名模型时自动转为接口项，不重复显示。删除补录记录也会清理默认模型和辅助模型中的相关引用。
 
 同账号切换 Claude 或 DSH 模型从后续回复生效；Codex 的持久设置需重启会话生效。跨账号或后端切换只允许在空闲时进行。来源禁用或目录获取失败显示 `MISS`。
 
@@ -80,22 +80,27 @@ api_key = "填写自己的 OpenRouter API key"
 # base_url = "https://openrouter.ai/api" # SDK 自动追加 /v1/messages
 # model = "moonshotai/kimi-k3"   # 可选：默认运行模型，须获账号目录确认
 # effort = "max"                       # 可选：仅覆盖默认运行模型的档位
-# models = "moonshotai/kimi-k3,google/gemini-3.8-flash" # 可选：自定义可选列表
+# models = "moonshotai/kimi-k3,google/gemini-3.8-flash" # 可选：固定列表，停止自动追新
+# shown_models = "moonshotai/kimi-k3" # 可选：在自动精选之外显示指定接口模型
 # slots = "haiku=moonshotai/kimi-k3" # 可选：辅助任务模型，须获账号目录确认且使用相同的 effort 参数模式
 ```
 
-内置默认列表保留以下 **6 项**，定义见[默认模型配置](../src/openrouter-defaults.ts)。Gemini 和 MiMo 使用 OpenRouter；这是项目提供的初始列表，可在面板中自行调整，其他兼容模型仍可从账号目录显示或补录。
+默认从账号目录为以下 **6 个家族**各选最新数字版本，定义见[默认模型配置](../src/openrouter-defaults.ts)。精选随每 5 分钟目录刷新更新，保留接口原始 ID；其他兼容模型仍可从账号目录显示或补录。
 
-| 厂商 | 模型 ID | 默认档位 |
+| 厂商 | 自动精选家族 | 默认档位 |
 | --- | --- | --- |
-| Tencent | `tencent/hy4-preview` | high |
-| Google | `google/gemini-3.8-flash` | high |
-| Meta | `meta/muse-spark-1.2` | xhigh |
-| Xiaomi | `xiaomi/mimo-v2.5-pro` | 模型默认 |
-| 字节跳动 | `bytedance-seed/seed-2-1-turbo` | 模型默认 |
-| 美团 | `meituan/longcat-2.0` | 模型默认 |
+| Tencent | Hy | high |
+| Google | Gemini Flash | high |
+| Meta | Muse Spark | xhigh |
+| Xiaomi | MiMo Pro | 模型默认 |
+| 字节跳动 | Seed Turbo | 模型默认 |
+| 美团 | LongCat | 模型默认 |
 
-在 `md` → Claude Code → OpenRouter 中，点「显示模型」进入账号目录，再点「显」加入列表，点「隐」移出面板列表。可见性自动保存，不改当前运行模型；全部隐藏后也能继续显示或补录。未配置 `models` 时才使用上述六项；`models = ""` 表示没有已显示的接口模型，刷新或重启不会补回默认项。内置列表更新不会覆盖用户维护的列表。
+版本逐段按数字比较，同版本再比较发布日期。腾讯 Hy 沿用 preview 候选，同版本优先正式版；其他家族不自动纳入 preview。Flash Lite、Pro（Gemini）、Flash（MiMo）、ultraspeed、thinking、free 等独立变体不会混入对应精选家族，仍可手动显示。家族默认档位必须在上游声明中受支持，否则保留缺失状态，要求明确选择。
+
+在 `md` → Claude Code → OpenRouter 中，点「显示模型」进入账号目录，再点「显」加入列表，点「隐」移出面板列表。自动精选项隐藏后，同家族后续版本保持隐藏；手动显示的旧版本按 ID 独立显隐。显隐增量保存为 `shown_models` 和 `hidden_models`（自动精选项同时记录 `family:` 家族键与当前 ID），不会冻结整个精选列表。当前运行模型、已配置的 `model` 和 `custom_models` 保持不变；全部隐藏后也能继续显示或补录。
+
+未配置 `models` 时使用自动精选；已有 `models` 仍是固定列表，`models = ""` 表示没有已显示的接口模型，刷新或重启不会补回默认项。已有固定列表要启用自动追新，需删除该来源的 `models` 字段；额外显示或隐藏的选择使用上述增量字段保存。
 
 候选目录来自 `/api/v1/models/user`，按账号供应商和隐私设置筛选，仅纳入支持文本和工具调用的交互模型；OpenAI、GLM、DeepSeek 及无法保证厂商范围的自动路由不会出现在添加候选中。目录刷新失败显示 `MISS`。显式配置但已下线的模型保留为可删除的 `MISS` 项。
 
@@ -107,7 +112,11 @@ OpenRouter 余额来自 `/api/v1/credits`，按 `total_credits - total_usage` �
 
 PackyAPI 提供三个来源入口：Claude Code 下的 `PackyAPI`、`PackyAPI · 令牌2`，以及 Codex 下的 `PackyAPI`。第二令牌独立保存；Codex 与主令牌共用一次存储的 Key 和平台地址，模型、effort、可见性分别维护。
 
-Packy 的 Claude 入口默认展示 MiniMax-M3、claude-opus-5、claude-fable-5-1、qwen3.8-max-0902；Codex 入口默认展示 kimi-k3 和 grok-4.6。Fable 5.1 的 API ID 使用连字符 `claude-fable-5-1`；Grok 4.6 通过 Responses 接口调用。Packy 目录中其余兼容模型只放在「显示模型」目录，不会自动出现在选择面板；已配置的 `model`、`models` 或 `custom_models` 仍按显式配置保留。
+Packy 的 Claude 入口默认展示 MiniMax M、Claude Opus、Claude Fable、Qwen Max 四个家族在兼容目录中的最新数字版本；Codex 入口展示 Kimi K、Grok 两个家族的最新版。Opus 5.5 的 API ID 为 `claude-opus-5-5`，目录包含时自动进入精选。版本逐段按数字比较，同版本再比较发布日期；保留接口原始 ID，不自动纳入 preview、thinking 等变体，也不构造不存在的模型。
+
+精选随现有每 5 分钟目录刷新更新；当前运行模型与 effort 不随目录切换。点「隐」隐藏自动精选项后，同家族后续版本保持隐藏；手动显示的旧版本仍可独立显隐。「显示模型」中加入的额外接口项保存到 `shown_models`，隐藏记录保存到 `hidden_models`（自动家族同时记录 `family:opus` 等标记与当前 ID），显隐操作不会冻结整个精选列表。已配置的 `model` 和 `custom_models` 保留。
+
+显式 `models` 仍是固定列表，优先于自动精选；`models = ""` 保持空列表。以前通过面板显隐生成的 `models` 也按固定列表保留，移除该配置项后才恢复自动精选。其余兼容模型继续留在「显示模型」目录，可手动显示或补录。
 
 ```toml
 [token_source.packy]
@@ -115,7 +124,8 @@ api_key = "填写主令牌"
 base_url = "https://cf.api.fan"
 model = "MiniMax-M3"
 effort = "default"
-# models = "MiniMax-M3,qwen3.8-max-0902" # 可选：显式覆盖默认精选列表
+# models = "MiniMax-M3,qwen3.8-max-0902" # 可选：固定列表，停止默认精选自动追新
+# shown_models = "other-model" # 可选：在自动精选之外保留指定接口模型
 management_token = "填写个人设置中的系统访问令牌"
 management_user_id = "填写该账号用户 ID"
 management_url = "https://www.packyapi.ai"

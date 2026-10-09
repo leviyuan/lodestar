@@ -175,6 +175,37 @@ describe('OpenRouter authoritative model catalog', () => {
     expect(source.models.every(entry => !openRouterModelExcluded(entry.model))).toBe(true)
   })
 
+  test('automatically selects newer compatible family versions with supported family effort preferences', async () => {
+    respond = () => json({ data: [
+      model('meta/muse-spark-1.2'),
+      model('meta/muse-spark-1.3', { reasoning: { supported_efforts: ['xhigh', 'high', 'medium'], default_effort: 'medium' } }),
+      model('meta/muse-spark-9', { supported_parameters: ['reasoning'] }),
+      model('xiaomi/mimo-v2.5-pro', { reasoning: {} }), model('xiaomi/mimo-v2.6-pro', { reasoning: {} }),
+      model('xiaomi/mimo-v3-pro-ultraspeed'), model('google/gemini-3.8-flash'), model('google/gemini-4-flash-lite'),
+      model('google/gemini-5-flash', { architecture: { output_modalities: ['image'] } }),
+    ] })
+    const source = factory.build({ api_key: 'test-key' })
+    await source.refreshModels()
+    expect(source.models.map(m => [m.model, m.defaultEffort])).toEqual([
+      ['google/gemini-3.8-flash', 'high'], ['meta/muse-spark-1.3', 'xhigh'], ['xiaomi/mimo-v2.6-pro', 'default'],
+    ])
+    expect(source.modelSelection?.availableModels.some(m => m.model === 'xiaomi/mimo-v3-pro-ultraspeed')).toBe(true)
+    expect(source.defaultModel).toBe('')
+  })
+
+  test('missing curated families are not fabricated and new unsupported preset efforts remain MISS', async () => {
+    respond = () => json({ data: [model('unrelated/interactive')] })
+    const source = factory.build({ api_key: 'test-key' })
+    await source.refreshModels()
+    expect(source.modelCatalogState?.status).toBe('ready')
+    expect(source.models).toEqual([])
+    respond = () => json({ data: [model('meta/muse-spark-1.3', {
+      reasoning: { supported_efforts: ['high', 'medium'], default_effort: 'medium' },
+    })] })
+    await source.refreshModels()
+    expect(source.models[0]).toMatchObject({ model: 'meta/muse-spark-1.3', efforts: ['high', 'medium'], defaultEffort: null })
+  })
+
   test('excluded authors cannot enter the add catalog or be routed through aliases', async () => {
     const excluded = ['openai/test', 'deepseek/test', 'z-ai/glm-test', 'openrouter/auto']
     respond = () => json({ data: [model(), ...excluded.map(id => model(id))] })

@@ -16,7 +16,7 @@ function runSelectionTest(work: string): void {
     const registry = await import(${modulePath('token-source.ts')})
     await import(${modulePath('token-source-openrouter.ts')})
     const { OPENROUTER_DEFAULT_MODELS } = await import(${modulePath('openrouter-defaults.ts')})
-    const { config } = await import(${modulePath('config.ts')})
+    const { config, loadConfig } = await import(${modulePath('config.ts')})
     const factory = registry.tokenSourceFactories().find(f => f.kind === 'openrouter')
     const { cachedTokenSource } = await import(${modulePath('token-source-cache.ts')})
     const { withModelVisibility } = await import(${modulePath('token-source-visibility.ts')})
@@ -30,13 +30,13 @@ function runSelectionTest(work: string): void {
     }
     mock.module(${modulePath('token-source-builtins.ts')}, () => ({ buildTokenSourcesFromConfig: rebuild }))
     const defaults = OPENROUTER_DEFAULT_MODELS.map(entry => entry.model)
-    let httpFailure = false
-    globalThis.fetch = async () => httpFailure ? Response.json({ error: { message: 'catalog down' } }, { status: 503 })
-      : Response.json({ data: [...defaults, 'qwen/extra-a', 'google/extra-b', 'openai/excluded'].map(id => ({
+    let currentDefaults = [...defaults], httpFailure = false, requests = 0
+    globalThis.fetch = async () => { requests++; return httpFailure ? Response.json({ error: { message: 'catalog down' } }, { status: 503 })
+      : Response.json({ data: [...new Set([...defaults, ...currentDefaults, 'qwen/extra-a', 'google/extra-b', 'openai/excluded'])].map(id => ({
         id, name: id, architecture: { output_modalities: ['text'] }, supported_parameters: ['tools'],
         reasoning: { supported_efforts: ['max', 'xhigh', 'high', 'medium', 'low'], default_effort: 'high' },
-      })) })
-    const { addTokenSource, editTokenSourceModels } = await import(${modulePath('token-source-config.ts')})
+      })) }) }
+    const { addTokenSource, editTokenSourceModels, registerCustomTokenSourceModel } = await import(${modulePath('token-source-config.ts')})
     rebuild()
     await registry.refreshAllTokenSourceModels()
     const source = () => registry.getTokenSource('openrouter')
@@ -61,6 +61,82 @@ test('concurrent model additions preserve all defaults and both new selections',
     await assert.rejects(editTokenSourceModels('openrouter', 'unknown/model', 'add'), /允许添加/)
     await assert.rejects(editTokenSourceModels('openrouter', 'qwen/extra-a', 'add'), /已在/)
     assert.equal(source().models.length, defaults.length + 2)
+    assert.equal(source().defaultModel, '')
+    assert.equal(loadConfig().token_sources.openrouter.models, undefined)
+    assert.equal(loadConfig().token_sources.openrouter.shown_models, 'qwen/extra-a,google/extra-b')
+    assert.equal(requests, 1)
+  `)
+})
+
+test('OpenRouter keeps following latest versions through visibility edits and cached rebuilds', () => {
+  runSelectionTest(`
+    const old = 'meta/muse-spark-1.2', next = 'meta/muse-spark-1.3', future = 'meta/muse-spark-1.4'
+    await editTokenSourceModels('openrouter', old, 'remove')
+    currentDefaults = defaults.map(id => id === old ? next : id)
+    await source().refreshModels()
+    assert.ok(!source().models.some(m => m.model === old || m.model === next))
+    await editTokenSourceModels('openrouter', old, 'add')
+    assert.ok(source().models.some(m => m.model === old))
+    assert.ok(!source().models.some(m => m.model === next))
+    await editTokenSourceModels('openrouter', old, 'remove')
+    await editTokenSourceModels('openrouter', next, 'add')
+    assert.ok(!config.token_sources.openrouter.shown_models.includes(next))
+    currentDefaults = defaults.map(id => id === old ? future : id)
+    await source().refreshModels()
+    assert.deepEqual(source().modelSelection.modelIds, currentDefaults)
+    await editTokenSourceModels('openrouter', 'qwen/extra-a', 'add')
+    assert.deepEqual(source().modelSelection.modelIds, [...currentDefaults, 'qwen/extra-a'])
+    assert.equal(requests, 3)
+    assert.equal(source().defaultModel, '')
+    assert.equal(loadConfig().token_sources.openrouter.models, undefined)
+    await registerCustomTokenSourceModel('openrouter', 'google/gemini-99-flash')
+    assert.ok(source().models.some(m => m.model === 'google/gemini-3.8-flash' && m.origin === 'upstream'))
+    assert.ok(source().models.some(m => m.model === 'google/gemini-99-flash' && m.origin === 'custom'))
+    await source().refreshModels()
+    assert.ok(source().models.some(m => m.model === 'google/gemini-3.8-flash' && m.origin === 'upstream'))
+    assert.equal(source().defaultModel, '')
+  `)
+})
+
+test('a hidden configured OpenRouter model does not reappear after its family upgrades', () => {
+  runSelectionTest(`
+    const old = 'meta/muse-spark-1.2', next = 'meta/muse-spark-1.3'
+    await addTokenSource('openrouter', { model: old, effort: 'xhigh' })
+    await editTokenSourceModels('openrouter', old, 'remove')
+    currentDefaults = defaults.map(id => id === old ? next : id)
+    await source().refreshModels()
+    assert.ok(!source().models.some(m => m.model === old || m.model === next))
+    await editTokenSourceModels('openrouter', next, 'add')
+    assert.ok(source().models.some(m => m.model === next))
+    assert.ok(!source().models.some(m => m.model === old))
+    assert.equal(source().defaultModel, old)
+    assert.equal(source().spawnEnv({}).ANTHROPIC_MODEL, old)
+    assert.equal(config.token_sources.openrouter.model, old)
+    assert.equal(config.token_sources.openrouter.effort, 'xhigh')
+  `)
+})
+
+test('automatic OpenRouter visibility uses catalog IDs without changing context-annotated runtime routes', () => {
+  runSelectionTest(`
+    const old = 'google/gemini-3.8-flash', next = 'google/gemini-3.9-flash', annotated = old + '[1m]'
+    await addTokenSource('openrouter', { model: annotated, effort: 'high' })
+    await editTokenSourceModels('openrouter', 'qwen/extra-a', 'add')
+    assert.ok(source().models.some(m => m.model === old))
+    assert.ok(!source().models.some(m => m.model === annotated))
+    assert.equal(source().models.length, defaults.length + 1)
+    await editTokenSourceModels('openrouter', old, 'remove')
+    await editTokenSourceModels('openrouter', old, 'add')
+    assert.ok(!config.token_sources.openrouter.hidden_models.includes('family:gemini-flash'))
+    currentDefaults = defaults.map(id => id === old ? next : id)
+    await source().refreshModels()
+    assert.ok(source().models.some(m => m.model === next))
+    assert.ok(source().models.some(m => m.model === old))
+    assert.ok(!source().models.some(m => m.model === annotated))
+    await editTokenSourceModels('openrouter', old, 'remove')
+    assert.ok(source().models.some(m => m.model === next))
+    assert.equal(source().defaultModel, annotated)
+    assert.equal(source().spawnEnv({}).ANTHROPIC_MODEL, annotated)
+    assert.equal(registry.tokenSourceRuntimeModel(source(), annotated).defaultEffort, 'high')
   `)
 })
 
@@ -92,7 +168,8 @@ test('a local edit uses cached models while background refresh errors remain vis
     httpFailure = true
     await editTokenSourceModels('openrouter', 'qwen/extra-a', 'add')
     await assert.rejects(source().refreshModels(), /catalog down/)
-    assert.ok(config.token_sources.openrouter.models.includes('qwen/extra-a'))
+    assert.equal(config.token_sources.openrouter.models, undefined)
+    assert.ok(config.token_sources.openrouter.shown_models.includes('qwen/extra-a'))
     assert.equal(source().modelCatalogState.status, 'ready')
     assert.ok(source().modelCatalogState.error.includes('catalog down'))
     assert.equal(source().models.length, defaults.length + 1)

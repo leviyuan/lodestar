@@ -33,6 +33,7 @@ function cfgToToml(id: string, cfg: TokenSourceConfig): string {
   push('effort', cfg.effort)
   push('models', cfg.models)
   push('hidden_models', cfg.hidden_models)
+  push('shown_models', cfg.shown_models)
   push('custom_models', cfg.custom_models)
   push('slots', cfg.slots)
   push('usage', cfg.usage)
@@ -143,7 +144,16 @@ export function editTokenSourceModels(id: string, model: string, action: 'add' |
     const cfg = config.token_sources[id]
     const isCatalog = source.modelSelection.mode === 'catalog'
     const hidden = modelList(cfg?.hidden_models)
-    const update: TokenSourceConfig = isCatalog
+    const autoSelect = source.modelSelection.selectDefaults
+    const visibilityKey = source.modelSelection.visibilityKey ?? ((id: string) => id)
+    const shown = modelList(cfg?.shown_models)
+    const isDefault = autoSelect?.(source.modelSelection.availableModels).includes(model)
+    const update: TokenSourceConfig = autoSelect ? {
+      hidden_models: (action === 'remove' ? [...new Set([...hidden, ...(isDefault ? [visibilityKey(model)] : []), model])]
+        : hidden.filter(id => id !== model && (!isDefault || id !== visibilityKey(model)))).join(','),
+      shown_models: (action === 'add' && !isDefault
+        ? [...new Set([...shown, model])] : shown.filter(id => id !== model)).join(','),
+    } : isCatalog
       ? { hidden_models: (action === 'remove' ? [...new Set([...hidden, model])] : hidden.filter(id => id !== model)).join(',') }
       : { models: models.join(',') }
     await applyTokenSourceConfig(id, update)
@@ -180,6 +190,7 @@ export function removeCustomTokenSourceModel(id: string, model: string, accountI
     const update: TokenSourceConfig = {
       custom_models: modelList(cfg.custom_models).filter(id => !refers(id)).join(','),
       hidden_models: modelList(cfg.hidden_models).filter(id => !refers(id)).join(','),
+      ...(cfg.shown_models !== undefined ? { shown_models: modelList(cfg.shown_models).filter(id => !refers(id)).join(',') } : {}),
       ...(cfg.models !== undefined ? { models: modelList(cfg.models).filter(id => !refers(id)).join(',') } : {}),
       ...(refers(cfg.model) ? { model: '', effort: '' } : {}),
       ...(cfg.slots ? { slots: cfg.slots.split(',').filter(slot => !refers(slot.slice(slot.indexOf('=') + 1))).join(',') } : {}),

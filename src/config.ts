@@ -85,6 +85,7 @@ export interface ClaudeModelConfig {
  *  effort      — 默认 effort
  *  models      — OpenRouter/Packy 显式可选列表；GLM/DeepSeek 经验证的补录模型
  *  hidden_models — 非 OpenRouter 来源从接口目录中隐藏的模型(逗号分隔)
+ *  shown_models — 自动精选列表之外显式显示的接口模型(逗号分隔)
  *  custom_models — 所有来源的列表外补录记录(逗号分隔，不代表已验证可运行)
  *  slots       — claude 槽位映射 'opus=X,sonnet=Y,haiku=Z'
  *  usage       — 额度查询策略 'codex-rate-limit' | 'glm-coding-plan' | 'none' */
@@ -108,6 +109,7 @@ export interface TokenSourceConfig {
   effort?: string
   models?: string
   hidden_models?: string
+  shown_models?: string
   custom_models?: string
   slots?: string
   usage?: string
@@ -318,7 +320,7 @@ export function loadConfig(): LodestarConfig {
           field === 'base_url' || field === 'auth_token' || field === 'api_key' ||
           field === 'management_token' || field === 'management_user_id' || field === 'management_url' || field === 'billing_source' ||
           field === 'bin' || field === 'model' || field === 'effort' ||
-          field === 'models' || field === 'hidden_models' || field === 'custom_models' || field === 'slots' || field === 'usage'
+          field === 'models' || field === 'hidden_models' || field === 'shown_models' || field === 'custom_models' || field === 'slots' || field === 'usage'
         ) {
           ;(cfg as Record<string, string>)[field] = value
         }

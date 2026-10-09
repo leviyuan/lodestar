@@ -2,7 +2,7 @@ import { CLAUDE_REASONING_EFFORTS, type AgentReasoningEffort } from './agent-pro
 import { CODEX_REASONING_EFFORTS } from './codex-process'
 import type { TokenSourceConfig } from './config'
 import { fetchPackyBalance, fetchPackyModels, fetchPackyUsage, packyApiRoot, packyManagementRoot, PACKY_BASE_URL, type PackyModel } from './packy-api'
-import { isPackyDefaultModel } from './packy-defaults'
+import { packyModelVisibilityKey, selectPackyDefaultModels } from './packy-defaults'
 import { customModelEfforts, modelList } from './token-source-visibility'
 import { tokenSourceErrorMessage } from './token-source-errors'
 import { log } from './log'
@@ -66,7 +66,8 @@ for (const definition of definitions) {
       const configuredModel = cfg.model?.trim()
       const configuredModelIds = cfg.models === undefined ? undefined : modelList(cfg.models)
       const customIds = new Set([...modelList(cfg.custom_models), ...(configuredModelIds ?? [])])
-      const defaultModelAllowed = (model: string) => isPackyDefaultModel(model, id)
+      const selectDefaults = (models: readonly TokenSourceModel[]) =>
+        selectPackyDefaultModels(models.filter(entry => entry.origin !== 'custom').map(entry => entry.model), id)
       let catalog: PackyModel[] = []
       const validateRequestModel = (model: string) => {
         const entry = catalog.find(entry => entry.id === model)
@@ -77,7 +78,8 @@ for (const definition of definitions) {
       const source: TokenSource = {
         id, kind: id, agent, display: cfg.display?.trim() || display,
         enabled: !!key && cfg.enabled !== false, models: [], defaultModel: configuredModel ?? '',
-        modelSelection: { mode: 'allowlist', modelIds: configuredModelIds ?? [], availableModels: [] },
+        modelSelection: { mode: 'allowlist', modelIds: configuredModelIds ?? [], availableModels: [],
+          ...(configuredModelIds === undefined ? { selectDefaults, visibilityKey: (model: string) => packyModelVisibilityKey(model, id) } : {}) },
         ...(hasBalanceAccount ? { usageAccount: {
           id: usageCredentialKey('packy-account', managementBase, managementUserId), label: 'PackyAPI',
         } } : {}),
@@ -110,11 +112,9 @@ for (const definition of definitions) {
                 throw new Error(`PackyAPI 默认模型不在目录中且未补录: ${configuredModel}`)
               }
             }
-            const desiredIds = configuredModelIds ?? catalogModels.filter(entry =>
-              entry.origin === 'custom' || defaultModelAllowed(entry.model)).map(entry => entry.model)
-            if (configuredModelIds === undefined && configuredModel && !desiredIds.some(id => id.toLowerCase() === configuredModel.toLowerCase())) {
-              desiredIds.unshift(configuredModel)
-            }
+            const desiredIds = configuredModelIds ?? [...new Set([...(configuredModel ? [configuredModel] : []),
+              ...selectDefaults(catalogModels), ...modelList(cfg.shown_models),
+              ...catalogModels.filter(entry => entry.origin === 'custom').map(entry => entry.model)])]
             const selected = desiredIds.map(id => catalogModels.find(entry => entry.model === id)
               ?? { model: id, display: id, efforts: [], defaultEffort: null,
                 unavailableReason: '账号目录未返回该模型' })

@@ -115,6 +115,32 @@ describe('Packy sources', () => {
     ])
   })
 
+  test('Opus follows the latest compatible catalog model while preserving explicit choices and declared effort', async () => {
+    let opus = 'claude-opus-5-5'
+    respond = () => Response.json({ data: [mixed[0],
+      { id: 'claude-opus-5', supported_endpoint_types: ['anthropic'] },
+      { id: opus, supported_endpoint_types: ['anthropic'], reasoning: { supported_efforts: ['xhigh', 'high'], default_effort: 'xhigh' } },
+      { id: 'claude-opus-99', supported_endpoint_types: ['openai-response'] },
+    ] })
+    const source = build('packy', { model: 'MiniMax-M3', shown_models: 'claude-opus-5', custom_models: 'manual-opus' })
+    await source.refreshModels()
+    expect(source.models.map(entry => entry.model)).toEqual(['MiniMax-M3', 'claude-opus-5-5', 'claude-opus-5', 'manual-opus'])
+    expect(source.models.find(entry => entry.model === opus)).toMatchObject({ efforts: ['high', 'xhigh'], defaultEffort: 'xhigh' })
+    opus = 'claude-opus-5-10'
+    await source.refreshModels()
+    expect(source.models.map(entry => entry.model)).toEqual(['MiniMax-M3', 'claude-opus-5-10', 'claude-opus-5', 'manual-opus'])
+    expect(source.defaultModel).toBe('MiniMax-M3')
+    expect(source.spawnEnv({}, 'claude-opus-5').ANTHROPIC_MODEL).toBe('claude-opus-5')
+    const hidden = build('packy', { hidden_models: 'family:opus' })
+    await hidden.refreshModels()
+    expect(hidden.models.map(entry => entry.model)).toEqual(['MiniMax-M3'])
+    expect(hidden.modelSelection?.availableModels.some(entry => entry.model === opus)).toBe(true)
+    const pinned = build('packy', { models: 'claude-opus-5' })
+    await pinned.refreshModels()
+    expect(pinned.models.map(entry => entry.model)).toEqual(['claude-opus-5'])
+    expect(pinned.modelSelection?.selectDefaults).toBeUndefined()
+  })
+
   test('an empty explicit list stays empty without disabling its configured runtime model', async () => {
     const source = build('packy', { models: '', model: 'MiniMax-M3' })
     await source.refreshModels()

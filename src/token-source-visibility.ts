@@ -20,6 +20,7 @@ export function customModelEfforts(source: TokenSource, cfg: TokenSourceConfig):
 export function withModelVisibility(source: TokenSource, cfg: TokenSourceConfig): TokenSource {
   const inheritedSelection = source.modelSelection
   const hidden = new Set(modelList(cfg.hidden_models))
+  const visibilityKey = inheritedSelection?.visibilityKey ?? ((model: string) => model)
   const customIds = [...new Set([...modelList(cfg.custom_models), ...(inheritedSelection ? [] : modelList(cfg.models))])]
   const selection = source.modelSelection = inheritedSelection ?? { mode: 'catalog' as const, modelIds: [] as string[], availableModels: [] as typeof source.models }
   const refresh = source.refreshModels.bind(source)
@@ -42,8 +43,11 @@ export function withModelVisibility(source: TokenSource, cfg: TokenSourceConfig)
     }
     selection.availableModels = catalog
     const visible = inheritedSelection ? listed.map(model => catalog.find(item => item.model === model.model) ?? { ...model, origin: 'upstream' as const }) : catalog
+    const automatic = new Set(inheritedSelection?.selectDefaults?.(catalog) ?? [])
+    const shown = new Set(modelList(cfg.shown_models))
     source.models = [
-      ...visible.filter(model => model.origin === 'custom' || !hidden.has(model.model)),
+      ...visible.filter(model => model.origin === 'custom' || !hidden.has(model.model)
+        && (!automatic.has(model.model) || shown.has(model.model) || !hidden.has(visibilityKey(model.model)))),
       ...catalog.filter(model => model.origin === 'custom' && !visible.some(item => item.model === model.model)),
     ]
     selection.modelIds = source.models.map(model => model.model)

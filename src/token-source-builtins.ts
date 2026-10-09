@@ -61,7 +61,7 @@ export function buildTokenSourcesFromConfig(): number {
       return source
     }
     const routing = (value: Partial<TokenSourceConfig> | null) => {
-      const { display, model, effort, models, hidden_models, custom_models, slots, default: _default, ...identity } = value ?? {}
+      const { display, model, effort, models, hidden_models, shown_models, custom_models, slots, default: _default, ...identity } = value ?? {}
       return identity
     }
     const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value, (_key, item) =>

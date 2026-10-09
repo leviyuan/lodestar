@@ -2,6 +2,7 @@ import { networkFetch } from '../src/network'
 /** 真实 OpenRouter / Claude SDK smoke；读取私有 Key 文件，在临时目录执行 Read。
  * 用法：bun scripts/test-openrouter.ts --credential /abs/key.json --output-dir /abs/private-dir --agent-runtimes /abs/agent-runtimes [--model vendor/model] [--capture-requests]
  * --sequence vendor/model,vendor/model 在同一原生会话中按顺序切换，验证 resume 和上下文。
+ * 未指定模型时探测账号目录中的当前精选；显式 ID 从允许目录解析，档位使用该项声明的默认值。
  * 会产生模型调用费用；不连接飞书、不启动 daemon、不改生产会话状态。
  */
 import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
@@ -27,7 +28,6 @@ if (typeof key !== 'string' || !key.trim()) throw new Error('私有凭据文件�
 const { createAgentProcess } = await import('../src/agent-launch')
 const { collectAgentTurn } = await import('../src/agent-runner')
 const { registerTokenSource, tokenSourceFactories } = await import('../src/token-source')
-const { OPENROUTER_DEFAULT_MODELS } = await import('../src/openrouter-defaults')
 await import('../src/token-source-openrouter')
 // 可选的临时转发探针只记录实际发出的模型/effort/预算；正文与凭据不写入报告。
 const wire: Array<Record<string, unknown>> = []
@@ -74,13 +74,21 @@ try {
   registerTokenSource(source)
   const filter = option('--model')
   const sequence = option('--sequence')
-  if (filter && sequence) throw new Error('--model 和 --sequence 不能同时使用')
-  const entries = sequence ? sequence.split(',').map(id => {
-    const entry = OPENROUTER_DEFAULT_MODELS.find(entry => entry.model === id)
-    if (!entry) throw new Error(`顺序测试模型不在默认列表中: ${id}`)
-    return entry
-  }) : filter ? OPENROUTER_DEFAULT_MODELS.filter(entry => entry.model === filter) : OPENROUTER_DEFAULT_MODELS
-  if (!entries.length) throw new Error('指定模型不在默认列表中')
+  if (args.includes('--model') && !filter?.trim()) throw new Error('--model 需要完整模型 ID')
+  if (args.includes('--sequence') && !sequence?.trim()) throw new Error('--sequence 需要逗号分隔的模型 ID')
+  if (filter !== undefined && sequence !== undefined) throw new Error('--model 和 --sequence 不能同时使用')
+  const explicit = filter !== undefined || sequence !== undefined
+  const requested = sequence !== undefined ? sequence.split(',').map(id => id.trim())
+    : filter !== undefined ? [filter.trim()] : source.models.map(entry => entry.model)
+  if (!requested.length || requested.some(id => !id)) throw new Error('没有可探测的模型或模型 ID 为空')
+  const catalog = explicit ? source.modelSelection!.availableModels : source.models
+  const entries = requested.map(id => {
+    const entry = catalog.find(entry => entry.model === id)
+    if (!entry || entry.unavailableReason) throw new Error(`探测模型不在可用账号目录中: ${id}${entry?.unavailableReason ? `: ${entry.unavailableReason}` : ''}`)
+    const effort = entry.defaultEffort
+    if (!effort || !entry.efforts.includes(effort)) throw new Error(`探测模型默认 effort 缺失或不受支持: ${id}/${effort ?? 'MISS'}`)
+    return { model: entry.model, effort }
+  })
   const results: Array<Record<string, unknown>> = []
   let previousSessionId: string | undefined
   let previousMarker: string | undefined

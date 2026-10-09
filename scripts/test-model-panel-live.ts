@@ -2,6 +2,7 @@
  * 必须显式指定目标群和临时添加模型，不启动/重启 daemon，不创建旁路 Session。
  * bun scripts/test-model-panel-live.ts --chat-id oc_xxx --extra-model anthropic/claude-sonnet-4.6
  * 单独验证其他运行路由：追加 --routes-only --test-source dsh-glm --test-model glm-5.3 --test-effort high。
+ * 默认探测当前可见的最新 MiMo Pro；默认档位取当前目录，精选基线从完整面板目录校验。
  */
 import assert from 'node:assert/strict'
 import { request } from 'node:http'
@@ -12,7 +13,7 @@ import { randomUUID } from 'node:crypto'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, SESSION_MODEL_MAP_FILE } from '../src/paths'
 import { client } from '../src/feishu'
 import { injectDebugMessage } from './debug-client'
-import { OPENROUTER_DEFAULT_MODELS } from '../src/openrouter-defaults'
+import { OPENROUTER_DEFAULT_MODELS, openRouterModelPreset, selectOpenRouterDefaultModels } from '../src/openrouter-defaults'
 import type { DebugModelSnapshot } from '../src/debug-model'
 
 const args = process.argv.slice(2)
@@ -28,8 +29,10 @@ const checks: string[] = []
 const sourceId = 'openrouter'
 const routesOnly = args.includes('--routes-only')
 const testSource = option('--test-source') ?? sourceId
-const testModel = option('--test-model') ?? 'xiaomi/mimo-v2.5-pro'
-const testEffort = option('--test-effort') ?? 'default'
+let testModel = option('--test-model')
+let testEffort = option('--test-effort')
+if (args.includes('--test-model') && !testModel?.trim()) throw new Error('--test-model 需要完整模型 ID')
+if (args.includes('--test-effort') && !testEffort?.trim()) throw new Error('--test-effort 需要具体档位')
 
 function call<T>(method: string, path: string, body?: object): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -275,8 +278,18 @@ try {
   const source = snapshot.sources.find(source => source.id === sourceId)
   assert.equal(source?.status, 'ready')
   baseline = source.models.map(model => model.model)
-  assert.deepEqual(baseline, OPENROUTER_DEFAULT_MODELS.map(entry => entry.model))
   assert.ok(!baseline.includes(extraModel), '临时模型已在列表中，请指定另一个')
+  const route = snapshot.sources.find(source => source.id === testSource)
+  assert.equal(route?.status, 'ready', `测试来源 ${testSource} 目录未就绪`)
+  testModel ??= selectOpenRouterDefaultModels(route.models
+    .filter(model => model.origin !== 'custom' && !model.unavailable_reason).map(model => model.model))
+    .find(model => openRouterModelPreset(model)?.family === 'mimo-pro')
+  assert.ok(testModel, `测试来源 ${testSource} 当前可见列表没有 MiMo Pro，请显式提供 --test-model`)
+  const testEntry = route.models.find(model => model.model === testModel)
+  assert.ok(testEntry && !testEntry.unavailable_reason, `测试模型不在 ${testSource} 当前可用列表中: ${testModel}`)
+  testEffort ??= testEntry.default_effort ?? undefined
+  assert.ok(testEffort && testEntry.efforts.some(effort => effort === testEffort),
+    `测试模型 effort 缺失或不受支持: ${testModel}/${testEffort ?? 'MISS'}，请提供有效的 --test-effort`)
   const tree = await rawCard(panel.message_id!)
   const rows = tree.body?.property?.elements?.[0]?.property?.elements ?? []
   const groups = rows.filter((row: any) => row.tag === 'collapsible_panel' && /^model_agent_/.test(row.id))
@@ -292,6 +305,29 @@ try {
   checks.push(`真实账号卡显示 ${baseline.length} 个模型`)
   checks.push('MD 首页按 claude / codex / dsh 分组')
   checks.push('模型行按钮为单字、宽按钮保留完整文字，两组 DeepSeek 来源名称一致')
+
+  // 可见列表与「显示模型」的全部分页共同组成当前缓存目录，不另查上游 API。
+  const catalog = new Set(source.models.filter(model => model.origin !== 'custom'
+    && !model.unavailable_reason && model.efforts.length).map(model => model.model))
+  snapshot = await action(panel, 'provider_select')
+  panel = panelFrom(snapshot, panel.panel_id)
+  snapshot = await action(panel, 'model_list_open', { mode: 'add' })
+  panel = panelFrom(snapshot, panel.panel_id)
+  const totalPages = panel.total_pages ?? 1
+  for (let page = 0; page < totalPages; page++) {
+    if (page > 0) {
+      snapshot = await action(panel, 'model_page', { page })
+      panel = panelFrom(snapshot, panel.panel_id)
+    }
+    assert.equal(panel.total_pages ?? 1, totalPages, '遍历期间模型目录页数变化，请重试')
+    for (const model of panel.models) if (model.origin !== 'custom') catalog.add(model.model)
+  }
+  assert.deepEqual(snapshot.sources.find(source => source.id === sourceId)?.models.map(model => model.model), baseline,
+    '遍历期间可见模型列表变化，请重试')
+  const expected = selectOpenRouterDefaultModels([...catalog])
+  assert.equal(expected.length, OPENROUTER_DEFAULT_MODELS.length, '账号目录未包含完整的六个精选家族')
+  assert.deepEqual(baseline, expected, '此 smoke 要求面板使用六家族当前最新版默认列表')
+  checks.push('完整面板缓存目录确认六家族最新版精选基线')
 
   if (!routesOnly) {
     snapshot = await action(panel, 'provider_select')

@@ -119,7 +119,13 @@ export interface TokenSource {
   enabled: boolean
   models: TokenSourceModel[]
   /** availableModels 包含接口目录及补录记录，origin 区分隐藏/显示和补录/删除。 */
-  modelSelection?: { mode?: 'allowlist' | 'catalog'; modelIds: string[]; availableModels: TokenSourceModel[] }
+  modelSelection?: {
+    mode?: 'allowlist' | 'catalog'; modelIds: string[]; availableModels: TokenSourceModel[]
+    /** 默认精选随目录更新；显隐只保存增量，不把目录快照写成固定白名单。 */
+    selectDefaults?(catalog: readonly TokenSourceModel[]): string[]
+    /** 自动精选项的家族隐藏键；手动显示的旧版本仍按精确 ID 隐藏。 */
+    visibilityKey?(model: string): string
+  }
   /** Committed catalog state. A ready snapshot may include a background refresh error. */
   modelCatalogState?: TokenSourceModelCatalogState
   defaultModel: string
