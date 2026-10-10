@@ -1504,6 +1504,9 @@ export async function downloadAttachment(
 // ── Outbound: upload + send file/image ────────────────────────────────
 // 用户约定的飞书出站文件上限，普通文件、图片和卡内图片共同遵守。
 export const MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+const FILE_UPLOAD_TIMEOUT_MS = 5 * 60_000
+const FILE_UPLOAD_RECOVERY_MS = 32 * 60_000
+const FILE_UPLOAD_MAX_RETRIES = 5
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'])
 
 function looksLikeImage(filePath: string): boolean {
@@ -1523,7 +1526,7 @@ async function uploadMultipart(filePath: string, type: 'image' | 'file'): Promis
     log(`feishu: ${label} local file validation failed ${filePath}: ${error}`)
     throw error
   }
-  return withOutputRecovery(`${label} ${filePath}`, async recovery => {
+  const upload = async (recovery: FeishuRecoveryWindow): Promise<string> => {
     const token = await getTenantToken(recovery)
     // Rebuild the multipart body; the immutable Blob can be reused. Its copied
     // ArrayBuffer-backed view above also preserves Node 18 BlobPart compatibility.
@@ -1534,18 +1537,25 @@ async function uploadMultipart(filePath: string, type: 'image' | 'file'): Promis
       form.append('file_name', basename(filePath))
     }
     form.append(type, file, basename(filePath))
-    // Token acquisition, request and response body reads share the recovery
-    // deadline. Each attempt gets at most 15s from the remaining budget.
+    // File transfers have their own longer deadline. Token acquisition, upload,
+    // response reads and retry waits still consume the same recovery budget.
+    const timeoutMs = recovery.timeoutMs(type === 'file' ? FILE_UPLOAD_TIMEOUT_MS : RAW_FETCH_TIMEOUT_MS)
     const data = await fetchFeishuJson(`https://open.feishu.cn/open-apis/im/v1/${type}s`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
       body: form,
-      signal: AbortSignal.timeout(recovery.timeoutMs(RAW_FETCH_TIMEOUT_MS)),
+      signal: AbortSignal.timeout(timeoutMs),
     }, label)
     const key = data.data?.[`${type}_key`]
     if (typeof key !== 'string' || !key.trim()) throw new Error(`${label} ${type}_key MISS`)
     return key
-  })
+  }
+  if (type === 'image') return withOutputRecovery(`${label} ${filePath}`, upload)
+  const recovery = new FeishuRecoveryWindow(FILE_UPLOAD_RECOVERY_MS, FILE_UPLOAD_MAX_RETRIES)
+  log(`feishu: ${label} ${filePath} started: bytes=${file.size} timeout=${FILE_UPLOAD_TIMEOUT_MS}ms maxAttempts=${FILE_UPLOAD_MAX_RETRIES + 1} recovery=${FILE_UPLOAD_RECOVERY_MS}ms`)
+  // Unlike message/card recovery, rejected uploads and exhausted attempts must
+  // report immediately instead of waiting out the entire long upload window.
+  return withFeishuRetry(`${label} ${filePath}`, () => upload(recovery), { recovery })
 }
 
 /** Upload a local image for embedding inside a Card Kit card. Returns the

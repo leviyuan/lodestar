@@ -12,7 +12,7 @@ async function runIsolated(script: string): Promise<void> {
     Date.now = () => now
     const originalSetTimeout = globalThis.setTimeout
     globalThis.setTimeout = (fn, ms, ...args) => {
-      assert.ok(Number.isFinite(ms) && ms >= 0 && ms <= 60000, 'unexpected timer: ' + ms)
+      assert.ok(Number.isFinite(ms) && ms >= 0 && ms <= 32 * 60000, 'unexpected timer: ' + ms)
       delays.push(ms)
       now += ms
       return originalSetTimeout(fn, 0, ...args)
@@ -474,6 +474,111 @@ test('uploads retry token failures and rebuild multipart bodies; message retries
   `)
 })
 
+test('file uploads allow five-minute attempts and five retries, including Node timeout errors', async () => {
+  await runIsolated(`
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const { tmpdir } = await import('node:os')
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-slow-upload-'))
+    const path = join(root, 'video.mp4')
+    writeFileSync(path, 'video bytes')
+    const originalTimeout = AbortSignal.timeout
+    try {
+      globalThis.fetch = async () => Response.json({ code: 0, tenant_access_token: 'test-token' })
+      await feishu.getTenantToken()
+      const timers = new WeakMap()
+      AbortSignal.timeout = ms => {
+        const controller = new AbortController()
+        timers.set(controller.signal, { ms, controller })
+        return controller.signal
+      }
+      for (const succeeds of [true, false]) {
+        const started = now, starts = [], forms = [], signals = [], sent = []
+        delays.length = 0
+        globalThis.fetch = async (url, init) => {
+          assert.ok(String(url).endsWith('/im/v1/files'))
+          const timer = timers.get(init.signal)
+          assert.equal(timer.ms, 300000)
+          starts.push(now - started)
+          forms.push(init.body)
+          signals.push(init.signal)
+          assert.equal(await init.body.get('file').text(), 'video bytes')
+          if (starts.length === 6 && succeeds) {
+            now += 120000
+            return Response.json({ code: 0, data: { file_key: 'slow-upload' } })
+          }
+          now += timer.ms
+          timer.controller.abort(new DOMException('upload attempt ' + starts.length + ' timed out', 'TimeoutError'))
+          const error = new DOMException('The operation was aborted', 'AbortError')
+          if (starts.length % 2) throw error
+          return new Response(new ReadableStream({ start(stream) { stream.error(error) } }))
+        }
+        feishu.client.im.message.create = async args => {
+          sent.push(args.data)
+          return { code: 0, data: { message_id: 'result' } }
+        }
+        assert.equal(await feishu.uploadAndSend('chat', path), succeeds)
+        assert.deepEqual(starts, [0, 303000, 611000, 926000, 1241000, 1556000])
+        assert.deepEqual(delays, [3000, 8000, 15000, 15000, 15000])
+        assert.equal(new Set(forms).size, 6)
+        assert.equal(new Set(signals).size, 6)
+        assert.equal(now - started, succeeds ? 1676000 : 1856000)
+        assert.equal(sent.length, 1)
+        assert.equal(sent[0].msg_type, succeeds ? 'file' : 'text')
+        if (succeeds) assert.equal(JSON.parse(sent[0].content).file_key, 'slow-upload')
+        else assert.match(JSON.parse(sent[0].content).text, /code=23 message=upload attempt 6 timed out/)
+      }
+    } finally {
+      AbortSignal.timeout = originalTimeout
+      rmSync(root, { recursive: true, force: true })
+    }
+  `)
+})
+
+test('file uploads honor server cooldown and cap their last request at the remaining total budget', async () => {
+  await runIsolated(`
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const { tmpdir } = await import('node:os')
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-upload-deadline-'))
+    const path = join(root, 'report.txt')
+    writeFileSync(path, 'report')
+    const originalTimeout = AbortSignal.timeout
+    try {
+      globalThis.fetch = async () => Response.json({ code: 0, tenant_access_token: 'test-token' })
+      await feishu.getTenantToken()
+      const timeouts = [], notices = []
+      let controller, attempts = 0
+      AbortSignal.timeout = ms => {
+        timeouts.push(ms)
+        controller = new AbortController()
+        return controller.signal
+      }
+      globalThis.fetch = async () => {
+        if (++attempts === 1) return new Response('busy', { status: 503, headers: { 'Retry-After': '1800' } })
+        now += timeouts.at(-1)
+        controller.abort(new DOMException('total upload deadline', 'TimeoutError'))
+        throw new DOMException('The operation was aborted', 'AbortError')
+      }
+      feishu.client.im.message.create = async args => {
+        notices.push(JSON.parse(args.data.content).text)
+        return { code: 0, data: { message_id: 'error-notice' } }
+      }
+      const started = now
+      assert.equal(await feishu.uploadAndSend('chat', path), false)
+      assert.equal(attempts, 2)
+      assert.deepEqual(timeouts, [300000, 120000])
+      assert.deepEqual(delays, [1800000])
+      assert.equal(now - started, 1920000)
+      assert.equal(notices.length, 1)
+      assert.match(notices[0], /code=23 message=total upload deadline/)
+    } finally {
+      AbortSignal.timeout = originalTimeout
+      rmSync(root, { recursive: true, force: true })
+    }
+  `)
+})
+
 test('upload and send exhaustion produce visible errors; invalid files and permanent rejections do not retry', async () => {
   await runIsolated(`
     const { mkdtempSync, writeFileSync, rmSync, openSync, ftruncateSync, closeSync } = await import('node:fs')
@@ -506,14 +611,16 @@ test('upload and send exhaustion produce visible errors; invalid files and perma
       assert.match(notices[0], /出站文件发送失败.*report.txt/)
       assert.deepEqual(delays, [3000, 8000, 15000, 15000, 15000, 4000])
 
-      for (const [response, expectedAttempts] of [
-        [() => new Response('busy', { status: 503 }), 6],
-        [() => Response.json({ code: 234002, msg: 'unauthorized' }, { status: 401 }), 1],
-        [() => Response.json({ code: 234001, msg: 'invalid parameters' }), 1],
-        [() => Response.json({ code: 0, data: {} }), 1],
-        [() => Response.json({ data: { file_key: 'missing-code' } }), 1],
-        [() => new Response('invalid JSON'), 1],
-        [() => new Response('busy', { status: 429, headers: { 'Retry-After': '120' } }), 1],
+      for (const [response, expectedAttempts, expectedWait] of [
+        [() => new Response('busy', { status: 503 }), 6, 56000],
+        [() => Response.json({ code: 234002, msg: 'unauthorized' }, { status: 401 }), 1, 0],
+        [() => Response.json({ code: 234001, msg: 'invalid parameters' }), 1, 0],
+        [() => Response.json({ code: 0, data: {} }), 1, 0],
+        [() => Response.json({ data: { file_key: 'missing-code' } }), 1, 0],
+        [() => new Response('invalid JSON'), 1, 0],
+        [() => { throw new DOMException('cancelled', 'AbortError') }, 1, 0],
+        [() => new Response('busy', { status: 429, headers: { 'Retry-After': '120' } }), 6, 600000],
+        [() => new Response('busy', { status: 429, headers: { 'Retry-After': '2000' } }), 1, 1920000],
       ]) {
         uploads = 0; notices.length = 0; sends.length = 0; delays.length = 0
         globalThis.fetch = async () => { uploads++; return response() }
@@ -523,7 +630,7 @@ test('upload and send exhaustion produce visible errors; invalid files and perma
         assert.equal(notices.length, 1)
         assert.match(notices[0], /出站文件上传失败.*report.txt/)
         assert.match(notices[0], /code=.*message=.*log_id=/)
-        assert.equal(delays.reduce((sum, delay) => sum + delay, 0), 60000)
+        assert.equal(delays.reduce((sum, delay) => sum + delay, 0), expectedWait)
       }
       globalThis.fetch = async () => { throw new Error('invalid file must not upload') }
       const fd = openSync(path, 'w')

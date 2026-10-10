@@ -59,9 +59,13 @@ export function feishuRetryAfterMs(error: unknown): number {
 /** One output operation, including transport retries and explicit reconciliation,
  * shares this deadline. Callers must also cap each request with timeoutMs(). */
 export class FeishuRecoveryWindow {
-  private readonly deadline = Date.now() + 60_000
+  private readonly deadline: number
   private retries = 0
   private lastFailure: unknown
+
+  constructor(durationMs = 60_000, private readonly maxRetries = Infinity) {
+    this.deadline = Date.now() + durationMs
+  }
 
   remainingMs(): number {
     return Math.max(0, this.deadline - Date.now())
@@ -84,7 +88,7 @@ export class FeishuRecoveryWindow {
   async waitForRetry(label: string, error: unknown, minimumDelayMs = 0): Promise<boolean> {
     this.lastFailure = error
     const remaining = this.remainingMs()
-    if (remaining <= 0) return false
+    if (remaining <= 0 || this.retries >= this.maxRetries) return false
     const backoff = RECOVERY_DELAYS_MS[Math.min(this.retries++, RECOVERY_DELAYS_MS.length - 1)]!
     const delay = Math.max(backoff, minimumDelayMs, feishuRetryAfterMs(error))
     const retryAt = Date.now() + delay
