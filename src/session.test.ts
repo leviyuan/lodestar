@@ -1264,59 +1264,73 @@ describe('Session token accounting', () => {
 })
 
 describe('Session assistant rendering', () => {
-  test('capacity backoff keeps the card open, survives footer refreshes and preserves usage before the retry', async () => {
-    const session = new Session('capacity-card', 'chat_id') as any
-    const proc = new FakeAgentProc('codex', 'capacity-thread') as any
-    const turn = turnState('card_capacity')
-    session.proc = proc
-    session.currentTurn = turn
-    session.status = 'working'
-    session.wireProc(proc)
-    cardkit.recordCardCreated(turn.cardId, 1)
-    try {
-      proc.lastTotalUsage = { total_tokens: 100, input_tokens: 80, output_tokens: 20 }
-      proc.emit('turn_started', { turn_id: 'original-turn' })
-      proc.lastTotalUsage = { total_tokens: 150, input_tokens: 110, output_tokens: 40 }
-      proc.turnRetry = { phase: 'waiting', attempt: 2, delayMs: 10_000, message: 'Selected model is at capacity' }
+  for (const { reason, label, message } of [
+    { reason: undefined, label: '模型满载', message: 'Selected model is at capacity' },
+    { reason: 'capacity', label: '模型满载', message: 'Selected model is at capacity' },
+    { reason: 'stream_disconnected', label: '连接中断', message: 'stream disconnected before completion: An error occurred while processing your request.' },
+  ] as const) {
+    test(`${reason ?? 'legacy capacity'} backoff keeps the card open, renders retry phases and preserves usage before the retry`, async () => {
+      const session = new Session('retry-card', 'chat_id') as any
+      const proc = new FakeAgentProc('codex', 'retry-thread') as any
+      const turn = turnState('card_retry')
+      session.proc = proc
+      session.currentTurn = turn
+      session.status = 'working'
+      session.wireProc(proc)
+      cardkit.recordCardCreated(turn.cardId, 1)
+      try {
+        proc.lastTotalUsage = { total_tokens: 100, input_tokens: 80, output_tokens: 20 }
+        proc.emit('turn_started', { turn_id: 'original-turn' })
+        proc.lastTotalUsage = { total_tokens: 150, input_tokens: 110, output_tokens: 40 }
+        proc.turnRetry = { phase: 'waiting', attempt: 1, delayMs: 5_000, message, reason }
+        proc.emit('turn_retry', proc.turnRetry)
+        session.startWorkingFooter(turn)
+        await cardkit.flush(turn.cardId)
+        expect(session.status).toBe('working')
+        expect(session.currentTurn).toBe(turn)
+        expect(turn.footerStatusLabel).toBe(`⏳ ${label} · 5s 后重试 #1`)
+        expect(calls.some(call => call.method === 'PUT' && JSON.stringify(call.body).includes(`${label} · 5s 后重试 #1`))).toBe(true)
+
+        proc.turnRetry = { ...proc.turnRetry, phase: 'retrying', delayMs: 0 }
+        proc.emit('turn_retry', proc.turnRetry)
+        session.startWorkingFooter(turn)
+        await cardkit.flush(turn.cardId)
+        expect(turn.footerStatusLabel).toBe(`⏳ ${label} · 正在重试 #1`)
+        await waitUntil(() => calls.some(call => call.method === 'PUT' && JSON.stringify(call.body).includes(`${label} · 正在重试 #1`)))
+
+        proc.turnRetry = null
+        proc.emit('turn_started', { turn_id: 'retry-turn', retry: true })
+        expect(turn.footerStatusLabel).not.toContain(label)
+        expect(turn.footerStatusLabel).not.toContain('重试')
+        proc.lastTotalUsage = { total_tokens: 200, input_tokens: 140, output_tokens: 60 }
+        session.accumulateResultStats()
+        expect(session.lastTurnUsage).toMatchObject({ total_tokens: 100, input_tokens: 60, output_tokens: 40 })
+        expect(session.cumStats.turns).toBe(1)
+      } finally {
+        session.stopFooterStatus(turn)
+        await cardkit.dispose(turn.cardId)
+      }
+    })
+
+    test(`a card opened after ${reason ?? 'legacy capacity'} failure reads the current retry state`, async () => {
+      const session = new Session('retry-card-opening', 'chat_id') as any
+      const proc = new FakeAgentProc('codex', 'retry-thread') as any
+      session.proc = proc
+      session.wireProc(proc)
+      proc.turnRetry = { phase: 'waiting', attempt: 1, delayMs: 5_000, message, reason }
       proc.emit('turn_retry', proc.turnRetry)
-      session.startWorkingFooter(turn)
-      await cardkit.flush(turn.cardId)
-      expect(session.status).toBe('working')
-      expect(session.currentTurn).toBe(turn)
-      expect(turn.footerStatusLabel).toBe('⏳ 模型满载 · 10s 后重试 #2')
-      expect(calls.some(call => call.method === 'PUT' && JSON.stringify(call.body).includes('10s 后重试 #2'))).toBe(true)
-
-      proc.turnRetry = null
-      proc.emit('turn_started', { turn_id: 'retry-turn', retry: true })
-      expect(turn.footerStatusLabel).not.toContain('满载')
-      proc.lastTotalUsage = { total_tokens: 200, input_tokens: 140, output_tokens: 60 }
-      session.accumulateResultStats()
-      expect(session.lastTurnUsage).toMatchObject({ total_tokens: 100, input_tokens: 60, output_tokens: 40 })
-      expect(session.cumStats.turns).toBe(1)
-    } finally {
-      session.stopFooterStatus(turn)
-      await cardkit.dispose(turn.cardId)
-    }
-  })
-
-  test('a card opened after capacity failure reads the current retry state', async () => {
-    const session = new Session('capacity-card-opening', 'chat_id') as any
-    const proc = new FakeAgentProc('codex', 'capacity-thread') as any
-    session.proc = proc
-    session.wireProc(proc)
-    proc.turnRetry = { phase: 'waiting', attempt: 1, delayMs: 5_000, message: 'Selected model is at capacity' }
-    proc.emit('turn_retry', proc.turnRetry)
-    const turn = turnState('card_capacity_opening')
-    session.currentTurn = turn
-    cardkit.recordCardCreated(turn.cardId, 1)
-    try {
-      session.startThinkingFooter(turn)
-      expect(turn.footerStatusLabel).toBe('⏳ 模型满载 · 5s 后重试 #1')
-    } finally {
-      session.stopFooterStatus(turn)
-      await cardkit.dispose(turn.cardId)
-    }
-  })
+      const turn = turnState('card_retry_opening')
+      session.currentTurn = turn
+      cardkit.recordCardCreated(turn.cardId, 1)
+      try {
+        session.startThinkingFooter(turn)
+        expect(turn.footerStatusLabel).toBe(`⏳ ${label} · 5s 后重试 #1`)
+      } finally {
+        session.stopFooterStatus(turn)
+        await cardkit.dispose(turn.cardId)
+      }
+    })
+  }
 
   test('buffers assistant deltas and inserts one completed markdown element without content streaming', async () => {
     // 本测断言 bucket 档位文案；显式钉死模式，隔离本机配置差异。

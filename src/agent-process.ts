@@ -34,13 +34,13 @@ export function isDshReasoningEffort(value: unknown): value is DshReasoningEffor
 export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'default'
 export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort | DshReasoningEffort
 
-/** A Codex capacity failure keeps the logical task open while retrying. */
+/** A Codex retry keeps the logical task open while waiting or reconnecting. */
 export interface AgentTurnRetry {
   phase: 'waiting' | 'retrying'
   attempt: number
   delayMs: number
   message: string
-  reason?: 'capacity' | 'quota'
+  reason?: 'capacity' | 'stream_disconnected' | 'quota'
 }
 
 export const CLAUDE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'default'] as const

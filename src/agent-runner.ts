@@ -239,8 +239,10 @@ export function collectAgentTurn(
     if (event.diagnostics.length) log(`agent-runner: selected Codex account=${event.accountId}; diagnostics: ${event.diagnostics.join('；')}`)
   }
   const onRetry = (retry: AgentTurnRetry) => {
+    const tool = retry.reason === 'quota' ? 'Codex 额度换号'
+      : retry.reason === 'stream_disconnected' ? 'Codex 连接中断重试' : 'Codex 容量重试'
     emitProgress({
-      at: new Date().toISOString(), phase: 'info', tool: retry.reason === 'quota' ? 'Codex 额度换号' : 'Codex 容量重试',
+      at: new Date().toISOString(), phase: 'info', tool,
       detail: retry.phase === 'waiting'
         ? `${retry.message} · ${retry.delayMs / 1000}s 后重试 #${retry.attempt}`
         : `正在重试 #${retry.attempt}`,

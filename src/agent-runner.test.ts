@@ -44,7 +44,12 @@ describe('full delegated Agent runner', () => {
     await handle.done
   })
 
-  test('capacity backoff reports progress without imposing a turn deadline or changing output', async () => {
+  test.each([
+    [undefined, 'Selected model is at capacity', 'Codex 容量重试'],
+    ['capacity', 'Selected model is at capacity', 'Codex 容量重试'],
+    ['stream_disconnected', 'stream disconnected before completion: An error occurred while processing your request.', 'Codex 连接中断重试'],
+    ['quota', '正在等待 Codex 额度恢复', 'Codex 额度换号'],
+  ] as const)('%s backoff reports progress without imposing a turn deadline or changing output', async (reason, message, tool) => {
     const timers = new Map<number, number>()
     let nextId = 100_000
     const timeout = spyOn(globalThis, 'setTimeout').mockImplementation(((_callback: () => void, delay: number) => {
@@ -59,13 +64,14 @@ describe('full delegated Agent runner', () => {
     const handle = collectAgentTurn(proc, 'do work', { onProgress: step => progress.push(step) }, () => {})
     try {
       expect(timers.size).toBe(0)
-      const retry = { phase: 'waiting', attempt: 1, delayMs: 60_000, message: 'Selected model is at capacity' }
+      const retry = { phase: 'waiting', attempt: 1, delayMs: 60_000, message, reason }
       proc.emit('turn_retry', retry)
       expect(timers.size).toBe(0)
       expect(proc.alive).toBe(true)
-      expect(progress.at(-1).detail).toContain(retry.message)
+      expect(progress.at(-1)).toMatchObject({ tool, detail: `${message} · 60s 后重试 #1` })
       proc.emit('turn_retry', { ...retry, phase: 'retrying', delayMs: 0 })
       expect(timers.size).toBe(0)
+      expect(progress.at(-1)).toMatchObject({ tool, detail: '正在重试 #1' })
       proc.emit('assistant_text', { text: 'finished', parentToolUseId: null })
       proc.emit('result', { is_error: false })
       await expect(handle.done).resolves.toMatchObject({ output: 'finished' })

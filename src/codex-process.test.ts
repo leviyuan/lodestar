@@ -169,7 +169,7 @@ function makeCodexProtocolHarness(
   const writes: any[] = []
   const events: Array<[string, any]> = []
   proc.alive = true
-  proc.capacityRetryEnabled = true
+  proc.turnRetryEnabled = true
   proc.opts = { workDir: '/repo', ...opts }
   proc.readyPromise = null
   proc.initializePromise = null
@@ -229,6 +229,7 @@ function makeCodexProtocolHarness(
 }
 
 const CAPACITY_MESSAGE = 'Selected model is at capacity. Please try a different model'
+const STREAM_MESSAGE = 'stream disconnected before completion: An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID 00000000-0000-4000-8000-000000000001 in your message.'
 
 async function withCapacityClock(run: (clock: {
   timers: Map<number, { callback: () => void; delay: number }>
@@ -420,12 +421,12 @@ describe('codex model capacity recovery', () => {
     })
   })
 
-  test('interrupt during backoff cancels even an already-queued timer callback', async () => {
+  test.each([CAPACITY_MESSAGE, STREAM_MESSAGE])('interrupt during backoff cancels even an already-queued timer callback (%s)', async message => {
     await withCapacityClock(async clock => {
       const { proc, calls, events } = capacityHarness()
       proc.sendUserText('do work')
       await flushCapacityMicrotasks()
-      completeCapacityTurn(proc)
+      completeCapacityTurn(proc, { message })
       const staleTimer = [...clock.timers.values()][0]!
       proc.sendInterrupt()
       expect(clock.timers.size).toBe(0)
@@ -438,7 +439,7 @@ describe('codex model capacity recovery', () => {
     })
   })
 
-  test('interrupt also cancels a retry awaiting its turn/start acknowledgement', async () => {
+  test.each([CAPACITY_MESSAGE, STREAM_MESSAGE])('interrupt also cancels a retry awaiting its turn/start acknowledgement (%s)', async message => {
     await withCapacityClock(async clock => {
       let resolveRetry!: (value: any) => void
       let starts = 0
@@ -449,7 +450,7 @@ describe('codex model capacity recovery', () => {
       })
       proc.sendUserText('do work')
       await flushCapacityMicrotasks()
-      completeCapacityTurn(proc)
+      completeCapacityTurn(proc, { message })
       await clock.tick()
       proc.sendInterrupt()
       proc.sendInterrupt()
@@ -461,14 +462,14 @@ describe('codex model capacity recovery', () => {
       })
       proc.handleNotification('turn/completed', {
         threadId: 'capacity-thread',
-        turn: { id: 'cancelled-retry', status: 'failed', error: { message: CAPACITY_MESSAGE } },
+        turn: { id: 'cancelled-retry', status: 'failed', error: { message } },
       })
       expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
       expect(clock.timers.size).toBe(0)
     })
   })
 
-  test('a synchronous stop at the retry progress event prevents the request from being sent', async () => {
+  test.each([CAPACITY_MESSAGE, STREAM_MESSAGE])('a synchronous stop at the retry progress event prevents the request from being sent (%s)', async message => {
     await withCapacityClock(async clock => {
       const { proc, calls, events } = capacityHarness()
       const emit = proc.emit
@@ -479,20 +480,20 @@ describe('codex model capacity recovery', () => {
       }
       proc.sendUserText('do work')
       await flushCapacityMicrotasks()
-      completeCapacityTurn(proc)
+      completeCapacityTurn(proc, { message })
       await clock.tick()
       expect(calls.filter(call => call.method === 'turn/start')).toHaveLength(1)
       expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
     })
   })
 
-  test('new input, native continuation, kill and OS exit all retire the waiting timer', async () => {
+  test.each([CAPACITY_MESSAGE, STREAM_MESSAGE])('new input, native continuation, kill and OS exit all retire the waiting timer (%s)', async message => {
     await withCapacityClock(async clock => {
       for (const action of ['input', 'native', 'kill', 'exit']) {
         const { proc, calls, events } = capacityHarness()
         proc.sendUserText('do work')
         await flushCapacityMicrotasks()
-        completeCapacityTurn(proc)
+        completeCapacityTurn(proc, { message })
         const staleTimer = [...clock.timers.values()][0]!
         if (action === 'input') proc.sendUserText('new instruction')
         if (action === 'native') proc.handleNotification('turn/started', {
@@ -516,20 +517,174 @@ describe('codex model capacity recovery', () => {
     })
   })
 
-  test('child-thread and stale capacity errors cannot turn an unrelated failure into a retry', async () => {
+  test.each([CAPACITY_MESSAGE, STREAM_MESSAGE])('child-thread and stale retryable errors cannot turn an unrelated failure into a retry (%s)', async message => {
     await withCapacityClock(async clock => {
       const { proc, events } = capacityHarness()
       proc.sendUserText('do work')
       await flushCapacityMicrotasks()
       for (const [threadId, turnId] of [['child-thread', proc.currentTurnId], ['capacity-thread', 'old-turn']]) {
-        proc.handleNotification('error', { threadId, turnId, error: { message: CAPACITY_MESSAGE }, willRetry: false })
-        proc.handleNotification('turn/completed', { threadId, turn: { id: turnId, status: 'failed', error: { message: CAPACITY_MESSAGE } } })
+        proc.handleNotification('error', { threadId, turnId, error: { message }, willRetry: false })
+        proc.handleNotification('turn/completed', { threadId, turn: { id: turnId, status: 'failed', error: { message } } })
       }
       proc.handleNotification('turn/completed', {
         threadId: 'capacity-thread', turn: { id: proc.currentTurnId, status: 'failed' },
       })
       expect(clock.timers.size).toBe(0)
       expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
+    })
+  })
+})
+
+describe('codex stream disconnection recovery', () => {
+  test.each([
+    { message: STREAM_MESSAGE, codexErrorInfo: 'other' },
+    { message: STREAM_MESSAGE },
+    { message: 'upstream stream ended', codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } } },
+  ])('continues accepted history only after a failed terminal event (%j)', async error => {
+    await withCapacityClock(async clock => {
+      const { proc, calls, events } = capacityHarness()
+      proc.sendUserText('task with completed effects', ['/tmp/input.csv'])
+      await flushCapacityMicrotasks()
+      const turnId = proc.currentTurnId
+      proc.handleNotification('item/completed', {
+        threadId: 'capacity-thread', turnId,
+        item: { id: 'completed-tool', type: 'commandExecution', command: 'echo done', cwd: '/repo', status: 'completed', aggregatedOutput: 'done', exitCode: 0 },
+      })
+      for (const willRetry of [true, false]) {
+        proc.handleNotification('error', { threadId: 'capacity-thread', turnId, error, willRetry })
+        expect(clock.timers.size).toBe(0)
+      }
+      // The terminal error may be supplied only by the preceding notification.
+      proc.handleNotification('turn/completed', { threadId: 'capacity-thread', turn: { id: turnId, status: 'failed' } })
+      proc.handleNotification('turn/completed', { threadId: 'capacity-thread', turn: { id: turnId, status: 'failed', error } })
+      expect(proc.turnRetry).toMatchObject({ reason: 'stream_disconnected', attempt: 1, delayMs: 5000, message: error.message })
+      expect(clock.timers.size).toBe(1)
+      expect(events.filter(([name]) => name === 'result')).toHaveLength(0)
+      expect(events.filter(([name]) => name === 'error')).toHaveLength(2)
+      await clock.tick()
+      const starts = calls.filter(call => call.method === 'turn/start')
+      expect(starts).toHaveLength(2)
+      const continuation = starts[1]!.params.input[0].text
+      expect(continuation).toContain('响应流连接中断')
+      expect(continuation).toContain('避免重复已完成的操作')
+      expect(continuation).not.toContain('task with completed effects')
+      expect(continuation).not.toContain('/tmp/input.csv')
+      expect(starts[1]!.params).toEqual({ ...starts[0]!.params, input: starts[1]!.params.input })
+      expect(events.filter(([name]) => name === 'turn_started').at(-1)?.[1].retry).toBe(true)
+      completeCapacityTurn(proc, null)
+      expect(events.filter(([name]) => name === 'result')).toEqual([
+        ['result', expect.objectContaining({ is_error: false })],
+      ])
+      expect(clock.timers.size).toBe(0)
+    })
+  })
+
+  test('limits stream recovery to three attempts and preserves the final error and request ID', async () => {
+    await withCapacityClock(async clock => {
+      const { proc, events } = capacityHarness()
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      for (const delay of [5000, 10000, 20000]) {
+        completeCapacityTurn(proc, { message: STREAM_MESSAGE, codexErrorInfo: 'other' })
+        expect([...clock.timers.values()].map(timer => timer.delay)).toEqual([delay])
+        expect(events.filter(([name]) => name === 'result')).toHaveLength(0)
+        await clock.tick()
+      }
+      completeCapacityTurn(proc, { message: STREAM_MESSAGE, codexErrorInfo: 'other' })
+      expect(clock.timers.size).toBe(0)
+      expect(proc.turnRetry).toBeNull()
+      expect(events.filter(([name]) => name === 'result')).toEqual([
+        ['result', expect.objectContaining({ is_error: true, error: STREAM_MESSAGE })],
+      ])
+      proc.sendUserText('next task')
+      await flushCapacityMicrotasks()
+      completeCapacityTurn(proc, { message: STREAM_MESSAGE })
+      expect(proc.turnRetry).toMatchObject({ attempt: 1, delayMs: 5000 })
+    })
+  })
+
+  test('capacity failures neither consume nor reset the separate stream retry budget', async () => {
+    await withCapacityClock(async clock => {
+      const { proc, events } = capacityHarness()
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      for (const delay of [5000, 10000, 20000]) {
+        for (let i = 0; i < 4; i++) {
+          completeCapacityTurn(proc)
+          await clock.tick()
+        }
+        completeCapacityTurn(proc, { message: STREAM_MESSAGE })
+        expect(proc.turnRetry.delayMs).toBe(delay)
+        await clock.tick()
+      }
+      completeCapacityTurn(proc, { message: STREAM_MESSAGE })
+      expect(clock.timers.size).toBe(0)
+      expect(events.filter(([name]) => name === 'result')).toHaveLength(1)
+    })
+  })
+
+  test('successful completion restores the stream budget for the next task', async () => {
+    await withCapacityClock(async clock => {
+      const { proc } = capacityHarness()
+      for (let task = 0; task < 2; task++) {
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        for (const delay of [5000, 10000, 20000]) {
+          completeCapacityTurn(proc, { message: STREAM_MESSAGE })
+          expect(proc.turnRetry.delayMs).toBe(delay)
+          await clock.tick()
+        }
+        completeCapacityTurn(proc, null)
+        expect(proc.turnRetry).toBeNull()
+      }
+    })
+  })
+
+  test('explicit rejection resends unaccepted input, while unknown transport outcomes stay terminal', async () => {
+    await withCapacityClock(async clock => {
+      let starts = 0
+      const { proc, calls, events } = capacityHarness(method => {
+        if (++starts === 1) throw new CodexRpcResponseError(method, 1, -32000, STREAM_MESSAGE, { codexErrorInfo: 'other' })
+        return { turn: { id: 'accepted-stream-retry' } }
+      })
+      proc.sendUserText('unaccepted task', ['/tmp/input.csv'])
+      await flushCapacityMicrotasks()
+      await clock.tick()
+      expect(calls[1]).toEqual(calls[0])
+      expect(events.find(([name]) => name === 'turn_started')?.[1].retry).toBeUndefined()
+      completeCapacityTurn(proc, null)
+      for (const failure of [new Error(STREAM_MESSAGE), new Error('turn/start timed out'),
+        new CodexRpcResponseError('thread/start', 2, -32000, STREAM_MESSAGE)]) {
+        const h = capacityHarness(() => { throw failure })
+        h.proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        expect(h.events.filter(([name]) => name === 'result')).toHaveLength(1)
+        expect(clock.timers.size).toBe(0)
+      }
+    })
+  })
+
+  test('permanent errors and unconfirmed terminal states do not authorize stream recovery', async () => {
+    await withCapacityClock(async clock => {
+      for (const error of [
+        ...['unauthorized', 'usageLimitExceeded', 'contextWindowExceeded', 'badRequest'].map(codexErrorInfo => ({ message: STREAM_MESSAGE, codexErrorInfo })),
+        ...[400, 401, 403, 429].map(httpStatusCode => ({ message: STREAM_MESSAGE, codexErrorInfo: { responseStreamDisconnected: { httpStatusCode } } })),
+        { message: 'An error occurred while processing your request.', codexErrorInfo: 'other' },
+      ]) {
+        const { proc, events } = capacityHarness()
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        completeCapacityTurn(proc, error)
+        expect(events.filter(([name]) => name === 'result')).toHaveLength(1)
+        expect(clock.timers.size).toBe(0)
+      }
+      for (const terminal of [{ status: 'interrupted', id: 'capacity-turn-1' }, { status: 'failed' }]) {
+        const { proc } = capacityHarness()
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        proc.handleNotification('turn/completed', { threadId: 'capacity-thread', turn: { ...terminal, error: { message: STREAM_MESSAGE } } })
+        expect(clock.timers.size).toBe(0)
+      }
     })
   })
 })

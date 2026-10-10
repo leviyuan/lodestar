@@ -69,14 +69,38 @@ const CODEX_GENERATED_IMAGES_DIR = join(codexAccounts.defaultHome, 'generated_im
 // turn. Bound them so a live PID with a dead transport cannot leak promises.
 const CODEX_REQUEST_TIMEOUT_MS = 30_000
 const CODEX_MATERIALIZATION_VERIFY_TIMEOUT_MS = 10 * 60_000
-const CODEX_CAPACITY_RETRY_BASE_MS = 5_000
-const CODEX_CAPACITY_RETRY_MAX_MS = 60_000
+const CODEX_TURN_RETRY_BASE_MS = 5_000
+const CODEX_TURN_RETRY_MAX_MS = 60_000
+const CODEX_STREAM_RETRY_LIMIT = 3
 // The failed turn already contains the user's input and any completed work.
 // Continue that history instead of replaying the original task and file hints.
 const CODEX_CAPACITY_CONTINUATION = '上一轮因模型暂时满载而中断。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。'
+const CODEX_STREAM_CONTINUATION = '上一轮因响应流连接中断而未完成。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。'
 
-function isModelCapacityError(message: unknown): message is string {
-  return typeof message === 'string' && /\bselected\s+model\s+is\s+at\s+capacity\b/i.test(message)
+type CodexTurnRetryReason = 'capacity' | 'stream_disconnected'
+
+function codexTurnRetryReason(error: unknown): CodexTurnRetryReason | null {
+  if (!error || typeof error !== 'object') return null
+  const { message, codexErrorInfo } = error as { message?: unknown; codexErrorInfo?: unknown }
+  if (typeof message !== 'string') return null
+  if (/\bselected\s+model\s+is\s+at\s+capacity\b/i.test(message)) return 'capacity'
+  // Classify only the known stream-disconnection failure, not arbitrary server
+  // errors or local control-request timeouts whose acceptance is unknown.
+  const disconnected = codexErrorInfo === 'responseStreamDisconnected'
+    || (!!codexErrorInfo && typeof codexErrorInfo === 'object'
+      && Object.hasOwn(codexErrorInfo, 'responseStreamDisconnected'))
+  if (isCodexQuotaError(error)) return null
+  if (codexErrorInfo != null && codexErrorInfo !== 'other' && !disconnected) return null
+  if (disconnected && typeof codexErrorInfo === 'object') {
+    const details = (codexErrorInfo as { responseStreamDisconnected?: { httpStatusCode?: unknown } })
+      .responseStreamDisconnected
+    const status = details?.httpStatusCode
+    if (typeof status === 'number' && status >= 400 && status < 500 && status !== 408) return null
+  }
+  if (disconnected || /^(?:Codex\s+)?stream disconnected before completion\s*:/i.test(message)) {
+    return 'stream_disconnected'
+  }
+  return null
 }
 
 export interface SpawnOpts {
@@ -357,10 +381,11 @@ export class CodexProcess extends EventEmitter {
   /** Bounded terminal-turn memory prevents a late turn/start response from
    * reviving a turn whose turn/completed notification already arrived. */
   private finishedTurnIds = new Set<string>()
-  private capacityRetryTimer: ReturnType<typeof setTimeout> | null = null
-  private capacityRetryCount = 0
-  private capacityRetryHasStarted = false
-  private capacityRetryEnabled = true
+  private turnRetryTimer: ReturnType<typeof setTimeout> | null = null
+  private turnRetryCount = 0
+  private streamRetryCount = 0
+  private turnRetryHasStarted = false
+  private turnRetryEnabled = true
   private turnError: { turnId: string; error: any } | null = null
   private rolloutFilePath: string | null = null
   private rolloutReadOffset = 0
@@ -480,7 +505,7 @@ export class CodexProcess extends EventEmitter {
       return
     }
     this.alive = false
-    this.cancelCapacityRetry()
+    this.cancelTurnRetry()
     this.childExitCode = code
     this.childExitSignal = signal
     // Do not reject pending RPCs here: Node's `exit` precedes stdio `close`,
@@ -491,7 +516,7 @@ export class CodexProcess extends EventEmitter {
 
   private handleChildClose(code: number | null, signal: NodeJS.Signals | null): void {
     this.alive = false
-    this.cancelCapacityRetry()
+    this.cancelTurnRetry()
     this.flushStdoutTail()
     this.flushStderrTail()
     this.rejectPendingRequests((id, pending) => (
@@ -529,7 +554,7 @@ export class CodexProcess extends EventEmitter {
     let terminalized = false
     if (spawnFailed && this.alive) {
       this.alive = false
-      this.cancelCapacityRetry()
+      this.cancelTurnRetry()
       this.serverRequests.clear()
       terminalized = true
     }
@@ -757,11 +782,14 @@ export class CodexProcess extends EventEmitter {
         this.lastCompletedTurnId = isCheckpointable ? completedTurnId : null
         this.currentTurnId = null
         this.inputConsumptionOpen = false
-        if (status === 'failed' && completedTurnId && isModelCapacityError(error?.message)
-          && this.scheduleCapacityRetry(error.message, CODEX_CAPACITY_CONTINUATION)) return
-        this.cancelCapacityRetry()
-        this.capacityRetryCount = 0
-        this.capacityRetryHasStarted = false
+        const retryReason = codexTurnRetryReason(error)
+        if (status === 'failed' && completedTurnId && retryReason
+          && this.scheduleTurnRetry(error.message,
+            retryReason === 'capacity' ? CODEX_CAPACITY_CONTINUATION : CODEX_STREAM_CONTINUATION, retryReason)) return
+        this.cancelTurnRetry()
+        this.turnRetryCount = 0
+        this.streamRetryCount = 0
+        this.turnRetryHasStarted = false
         const subtype = isError ? (error?.type ?? error?.message ?? 'failed') : 'success'
         this.lastResult = {
           cost_usd: null,
@@ -1734,10 +1762,11 @@ export class CodexProcess extends EventEmitter {
 
   sendUserText(text: string, files: string[] = []): void {
     const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
-    this.cancelCapacityRetry()
-    this.capacityRetryCount = 0
-    this.capacityRetryHasStarted = false
-    this.capacityRetryEnabled = true
+    this.cancelTurnRetry()
+    this.turnRetryCount = 0
+    this.streamRetryCount = 0
+    this.turnRetryHasStarted = false
+    this.turnRetryEnabled = true
     this.turnError = null
     const attempt = this.beginTurnStart(fileHints + text)
     void this.startTurn(fileHints + text, attempt).catch(e => this.failTurnStart(e, attempt))
@@ -1905,12 +1934,16 @@ export class CodexProcess extends EventEmitter {
     attempt.terminal = true
     const message = e instanceof Error ? e.message : String(e)
     log(`codex-process: turn/start failed: ${message}`)
-    if (e instanceof CodexRpcResponseError && e.method === 'turn/start'
-      && isModelCapacityError(e.serverMessage) && attempt.inputText !== undefined
-      && this.scheduleCapacityRetry(e.serverMessage, attempt.inputText)) return
-    this.cancelCapacityRetry()
-    this.capacityRetryCount = 0
-    this.capacityRetryHasStarted = false
+    if (e instanceof CodexRpcResponseError && e.method === 'turn/start' && attempt.inputText !== undefined) {
+      const retryReason = codexTurnRetryReason({
+        ...(e.serverData && typeof e.serverData === 'object' ? e.serverData : {}), message: e.serverMessage,
+      })
+      if (retryReason && this.scheduleTurnRetry(e.serverMessage, attempt.inputText, retryReason)) return
+    }
+    this.cancelTurnRetry()
+    this.turnRetryCount = 0
+    this.streamRetryCount = 0
+    this.turnRetryHasStarted = false
     this.lastResult = {
       cost_usd: null,
       cost_delta_usd: null,
@@ -1959,12 +1992,12 @@ export class CodexProcess extends EventEmitter {
     const changed = this.currentTurnId !== turnId
     this.currentTurnId = turnId
     if (!changed) return
-    const retrying = this.capacityRetryHasStarted && (this.capacityRetryCount ?? 0) > 0
-    this.capacityRetryHasStarted = true
-    if (this.capacityRetryTimer && this.turnRetry) {
+    const retrying = this.turnRetryHasStarted && (this.turnRetryCount ?? 0) > 0
+    this.turnRetryHasStarted = true
+    if (this.turnRetryTimer && this.turnRetry) {
       // A native goal/background continuation can beat our timer.
       const retry = { ...this.turnRetry, phase: 'retrying' as const, delayMs: 0 }
-      this.cancelCapacityRetry()
+      this.cancelTurnRetry()
       this.emit('turn_retry', retry)
     }
     this.turnRetry = null
@@ -2084,9 +2117,9 @@ export class CodexProcess extends EventEmitter {
   sendInterrupt(): void {
     this.inputConsumptionOpen = false
     this.steeringInputs?.clear()
-    this.capacityRetryEnabled = false
+    this.turnRetryEnabled = false
     const wasWaiting = !!this.turnRetry && !this.currentTurnId
-    this.cancelCapacityRetry()
+    this.cancelTurnRetry()
     const pendingStart = this.turnStartOwner
     const interruptPendingStart = pendingStart && !pendingStart.confirmed && !pendingStart.terminal
     if (interruptPendingStart) {
@@ -2110,38 +2143,46 @@ export class CodexProcess extends EventEmitter {
       .catch(e => log(`codex-process: interrupt failed: ${e}`))
   }
 
-  private cancelCapacityRetry(): void {
-    if (this.capacityRetryTimer) clearTimeout(this.capacityRetryTimer)
-    this.capacityRetryTimer = null
+  private cancelTurnRetry(): void {
+    if (this.turnRetryTimer) clearTimeout(this.turnRetryTimer)
+    this.turnRetryTimer = null
     this.turnRetry = null
   }
 
-  private scheduleCapacityRetry(message: string, inputText: string): boolean {
-    if (!this.alive || this.expectedExit || !this.capacityRetryEnabled) return false
-    if (this.capacityRetryTimer) return true
-    const attempt = (this.capacityRetryCount ?? 0) + 1
-    this.capacityRetryCount = attempt
-    const delayMs = Math.min(CODEX_CAPACITY_RETRY_BASE_MS * 2 ** Math.min(attempt - 1, 4), CODEX_CAPACITY_RETRY_MAX_MS)
+  private scheduleTurnRetry(message: string, inputText: string, reason: CodexTurnRetryReason): boolean {
+    if (!this.alive || this.expectedExit || !this.turnRetryEnabled) return false
+    if (this.turnRetryTimer) return true
+    if (reason === 'stream_disconnected') {
+      if ((this.streamRetryCount ?? 0) >= CODEX_STREAM_RETRY_LIMIT) {
+        log(`codex-process: stream disconnected retry limit reached (${CODEX_STREAM_RETRY_LIMIT}): ${message}`)
+        return false
+      }
+      this.streamRetryCount = (this.streamRetryCount ?? 0) + 1
+    }
+    const attempt = (this.turnRetryCount ?? 0) + 1
+    this.turnRetryCount = attempt
+    const backoffAttempt = reason === 'stream_disconnected' ? this.streamRetryCount : attempt
+    const delayMs = Math.min(CODEX_TURN_RETRY_BASE_MS * 2 ** Math.min(backoffAttempt - 1, 4), CODEX_TURN_RETRY_MAX_MS)
     const generation = this.turnStartGeneration ?? 0
-    const notice: AgentTurnRetry = { phase: 'waiting', attempt, delayMs, message }
+    const notice: AgentTurnRetry = { phase: 'waiting', attempt, delayMs, message, reason }
     this.turnRetry = notice
-    log(`codex-process: model capacity retry #${attempt} in ${delayMs}ms: ${message}`)
-    // Deliberately keep retrying this specific capacity error until cancelled;
-    // delays are capped, and every failure stays visible in the log and UI.
+    log(`codex-process: ${reason} retry #${attempt} in ${delayMs}ms: ${message}`)
+    // Capacity retries continue until cancelled; stream retries have a budget.
+    // Every failure stays visible in the log and UI.
     const timer = setTimeout(() => {
-      if (this.capacityRetryTimer !== timer) return
-      this.capacityRetryTimer = null
-      if (!this.alive || this.expectedExit || !this.capacityRetryEnabled
+      if (this.turnRetryTimer !== timer) return
+      this.turnRetryTimer = null
+      if (!this.alive || this.expectedExit || !this.turnRetryEnabled
         || this.currentTurnId || generation !== (this.turnStartGeneration ?? 0)) return
       this.turnRetry = { ...notice, phase: 'retrying', delayMs: 0 }
       this.emit('turn_retry', this.turnRetry)
       // Event consumers can synchronously stop the worker or supply new input.
-      if (!this.alive || this.expectedExit || !this.capacityRetryEnabled
+      if (!this.alive || this.expectedExit || !this.turnRetryEnabled
         || generation !== (this.turnStartGeneration ?? 0)) return
       const owner = this.beginTurnStart(inputText)
       void this.startTurn(inputText, owner).catch(e => this.failTurnStart(e, owner))
     }, delayMs)
-    this.capacityRetryTimer = timer
+    this.turnRetryTimer = timer
     this.emit('turn_retry', notice)
     return true
   }
@@ -2209,8 +2250,8 @@ export class CodexProcess extends EventEmitter {
   isAlive(): boolean { return !this.exitEventEmitted }
 
   async kill(timeoutMs = 5000): Promise<void> {
-    this.capacityRetryEnabled = false
-    this.cancelCapacityRetry()
+    this.turnRetryEnabled = false
+    this.cancelTurnRetry()
     this.inputPolicyAbort?.abort(new Error('Codex process cancelled'))
     if (this.startupPromise) {
       this.expectedExit = true

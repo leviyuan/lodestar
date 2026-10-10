@@ -3766,8 +3766,8 @@ export class Session {
       this.steerPendingInputs()
       if (retry) {
         if (this.currentTurn) this.startThinkingFooter(this.currentTurn)
-        // Capacity retries belong to the same visible task. Keep its original
-        // usage baseline so work preceding the capacity error is still counted.
+        // Retries belong to the same visible task. Keep its original usage
+        // baseline so work preceding the transient error is still counted.
         return
       }
       const total = snapshot.totalUsage
@@ -5748,9 +5748,10 @@ export class Session {
     if (turn.cardRotationFailed) return
     const retry = turn.provider === 'codex' ? this.proc?.turnRetry : null
     if (retry) {
+      const reason = retry.reason === 'stream_disconnected' ? '连接中断' : '模型满载'
       status = retry.reason === 'quota' ? `⏳ ${retry.message}` : retry.phase === 'waiting'
-        ? `⏳ 模型满载 · ${retry.delayMs / 1000}s 后重试 #${retry.attempt}`
-        : `⏳ 模型满载 · 正在重试 #${retry.attempt}`
+        ? `⏳ ${reason} · ${retry.delayMs / 1000}s 后重试 #${retry.attempt}`
+        : `⏳ ${reason} · 正在重试 #${retry.attempt}`
     }
     if (turn.footerStatusLabel === status) return
     this.stopFooterStatus(turn)
