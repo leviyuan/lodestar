@@ -5748,7 +5748,9 @@ export class Session {
     if (turn.cardRotationFailed) return
     const retry = turn.provider === 'codex' ? this.proc?.turnRetry : null
     if (retry) {
-      const reason = retry.reason === 'stream_disconnected' ? '连接中断' : '模型满载'
+      const reason = retry.reason === 'stream_disconnected' ? '连接中断'
+        : retry.reason === 'compact_connection_failed' ? '压缩连接中断'
+        : retry.reason === 'transient_error' ? '服务暂时异常' : '模型满载'
       status = retry.reason === 'quota' ? `⏳ ${retry.message}` : retry.phase === 'waiting'
         ? `⏳ ${reason} · ${retry.delayMs / 1000}s 后重试 #${retry.attempt}`
         : `⏳ ${reason} · 正在重试 #${retry.attempt}`

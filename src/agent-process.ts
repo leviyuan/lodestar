@@ -40,7 +40,7 @@ export interface AgentTurnRetry {
   attempt: number
   delayMs: number
   message: string
-  reason?: 'capacity' | 'stream_disconnected' | 'quota'
+  reason?: 'capacity' | 'stream_disconnected' | 'compact_connection_failed' | 'transient_error' | 'quota'
 }
 
 export const CLAUDE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'default'] as const

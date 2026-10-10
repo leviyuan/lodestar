@@ -71,34 +71,71 @@ const CODEX_REQUEST_TIMEOUT_MS = 30_000
 const CODEX_MATERIALIZATION_VERIFY_TIMEOUT_MS = 10 * 60_000
 const CODEX_TURN_RETRY_BASE_MS = 5_000
 const CODEX_TURN_RETRY_MAX_MS = 60_000
-const CODEX_STREAM_RETRY_LIMIT = 3
+const CODEX_TRANSIENT_RETRY_LIMIT = 3
 // The failed turn already contains the user's input and any completed work.
 // Continue that history instead of replaying the original task and file hints.
-const CODEX_CAPACITY_CONTINUATION = '上一轮因模型暂时满载而中断。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。'
-const CODEX_STREAM_CONTINUATION = '上一轮因响应流连接中断而未完成。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。'
+const CODEX_TURN_CONTINUATIONS = {
+  capacity: '上一轮因模型暂时满载而中断。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。',
+  stream_disconnected: '上一轮因响应流连接中断而未完成。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。',
+  compact_connection_failed: '上一轮因远程压缩时连接失败而未完成。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。',
+  transient_error: '上一轮因临时连接或服务错误而未完成。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。',
+}
 
-type CodexTurnRetryReason = 'capacity' | 'stream_disconnected'
+type CodexTurnRetryReason = keyof typeof CODEX_TURN_CONTINUATIONS
 
-function codexTurnRetryReason(error: unknown): CodexTurnRetryReason | null {
+const CODEX_TRANSPORT_ERRORS = new Set([
+  'httpConnectionFailed', 'responseStreamConnectionFailed',
+  'responseStreamDisconnected', 'responseTooManyFailedAttempts',
+])
+const CODEX_TRANSIENT_HTTP_STATUSES = new Set([408, 500, 502, 503, 504])
+
+function codexTurnRetryReason(error: unknown, routingTimedOut = false): CodexTurnRetryReason | null {
   if (!error || typeof error !== 'object') return null
-  const { message, codexErrorInfo } = error as { message?: unknown; codexErrorInfo?: unknown }
+  const { message, codexErrorInfo, additionalDetails } = error as { message?: unknown; codexErrorInfo?: unknown; additionalDetails?: unknown }
   if (typeof message !== 'string') return null
-  if (/\bselected\s+model\s+is\s+at\s+capacity\b/i.test(message)) return 'capacity'
-  // Classify only the known stream-disconnection failure, not arbitrary server
-  // errors or local control-request timeouts whose acceptance is unknown.
-  const disconnected = codexErrorInfo === 'responseStreamDisconnected'
-    || (!!codexErrorInfo && typeof codexErrorInfo === 'object'
-      && Object.hasOwn(codexErrorInfo, 'responseStreamDisconnected'))
   if (isCodexQuotaError(error)) return null
-  if (codexErrorInfo != null && codexErrorInfo !== 'other' && !disconnected) return null
-  if (disconnected && typeof codexErrorInfo === 'object') {
-    const details = (codexErrorInfo as { responseStreamDisconnected?: { httpStatusCode?: unknown } })
-      .responseStreamDisconnected
-    const status = details?.httpStatusCode
-    if (typeof status === 'number' && status >= 400 && status < 500 && status !== 408) return null
+
+  // Native network errors are tagged objects; tolerate legacy string tags,
+  // but never turn unknown future variants or malformed payloads into retries.
+  let kind: string | null = null
+  if (typeof codexErrorInfo === 'string') kind = codexErrorInfo
+  else if (codexErrorInfo != null) {
+    if (typeof codexErrorInfo !== 'object' || Array.isArray(codexErrorInfo)) return null
+    const entries = Object.entries(codexErrorInfo)
+    if (entries.length !== 1) return null
+    const [tag, details] = entries[0]!
+    kind = tag
+    if (!CODEX_TRANSPORT_ERRORS.has(kind) || !details || typeof details !== 'object' || Array.isArray(details)) return null
+    const status = (details as { httpStatusCode?: unknown }).httpStatusCode
+    if (status != null && (typeof status !== 'number' || !CODEX_TRANSIENT_HTTP_STATUSES.has(status))) return null
   }
-  if (disconnected || /^(?:Codex\s+)?stream disconnected before completion\s*:/i.test(message)) {
-    return 'stream_disconnected'
+  if (kind !== null && kind !== 'other' && kind !== 'serverOverloaded' && !CODEX_TRANSPORT_ERRORS.has(kind)) return null
+
+  const compact = /^(?:Codex\s+)?Error running remote compact task:\s*/i.test(message)
+  const detail = message.replace(/^(?:Codex\s+)?Error running remote compact task:\s*/i, '').replace(/^Codex\s+/i, '').trim()
+  // Details can veto retry but cannot on their own broaden the allowed errors.
+  // A generic transport tag must not override an explicit permanent diagnostic.
+  for (const diagnostic of [detail, additionalDetails]) {
+    if (typeof diagnostic !== 'string') continue
+    if (isCodexQuotaError({ message: diagnostic })
+      || /(?:^|:\s*)(?:unauthorized\b|forbidden\b|authentication failed\b|invalid (?:api key|request|argument)\b|(?:usage|rate|session budget) limit exceeded\b|context window exceeded\b)/i.test(diagnostic)) return null
+    const status = /(?:^|:\s*)unexpected status (\d{3})\b/i.exec(diagnostic)
+    if (status && !CODEX_TRANSIENT_HTTP_STATUSES.has(Number(status[1]))) return null
+  }
+  const renderedStatus = /(?:^|:\s*)unexpected status (\d{3})\b/i.exec(detail)
+  if (/\bselected\s+model\s+is\s+at\s+capacity\b/i.test(detail)) return 'capacity'
+
+  const knownConnectionFailure = /^Connection failed:\s*error sending request(?: for url \([^\r\n]+\))?\s*$/i.test(detail)
+    || /^(?:request timed out|workspace routing discovery timed out)$/i.test(detail)
+    // The generic discovery failure is ambiguous. Only a timeout observed in
+    // this same turn authorizes continuation; never borrow a prior turn's cause.
+    || (routingTimedOut && /^workspace routing discovery failed$/i.test(detail))
+  const streamDisconnected = /^stream disconnected before completion\s*:/i.test(detail)
+  if (CODEX_TRANSPORT_ERRORS.has(kind ?? '') || kind === 'serverOverloaded'
+    || knownConnectionFailure || streamDisconnected || renderedStatus) {
+    if (compact) return 'compact_connection_failed'
+    if (kind === 'responseStreamDisconnected' || streamDisconnected) return 'stream_disconnected'
+    return 'transient_error'
   }
   return null
 }
@@ -383,10 +420,11 @@ export class CodexProcess extends EventEmitter {
   private finishedTurnIds = new Set<string>()
   private turnRetryTimer: ReturnType<typeof setTimeout> | null = null
   private turnRetryCount = 0
-  private streamRetryCount = 0
+  private transientRetryCount = 0
   private turnRetryHasStarted = false
   private turnRetryEnabled = true
   private turnError: { turnId: string; error: any } | null = null
+  private routingTimeoutTurnId: string | null = null
   private rolloutFilePath: string | null = null
   private rolloutReadOffset = 0
   private rolloutLineRemainder = ''
@@ -772,8 +810,16 @@ export class CodexProcess extends EventEmitter {
           logUnhandledAppServerPayload('TURN_COMPLETED_MISSING_ID', { method, params })
         }
         const status = turn.status
-        const error = turn.error ?? (status === 'failed' && this.turnError && this.turnError.turnId === completedTurnId
-          ? this.turnError.error : null)
+        const notifiedError = status === 'failed' && this.turnError && this.turnError.turnId === completedTurnId
+          ? this.turnError.error : null
+        const error = turn.error && notifiedError && typeof turn.error.message === 'string'
+          && turn.error.message === notifiedError.message
+          ? {
+              ...notifiedError, ...turn.error,
+              codexErrorInfo: turn.error.codexErrorInfo ?? notifiedError.codexErrorInfo,
+              additionalDetails: turn.error.additionalDetails ?? notifiedError.additionalDetails,
+            }
+          : turn.error ?? notifiedError
         this.turnError = null
         const isError = status === 'failed' || !!error
         const isCheckpointable = status === 'completed' && !isError && !!completedTurnId
@@ -782,13 +828,13 @@ export class CodexProcess extends EventEmitter {
         this.lastCompletedTurnId = isCheckpointable ? completedTurnId : null
         this.currentTurnId = null
         this.inputConsumptionOpen = false
-        const retryReason = codexTurnRetryReason(error)
+        const retryReason = codexTurnRetryReason(error, !!completedTurnId && this.routingTimeoutTurnId === completedTurnId)
+        this.routingTimeoutTurnId = null
         if (status === 'failed' && completedTurnId && retryReason
-          && this.scheduleTurnRetry(error.message,
-            retryReason === 'capacity' ? CODEX_CAPACITY_CONTINUATION : CODEX_STREAM_CONTINUATION, retryReason)) return
+          && this.scheduleTurnRetry(error.message, CODEX_TURN_CONTINUATIONS[retryReason], retryReason)) return
         this.cancelTurnRetry()
         this.turnRetryCount = 0
-        this.streamRetryCount = 0
+        this.transientRetryCount = 0
         this.turnRetryHasStarted = false
         const subtype = isError ? (error?.type ?? error?.message ?? 'failed') : 'success'
         this.lastResult = {
@@ -885,6 +931,12 @@ export class CodexProcess extends EventEmitter {
           && !this.finishedTurnIds?.has(params.turnId)
           && (!this.currentTurnId || this.currentTurnId === params.turnId)) {
           this.turnError = { turnId: params.turnId, error }
+          if (params.willRetry === true && [error.message, error.additionalDetails]
+            .some(value => typeof value === 'string' && /^workspace routing discovery timed out$/i.test(value.trim())
+              && codexTurnRetryReason({ ...error, message: value,
+                additionalDetails: value === error.additionalDetails ? error.message : error.additionalDetails }) !== null)) {
+            this.routingTimeoutTurnId = params.turnId
+          }
         }
         // Even willRetry=false precedes turn/completed. Never start a competing
         // turn here, particularly while app-server is doing its own retries.
@@ -1764,10 +1816,11 @@ export class CodexProcess extends EventEmitter {
     const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
     this.cancelTurnRetry()
     this.turnRetryCount = 0
-    this.streamRetryCount = 0
+    this.transientRetryCount = 0
     this.turnRetryHasStarted = false
     this.turnRetryEnabled = true
     this.turnError = null
+    this.routingTimeoutTurnId = null
     const attempt = this.beginTurnStart(fileHints + text)
     void this.startTurn(fileHints + text, attempt).catch(e => this.failTurnStart(e, attempt))
   }
@@ -1920,6 +1973,12 @@ export class CodexProcess extends EventEmitter {
     if (!this.readyPromise) throw new Error('codex thread not initialized')
     await this.readyPromise
     if (!this.sessionId) throw new Error('codex thread not initialized')
+    if (this.currentTurnId || this.turnRetry || (this.turnStartOwner && !this.turnStartOwner.terminal)) {
+      throw new Error('codex cannot manually compact while a task is active')
+    }
+    // Manual compaction has no unfinished user task to continue. A failed cm
+    // must report its own error, never resurrect the last completed task.
+    this.turnRetryEnabled = false
     await this.request('thread/compact/start', {
       threadId: this.sessionId,
     })
@@ -1942,7 +2001,7 @@ export class CodexProcess extends EventEmitter {
     }
     this.cancelTurnRetry()
     this.turnRetryCount = 0
-    this.streamRetryCount = 0
+    this.transientRetryCount = 0
     this.turnRetryHasStarted = false
     this.lastResult = {
       cost_usd: null,
@@ -2152,22 +2211,22 @@ export class CodexProcess extends EventEmitter {
   private scheduleTurnRetry(message: string, inputText: string, reason: CodexTurnRetryReason): boolean {
     if (!this.alive || this.expectedExit || !this.turnRetryEnabled) return false
     if (this.turnRetryTimer) return true
-    if (reason === 'stream_disconnected') {
-      if ((this.streamRetryCount ?? 0) >= CODEX_STREAM_RETRY_LIMIT) {
-        log(`codex-process: stream disconnected retry limit reached (${CODEX_STREAM_RETRY_LIMIT}): ${message}`)
+    if (reason !== 'capacity') {
+      if ((this.transientRetryCount ?? 0) >= CODEX_TRANSIENT_RETRY_LIMIT) {
+        log(`codex-process: transient retry limit reached (${CODEX_TRANSIENT_RETRY_LIMIT}): ${message}`)
         return false
       }
-      this.streamRetryCount = (this.streamRetryCount ?? 0) + 1
+      this.transientRetryCount = (this.transientRetryCount ?? 0) + 1
     }
     const attempt = (this.turnRetryCount ?? 0) + 1
     this.turnRetryCount = attempt
-    const backoffAttempt = reason === 'stream_disconnected' ? this.streamRetryCount : attempt
+    const backoffAttempt = reason === 'capacity' ? attempt : this.transientRetryCount
     const delayMs = Math.min(CODEX_TURN_RETRY_BASE_MS * 2 ** Math.min(backoffAttempt - 1, 4), CODEX_TURN_RETRY_MAX_MS)
     const generation = this.turnStartGeneration ?? 0
     const notice: AgentTurnRetry = { phase: 'waiting', attempt, delayMs, message, reason }
     this.turnRetry = notice
     log(`codex-process: ${reason} retry #${attempt} in ${delayMs}ms: ${message}`)
-    // Capacity retries continue until cancelled; stream retries have a budget.
+    // Capacity retries continue until cancelled; transient failures share a budget.
     // Every failure stays visible in the log and UI.
     const timer = setTimeout(() => {
       if (this.turnRetryTimer !== timer) return

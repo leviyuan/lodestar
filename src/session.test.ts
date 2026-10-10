@@ -1268,6 +1268,8 @@ describe('Session assistant rendering', () => {
     { reason: undefined, label: '模型满载', message: 'Selected model is at capacity' },
     { reason: 'capacity', label: '模型满载', message: 'Selected model is at capacity' },
     { reason: 'stream_disconnected', label: '连接中断', message: 'stream disconnected before completion: An error occurred while processing your request.' },
+    { reason: 'compact_connection_failed', label: '压缩连接中断', message: 'Error running remote compact task: Connection failed: error sending request' },
+    { reason: 'transient_error', label: '服务暂时异常', message: 'Server overloaded, please try again later.' },
   ] as const) {
     test(`${reason ?? 'legacy capacity'} backoff keeps the card open, renders retry phases and preserves usage before the retry`, async () => {
       const session = new Session('retry-card', 'chat_id') as any

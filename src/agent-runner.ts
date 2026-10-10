@@ -240,7 +240,9 @@ export function collectAgentTurn(
   }
   const onRetry = (retry: AgentTurnRetry) => {
     const tool = retry.reason === 'quota' ? 'Codex 额度换号'
-      : retry.reason === 'stream_disconnected' ? 'Codex 连接中断重试' : 'Codex 容量重试'
+      : retry.reason === 'stream_disconnected' ? 'Codex 连接中断重试'
+      : retry.reason === 'compact_connection_failed' ? 'Codex 压缩连接中断重试'
+      : retry.reason === 'transient_error' ? 'Codex 临时故障重试' : 'Codex 容量重试'
     emitProgress({
       at: new Date().toISOString(), phase: 'info', tool,
       detail: retry.phase === 'waiting'

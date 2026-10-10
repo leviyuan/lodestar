@@ -48,6 +48,8 @@ describe('full delegated Agent runner', () => {
     [undefined, 'Selected model is at capacity', 'Codex 容量重试'],
     ['capacity', 'Selected model is at capacity', 'Codex 容量重试'],
     ['stream_disconnected', 'stream disconnected before completion: An error occurred while processing your request.', 'Codex 连接中断重试'],
+    ['compact_connection_failed', 'Error running remote compact task: Connection failed: error sending request', 'Codex 压缩连接中断重试'],
+    ['transient_error', 'Server overloaded, please try again later.', 'Codex 临时故障重试'],
     ['quota', '正在等待 Codex 额度恢复', 'Codex 额度换号'],
   ] as const)('%s backoff reports progress without imposing a turn deadline or changing output', async (reason, message, tool) => {
     const timers = new Map<number, number>()
