@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from 'bun:test'
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { AgentService, type AgentServiceDeps } from './agent-service'
@@ -9,6 +9,7 @@ import { AgentWorkerFailure, type AgentWorkerHandle, type AgentWorkerResult } fr
 import type { AgentInputRequest, AgentRunSnapshot } from './agent-run-types'
 import { AGENT_RUNS_DIR } from './paths'
 import { projectProfiles, sentLocalFiles } from './feishu-test-mock'
+import { config } from './config'
 
 function identity(id: string, name = id): AgentIdentity {
   return {
@@ -125,6 +126,173 @@ function harness(opts: {
   const service = new AgentService(deps)
   return { service, root: service.rootPrincipal(session), artifacts, textArtifacts, artifactReads }
 }
+
+test('verified worker presentation stays on live cards without changing native API or history', async () => {
+  const cards: string[] = []
+  const h = harness({
+    identities: [identity('claude-sub')],
+    startWorker: options => {
+      expect(options.callbacks?.onDisplayContext?.({ description: '检查接口', prompt: '检查接口实现' })).toBe(true)
+      return resolvedHandle({ ...result('native-sub', 'Native result'), displayOutput: '检查结果' })
+    },
+    sendCard: async (_chatId, card) => { cards.push(JSON.stringify(card)); return 'message-1' },
+    replaceElementChecked: async (_card, _id, element) => { cards.push(JSON.stringify(element)); return true },
+  })
+  const started = await h.service.startRun(h.root, { identityIds: ['agent:claude-sub'], description: 'Inspect API', prompt: 'Inspect API implementation' })
+  const completed = await waitFor(h.service, h.root, started.runId, 'completed')
+  expect(completed.workers[0]!.output).toBe('Native result')
+  expect(JSON.stringify(completed)).not.toContain('display')
+  expect(completed.workers[0]!.translationEnabled).toBeUndefined()
+  expect(cards[0]).toContain('正在翻译任务说明')
+  expect(cards.every(card => !card.includes('Inspect API'))).toBe(true)
+  expect(cards.some(card => card.includes('检查接口实现') && card.includes('检查结果'))).toBe(true)
+  const durable = h.artifacts.at(-1) as AgentRunSnapshot
+  const worker = durable.workers[0]!
+  expect(worker.output).toBe('')
+  expect(JSON.stringify(h.artifacts)).not.toContain('display')
+  expect(worker.translationEnabled).toBeUndefined()
+  expect(h.textArtifacts.get(join(AGENT_RUNS_DIR, worker.outputArtifact!))).toBe('Native result')
+  expect(h.textArtifacts.size).toBe(2)
+  expect([...h.textArtifacts.keys()].some(path => path.includes('.display-'))).toBe(false)
+})
+
+test('unconfigured GLM workers retain their native presentation', async () => {
+  const cards: string[] = []
+  const h = harness({ identities: [identity('glm')], startWorker: options => {
+    expect(options.identity.tokenSourceId).toBe('glm')
+    return resolvedHandle(result('glm-native', 'English result'))
+  }, sendCard: async (_chat, card) => { cards.push(JSON.stringify(card)); return 'glm-message' } })
+  const run = await h.service.startRun(h.root, { identityIds: ['agent:glm'], description: 'Inspect API', prompt: 'Check the explanation' })
+  const completed = await waitFor(h.service, h.root, run.runId, 'completed')
+  expect(completed.workers[0]!.tokenSourceId).toBe('glm')
+  expect(completed.workers[0]!.translationEnabled).toBeUndefined()
+  expect(completed.workers[0]!.output).toBe('English result')
+  expect(cards[0]).toContain('Inspect API')
+  expect(cards[0]).not.toContain('正在翻译任务说明')
+})
+
+test.each([
+  ['glm', 'GLM-5.3', true],
+  ['glm', 'GLM-5.3-Flash', false],
+  ['claude-sub', 'opus', false],
+] as const)('worker cards honor safety configuration for %s/%s: %s', async (source, model, translated) => {
+  const previousSafeMode = config.claude.safe_mode
+  config.claude.safe_mode = { 'claude-sub': [], glm: ['GLM-5.3'] }
+  try {
+    const cards: string[] = []
+    const selected = { ...identity(source), model }
+    const h = harness({ identities: [selected], startWorker: options => {
+      expect(options.identity.tokenSourceId).toBe(source)
+      expect(options.identity.model).toBe(model)
+      if (translated) expect(options.callbacks?.onDisplayContext?.({ description: '检查接口', prompt: '检查接口实现' })).toBe(true)
+      return resolvedHandle({ ...result(`native-${source}`, 'Native result'), ...(translated ? { displayOutput: '检查结果' } : {}) })
+    },
+    sendCard: async (_chat, card) => { cards.push(JSON.stringify(card)); return 'message-1' },
+    replaceElementChecked: async (_card, _id, element) => { cards.push(JSON.stringify(element)); return true },
+    })
+    const run = await h.service.startRun(h.root, { identityIds: [selected.id], description: 'Inspect API', prompt: 'Inspect API implementation' })
+    const completed = await waitFor(h.service, h.root, run.runId, 'completed')
+    expect(completed.workers[0]!.output).toBe('Native result')
+    expect(completed.workers[0]!.translationEnabled).toBeUndefined()
+    expect(cards[0]!.includes('正在翻译任务说明')).toBe(translated)
+    if (translated) {
+      expect(cards.every(card => !card.includes('Inspect API'))).toBe(true)
+      expect(cards.some(card => card.includes('检查结果'))).toBe(true)
+    } else {
+      expect(cards[0]).toContain('Inspect API')
+      expect(cards.some(card => card.includes('Native result'))).toBe(true)
+      expect(cards.every(card => !card.includes('译文 MISS'))).toBe(true)
+    }
+  } finally {
+    config.claude.safe_mode = previousSafeMode
+  }
+})
+
+test('evicted native history ignores obsolete presentation artifact references', () => {
+  const history = completedHistory(520)
+  Object.assign(history[0]!.workers[0]!, {
+    displayOutput: '历史结果', displayPrompt: '历史任务说明', displayDescription: '历史任务',
+    displayOutputArtifact: 'missing-display-output.txt', displayPromptArtifact: 'missing-display-prompt.txt',
+  })
+  const h = harness({ loadArtifacts: () => history })
+  expect(h.service.getRun(h.root, 'agent_history_0').workers[0]!.output).toBe('original output 0')
+  expect(h.artifactReads).toHaveLength(2)
+  const native = h.service.getRun(h.root, 'agent_history_0')
+  expect(native.prompt).toBe('original prompt 0')
+  expect(native.workers[0]!.output).toBe('original output 0')
+  expect(JSON.stringify(native)).not.toContain('display')
+  expect(h.artifactReads).toHaveLength(4)
+  expect(h.artifactReads).not.toContain('missing-display-output.txt')
+  expect(h.artifactReads).not.toContain('missing-display-prompt.txt')
+})
+
+test.each(['displayOutputArtifact', 'displayPromptArtifact'] as const)('startup and native API ignore an obsolete missing %s', field => {
+  const saved = completedHistory(1)[0]!
+  saved.runId = `agent_missing_${field}`
+  Object.assign(saved.workers[0]!, { [field]: `${saved.runId}.missing.txt`, translationEnabled: true })
+  saved.promptArtifact = `${saved.runId}.prompt.txt`
+  saved.workers[0]!.outputArtifact = `${saved.runId}.output.txt`
+  const artifact = join(AGENT_RUNS_DIR, `${saved.runId}.json`)
+  const promptArtifact = join(AGENT_RUNS_DIR, saved.promptArtifact)
+  const outputArtifact = join(AGENT_RUNS_DIR, saved.workers[0]!.outputArtifact)
+  mkdirSync(AGENT_RUNS_DIR, { recursive: true })
+  writeFileSync(artifact, JSON.stringify(saved))
+  writeFileSync(promptArtifact, saved.prompt)
+  writeFileSync(outputArtifact, saved.workers[0]!.output)
+  try {
+    const service = new AgentService()
+    const native = service.getRun(service.rootPrincipal(session), saved.runId)
+    expect(native.prompt).toBe('original prompt 0')
+    expect(native.workers[0]!.output).toBe('original output 0')
+    expect(native.workers[0]!.translationEnabled).toBeUndefined()
+    expect(native.workers[0]).not.toHaveProperty(field)
+    const durable = JSON.parse(readFileSync(artifact, 'utf8'))
+    expect(durable.workers[0]).not.toHaveProperty(field)
+    expect(durable.workers[0].translationEnabled).toBeUndefined()
+  } finally {
+    for (const path of [artifact, promptArtifact, outputArtifact]) rmSync(path)
+  }
+})
+
+test('translated pending questions keep original API keys and clear their display after answering', async () => {
+  const native: AgentInputRequest = { requestId: 'translated-question', questions: [{ id: 'Which test?', question: 'Which test?', options: [{ label: 'Unit test' }] }] }
+  const display: AgentInputRequest = { requestId: native.requestId, questions: [{ id: 'Which test?', question: '选择哪种测试？', options: [{ label: '单元测试' }] }] }
+  const control = controlledHandle()
+  let pending: AgentInputRequest | null = null
+  const cards: string[] = []
+  const h = harness({
+    identities: [identity('claude-sub')],
+    startWorker: options => {
+      queueMicrotask(() => {
+        pending = native
+        options.callbacks?.onNeedsInput?.(native, display)
+        options.callbacks?.onProgress?.({ at: new Date().toISOString(), phase: 'started', tool: 'Bash', detail: 'Inspect files', displayDetail: '检查文件' })
+      })
+      return {
+        ...control.handle, pendingInput: () => pending, displayPendingInput: () => pending ? display : null,
+        answer(requestId, answers) {
+          expect(requestId).toBe(native.requestId)
+          expect(answers).toEqual({ 'Which test?': 'Unit test' })
+          pending = null
+        },
+      }
+    },
+    replaceElementChecked: async (_card, _id, element) => { cards.push(JSON.stringify(element)); return true },
+  })
+  const started = await h.service.startRun(h.root, { identityIds: ['agent:claude-sub'], description: 'Inspect API', prompt: 'Inspect API' })
+  const waiting = await waitFor(h.service, h.root, started.runId, 'needs_input')
+  expect(waiting.workers[0]!.pendingInput).toEqual(native)
+  expect(waiting.workers[0]!.steps[0]!.detail).toBe('Inspect files')
+  expect(JSON.stringify(waiting)).not.toContain('display')
+  expect(cards.some(card => card.includes('选择哪种测试？') && card.includes('单元测试'))).toBe(true)
+  await h.service.answer(h.root, started.runId, { requestId: native.requestId, answers: { 'Which test?': 'Unit test' } })
+  const durable = h.artifacts.at(-1) as AgentRunSnapshot
+  expect(durable.workers[0]!.pendingInput).toBeUndefined()
+  expect(durable.workers[0]!.displayPendingInput).toBeUndefined()
+  expect(cards.at(-1)).not.toContain('选择哪种测试？')
+  control.resolve({ ...result('translated-question-session'), displayOutput: '已完成' })
+  await waitFor(h.service, h.root, started.runId, 'completed')
+})
 
 async function waitFor(
   service: AgentService,

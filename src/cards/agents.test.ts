@@ -123,4 +123,35 @@ describe('delegated Agent cards', () => {
     expect(next.body.elements[0].element_id).not.toBe(card.body.elements[0].element_id)
     expect(card.body.elements[0].element_id.length).toBeLessThanOrEqual(20)
   })
+
+  test.each(['claude-sub', 'glm'])('translation-enabled %s cards render only verified context, answers and results', source => {
+    const run: AgentRunSnapshot = {
+      runId: 'translated', sessionName: 'project', chatId: 'chat', workDir: '/repo', prompt: 'Inspect API implementation',
+      description: 'Inspect API', depth: 0, status: 'needs_input', createdAt: new Date().toISOString(), workers: [{
+        identityId: identity.id, identityName: identity.displayName, tokenSourceId: source, provider: 'claude', translationEnabled: true,
+        model: identity.model, effort: 'max', status: 'needs_input', output: 'Native result', displayOutput: '检查结果',
+        displayDescription: '检查接口', displayPrompt: '检查接口实现', steps: [],
+        pendingInput: { requestId: 'q', questions: [{ id: 'Proceed?', question: 'Proceed?', options: [{ label: 'Yes' }] }] },
+        displayPendingInput: { requestId: 'q', questions: [{ id: 'Proceed?', question: '是否继续？', options: [{ label: '是' }] }] },
+        error: 'Native error', displayError: '请求失败',
+      }],
+    }
+    const rendered = JSON.stringify(agentRunCard(run))
+    for (const text of ['检查接口', '检查接口实现', '检查结果', '是否继续？', '请求失败']) expect(rendered).toContain(text)
+    for (const text of ['Inspect API', 'Native result', 'Proceed?', 'Native error']) expect(rendered).not.toContain(text)
+    delete run.workers[0]!.displayDescription
+    delete run.workers[0]!.displayPrompt
+    delete run.workers[0]!.displayOutput
+    delete run.workers[0]!.displayPendingInput
+    const missing = JSON.stringify(agentRunCard(run))
+    expect(missing).toContain('正在翻译任务说明')
+    expect(missing).toContain('结果译文 MISS')
+    expect(missing).toContain('问题译文 MISS')
+    for (const text of ['Inspect API', 'Native result', 'Proceed?']) expect(missing).not.toContain(text)
+    run.workers[0]!.translationEnabled = false
+    const disabled = JSON.stringify(agentRunCard(run))
+    for (const text of ['Inspect API', 'Native result', 'Proceed?']) expect(disabled).toContain(text)
+    expect(disabled).not.toContain('译文 MISS')
+    expect(disabled).not.toContain('正在翻译任务说明')
+  })
 })

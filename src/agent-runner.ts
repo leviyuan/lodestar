@@ -1,4 +1,5 @@
 import type { AgentProcess, AgentReasoningEffort, AgentTurnRetry } from './agent-process'
+import { processUsesClaudeTranslation } from './agent-process'
 import type { AgentIdentity } from './agent-identities'
 import { createAgentProcess } from './agent-launch'
 import { rememberAgentSession } from './agent-session-registry'
@@ -9,9 +10,11 @@ import type { ProjectProfile } from './config'
 import { getTokenSourceForAccount } from './token-source'
 import { DELEGATED_AGENT_INSTRUCTIONS, PROJECT_AGENT_INSTRUCTIONS } from './agent-skill'
 import { log } from './log'
+import { shellCommandPresentation } from './cards/shell-command'
 
 export interface AgentWorkerResult {
   output: string
+  displayOutput?: string
   outputTruncated: boolean
   sessionId: string
   checkpointId?: string
@@ -22,14 +25,17 @@ export interface AgentWorkerResult {
 /** Failed work may still contain useful output. Preserve it with the actual
  * failure instead of dropping everything that preceded an error or cancel. */
 export class AgentWorkerFailure extends Error {
-  constructor(cause: Error, readonly output: string, readonly sessionId: string | null) {
+  constructor(cause: Error, readonly output: string, readonly sessionId: string | null, readonly displayOutput?: string,
+    readonly displayError?: string) {
     super(cause.message, { cause })
     this.name = 'AgentWorkerFailure'
   }
 }
 
 export interface AgentWorkerCallbacks {
-  onNeedsInput?(request: AgentInputRequest): void
+  onNeedsInput?(request: AgentInputRequest, displayRequest?: AgentInputRequest): void
+  /** False rejects presentation, for example when the owning run was cancelled. */
+  onDisplayContext?(context: { description: string; prompt: string }): boolean | void
   onProgress?(step: AgentStep): void
   onSession?(sessionId: string): void
   onCodexAccount?(accountId: string): void
@@ -39,6 +45,7 @@ export interface AgentWorkerHandle {
   done: Promise<AgentWorkerResult>
   isAlive?(): boolean
   pendingInput(): AgentInputRequest | null
+  displayPendingInput?(): AgentInputRequest | null
   answer(requestId: string, answers: Record<string, string>): void
   cancel(reason?: string): Promise<void>
 }
@@ -50,6 +57,7 @@ export function startAgentWorker(opts: {
   effort: AgentReasoningEffort
   workDir: string
   prompt: string
+  description?: string
   resumeSessionId?: string
   developerInstructions?: string
   profile?: ProjectProfile
@@ -85,7 +93,8 @@ export function startAgentWorker(opts: {
     hostEnv: { ...opts.hostEnv, LODESTAR_AGENT_ROLE: 'worker' },
     serviceName: 'lodestar-agent',
   })
-  return collectAgentTurn(proc, opts.prompt, opts.callbacks, undefined, opts.resumeSessionId, !opts.projectBound)
+  return collectAgentTurn(proc, opts.prompt, opts.callbacks, undefined, opts.resumeSessionId, !opts.projectBound,
+    opts.description ? { description: opts.description, prompt: opts.prompt } : undefined)
 }
 
 export function collectAgentTurn(
@@ -95,13 +104,18 @@ export function collectAgentTurn(
   remember: typeof rememberAgentSession = rememberAgentSession,
   expectedSessionId?: string,
   allowUserInput = true,
+  presentationContext?: { description: string; prompt: string },
 ): AgentWorkerHandle {
   const output: string[] = []
+  const displayOutput: string[] = []
+  const requiresTranslation = processUsesClaudeTranslation(proc)
+  let hasDisplayOutput = requiresTranslation
   let lastError: Error | null = null
   let settled = false
   let finishing: Promise<void> | null = null
   let closeError: Error | null = null
-  const waiting: Array<{ request: AgentInputRequest; originalInput: Record<string, unknown> }> = []
+  const presentationController = new AbortController()
+  const waiting: Array<{ request: AgentInputRequest; displayRequest?: AgentInputRequest; originalInput: Record<string, unknown> }> = []
   let resolveDone!: (value: AgentWorkerResult) => void
   let rejectDone!: (error: Error) => void
   const startedAt = Date.now()
@@ -139,9 +153,10 @@ export function collectAgentTurn(
     proc.off('result', onResult)
     proc.off('exit', onExit)
   }
-  const finish = (error?: Error, result?: { checkpoint?: any }): Promise<void> => {
+  const finish = (error?: Error, result?: { checkpoint?: any; displayError?: string }): Promise<void> => {
     if (finishing) return finishing
     settled = true
+    presentationController.abort(new Error('delegated agent turn ended'))
     waiting.length = 0
     finishing = Promise.resolve().then(async () => {
       const registryError = rememberSession(proc.sessionId)
@@ -153,13 +168,17 @@ export function collectAgentTurn(
         ? new AggregateError(failures, failures.map(value => value.message).join('; '))
         : failures[0]
       if (failure) {
-        rejectDone(new AgentWorkerFailure(failure, output.join('').trim(), proc.sessionId))
+        rejectDone(new AgentWorkerFailure(failure, output.join('').trim(), proc.sessionId,
+          hasDisplayOutput ? displayOutput.join('').trim() : undefined,
+          result?.displayError === undefined ? undefined
+            : [result.displayError, ...failures.filter(value => value !== error).map(value => value.message)].join('; ')))
         return
       }
       const sessionId = proc.sessionId
       if (!sessionId) {
         rejectDone(new AgentWorkerFailure(
           new Error('delegated agent completed without a native session id'), output.join('').trim(), null,
+          hasDisplayOutput ? displayOutput.join('').trim() : undefined,
         ))
         return
       }
@@ -167,6 +186,7 @@ export function collectAgentTurn(
       const checkpointId = checkpointIdFrom(result?.checkpoint, proc)
       resolveDone({
         output: text,
+        ...(hasDisplayOutput ? { displayOutput: displayOutput.join('').trim() } : {}),
         outputTruncated: false,
         sessionId,
         ...(checkpointId ? { checkpointId } : {}),
@@ -176,17 +196,25 @@ export function collectAgentTurn(
     })
     return finishing
   }
-  const onText = (event: { text?: string; parentToolUseId?: string | null }) => {
+  const onText = (event: { text?: string; displayText?: string; parentToolUseId?: string | null }) => {
     if (settled || event?.parentToolUseId || typeof event?.text !== 'string') return
     output.push(event.text)
+    if (requiresTranslation && typeof event.displayText !== 'string') {
+      void finish(new Error('Claude subscription delegated output is missing verified translation'))
+      return
+    }
+    hasDisplayOutput ||= typeof event.displayText === 'string'
+    displayOutput.push(event.displayText ?? event.text)
   }
   const emitProgress = (step: AgentStep) => {
     if (settled) return
     try { callbacks.onProgress?.(step) }
     catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
   }
-  const onToolUse = (event: { name?: string }) => emitProgress({
-    at: new Date().toISOString(), phase: 'started', tool: String(event?.name ?? 'tool'), detail: '',
+  const onToolUse = (event: { name?: string; input?: Record<string, unknown>; displayInput?: Record<string, unknown> }) => emitProgress({
+    at: new Date().toISOString(), phase: 'started', tool: String(event?.name ?? 'tool'),
+    detail: event.displayInput ? toolProgressDescription(event.input) : '',
+    ...(event.displayInput ? { displayDetail: toolProgressDescription(event.displayInput) } : {}),
   })
   const onToolResult = (event: { is_error?: boolean }) => emitProgress({
     at: new Date().toISOString(), phase: 'completed', tool: event?.is_error ? 'tool error' : 'tool result', detail: '',
@@ -199,6 +227,7 @@ export function collectAgentTurn(
     tool_name?: string
     tool_use_id?: string
     input?: Record<string, unknown>
+    originalInput?: Record<string, unknown>
   }) => {
     if (settled) return
     if (request.tool_name !== 'AskUserQuestion') {
@@ -207,8 +236,16 @@ export function collectAgentTurn(
       return
     }
     let normalized: AgentInputRequest
+    let displayRequest: AgentInputRequest | undefined
     try {
-      normalized = normalizeInputRequest(request)
+      normalized = normalizeInputRequest({ ...request, input: request.originalInput ?? request.input })
+      if (request.originalInput) {
+        displayRequest = normalizeInputRequest(request)
+        if (displayRequest.questions.length !== normalized.questions.length) throw new Error('translated question count does not match native questions')
+        displayRequest.questions = displayRequest.questions.map((question, index) => ({ ...question, id: normalized.questions[index]!.id }))
+      } else if (requiresTranslation) {
+        throw new Error('Claude subscription delegated question is missing verified translation')
+      }
       if (!allowUserInput) {
         throw new Error(`${PROJECT_AGENT_INPUT_ERROR}: ${normalized.questions.map(question => question.question).join('; ')}`)
       }
@@ -218,8 +255,8 @@ export function collectAgentTurn(
       return
     }
     if (waiting.some(pending => pending.request.requestId === normalized.requestId)) return
-    waiting.push({ request: normalized, originalInput: request.input ?? {} })
-    try { if (waiting.length === 1) callbacks.onNeedsInput?.(normalized) }
+    waiting.push({ request: normalized, displayRequest, originalInput: request.originalInput ?? request.input ?? {} })
+    try { if (waiting.length === 1) callbacks.onNeedsInput?.(normalized, displayRequest) }
     catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
   }
   const onHook = (request: { request_id: string | number }) => {
@@ -250,7 +287,7 @@ export function collectAgentTurn(
         : `正在重试 #${retry.attempt}`,
     })
   }
-  const onResult = (result: { is_error?: boolean; error?: unknown; subtype?: unknown; checkpoint?: unknown }) => {
+  const onResult = (result: { is_error?: boolean; error?: unknown; subtype?: unknown; checkpoint?: unknown; displayError?: string }) => {
     const error = result?.is_error
       ? new Error(String(result.error ?? result.subtype ?? proc.lastResult.subtype ?? 'delegated agent failed'))
       : undefined
@@ -274,9 +311,34 @@ export function collectAgentTurn(
   proc.on('codex_account_changed', onAccount)
   proc.on('result', onResult)
   proc.on('exit', onExit)
+  if (requiresTranslation) proc.setTranslationPresentationPolicy?.(event => {
+    if (settled) return 'hidden'
+    if (event.kind === 'assistant_text') return event.parentToolUseId ? 'hidden' : 'worker'
+    if (event.kind === 'tool_input') return 'worker'
+    return 'hidden'
+  })
   try {
     proc.sendInitialize()
-    proc.sendUserText(prompt)
+    if (requiresTranslation && presentationContext) {
+      void (async () => {
+        if (!proc.translateDisplayFields) throw new Error('Claude subscription delegated context translation is unavailable')
+        await proc.translateDisplayFields(
+          [presentationContext.description, presentationContext.prompt], presentationController.signal,
+          translated => {
+            if (settled || !callbacks.onDisplayContext) return false
+            if (translated.length !== 2 || translated.some(text => typeof text !== 'string')) {
+              throw new Error('Claude subscription delegated context translation returned invalid fields')
+            }
+            if (callbacks.onDisplayContext({ description: translated[0]!, prompt: translated[1]! }) === false) {
+              throw new Error('Delegated task display was not accepted')
+            }
+            return !settled
+          },
+        )
+        if (settled) return
+        proc.sendUserText(prompt)
+      })().catch(error => { if (!settled) void finish(error instanceof Error ? error : new Error(String(error))) })
+    } else proc.sendUserText(prompt)
   } catch (error) {
     void finish(error instanceof Error ? error : new Error(String(error)))
   }
@@ -285,6 +347,7 @@ export function collectAgentTurn(
     done,
     isAlive: () => proc.isAlive(),
     pendingInput: () => waiting[0]?.request ?? null,
+    displayPendingInput: () => waiting[0]?.displayRequest ?? null,
     answer(requestId: string, answers: Record<string, string>): void {
       const pending = waiting[0]
       if (!pending) throw new Error('delegated agent is not waiting for input')
@@ -293,7 +356,7 @@ export function collectAgentTurn(
       }
       proc.sendPermissionResponse(requestId, 'allow', { updatedInput: { ...pending.originalInput, answers } })
       waiting.shift()
-      if (waiting[0]) callbacks.onNeedsInput?.(waiting[0].request)
+      if (waiting[0]) callbacks.onNeedsInput?.(waiting[0].request, waiting[0].displayRequest)
     },
     async cancel(reason = 'delegated agent cancelled'): Promise<void> {
       const wasSettled = settled
@@ -307,6 +370,18 @@ export function collectAgentTurn(
       if (closeError) throw closeError
     },
   }
+}
+
+function toolProgressDescription(input?: Record<string, unknown>): string {
+  // Only explicit presentation input is safe to show here. Never echo command
+  // output, arbitrary tool arguments, credentials, or unverified source prose.
+  if (!input) return ''
+  if (typeof input.__displayDescription === 'string') return input.__displayDescription
+  if (typeof input.description === 'string') return input.description
+  const command = input.command ?? input.cmd ?? input.script
+  if (typeof command === 'string') return shellCommandPresentation(command).description
+  if (typeof input.subject === 'string') return input.subject
+  return ''
 }
 
 function normalizeInputRequest(request: {

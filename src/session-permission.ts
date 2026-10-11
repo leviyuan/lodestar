@@ -57,14 +57,14 @@ export async function onPermissionDecision(
       const note = `🚫 已拒绝 by ${user || '匿名'}`
       const el = taskName
         ? cards.taskBoardElement(meta.i, s.taskBoard, { name: taskName, status: '❌' }, note)
-        : cards.toolCallElement(meta.i, meta.name, meta.input, note, '❌')
+        : cards.toolCallElement(meta.i, meta.name, meta.displayInput ?? meta.input, note, '❌')
       void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
     } else {
       const label = decision === 'allow_always' ? '始终允许' : '已允许'
       meta.resolvedNote = `✅ **${label}** by ${user || '匿名'}`
       const el = taskName
         ? cards.taskBoardElement(meta.i, s.taskBoard, { name: taskName, status: '⏳' }, meta.resolvedNote)
-        : cards.toolCallElement(meta.i, meta.name, meta.input, null, '⏳', meta.resolvedNote)
+        : cards.toolCallElement(meta.i, meta.name, meta.displayInput ?? meta.input, null, '⏳', meta.resolvedNote)
       void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
     }
   }
@@ -140,13 +140,13 @@ export function renderPermission(s: Session, req: CanUseToolRequest): void {
   s.status = 'awaiting_permission'
   s.pendingPermissions.set(req.request_id, { toolUseId, permissionSuggestions: req.permission_suggestions })
   log(`session "${s.sessionName}": can_use_tool request=${req.request_id} tool_use_id=${toolUseId} tool=${meta.name}`)
-  const el = cards.toolCallPermissionElement(meta.i, meta.name, meta.input, req.request_id)
+  const el = cards.toolCallPermissionElement(meta.i, meta.name, meta.displayInput ?? meta.input, req.request_id)
   void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
   // Phone push — Codex is blocked until the user approves/denies.
   // Set summary to "🔐 等审批: <tool>(<input summary>)" so the lock-
   // screen notification shows which tool needs approval.
   if (turn.userOpenId && turn.messageId) {
-    const inputSummary = cards.summarizeToolInput(meta.name, meta.input)
+    const inputSummary = cards.summarizeToolInput(meta.name, meta.displayInput ?? meta.input)
     const toolName = cards.displayToolName(meta.name)
     const tail = inputSummary && inputSummary.length > 30
       ? inputSummary.slice(0, 30) + '…'

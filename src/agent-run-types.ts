@@ -63,6 +63,7 @@ export interface AgentStep {
   phase: 'started' | 'completed' | 'info'
   tool: string
   detail: string
+  displayDetail?: string
 }
 
 export type AgentWorkerStatus = 'queued' | 'running' | 'needs_input' | 'completed' | 'failed' | 'cancelled'
@@ -72,21 +73,29 @@ export interface AgentWorkerResult {
   identityId: string
   identityName: string
   tokenSourceId: string
+  /** Runtime capability used only by translated cards. */
+  translationEnabled?: boolean
   provider: 'codex' | 'claude' | 'dsh'
   codexAccountId?: string
   model: string
   effort: string
   status: AgentWorkerStatus
   output: string
+  /** Verified presentation text; native output remains unchanged for callers. */
+  displayOutput?: string
   /** Durable output is stored separately so lifecycle snapshots stay small. */
   outputArtifact?: string
+  displayDescription?: string
+  displayPrompt?: string
   outputTruncated?: boolean
   sessionId?: string
   checkpointId?: string
   pendingInput?: AgentInputRequest
+  displayPendingInput?: AgentInputRequest
   queuedReason?: string
   steps: AgentStep[]
   error?: string
+  displayError?: string
   startedAt?: string
   finishedAt?: string
   durationMs?: number

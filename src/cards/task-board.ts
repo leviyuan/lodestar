@@ -131,6 +131,7 @@ export function applyTaskTool(
   name: TaskToolName,
   input: any,
   output: string | null,
+  displayInput?: any,
 ): TaskBoardEntry[] {
   // ── TaskList:全量快照,权威替换(校正之前所有漂移) ──
   if (name === 'TaskList') {
@@ -160,11 +161,12 @@ export function applyTaskTool(
         : Array.isArray(parsed) ? parsed : null
       let next = board
       inputTasks.forEach((it: any, idx: number) => {
-        const subject = subjectOf(it)
+        const shown = displayInput === undefined ? it : displayInput.tasks[idx]
+        const subject = subjectOf(shown)
         if (!subject) return
         const fromResult = resultTasks?.[idx]
         const id = (fromResult && taskIdOf(fromResult)) || idFromResultText(output ?? '')
-        next = upsertCreate(next, id, subject, it)
+        next = upsertCreate(next, id, subject, shown)
       })
       return next
     }
@@ -172,9 +174,9 @@ export function applyTaskTool(
     const parsed = parseOutput(output)
     const t = parsed?.task ?? parsed
     const id = taskIdOf(t) || idFromResultText(output ?? '')
-    const subject = subjectOf(t) || subjectOf(input)
+    const subject = displayInput === undefined ? subjectOf(t) || subjectOf(input) : subjectOf(displayInput)
     if (!subject) return board
-    return upsertCreate(board, id, subject, input)
+    return upsertCreate(board, id, subject, displayInput ?? input)
   }
 
   // ── TaskUpdate:按 id 改 status/subject;找不到 no-op(绝不拿 id 当内容) ──

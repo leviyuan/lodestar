@@ -1,6 +1,8 @@
 import type { Session } from './session'
 import type { AgentProvider } from './agent-process'
+import { getTokenSource } from './token-source'
 import { channelInstructions } from './instructions'
+import { claudeTranslationModeEnabled } from './claude-translation-mode'
 import type { FileDeliveryMode } from './file-delivery-types'
 import * as cards from './cards'
 import * as feishu from './feishu'
@@ -22,7 +24,9 @@ export function worktreeSessionDir(s: Session): string {
 }
 
 export function spawnDeveloperInstructions(s: Session, mode: FileDeliveryMode, provider: AgentProvider = s.currentProvider()): string {
-  const base = channelInstructions(provider, mode)
+  const model = s.selectedModel ?? (s.selectedTokenSourceId ? getTokenSource(s.selectedTokenSourceId)?.defaultModel : undefined)
+  const translate = provider === 'claude' && claudeTranslationModeEnabled(s.selectedTokenSourceId, model)
+  const base = channelInstructions(provider, mode, translate ? 'en' : 'zh')
   const extra = worktreeExtraInstruction(s)
   return extra ? `${base}\n${extra}` : base
 }

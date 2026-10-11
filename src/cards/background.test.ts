@@ -293,6 +293,15 @@ describe('applyBgToolUse / applyBgToolResult — 双池 steps 累积', () => {
     expect(s.active[0].steps[0].brief).not.toContain('# desc')
   })
 
+  test('translated shell descriptions and result prose reach background steps without mutating commands', () => {
+    let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
+    const input = Object.freeze({ command: '# desc: Inspect project files\nls /tmp/中文', __displayDescription: '检查项目文件' })
+    s = applyBgToolUse(s, 'p', 'tu', 'Bash', input)
+    s = applyBgToolResult(s, 'p', 'tu', '已读取项目文件', false)
+    expect(s.active[0].steps[0].brief).toBe('Bash 检查项目文件 → 已读取项目文件')
+    expect(input.command).toBe('# desc: Inspect project files\nls /tmp/中文')
+  })
+
   test('tool_result 错误加 ❌', () => {
     let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
     s = applyBgToolUse(s, 'p', 'tu', 'Bash', { command: 'npm test' })

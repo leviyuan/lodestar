@@ -180,8 +180,8 @@ class FakeAgentProc extends EventEmitter {
     return this.materializationBarrier
   }
 
-  sendUserText(text: string): void {
-    this.sentTexts.push(text)
+  sendUserText(text: string, _files?: string[], metadata?: { contextPrefix?: string }): void {
+    this.sentTexts.push((metadata?.contextPrefix ?? '') + text)
   }
 
   sendInterrupt(): void {}
@@ -854,6 +854,57 @@ describe('Session cloud file receipts', () => {
     proc.sendUserText = send
     session.sendClaimedUserText(proc, '生成报告')
     expect(proc.sentTexts).toEqual([`${fileDeliveryAgentContext('chat')}\n\n生成报告`])
+  })
+
+  test('an async translation rejection releases the input claim and resends unsent delivery context', async () => {
+    const session = new Session('translation-delivery-failure', 'chat') as any
+    const proc = new FakeAgentProc('claude', 'translation-session', 'claude-sub') as any
+    proc.translationEnabled = true
+    session.proc = proc
+    session.wireProc(proc)
+    session.closeTurnCard = async () => {}
+    session.getFileDeliveryMode = () => 'chat'
+    session.procFileDeliveryModes.set(proc, 'drive')
+    await session.sendClaimedUserText(proc, 'first')
+    expect(session.pendingUserMessageCount).toBe(1)
+    proc.lastResult = { ...proc.lastResult, subtype: 'claude_turn_start_failed', is_error: true }
+    proc.emit('result', { subtype: 'claude_turn_start_failed', is_error: true, error: 'validation rejected' })
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(session.procFileDeliveryModes.get(proc)).toBe('drive')
+    await session.sendClaimedUserText(proc, 'second')
+    expect(proc.sentTexts).toEqual([
+      `${fileDeliveryAgentContext('chat', 'en')}\n\nfirst`,
+      `${fileDeliveryAgentContext('chat', 'en')}\n\nsecond`,
+    ])
+    proc.emit('user_input_submitted', {})
+    expect(session.procFileDeliveryModes.get(proc)).toBe('chat')
+    proc.hasPendingNativeTurn = () => false
+    session.userInterrupted = true
+    session.interrupt()
+    expect(session.userInterrupted).toBe(false)
+    expect(session.procFileDeliveryModes.get(proc)).toBe('chat')
+    expect(session.procFileDeliveryNeedsUpdate.has(proc)).toBe(true)
+    session.dispose()
+  })
+
+  test('nontranslated Claude sources retain their existing failed-input and interrupt handling', async () => {
+    for (const sourceId of ['claude-native', 'glm', 'deepseek']) {
+      const session = new Session(`plain-${sourceId}`, 'chat') as any
+      const proc = new FakeAgentProc('claude', `${sourceId}-session`, sourceId) as any
+      proc.hasPendingNativeTurn = () => false
+      session.proc = proc
+      session.wireProc(proc)
+      session.closeTurnCard = async () => {}
+      session.pendingUserMessageCount = 2
+      proc.lastResult = { ...proc.lastResult, subtype: 'claude_turn_start_failed', is_error: true }
+      proc.emit('result', { subtype: 'claude_turn_start_failed', is_error: true, error: 'native write failed' })
+      expect(session.pendingUserMessageCount).toBe(2)
+      session.userInterrupted = true
+      session.interrupt()
+      expect(session.userInterrupted).toBe(true)
+      expect(session.procFileDeliveryNeedsUpdate.has(proc)).toBe(false)
+      session.dispose()
+    }
   })
 
   test('routes files commands to the current group settings without forwarding them to an Agent', async () => {
@@ -2456,6 +2507,12 @@ describe('Session provider switching', () => {
     const instructions = session.spawnDeveloperInstructions()
     expect(instructions).toContain('AskUserQuestion')
     expect(instructions).not.toContain('request_user_input')
+
+    session.selectedTokenSourceId = 'claude-sub'
+    const english = session.spawnDeveloperInstructions()
+    expect(english).toContain('AskUserQuestion')
+    expect(english).toContain('Lodestar')
+    expect(english).not.toMatch(/\p{Script=Han}/u)
   })
 
   test('keeps selected provider resume id from being overwritten by stale backend events', () => {
@@ -2721,7 +2778,7 @@ describe('Session provider switching', () => {
 
   test.each([false, true])('Claude subscription rechecks the switch after opening an input card (queued=%s)', async queued => {
     const session = new Session('subscription-race', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'existing-conversation', 'claude-sub')
+    const proc = Object.assign(new FakeAgentProc('claude', 'existing-conversation', 'claude-sub'), { translationEnabled: true })
     session.proc = proc
     session.selectedProvider = 'claude'
     session.selectedTokenSourceId = 'claude-sub'
@@ -5108,6 +5165,29 @@ describe('Session claude subagent tool calls stay off the main card', () => {
     }
   })
 
+  test('displays the verified translation and preserves delivery markers', async () => {
+    const session = new Session('translation-display', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-translated-session')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_translated_text')
+    cardkit.recordCardCreated('card_translated_text', 1)
+    try {
+      proc.emit('assistant_text', {
+        text: 'The report is ready. `[[send: /tmp/report.txt]]`',
+        displayText: '报告已完成。`[[send: /tmp/report.txt]]`', parentToolUseId: null,
+      })
+      proc.emit('assistant_block_stop', { index: 'translated-main', parentToolUseId: null })
+      await cardkit.flush('card_translated_text')
+      expect([...session.currentTurn.segmentTexts.values()]).toEqual(['报告已完成。`[[send: /tmp/report.txt]]`'])
+      expect(calls.some(call => JSON.stringify(call.body).includes('The report is ready'))).toBe(false)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      session.dispose()
+      await cardkit.dispose('card_translated_text')
+    }
+  })
+
   test('子 agent assistant text/block_stop 不进入主卡,主 agent 正文仍正常渲染', async () => {
     const session = new Session('probe', 'chat_id') as any
     const proc = new FakeAgentProc('claude', 'claude-session-1')
@@ -6072,6 +6152,57 @@ describe('Session card outage backpressure', () => {
 })
 
 describe('Session lifecycle reliability', () => {
+  test('explicit restart continuation sends a new request on the restored native conversation', async () => {
+    const session = new Session('daemon-continue-ready', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'saved-thread')
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = null
+    session.proc = proc
+    session.lastSessionId = proc.sessionId
+    session.lastSessionRef = { provider: 'codex', sessionId: proc.sessionId, cwd: session.workDir }
+    session.initCount = 1
+    session.status = 'idle'
+    session.spawnAgent = () => { throw new Error('must not spawn another conversation') }
+    try {
+      await session.continueAfterDaemonRestart()
+      expect(proc.sentTexts).toHaveLength(1)
+      expect(proc.sentTexts[0]).toContain('[宿主重启自动续接]')
+      expect(proc.sentTexts[0]).toContain('不要重复已完成的测试或操作')
+      expect(session.lastSessionId).toBe('saved-thread')
+      expect(proc.killCalls).toBe(0)
+      await expect(session.continueAfterDaemonRestart()).rejects.toThrow('未发送自动续接请求')
+      expect(proc.sentTexts).toHaveLength(1)
+    } finally { await session.stop('测试收尾', { announce: false }) }
+  })
+
+  test.each(['quota', 'exited', 'different-thread', 'busy', 'different-source', 'exits-before-send', 'card-open-failed'])(
+    'restart continuation never opens a fresh conversation or queues into an unavailable one: %s', async reason => {
+      const session = new Session(`daemon-continue-${reason}`, 'chat_id') as any
+      const proc = new FakeAgentProc('codex', 'saved-thread')
+      session.selectedProvider = 'codex'
+      session.selectedTokenSourceId = null
+      session.proc = proc
+      session.lastSessionId = proc.sessionId
+      session.lastSessionRef = { provider: 'codex', sessionId: proc.sessionId, cwd: session.workDir }
+      session.initCount = 1
+      session.status = 'idle'
+      if (reason === 'quota') { session.daemonRestoreRequired = true; session.status = 'starting' }
+      if (reason === 'exited') proc.alive = false
+      if (reason === 'different-thread') proc.sessionId = 'another-thread'
+      if (reason === 'busy') session.pendingUserMessageCount = 1
+      if (reason === 'different-source') session.selectedTokenSourceId = 'other-source'
+      if (reason === 'exits-before-send') session.stopIdleMismatchedProcessUnlocked = async () => { proc.alive = false }
+      if (reason === 'card-open-failed') session.openTurnCard = async () => null
+      session.spawnAgent = () => { throw new Error('must not spawn another conversation') }
+      try {
+        await expect(session.continueAfterDaemonRestart()).rejects.toThrow('未发送')
+        expect(proc.sentTexts).toEqual([])
+        expect(session.pendingMidTurnMsgs).toEqual([])
+        expect(session.lastSessionId).toBe('saved-thread')
+      } finally { session.proc = null; session.dispose() }
+    },
+  )
+
   test('daemon recovery finishes the saved thread initialization before delivering a queued message', async () => {
     const session = new Session('daemon-restore-input', 'chat_id') as any
     const ref = { provider: 'codex' as const, sessionId: 'saved-thread', cwd: session.workDir }
@@ -7901,5 +8032,534 @@ describe('Session lifecycle reliability', () => {
     expect((await session.onForkSelect(0, 'ou_user')).ok).toBe(false)
     expect((await session.onBackSelect(0)).ok).toBe(false)
     expect((await session.onResumeSelect('session-1')).ok).toBe(false)
+  })
+})
+
+describe('Session translated tool presentation', () => {
+  function translatedToolSession(name: string) {
+    const session = new Session(name, 'chat_id') as any
+    session.currentTurn = turnState(`card_${name}`)
+    session.maybeMidTurnRotate = () => {}
+    session.startWorkingFooter = () => {}
+    session.startThinkingFooter = () => {}
+    cardkit.recordCardCreated(session.currentTurn.cardId, 1)
+    return session
+  }
+
+  test('translated summaries and results survive card rotation while native data stays exact', async () => {
+    const session = translatedToolSession('translated_rotation')
+    const oldTurn = session.currentTurn
+    const summary = spyOn(cardkit, 'patchSummaryThrottled').mockImplementation(() => {})
+    const rawInput = Object.freeze({ command: '# desc: Inspect files\nls /tmp/中文', description: 'Inspect files' })
+    const shownInput = { ...rawInput, __displayDescription: '检查文件' }
+    const rawOutput = 'The requested directory does not exist: /tmp/中文'
+    const shownOutput = '请求的目录不存在：/tmp/中文'
+    const nextTurn = turnState('card_translated_rotation_next')
+    try {
+      sessionTools.addTool(session, 'tool-translated', 'Bash', rawInput, shownInput)
+      await cardkit.flush(oldTurn.cardId)
+      expect(summary.mock.calls[0]?.[1]).toContain('检查文件')
+      expect(oldTurn.toolByUseId.get('tool-translated').input).toBe(rawInput)
+      session.currentTurn = nextTurn
+      cardkit.recordCardCreated(nextTurn.cardId, 1)
+      sessionTools.rebuildToolsOnRotate(session, oldTurn.cardId, nextTurn.cardId, oldTurn.toolByUseId, oldTurn.toolBatches)
+      await cardkit.flush(nextTurn.cardId)
+      const created = calls.find(call => call.method === 'POST' && call.path === `/cards/${nextTurn.cardId}/elements`)!
+      const rebuilt = JSON.parse(created.body.elements)[0]
+      expect(rebuilt.header.title.content).toContain('检查文件')
+      expect(rebuilt.elements[0].content).toContain('ls /tmp/中文')
+      sessionTools.completeTool(session, 'tool-translated', rawOutput, true, undefined, shownOutput)
+      await cardkit.flush(nextTurn.cardId)
+      const completed = calls.filter(call => call.method === 'PUT' && call.path.startsWith(`/cards/${nextTurn.cardId}/elements/`)).at(-1)!
+      const element = JSON.parse(completed.body.element)
+      expect(element.elements[0].content).toContain(shownOutput)
+      expect(element.elements[0].content).not.toContain(rawOutput)
+      const meta = nextTurn.toolByUseId.get('tool-translated')
+      expect(meta.input).toBe(rawInput)
+      expect(meta.output).toBe(rawOutput)
+      expect(meta.displayInput).toEqual(shownInput)
+      expect(meta.displayOutput).toBe(shownOutput)
+      expect(rawInput.command).toBe('# desc: Inspect files\nls /tmp/中文')
+    } finally {
+      summary.mockRestore()
+      await cardkit.dispose(oldTurn.cardId)
+      await cardkit.dispose(nextTurn.cardId)
+      session.dispose()
+    }
+  })
+
+  test('task cards combine native creation IDs with translated inputs and structured snapshots', async () => {
+    const session = translatedToolSession('translated_tasks')
+    const turn = session.currentTurn
+    try {
+      const create = { subject: 'Read source', description: 'Inspect the source', activeForm: 'Reading source' }
+      const shownCreate = { subject: '读取源码', description: '检查源码', activeForm: '正在读取源码' }
+      sessionTools.addTool(session, 'task-create', 'TaskCreate', create, shownCreate)
+      const receipt = 'Task #28 created successfully: Read source'
+      sessionTools.completeTool(session, 'task-create', receipt, false, undefined, '任务已创建：读取源码')
+      expect(session.taskBoard).toEqual([
+        { id: '28', subject: '读取源码', description: '检查源码', activeForm: '正在读取源码', status: 'pending' },
+      ])
+      const update = { taskId: '28', status: 'in_progress', activeForm: 'Reviewing source' }
+      sessionTools.addTool(session, 'task-update', 'TaskUpdate', update, { ...update, activeForm: '正在检查源码' })
+      sessionTools.completeTool(session, 'task-update', 'Updated task #28 status', false, undefined, '已更新任务状态')
+      expect(session.taskBoard[0]).toMatchObject({ id: '28', status: 'in_progress', activeForm: '正在检查源码' })
+      const rawList = JSON.stringify({ tasks: [{ id: '28', subject: 'Read source', status: 'completed' }] })
+      const shownList = JSON.stringify({ tasks: [{ id: '28', subject: '读取源码', status: 'completed' }] })
+      sessionTools.addTool(session, 'task-list', 'TaskList', {})
+      sessionTools.completeTool(session, 'task-list', rawList, false, undefined, shownList)
+      expect(session.taskBoard[0]).toMatchObject({ id: '28', subject: '读取源码', status: 'completed' })
+      const rawGet = JSON.stringify({ task: { id: '28', subject: 'Read source', status: 'completed', description: 'All files inspected' } })
+      const shownGet = JSON.stringify({ task: { id: '28', subject: '读取源码', status: 'completed', description: '已检查全部文件' } })
+      sessionTools.addTool(session, 'task-get', 'TaskGet', { taskId: '28' })
+      sessionTools.completeTool(session, 'task-get', rawGet, false, undefined, shownGet)
+      expect(session.taskBoard[0]).toMatchObject({ id: '28', description: '已检查全部文件' })
+      await cardkit.flush(turn.cardId)
+      expect(turn.toolByUseId.get('task-create').output).toBe(receipt)
+      expect(turn.toolByUseId.get('task-list').output).toBe(rawList)
+      expect(turn.toolByUseId.get('task-get').output).toBe(rawGet)
+      const rendered = calls.filter(call => call.method === 'PUT').map(call => call.body.element).join('\n')
+      expect(rendered).toContain('读取源码')
+      expect(rendered).not.toContain('Read source')
+    } finally { await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+
+  test('image delivery uses the original output path and displays translated final prompt metadata', async () => {
+    const session = translatedToolSession('translated_image')
+    const turn = session.currentTurn
+    try {
+      sessionTools.addTool(session, 'image', 'ImageGeneration', { prompt: 'A small boat', status: 'inProgress' }, { prompt: '一艘小船', status: 'inProgress' })
+      sessionTools.completeTool(session, 'image', '/tmp/原始图片.png', false,
+        { revisedPrompt: 'A blue small boat', status: 'completed' }, '图片已生成',
+        { revisedPrompt: '一艘蓝色小船', status: 'completed' })
+      await sessionTools.waitForImageDeliveries(turn)
+      await cardkit.flush(turn.cardId)
+      expect(uploadedImages).toEqual(['/tmp/原始图片.png'])
+      expect(turn.toolByUseId.get('image').output).toBe('/tmp/原始图片.png')
+      expect(turn.toolByUseId.get('image').input.revisedPrompt).toBe('A blue small boat')
+      const completed = calls.filter(call => call.method === 'PUT').at(-1)!
+      const element = JSON.parse(completed.body.element)
+      expect(element.elements[0].content).toContain('一艘小船')
+      expect(element.elements[0].content).toContain('一艘蓝色小船')
+      expect(element.elements[0].content).not.toContain('A blue small boat')
+      expect(element.elements[1]).toMatchObject({ tag: 'img', img_key: 'img_generated' })
+    } finally { await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+})
+
+describe('Session Claude translated event wiring', () => {
+  test('hidden main question receipts never enter Flash or history while displayed child receipts still do', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { ClaudeTranslationContext } = await import('./claude-translation-context')
+    const directory = mkdtempSync(join(tmpdir(), 'session-question-receipts-'))
+    const context = new ClaudeTranslationContext({ workDir: tmpdir(), storeDir: directory })
+    await context.initialize(new AbortController().signal)
+    context.bindSession('question-receipts')
+    const translated: string[] = [], results: any[] = [], errors: Error[] = []
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high', tokenSourceId: 'claude-sub', translationContext: context,
+      translation: {
+        toEnglish: async text => text,
+        toChinese: async text => { translated.push(text); return `ZH:${text}` },
+        toChineseFields: async fields => { translated.push(...fields); return fields.map(text => `ZH:${text}`) },
+      },
+    }) as any
+    proc.translationContextInitialized = true
+    proc.on('tool_result', (event: any) => results.push(event))
+    proc.on('error', (error: Error) => errors.push(error))
+    const session = new Session('translated-question-receipts', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_translated_question_receipts')
+    session.onBackgroundTaskChanged = () => {}
+    session.startThinkingFooter = () => {}
+    cardkit.recordCardCreated(session.currentTurn.cardId, 1)
+    const input = { questions: [{ question: 'Complete the task?', options: [{ label: 'Complete' }] }] }
+    const receipt = async (id: string, content: string, isError: boolean, parent: string | null = null) => {
+      await proc.handleTranslatedMessage({ type: 'assistant', uuid: `${id}-input`, parent_tool_use_id: parent,
+        message: { content: [{ type: 'tool_use', id, name: 'AskUserQuestion', input }] } })
+      await proc.handleTranslatedMessage({ type: 'user', uuid: `${id}-result`, parent_tool_use_id: parent,
+        message: { content: [{ type: 'tool_result', tool_use_id: id, content, is_error: isError }] } })
+    }
+    try {
+      const invalid = '<tool_use_error>questions.0.options: must contain at least two options</tool_use_error>'
+      await receipt('invalid-question', invalid, true)
+      await receipt('hidden-question-echo', 'The user answered: Complete', false)
+      await receipt('unowned-question', invalid, true, 'unknown-parent')
+      expect(translated).toEqual([])
+      expect(context.snapshot().entries).toEqual([])
+      expect(session.currentTurn.toolByUseId.size).toBe(0)
+      expect(results.map(event => event.content)).toEqual([invalid, 'The user answered: Complete', invalid])
+      expect(results.every(event => event.displayContent === undefined)).toBe(true)
+      session.backgroundTasks = [{ id: 'child-task', toolUseId: 'parent-tool', type: 'subagent', status: 'running',
+        description: 'Visible task', startedAt: Date.now(),
+        steps: [{ toolUseId: 'child-question', tool: 'AskUserQuestion', brief: 'AskUserQuestion' }] }]
+      await receipt('child-question', 'The question was cancelled', true, 'parent-tool')
+      expect(translated).toEqual(['The question was cancelled'])
+      expect(context.snapshot().entries).toHaveLength(1)
+      expect(context.snapshot().entries[0]).toMatchObject({
+        original: 'The question was cancelled', translated: 'ZH:The question was cancelled',
+      })
+      expect(session.backgroundTasks[0].steps[0].brief).toContain('ZH:The question was cancelled')
+      expect(errors).toEqual([])
+    } finally {
+      session.dispose()
+      await cardkit.dispose('card_translated_question_receipts')
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('child prose never enters translation, history or background summaries in any task state', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { ClaudeTranslationContext } = await import('./claude-translation-context')
+    const directory = mkdtempSync(join(tmpdir(), 'session-presentation-context-'))
+    const context = new ClaudeTranslationContext({ workDir: tmpdir(), storeDir: directory })
+    await context.initialize(new AbortController().signal)
+    context.bindSession('session-presentation-context')
+    const translated: string[] = []
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high', tokenSourceId: 'claude-sub', translationContext: context,
+      translation: {
+        toEnglish: async text => text,
+        toChinese: async text => { translated.push(text); return `ZH:${text}` },
+        toChineseFields: async fields => { translated.push(...fields); return fields.map(text => `ZH:${text}`) },
+      },
+    }) as any
+    proc.translationContextInitialized = true
+    const session = new Session('translated-child-visibility', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    session.onBackgroundTaskChanged = () => {}
+    session.backgroundTasks = [{ id: 'child-task', toolUseId: 'parent-tool', status: 'completed',
+      description: 'Visible task', summary: 'Authoritative result', steps: [] }]
+    const message = (id: string, text: string, parent = 'parent-tool') => ({ type: 'assistant', uuid: id,
+      parent_tool_use_id: parent, message: { content: [{ type: 'text', text }] } })
+    try {
+      await proc.handleTranslatedMessage(message('unknown-child', 'Unknown hidden child text', 'unknown-parent'))
+      for (const status of ['pending', 'running', 'completed']) {
+        session.backgroundTasks[0].status = status
+        await proc.handleTranslatedMessage(message(`${status}-child`, `Hidden ${status} child text`))
+        expect(session.backgroundTasks[0].summary).toBe('Authoritative result')
+        expect(translated).toEqual([])
+        expect(context.snapshot().entries).toEqual([])
+      }
+    } finally {
+      session.dispose()
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('nontranslated Sessions do not install a presentation policy', () => {
+    const session = new Session('plain-presentation-policy', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'plain-policy-session', 'glm') as any
+    let installed = false
+    proc.setTranslationPresentationPolicy = () => { installed = true }
+    try {
+      session.wireProc(proc)
+      expect(installed).toBe(false)
+    } finally { session.dispose() }
+  })
+
+  function wiredTranslatedSession(name: string, withTurn = true) {
+    const session = new Session(name, 'chat_id') as any
+    const proc = new FakeAgentProc('claude', `native_${name}`)
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    session.maybeMidTurnRotate = () => {}
+    session.startWorkingFooter = () => {}
+    session.startThinkingFooter = () => {}
+    if (withTurn) {
+      session.currentTurn = turnState(`card_${name}`)
+      session.currentTurn.provider = 'claude'
+      cardkit.recordCardCreated(session.currentTurn.cardId, 1)
+    }
+    return { session, proc }
+  }
+
+  test('native tool events use display metadata in permission cards and after rotation while permission machine data stays raw', async () => {
+    const { session, proc } = wiredTranslatedSession('translated_event_tool')
+    const oldTurn = session.currentTurn
+    const newTurn = turnState('card_translated_event_tool_next')
+    const permissionReply = spyOn(proc, 'sendPermissionResponse')
+    const rawInput = Object.freeze({ command: '# desc: Inspect permissions\nls -ld /tmp/中文', description: 'Inspect permissions' })
+    const displayInput = { ...rawInput, __displayDescription: '检查目录权限' }
+    const suggestions = [{ type: 'addDirectories', directories: ['/tmp/中文'], destination: 'session' }]
+    try {
+      proc.emit('tool_use', { id: 'translated-tool', name: 'Bash', input: rawInput, displayInput, parentToolUseId: null })
+      proc.emit('can_use_tool', { request_id: 'translated-permission', tool_name: 'Bash', tool_use_id: 'translated-tool', input: rawInput, permission_suggestions: suggestions })
+      await cardkit.flush(oldTurn.cardId)
+      const permission = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/elements/tool_0')).at(-1)!
+      expect(JSON.parse(permission.body.element).header.title.content).toContain('等审批 · Bash: 检查目录权限')
+      expect(JSON.parse(permission.body.element).elements[0].content).toContain('ls -ld /tmp/中文')
+      expect(session.pendingPermissions.get('translated-permission').permissionSuggestions).toBe(suggestions)
+      expect(await session.onPermissionDecision('translated-permission', 'allow_always', 'tester')).toMatchObject({ ok: true })
+      expect(permissionReply).toHaveBeenCalledWith('translated-permission', 'allow', { updatedPermissions: suggestions })
+      await cardkit.flush(oldTurn.cardId)
+      const allowed = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/elements/tool_0')).at(-1)!
+      expect(JSON.parse(allowed.body.element).header.title.content).toContain('检查目录权限')
+      session.currentTurn = newTurn
+      cardkit.recordCardCreated(newTurn.cardId, 1)
+      sessionTools.rebuildToolsOnRotate(session, oldTurn.cardId, newTurn.cardId, oldTurn.toolByUseId, oldTurn.toolBatches)
+      proc.emit('tool_result', { tool_use_id: 'translated-tool', content: 'Permission denied', displayContent: '权限不足', is_error: true, parentToolUseId: null })
+      await cardkit.flush(newTurn.cardId)
+      const done = calls.filter(call => call.method === 'PUT' && call.path.startsWith(`/cards/${newTurn.cardId}/elements/`)).at(-1)!
+      expect(JSON.parse(done.body.element).elements[0].content).toContain('权限不足')
+      expect(JSON.parse(done.body.element).elements[0].content).not.toContain('Permission denied')
+      expect(newTurn.toolByUseId.get('translated-tool').input).toBe(rawInput)
+      expect(newTurn.toolByUseId.get('translated-tool').output).toBe('Permission denied')
+      expect(newTurn.toolByUseId.get('translated-tool').displayOutput).toBe('权限不足')
+      expect(rawInput.command).toBe('# desc: Inspect permissions\nls -ld /tmp/中文')
+    } finally {
+      permissionReply.mockRestore()
+      session.dispose()
+      await cardkit.dispose(oldTurn.cardId)
+      await cardkit.dispose(newTurn.cardId)
+    }
+  })
+
+  test('denying a translated permission keeps its Chinese purpose and the exact native request ID', async () => {
+    const { session, proc } = wiredTranslatedSession('translated_permission_deny')
+    const turn = session.currentTurn
+    const permissionReply = spyOn(proc, 'sendPermissionResponse')
+    try {
+      const input = { command: '# desc: Remove temporary file\nrm /tmp/task-output' }
+      proc.emit('tool_use', { id: 'deny-tool', name: 'Bash', input, displayInput: { ...input, __displayDescription: '删除临时文件' }, parentToolUseId: null })
+      proc.emit('can_use_tool', { request_id: 'native-permission-id', tool_name: 'Bash', tool_use_id: 'deny-tool', input })
+      await session.onPermissionDecision('native-permission-id', 'deny', 'tester')
+      await cardkit.flush(turn.cardId)
+      expect(permissionReply).toHaveBeenCalledWith('native-permission-id', 'deny', undefined)
+      const last = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/elements/tool_0')).at(-1)!
+      const element = JSON.parse(last.body.element)
+      expect(element.header.title.content).toContain('删除临时文件')
+      expect(element.elements[0].content).toContain('已拒绝')
+      expect(turn.toolByUseId.get('deny-tool').input.command).toBe(input.command)
+    } finally {
+      permissionReply.mockRestore()
+      session.dispose()
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('native background events and tool steps use Chinese panels while child prose stays hidden', async () => {
+    const { session, proc } = wiredTranslatedSession('translated_background_events')
+    const turn = session.currentTurn
+    const rawAgentInput = Object.freeze({ description: 'Review code', prompt: 'Check the source tree', subagent_type: 'Explore', run_in_background: true })
+    try {
+      proc.emit('tool_use', { id: 'parent-tool', name: 'Agent', input: rawAgentInput, displayInput: { ...rawAgentInput, description: '检查代码', prompt: '检查源码树' }, parentToolUseId: null })
+      expect(session.nativeAgentTools.get('parent-tool').input).toBe(rawAgentInput)
+      proc.emit('bg_task_started', { task_id: 'native-task-id', tool_use_id: 'parent-tool', task_type: 'local_agent', subagent_type: 'Explore', description: 'Review code', prompt: 'Check the source tree', display: { description: '检查代码', prompt: '检查源码树' } })
+      const rawChildInput = Object.freeze({ command: '# desc: Inspect the source tree\nls /tmp/中文', description: 'Inspect the source tree' })
+      proc.emit('tool_use', { id: 'child-tool', name: 'Bash', input: rawChildInput, displayInput: { ...rawChildInput, __displayDescription: '检查源码树' }, parentToolUseId: 'parent-tool' })
+      proc.emit('tool_result', { tool_use_id: 'child-tool', content: 'Source tree inspected', displayContent: '已检查源码树', is_error: false, parentToolUseId: 'parent-tool' })
+      proc.emit('assistant_text', { text: 'The child found two issues', displayText: '子任务发现两个问题', parentToolUseId: 'parent-tool' })
+      proc.emit('assistant_block_stop', { index: 'child-message', parentToolUseId: 'parent-tool' })
+      expect(turn.assistantSegmentCount).toBe(0)
+      expect(turn.segmentTexts.size).toBe(0)
+      expect(session.backgroundTasks[0]).toMatchObject({ id: 'native-task-id', toolUseId: 'parent-tool', subagentType: 'Explore', description: '检查代码', prompt: '检查源码树' })
+      expect(session.backgroundTasks[0].summary).toBeUndefined()
+      expect(session.backgroundTasks[0].steps[0].brief).toBe('Bash 检查源码树 → 已检查源码树')
+      await session.refreshBackgroundCardFull()
+      expect(JSON.stringify([...sentCards, ...calls])).not.toContain('子任务发现两个问题')
+      proc.emit('bg_task_progress', { task_id: 'native-task-id', description: 'Checking two findings', summary: 'Working on confirmation', display: { description: '核对两个发现', summary: '正在确认结果' } })
+      expect(session.backgroundTasks[0]).toMatchObject({ description: '核对两个发现', summary: '正在确认结果' })
+      proc.emit('bg_task_updated', { task_id: 'native-task-id', patch: { description: 'One file is inaccessible', error: 'Read access denied', status: 'running' }, display: { description: '一个文件无法访问', error: '读取权限不足' } })
+      expect(session.backgroundTasks[0]).toMatchObject({ description: '一个文件无法访问', error: '读取权限不足', status: 'running' })
+      proc.emit('bg_task_settled', { task_id: 'native-task-id', status: 'completed', summary: 'Reviewed all readable files', display: { summary: '已检查所有可读文件' } })
+      proc.emit('assistant_text', { text: 'Late child text', displayText: '迟到的子任务文本', parentToolUseId: 'parent-tool' })
+      await session.refreshBackgroundCardFull()
+      expect(session.backgroundTasks[0]).toMatchObject({ status: 'completed', summary: '已检查所有可读文件' })
+      const rendered = JSON.stringify([...sentCards, ...calls])
+      expect(rendered).toContain('已检查所有可读文件')
+      expect(rendered).toContain('读取权限不足')
+      expect(rendered).not.toContain('The child found two issues')
+      expect(rendered).not.toContain('子任务发现两个问题')
+      expect(rendered).not.toContain('迟到的子任务文本')
+      expect(rendered).not.toContain('Read access denied')
+      expect(rendered).not.toContain('Check the source tree')
+      expect(turn.toolByUseId.size).toBe(0)
+      expect(rawAgentInput.subagent_type).toBe('Explore')
+      expect(rawChildInput.command).toBe('# desc: Inspect the source tree\nls /tmp/中文')
+    } finally {
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+      session.dispose()
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('synchronous native Agent result uses translated completion prose and keeps the original tool contract', async () => {
+    const { session, proc } = wiredTranslatedSession('translated_sync_agent')
+    const turn = session.currentTurn
+    const input = Object.freeze({ description: 'Inspect files', prompt: 'Inspect source files', run_in_background: false })
+    try {
+      proc.emit('tool_use', { id: 'sync-child', name: 'Agent', input, displayInput: { ...input, description: '检查文件', prompt: '检查源文件' }, parentToolUseId: null })
+      proc.emit('tool_result', { tool_use_id: 'sync-child', content: 'All source files inspected', displayContent: '已检查全部源文件', is_error: false, parentToolUseId: null })
+      await session.refreshBackgroundCardFull()
+      expect(session.backgroundTasks[0]).toMatchObject({ id: 'sync-child', description: '检查文件', summary: '已检查全部源文件', status: 'completed' })
+      expect(JSON.stringify([...sentCards, ...calls])).not.toContain('All source files inspected')
+      expect(input.run_in_background).toBe(false)
+      expect(turn.segmentTexts.size).toBe(0)
+    } finally {
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+      session.dispose()
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('native input and terminal errors show displayError while retaining immutable raw event errors', async () => {
+    const { session, proc } = wiredTranslatedSession('translated_native_errors')
+    const turn = session.currentTurn
+    const inputError = Object.freeze({ error: 'Native input rejected E_INPUT', displayError: '原生输入被拒绝 E_INPUT' })
+    const resultError = Object.freeze({ subtype: 'error_during_execution', is_error: true, error: 'Native operation failed E_TASK', displayError: '原生操作失败 E_TASK' })
+    try {
+      proc.emit('turn_input_error', inputError)
+      expect(sentRawTexts.some(text => text.includes('原生输入被拒绝 E_INPUT'))).toBe(true)
+      expect(sentRawTexts.some(text => text.includes('Native input rejected'))).toBe(false)
+      proc.lastResult = { ...proc.lastResult, is_error: true, subtype: 'error_during_execution' }
+      proc.emit('result', resultError)
+      await session.waitForTurnCloses()
+      expect(session.currentTurn).toBeNull()
+      const rendered = JSON.stringify([...sentCards, ...calls, ...sentRawTexts])
+      expect(rendered).toContain('原生操作失败 E_TASK')
+      expect(rendered).not.toContain('Native operation failed E_TASK')
+      expect(inputError.error).toBe('Native input rejected E_INPUT')
+      expect(resultError.error).toBe('Native operation failed E_TASK')
+      expect(proc.lastResult.subtype).toBe('error_during_execution')
+    } finally {
+      session.dispose()
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('scheduled wakeups record Chinese preview text and place translated agentmessage on their own card', async () => {
+    const { session, proc } = wiredTranslatedSession('translated_cron_events', false)
+    const event = Object.freeze({ text: 'Check the scheduled build', displayText: '检查定时构建', promptId: 'native-cron-prompt' })
+    let cardId: string | undefined
+    try {
+      proc.emit('init', { session_id: proc.sessionId })
+      proc.emit('scheduled_turn_input', event)
+      await waitUntil(() => session.currentTurn !== null)
+      cardId = session.currentTurn.cardId
+      expect(session.currentTurn.trigger).toBe('scheduled_wakeup')
+      expect(session.lastTurnUserPreview).toBe('⏰ 检查定时构建')
+      proc.emit('assistant_text', { text: 'The scheduled build passed', displayText: '定时构建已通过', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { index: 'scheduled-message', parentToolUseId: null })
+      await cardkit.flush(cardId!)
+      expect([...session.currentTurn.segmentTexts.values()]).toEqual(['定时构建已通过'])
+      const rendered = JSON.stringify([...sentCards, ...calls])
+      expect(rendered).toContain('定时构建已通过')
+      expect(rendered).not.toContain('The scheduled build passed')
+      expect(event.text).toBe('Check the scheduled build')
+      expect(event.promptId).toBe('native-cron-prompt')
+    } finally {
+      if (session.currentTurn) await session.closeTurnCard('测试收尾')
+      session.dispose()
+      if (cardId) await cardkit.dispose(cardId)
+    }
+  })
+})
+
+describe('Claude model selection across configured translation boundaries', () => {
+  async function withSelection(
+    sourceId: string, models: string[], initialTranslation: boolean,
+    run: (session: any, proc: FakeAgentProc) => Promise<void>,
+  ): Promise<void> {
+    const previousSources = listTokenSources()
+    const previousModes = config.claude.safe_mode
+    const source = {
+      id: sourceId, kind: 'test', agent: 'claude' as const, display: sourceId, enabled: true,
+      defaultModel: 'GLM-5.3', modelCatalogState: { status: 'ready' as const, updatedAt: 1 },
+      models: ['GLM-5.3', 'GLM-5.3-Flash'].map(model => ({ model, display: model,
+        efforts: ['max' as const], defaultEffort: 'max' as const })),
+      refreshModels: async () => {}, spawnEnv: (env: Record<string, string | undefined>) => env,
+      resolveSpawnModel: (model: string) => `${model}[1m]`,
+      readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
+    }
+    registerTokenSource(source)
+    config.claude.safe_mode = { ...previousModes, [sourceId]: models }
+    const session = new Session(`translation-boundary-${sourceId}`, 'chat_id') as any
+    const proc = Object.assign(new FakeAgentProc('claude', 'boundary-native-session', sourceId), {
+      translationEnabled: initialTranslation,
+    })
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = sourceId
+    session.selectedModel = 'GLM-5.3'
+    session.selectedEffort = 'max'
+    session.modelPanels.set('boundary-panel', { models: source.models.map(entry => ({
+      provider: 'claude', sourceId, model: entry.model, displayName: entry.display,
+      efforts: [{ effort: 'max', isDefault: true }],
+    })) })
+    try {
+      await run(session, proc)
+    } finally {
+      session.dispose()
+      config.claude.safe_mode = previousModes
+      resetTokenSourceRegistry()
+      for (const entry of previousSources) registerTokenSource(entry)
+    }
+  }
+
+  for (const fromEnabled of [true, false]) {
+    test(`idle model change ${fromEnabled ? 'out of' : 'into'} translation replaces only the process and preserves native history`, async () => {
+      await withSelection('glm', ['GLM-5.3'], fromEnabled, async (session, proc) => {
+        session.selectedModel = fromEnabled ? 'GLM-5.3' : 'GLM-5.3-Flash'
+        const target = fromEnabled ? 'GLM-5.3-Flash' : 'GLM-5.3'
+        const result = await session.onModelEffortSelect(target, 'max', 'boundary-panel', '', 'claude')
+        expect(result.ok).toBe(true)
+        expect(proc.setModelSettingsCalls).toEqual([])
+        expect(proc.killCalls).toBe(1)
+        expect(session.selectedModel).toBe(target)
+        expect(boundResumes).toContainEqual([session.sessionName, 'boundary-native-session', 'claude'])
+        expect(session.lastSessionId).toBe('boundary-native-session')
+      })
+    })
+  }
+
+  test('a running task cannot change the configured translation boundary', async () => {
+    await withSelection('glm', ['GLM-5.3'], true, async (session, proc) => {
+      session.currentTurn = { ...turnState(), provider: 'claude' }
+      const result = await session.onModelEffortSelect('GLM-5.3-Flash', 'max', 'boundary-panel', '', 'claude')
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain('请等当前任务结束后再选择')
+      expect(proc.setModelSettingsCalls).toEqual([])
+      expect(proc.killCalls).toBe(0)
+      expect(session.selectedModel).toBe('GLM-5.3')
+      expect(boundResumes).toEqual([])
+    })
+  })
+
+  for (const enabled of [true, false]) {
+    test(`models sharing translation=${enabled} retain the existing hot update`, async () => {
+      await withSelection('glm', enabled ? ['*'] : [], enabled, async (session, proc) => {
+        const result = await session.onModelEffortSelect('GLM-5.3-Flash', 'max', 'boundary-panel', '', 'claude')
+        expect(result.ok).toBe(true)
+        expect(proc.setModelSettingsCalls).toEqual([['GLM-5.3-Flash[1m]', 'max']])
+        expect(proc.killCalls).toBe(0)
+        expect(session.proc).toBe(proc)
+      })
+    })
+  }
+
+  test('an explicitly disabled subscription source does not force translation or process replacement', async () => {
+    await withSelection('claude-sub', [], false, async (session, proc) => {
+      const result = await session.onModelEffortSelect('GLM-5.3-Flash', 'max', 'boundary-panel', '', 'claude')
+      expect(result.ok).toBe(true)
+      expect(proc.setModelSettingsCalls).toEqual([['GLM-5.3-Flash[1m]', 'max']])
+      expect(proc.killCalls).toBe(0)
+      expect(session.proc).toBe(proc)
+    })
+  })
+
+  test('an unspecified selection compares the catalog default before spawn alias resolution', async () => {
+    await withSelection('glm', ['GLM-5.3'], true, async (session, proc) => {
+      session.selectedModel = null
+      expect(session.modelSelectionNeedsProcessStop()).toBe(false)
+      Object.assign(proc, { translationEnabled: false })
+      expect(session.modelSelectionNeedsProcessStop()).toBe(true)
+    })
   })
 })

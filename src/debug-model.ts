@@ -19,6 +19,7 @@ export function debugModelState(session: Session) {
   return {
     session_name: session.sessionName, chat_id: session.chatId, status: session.status,
     running: session.isRunning(),
+    translation: { enabled: session.proc?.translationEnabled === true },
     native_session_id: session.proc?.sessionId ?? null,
     codex_account: session.proc?.provider === 'codex' && session.proc.isAlive() ? {
       name: codexAccounts.get(processCodexAccount(session.proc)).name,

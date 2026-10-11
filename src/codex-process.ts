@@ -220,6 +220,8 @@ export interface CanUseToolRequest {
   request_id: string
   tool_name: string
   input: any
+  /** Native question payload when input contains a translated UI copy. */
+  originalInput?: Record<string, unknown>
   permission_suggestions?: any
   blocked_paths?: string[]
   tool_use_id?: string

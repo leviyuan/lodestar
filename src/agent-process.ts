@@ -79,6 +79,20 @@ export class ModelSettingsUpdateError extends Error {
   }
 }
 
+export type AgentTranslationPresentationSurface = 'main' | 'background' | 'worker'
+export interface AgentTranslationPresentationEvent {
+  kind: 'assistant_text' | 'tool_input' | 'tool_result' | 'background' | 'scheduled_input'
+  parentToolUseId?: string | null
+  toolUseId?: string
+  toolName?: string
+  isError?: boolean
+  taskId?: string
+  subtype?: string
+}
+export type AgentTranslationPresentationPolicy = (
+  event: AgentTranslationPresentationEvent,
+) => AgentTranslationPresentationSurface | 'hidden'
+
 export interface AgentProcess extends EventEmitter {
   readonly provider: AgentProvider
   /** 该进程 spawn 时绑定的 token source id(= spawnEnv 注入 env 的那个 source)。
@@ -86,6 +100,8 @@ export interface AgentProcess extends EventEmitter {
    *  stopIdleMismatchedProcess 据此判定跨 source 切换要杀进程换 env(同 provider 也要杀)。
    *  null = 无 source(透传型 native 在 spawn 时仍带 'claude-native' id;null 仅用于无 ts 的裸跑)。 */
   readonly tokenSourceId: string | null
+  /** Verified translation applies to this process's user-facing boundaries. */
+  readonly translationEnabled?: boolean
   sessionId: string | null
   lastAssistantUuid: string | null
   /** Canonical completed turn id when the backend exposes turn-granular forks (Codex). */
@@ -121,12 +137,19 @@ export interface AgentProcess extends EventEmitter {
   isConversationResumable?(): boolean
   conversationMaterializationBarrier?(): Promise<void> | null
   conversationMaterializationFailure?(): Error | null
-  sendUserText(text: string, files?: string[]): void
+  sendUserText(text: string, files?: string[], metadata?: { contextPrefix?: string }): void
   /** Append guidance without interrupting the running task. False means no
    * native turn can accept it yet and nothing was submitted. Rejections must
    * surface to the caller; an uncertain submission must never be replayed. */
   steerUserText?(text: string, files?: string[], inputId?: string): Promise<boolean>
   sendInterrupt(): void
+  /** Distinguish local preprocessing from a submitted native turn on stop. */
+  hasPendingNativeTurn?(): boolean
+  /** Record verified text only after the consumer accepts it for display. */
+  translateDisplayFields?(texts: string[], signal?: AbortSignal,
+    acceptDisplay?: (translated: string[]) => boolean): Promise<string[]>
+  /** Select what this consumer displays; never change native execution or events. */
+  setTranslationPresentationPolicy?(policy: AgentTranslationPresentationPolicy): void
   sendPermissionResponse(
     requestId: string | number,
     decision: 'allow' | 'deny',
@@ -144,6 +167,13 @@ export interface AgentProcess extends EventEmitter {
   /** codex:在现有 app-server 连接上读账号额度(read 端点,权威多桶);
    *  claude:无此通道,返回 null(session 的额度走 token source)。 */
   readRateLimits?(): Promise<any>
+}
+
+/** Display consumers follow the boundary attached to the actual process. */
+export function processUsesClaudeTranslation(
+  proc: Pick<AgentProcess, 'translationEnabled'>,
+): boolean {
+  return proc.translationEnabled === true
 }
 
 export interface AgentModel extends Omit<CodexModel, 'supportedReasoningEfforts' | 'defaultReasoningEffort'> {
@@ -166,10 +196,12 @@ export type AgentProcessEventMap = {
   turn_started: { turn_id?: string | null; thread_id?: string | null; retry?: boolean }
   turn_retry: AgentTurnRetry
   /** Native input consumption, continuation, or cancellation failed. */
-  turn_input_error: { error: string }
+  turn_input_error: { error: string; displayError?: string }
   /** Native execution reached this submitted input. Emitted in output order;
    * the transport acknowledgement alone is not a consumption boundary. */
   user_input_consumed: { inputId: string }
+  /** Local preprocessing finished and the initial input entered the native queue. */
+  user_input_submitted: Record<string, never>
   /** The next native non-user item starts. Consecutive consumed inputs before
    * this boundary share one card, even when delivered in separate RPC frames. */
   input_batch_end: { itemId: string }
@@ -185,15 +217,15 @@ export type AgentProcessEventMap = {
   thread_goal_cleared: any
   /** A backend dequeued autonomous work (Claude Cron or a DSH continuation). Unlike a daemon user
    * write, this has no pending input claim, so Session must open its own card. */
-  scheduled_turn_input: { text: string; promptId: string | null }
+  scheduled_turn_input: { text: string; displayText?: string; promptId: string | null }
   /** parentToolUseId 非空 = 子 agent 的正文块。它必须与子 agent 工具事件
    *  一样保留归属，Session 不得把它追加到主 Agent 对话卡。 */
-  assistant_text: { uuid?: string; text: string; parentToolUseId: string | null }
+  assistant_text: { uuid?: string; text: string; displayText?: string; parentToolUseId: string | null }
   assistant_block_stop: { index?: string; parentToolUseId: string | null }
   /** parentToolUseId 非空 = 子 agent 内的调用,session 只累积进后台 task steps,
    *  不上主卡(与 codex isSubagentThread 分流同构)。 */
-  tool_use: { id: string; name: string; input: any; parentToolUseId: string | null }
-  tool_result: { tool_use_id: string; content: any; is_error: boolean; parentToolUseId: string | null }
+  tool_use: { id: string; name: string; input: any; displayInput?: any; parentToolUseId: string | null }
+  tool_result: { tool_use_id: string; content: any; displayContent?: string; displayInput?: any; is_error: boolean; parentToolUseId: string | null }
   can_use_tool: CanUseToolRequest
   hook_callback: HookCallbackRequest
   /** 后台任务/子 agent 生命周期(claude: SDK task_* 消息族;codex: collab 状态机

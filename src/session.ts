@@ -45,6 +45,7 @@ import {
   CLAUDE_EFFORT,
   agentProviderLabel,
   isClaudeReasoningEffort,
+  processUsesClaudeTranslation,
   type AgentProcess,
   type AgentProcessEventMap,
   type AgentProvider,
@@ -52,6 +53,7 @@ import {
   type ClaudeReasoningEffort,
 } from './agent-process'
 import { config } from './config'
+import { claudeTranslationModeEnabled } from './claude-translation-mode'
 import { createAgentProcess } from './agent-launch'
 import { agentApiUrl } from './agent-runtime'
 import { createAgentCards } from './agent-cards-runtime'
@@ -289,6 +291,8 @@ export class Session {
   private readonly procSourceRevisions = new WeakMap<AgentProcess, string | null>()
   /** Delivery rules actually given to each process, including later group changes. */
   private readonly procFileDeliveryModes = new WeakMap<AgentProcess, FileDeliveryMode>()
+  private readonly procPendingFileDeliveryModes = new WeakMap<AgentProcess, FileDeliveryMode>()
+  private readonly procFileDeliveryNeedsUpdate = new WeakSet<AgentProcess>()
   currentTurn: TurnState | null = null
   /** Item-scoped compaction ownership survives a turn-card close so a late
    * completion cannot attach itself to the next turn. Completed receipts keep
@@ -313,7 +317,7 @@ export class Session {
   private backgroundSync: Promise<void> | null = null
   private backgroundWriteError: string | null = null
   private lastMainTaskToolUseId: string | null = null
-  private nativeAgentTools = new Map<string, { confirmed: boolean; input: any }>()
+  private nativeAgentTools = new Map<string, { confirmed: boolean; input: any; displayInput?: any }>()
   /** turn 收尾后有后台任务结算 → SDK 会自发开一轮恢复轮(task_notification
    *  合并结果),该轮 init 没有伴随用户消息。置位后,下一个无用户批次的 init
    *  据此开 bg_task_resume 卡承接输出;任何 turn 开卡即消费(结算通知会被
@@ -1060,6 +1064,10 @@ export class Session {
       this.blockedProc === proc
       || proc.provider !== provider
       || proc.tokenSourceId !== tokenSourceId
+      || provider === 'claude' && proc.provider === 'claude'
+        && processUsesClaudeTranslation(proc) !== claudeTranslationModeEnabled(
+          tokenSourceId, model ?? this.tokenSource(tokenSourceId)?.defaultModel,
+        )
       || provider === 'claude' && proc.provider === 'claude' && effort !== null
         && ((proc.lastEffort ?? this.selectedEffort) === 'default') !== (effort === 'default')
       || !this.processSourceMatches(this.tokenSource(tokenSourceId), model)
@@ -1939,6 +1947,26 @@ export class Session {
     })
   }
 
+  /** Explicit local restart exception: one new continuation request on the
+   * restored conversation, never a replay or an implicit fresh start. */
+  async continueAfterDaemonRestart(): Promise<void> {
+    await this.runLifecycle('daemon-continue', async () => {
+      const proc = this.proc
+      if (this.daemonRestoreRequired || this.status !== 'idle' || this.initCount < 1 || !proc?.isAlive()
+        || !this.lastSessionRef || proc.sessionId !== this.lastSessionRef.sessionId
+        || proc.provider !== this.lastSessionRef.provider || this.lastSessionId !== proc.sessionId
+        || this.modelSelectionNeedsProcessStop()
+        || this.currentTurn || this.openingTurn || this.steeringSend
+        || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) {
+        throw new Error('原会话尚未恢复为空闲可用状态，未发送自动续接请求')
+      }
+      await this.onUserMessageUnlocked(
+        '[宿主重启自动续接] daemon 已重启并恢复本会话。按用户已授权的范围继续尚未完成的工作，先核对已有执行结果，不要重复已完成的测试或操作。若工作已完成，直接报告结果。',
+        [], '', '', proc,
+      )
+    })
+  }
+
   private async restartUnlocked(
     resume = false,
     opts: LifecycleProgressOpts = {},
@@ -2553,7 +2581,7 @@ export class Session {
   }
 
   private spawnDeveloperInstructions(mode: FileDeliveryMode = this.getFileDeliveryMode()): string {
-    return sessionWorktree.spawnDeveloperInstructions(this, mode)
+    return sessionWorktree.spawnDeveloperInstructions(this, mode, this.currentProvider())
   }
 
   delegatedAgentDeveloperInstructions(provider: AgentProvider): string {
@@ -2863,6 +2891,15 @@ export class Session {
     this.steeringBoundary = null
     if (!this.proc) return
     log(`session "${this.sessionName}": interrupt`)
+    // Keep the last submitted policy for background work. A cancelled update
+    // is retried only as context on the next explicit user input.
+    if (processUsesClaudeTranslation(this.proc)) {
+      this.procPendingFileDeliveryModes.delete(this.proc)
+      this.procFileDeliveryNeedsUpdate.add(this.proc)
+    }
+    // Local translation has no native result to acknowledge this stop. Do not
+    // consume the next actual task's result as a stale interrupt receipt.
+    if (processUsesClaudeTranslation(this.proc) && this.proc.hasPendingNativeTurn?.() === false) this.userInterrupted = false
     this.proc.sendInterrupt()
   }
 
@@ -2892,14 +2929,18 @@ export class Session {
     const turn = this.currentTurn
     const mode = turn ? (turn.fileDeliveryMode ??= this.getFileDeliveryMode()) : this.getFileDeliveryMode()
     const previousMode = this.procFileDeliveryModes.get(proc)
-    const context = previousMode === mode ? '' : `${fileDeliveryAgentContext(mode)}\n\n`
+    const context = previousMode === mode && !this.procFileDeliveryNeedsUpdate.has(proc)
+      ? '' : `${fileDeliveryAgentContext(mode, processUsesClaudeTranslation(proc) ? 'en' : 'zh')}\n\n`
     // Capture before the write: synchronous backend events can open a card or deliver a file.
-    this.procFileDeliveryModes.set(proc, mode)
+    if (processUsesClaudeTranslation(proc)) this.procPendingFileDeliveryModes.set(proc, mode)
+    else this.procFileDeliveryModes.set(proc, mode)
     this.pendingUserMessageCount++
     try {
-      proc.sendUserText(context + text, [])
+      if (processUsesClaudeTranslation(proc)) proc.sendUserText(text, [], { contextPrefix: context })
+      else proc.sendUserText(context + text, [])
     } catch (error) {
       this.pendingUserMessageCount = Math.max(0, this.pendingUserMessageCount - 1)
+      this.procPendingFileDeliveryModes.delete(proc)
       if (previousMode === undefined) this.procFileDeliveryModes.delete(proc)
       else this.procFileDeliveryModes.set(proc, previousMode)
       throw error
@@ -2965,24 +3006,28 @@ export class Session {
     await this.runLifecycle('user-message', () => this.onUserMessageUnlocked(text, files, userOpenId, msgId))
   }
 
-  private async onUserMessageUnlocked(text: string, files: string[], userOpenId: string, msgId: string): Promise<void> {
+  private async onUserMessageUnlocked(text: string, files: string[], userOpenId: string, msgId: string, resumedProc?: AgentProcess): Promise<void> {
     const settingsBlocked = this.modelSettingsBlockReason()
     if (settingsBlocked) {
       await feishu.sendText(this.chatId, `⚠️ ${settingsBlocked} 本条消息未送给 Agent，请确认设置后重发。`)
+      if (resumedProc) throw new Error(settingsBlocked)
       return
     }
     const subscriptionDisabled = this.disabledSubscriptionMessage()
     if (subscriptionDisabled) {
       await feishu.sendText(this.chatId, `❌ ${subscriptionDisabled}。消息未送给 Agent，请启用后重发或通过 md 切换来源。`)
+      if (resumedProc) throw new Error(subscriptionDisabled)
       return
     }
     const blocked = this.blockedProcessMessage()
     if (blocked) {
       await feishu.sendText(this.chatId, `❌ ${blocked}。请重试 stop/restart，或等待旧进程退出。`)
+      if (resumedProc) throw new Error(blocked)
       return
     }
     if (this.daemonRestoreRequired) {
       await feishu.sendText(this.chatId, '❌ daemon 重启后的会话恢复尚未成功，这条消息未送给 Agent。请发送 rs 选择历史会话，或 hi 明确启动新会话，然后重发消息。')
+      if (resumedProc) throw new Error('daemon 会话恢复尚未成功')
       return
     }
     // Garbage-collect leftover state from a batch the SDK abandoned —
@@ -3054,6 +3099,9 @@ export class Session {
       })
     }
 
+    if (resumedProc && (this.proc !== resumedProc || !resumedProc.isAlive())) {
+      throw new Error('原会话进程已退出，未发送自动续接请求，也未创建新会话')
+    }
     if (!this.isRunning()) {
       if (this.openingTurn || this.currentTurn) {
         this.pendingMidTurnMsgs.push({ text, wireText, userOpenId, msgId })
@@ -3092,12 +3140,19 @@ export class Session {
         // daemon 自渲染,跟 SDK input 流分离)。
         this.pendingTurnInputs.push(text)
         const opened = await this.openTurnCard(openOwner, userOpenId, 'user_message')
-        if (!opened || this.currentTurn !== opened) return
-        if (this.proc !== proc || this.procEpoch !== epoch || !proc.isAlive()) {
-          await this.closeTurnCard(`⚠️ ${this.backendLabel(proc.provider)} 已退出`)
+        if (!opened || this.currentTurn !== opened) {
+          if (resumedProc) throw new Error('自动续接卡片未打开，未发送续接请求')
           return
         }
-        if (!await this.sendClaimedUserText(proc, wireText)) return
+        if (this.proc !== proc || this.procEpoch !== epoch || !proc.isAlive()) {
+          await this.closeTurnCard(`⚠️ ${this.backendLabel(proc.provider)} 已退出`)
+          if (resumedProc) throw new Error('原会话进程已退出，未发送自动续接请求')
+          return
+        }
+        if (!await this.sendClaimedUserText(proc, wireText)) {
+          if (resumedProc) throw new Error('自动续接请求提交失败，未重试')
+          return
+        }
         this.status = 'working'
       } finally {
         this.releaseTurnOpen(openOwner)
@@ -3520,6 +3575,16 @@ export class Session {
     const epoch = wiredEpoch ?? ++this.procEpoch
     if (wiredEpoch === undefined && this.proc !== p) this.proc = p
     const isCurrent = (): boolean => this.proc === p && this.procEpoch === epoch
+    if (processUsesClaudeTranslation(p)) p.setTranslationPresentationPolicy?.(event => {
+      if (!isCurrent() || this.stoppingProc === p || this.blockedProc === p) return 'hidden'
+      if (event.kind === 'assistant_text' && event.parentToolUseId) return 'hidden'
+      if ((event.kind === 'tool_input' || event.kind === 'tool_result')
+        && event.parentToolUseId && this.bgTaskOwns(event.parentToolUseId)) return 'background'
+      // The main question panel never renders the SDK receipt, including
+      // validation errors raised before canUseTool created a question panel.
+      if (event.kind === 'tool_result' && event.toolName === 'AskUserQuestion') return 'hidden'
+      return 'main'
+    })
     let staleEventLogged = false
     let stoppedEventLogged = false
     const on = <K extends keyof AgentProcessEventMap>(
@@ -3575,6 +3640,13 @@ export class Session {
 
     on('error', err => {
       log(`session "${this.sessionName}": ${p.provider} process error: ${err}`)
+    })
+    on('user_input_submitted', () => {
+      const mode = this.procPendingFileDeliveryModes.get(p)
+      if (mode === undefined) return
+      this.procFileDeliveryModes.set(p, mode)
+      this.procPendingFileDeliveryModes.delete(p)
+      this.procFileDeliveryNeedsUpdate.delete(p)
     })
     on('init', () => {
       if (p.provider === 'codex' && p.quotaWaitPromise) {
@@ -3719,9 +3791,9 @@ export class Session {
         log(`session "${this.sessionName}": init turn-open handler failed: ${messageOf(e)}`)
       })
     })
-    on('scheduled_turn_input', ({ text, promptId }) => {
+    on('scheduled_turn_input', ({ text, displayText, promptId }) => {
       if (p.provider !== 'claude' && p.provider !== 'dsh') return
-      this.startScheduledTurnCard(p, epoch, text, promptId)
+      this.startScheduledTurnCard(p, epoch, displayText ?? text, promptId)
     })
     on('conversation_materialized', ({ session_id: sessionId, source }) => {
       if (p.provider !== 'codex') return
@@ -3779,9 +3851,9 @@ export class Session {
       this.currentTurnUsageBaseline = total ? { ...total } : null
       this.currentTurnUsageBaselineKnown = true
     })
-    on('turn_input_error', ({ error }) => {
+    on('turn_input_error', ({ error, displayError }) => {
       log(`session "${this.sessionName}": native input processing failed: ${error}`)
-      void feishu.sendTextRaw(this.chatId, `⚠️ ${this.backendLabel(p.provider)} 输入处理错误：${error}`)
+      void feishu.sendTextRaw(this.chatId, `⚠️ ${this.backendLabel(p.provider)} 输入处理错误：${displayError ?? error}`)
     })
     on('user_input_consumed', ({ inputId }) => this.onSteeringInputConsumed(p, epoch, inputId))
     on('input_batch_end', () => {})
@@ -3813,12 +3885,12 @@ export class Session {
     on('thread_goal_cleared', () => {
       this.handleThreadGoalCleared()
     })
-    on('assistant_text', ({ text, parentToolUseId }: { text: string; parentToolUseId: string | null }) => {
+    on('assistant_text', ({ text, displayText, parentToolUseId }: { text: string; displayText?: string; parentToolUseId: string | null }) => {
       // SDK/CLI 若转发子 Agent assistant 正文，会在 parentToolUseId 上标归属；
       // 其工具已进共享任务面板，正文同样不得泄漏进主对话卡。后台任务的可见进度/
       // 终稿由 task_progress/task_notification 权威事件承载。
       if (parentToolUseId) return
-      this.appendAssistant(text)
+      this.appendAssistant(displayText ?? text)
     })
     on('assistant_block_stop', ({ parentToolUseId }: { parentToolUseId: string | null }) => {
       if (parentToolUseId) return
@@ -3830,7 +3902,8 @@ export class Session {
       // 主线程定稿一段 assistant = 主 agent 在继续说话、没在等 pending task → 提升后台入卡。
       this.onMainThreadAdvance()
     })
-    on('tool_use', ({ id, name, input, parentToolUseId }: { id: string; name: string; input: any; parentToolUseId: string | null }) => {
+    on('tool_use', ({ id, name, input, displayInput, parentToolUseId }) => {
+      const shownInput = displayInput ?? input
       // 子 agent 内的工具调用(parentToolUseId 非空)不上主卡 —— 只累积进对应后台
       // task 的 steps[](共享任务面板展开可见)。与 codex 侧 isSubagentThread 分流同构:
       // 主卡只承载主 agent,子 agent 过程不把主卡面板数刷爆。parentToolUseId 无
@@ -3838,7 +3911,7 @@ export class Session {
       if (parentToolUseId && this.bgTaskOwns(parentToolUseId)) {
         this.applyBgStore(cards.applyBgToolUse(
           { active: this.backgroundTasks, pending: this.pendingBgTasks },
-          parentToolUseId, id, name, input,
+          parentToolUseId, id, name, shownInput,
         ))
         this.onBackgroundTaskChanged()
         return
@@ -3854,7 +3927,7 @@ export class Session {
           turn.taskUpdateI = null
         }
         this.onMainThreadAdvance()
-        this.nativeAgentTools.set(id, { confirmed: false, input })
+        this.nativeAgentTools.set(id, { confirmed: false, input, displayInput })
         // Codex exposes each child separately through collab lifecycle events.
         // Claude's native tool is itself the initial task until task_started
         // supplies its SDK id. Both paths keep launch details off the main card.
@@ -3862,24 +3935,25 @@ export class Session {
           this.lastMainTaskToolUseId = id
           this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), {
             task_id: id, tool_use_id: id, task_type: 'subagent',
-            description: input?.description || input?.name || '子 Agent',
-            prompt: input?.prompt, subagent_type: input?.subagent_type,
+            description: shownInput?.description || shownInput?.name || '子 Agent',
+            prompt: shownInput?.prompt, subagent_type: input?.subagent_type,
           }))
           this.onBackgroundTaskChanged(true)
         }
         return
       }
-      sessionTools.addTool(this, id, name, input)
+      sessionTools.addTool(this, id, name, input, displayInput)
       // 主线程发起新 tool_use = 主 agent 没在等 pending 里的 task → 它们是后台,提升入卡。
       // 前台 task 的 settled 先于主线程下一个 tool_use 到达,pending 已空,不会误提。
       if (!parentToolUseId) this.onMainThreadAdvance()
     })
-    on('tool_result', ({ tool_use_id, content, is_error, parentToolUseId, input }: any) => {
+    on('tool_result', ({ tool_use_id, content, displayContent, displayInput, is_error, parentToolUseId, input }: any) => {
+      const shownContent = displayContent ?? content
       // 子 agent 内的工具结果同 tool_use:只回填后台 task steps,不上主卡面板。
       if (parentToolUseId && this.bgTaskOwns(parentToolUseId)) {
         this.applyBgStore(cards.applyBgToolResult(
           { active: this.backgroundTasks, pending: this.pendingBgTasks },
-          parentToolUseId, tool_use_id, content, is_error,
+          parentToolUseId, tool_use_id, shownContent, is_error,
         ))
         this.onBackgroundTaskChanged()
         return
@@ -3891,14 +3965,14 @@ export class Session {
         // A background launch receipt is not the child's result. Only an
         // unbound synchronous invocation or a failed launch settles here.
         if (is_error || p.provider === 'claude' && !nativeTool.confirmed && nativeTool.input?.run_in_background !== true) {
-          const output = typeof content === 'string' ? content : Array.isArray(content)
-            ? content.map((block: any) => typeof block?.text === 'string' ? block.text : JSON.stringify(block)).join('\n')
-            : JSON.stringify(content) ?? 'MISS'
+          const output = typeof shownContent === 'string' ? shownContent : Array.isArray(shownContent)
+            ? shownContent.map((block: any) => typeof block?.text === 'string' ? block.text : JSON.stringify(block)).join('\n')
+            : JSON.stringify(shownContent) ?? 'MISS'
           let task = this.backgroundTasks.find(entry => entry.toolUseId === tool_use_id)
           if (!task) {
             this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), {
               task_id: tool_use_id, tool_use_id, task_type: 'subagent',
-              description: nativeTool.input?.description || '子 Agent', prompt: nativeTool.input?.prompt,
+              description: (nativeTool.displayInput ?? nativeTool.input)?.description || '子 Agent', prompt: (nativeTool.displayInput ?? nativeTool.input)?.prompt,
             }))
             task = this.backgroundTasks.find(entry => entry.toolUseId === tool_use_id)!
           }
@@ -3910,7 +3984,7 @@ export class Session {
         sessionTools.startThinkingIfNoToolsRunning(this)
         return
       }
-      sessionTools.completeTool(this, tool_use_id, content, is_error, input)
+      sessionTools.completeTool(this, tool_use_id, content, is_error, input, displayContent, displayInput)
     })
     on('can_use_tool', (req: CanUseToolRequest) => {
       sessionPermission.renderPermission(this, req)
@@ -3920,6 +3994,12 @@ export class Session {
       this.proc?.sendHookResponse(req.request_id, {})
     })
     on('result', (result: any, snapshot) => {
+      if (processUsesClaudeTranslation(p) && result?.subtype === 'claude_turn_start_failed') {
+        // Async validation can reject before native init/turn_started consumes
+        // the claim. Its delivery context was not submitted either.
+        this.pendingUserMessageCount = Math.max(0, this.pendingUserMessageCount - 1)
+        this.procPendingFileDeliveryModes.delete(p)
+      }
       this.releaseUnconsumedSteering(p)
       const resumePersistenceError = this.persistResumableSessionId()
       const pendingPersistenceError = resumePersistenceError
@@ -3957,8 +4037,8 @@ export class Session {
       const hasMidTurn = this.pendingMidTurnMsgs.length > 0
       const isError = snapshot.result.is_error === true
       const subtype = snapshot.result.subtype ?? 'success'
-      const failureDetail = typeof result?.error === 'string' && result.error.trim()
-        ? result.error.trim() : subtype
+      const failureText = result?.displayError ?? result?.error
+      const failureDetail = typeof failureText === 'string' && failureText.trim() ? failureText.trim() : subtype
 
       let suffix: string | undefined
       let forcePush = false
@@ -4003,20 +4083,20 @@ export class Session {
       const nativeTool = toolUseId ? this.nativeAgentTools.get(toolUseId) : undefined
       if (nativeTool) nativeTool.confirmed = true
       log(`session "${this.sessionName}": bg_task_started task=${e.task_id} type=${e.task_type ?? '-'} subagent=${e.subagent_type ?? '-'} toolUseId=${toolUseId?.slice(0, 8) ?? '-'} desc=${(e.description ?? '').slice(0, 40)}`)
-      this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), { ...e, tool_use_id: toolUseId }))
+      this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), { ...e, ...e.display, tool_use_id: toolUseId }))
       this.onBackgroundTaskChanged(true)
     })
     on('bg_task_progress', (e: BgTaskProgressEvent) => {
-      this.applyBgStore(cards.applyBgTaskProgress(this.bgStore(), e))
+      this.applyBgStore(cards.applyBgTaskProgress(this.bgStore(), { ...e, ...e.display }))
       this.onBackgroundTaskChanged()
     })
     on('bg_task_updated', (e: BgTaskUpdatedEvent) => {
-      this.applyBgStore(cards.applyBgTaskUpdated(this.bgStore(), e))
+      this.applyBgStore(cards.applyBgTaskUpdated(this.bgStore(), { ...e, patch: { ...e.patch, ...e.display } }))
       this.onBackgroundTaskChanged(!!e.patch.status || e.patch.is_backgrounded === true)
     })
     on('bg_task_settled', (e: BgTaskSettledEvent) => {
       log(`session "${this.sessionName}": bg_task_settled task=${e.task_id} status=${e.status}`)
-      this.applyBgStore(cards.applyBgTaskSettled(this.bgStore(), e))
+      this.applyBgStore(cards.applyBgTaskSettled(this.bgStore(), { ...e, ...e.display }))
       this.onBackgroundTaskChanged(true)
       // turn 已收尾后才结算的任务:Claude SDK 会自发开一轮恢复轮合并结果,
       // 标记给下一个无用户批次的 init 开卡。Codex 的 collab 子 agent 结果由

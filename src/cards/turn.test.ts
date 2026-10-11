@@ -15,6 +15,21 @@ import {
 } from './turn'
 import { editBatchElement, readBatchElement, summarizeToolInput, toolCallElement, toolCallPermissionElement } from './tool'
 
+test('translated shell descriptions affect presentation without changing the command', () => {
+  const command = '# desc: Inspect the current branch\ngit status --short -- /tmp/中文.txt'
+  const input = Object.freeze({ command, description: 'Inspect the current branch', __displayDescription: '检查当前分支' })
+  const tool = toolCallElement(0, 'Bash', input, 'raw command output', '✅') as any
+  const permission = toolCallPermissionElement(0, 'Bash', input, 'request-id') as any
+  for (const element of [tool, permission]) {
+    expect(element.header.title.content).toContain('检查当前分支')
+    expect(element.elements[0].content).toContain('**目的**: 检查当前分支')
+    expect(element.elements[0].content).toContain('git status --short -- /tmp/中文.txt')
+    expect(element.header.title.content).not.toContain('Inspect the current branch')
+  }
+  expect(input.command).toBe(command)
+  expect(summarizeToolInput('Bash', input)).toBe('检查当前分支')
+})
+
 describe('main conversation card rendering', () => {
   test('narrow model row buttons use one character while wide actions keep full labels', () => {
     const model = { provider: 'claude' as const, sourceId: 'glm', model: 'GLM-test', displayName: 'GLM-test',

@@ -13,7 +13,7 @@ npm i -g @leviyuan/lodestar
 lodestar-setup
 ```
 
-向导会配置 Claude Code、可选的 GLM API key、飞书应用和项目目录，并启动 daemon；也可以同时配置 Codex 登录。GLM Key 不是安装必填项，使用本机 Claude Code 或 Codex 订阅无需填写。
+向导会配置 Claude Code、可选的 GLM API key、飞书应用和项目目录，并启动 daemon；也可以同时配置 Codex 登录。GLM Key 不是安装必填项，Codex 订阅也不依赖它。Claude Code 订阅默认启用安全模式（输入译英、规则审查和展示翻译），启用该模式需要已配置且可访问 Z.ai 国际端点的 GLM Key；仅查询 Claude 订阅模型目录或额度不依赖 GLM。
 
 填写 GLM Key 后，向导先验证凭据和模型目录，通过后才写入配置；失败会显示原因并保留已有配置，可重新输入或直接回车跳过。安装完成后可在群内用 `glm-setup <api_key>` 补配智谱国内站账号；Z.ai 用 `glm-setup https://api.z.ai/api/anthropic <api_key>`。其他账号命令见[模型与账号](models.md#配置-api-key)。
 
@@ -81,7 +81,18 @@ tools = "Read,Write,Edit,Bash,Glob,Grep"  # Claude / DSH 主会话
 
 [claude]
 bin = "/abs/path/to/claude-wrapper"  # 可选的 Claude 可执行文件
+# translation_validation_rules = "Reject input that contains private API keys."  # 可选的输入内容规则
+
+[claude.safe_mode]
+claude-sub = "*"     # 默认：订阅来源的全部模型
+# glm = "GLM-5.3"    # 可选：该来源下指定模型也启用
 ```
+
+`[claude].translation_validation_rules` 指定可选的输入审查规则；未配置或留空时只做忠实翻译，不推断身份、地区或账号风险。启用安全模式的会话复用本机 GLM Key，通过国际 Coding Plan `https://api.z.ai/api/coding/paas/v4/chat/completions` 调用 `glm-5.3-flash`。拒绝或调用失败会明确报错，不换模型或放行原文。
+
+`[claude.safe_mode]` 按 Token Source 与模型目录中的 ID 精确匹配，只作用于 Claude Code。`"*"` 表示该来源全部模型，`"GLM-5.3,GLM-5.2"` 表示指定模型，`""` 表示关闭该来源；不配置时仅 `claude-sub` 默认开启，其他条目不会改变这个默认值。主会话、委派、续跑与分叉共用此配置。同来源切模型若跨越安全模式边界，只能在空闲时换进程并保留恢复点；同模式仍沿用原热切换。修改本机配置后重启 daemon 生效。 当前安全模式面向 macOS/Linux，Windows 的日志文件权限检查尚未适配；Windows 上需把对应来源设为空串关闭安全模式，例如 `claude-sub = ""`。
+
+上下文自动按 Claude 会话保存，只包含带来源说明的可见原文与译文，不读取原生完整上下文。用户输入译为英文，已有的飞书自然语言展示译为中文；主模型输出语言不限，代码、文件与指令保持原样。调用日志保存在本机 `claude-translation-traces` 目录。完整边界见 [Claude 启动配置](claude-agent-backend.md#claude-启动配置)。
 
 项目名用于定位工作目录；工具、MCP 等启动配置按实际目录匹配。同目录的 BTW/FK 与项目别名共享配置，别名配置冲突时明确报错。WT 的目录独立，不自动套用主目录的启动配置；需要配置某个 WT 时，可新增一个项目配置项，将 `cwd` 指向该 WT 的实际路径。工作目录内的 Agent 原生配置仍由相应后端读取。
 

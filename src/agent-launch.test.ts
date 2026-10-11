@@ -1,7 +1,119 @@
 import { expect, test } from 'bun:test'
 import { createAgentProcess } from './agent-launch'
+import { config } from './config'
 import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, tokenSourceFactories, type TokenSource } from './token-source'
 import './token-source-openrouter'
+
+test('default safety configuration attaches translation to Claude subscriptions without changing routing', () => {
+  const previous = listTokenSources()
+  const previousSafeMode = config.claude.safe_mode
+  config.claude.safe_mode = { 'claude-sub': ['*'] }
+  try {
+    for (const id of ['claude-sub', 'glm', 'claude-native']) {
+      const source: TokenSource = {
+        id, kind: id === 'claude-sub' ? 'claude-subscription' : 'test', agent: 'claude', display: id, enabled: true,
+        models: [{ model: 'test-model', display: 'Test', efforts: ['high'], defaultEffort: 'high' }],
+        defaultModel: 'test-model', modelCatalogState: { status: 'ready', updatedAt: 1 },
+        refreshModels: async () => {}, spawnEnv: env => ({ ...env, ANTHROPIC_BASE_URL: `https://${id}.test/api/anthropic` }),
+        resolveSpawnModel: model => model,
+        readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+      }
+      registerTokenSource(source)
+      for (const serviceName of [undefined, 'lodestar-agent']) {
+        for (const profile of [undefined, { tools: 'Read' }]) {
+          const created = createAgentProcess({ provider: 'claude', tokenSourceId: id, workDir: '/tmp',
+            model: 'test-model', effort: 'high', serviceName, profile })
+          const options = (created.process as any).opts
+          const translated = id === 'claude-sub'
+          expect(Boolean(options.translation)).toBe(translated)
+          expect(Boolean(options.translationContext)).toBe(translated)
+          expect(created.process.translationEnabled).toBe(translated)
+          expect(created.process.tokenSourceId).toBe(id)
+          expect(options.model).toBe('test-model')
+          expect(options.effort).toBe('high')
+          expect(options.transformEnv({}).ANTHROPIC_BASE_URL).toBe(`https://${id}.test/api/anthropic`)
+          expect(options.appendSystemPrompt).toBeUndefined()
+        }
+      }
+    }
+  } finally {
+    config.claude.safe_mode = previousSafeMode
+    resetTokenSourceRegistry()
+    for (const source of previous) registerTokenSource(source)
+  }
+})
+
+test('configured GLM translation persists across main and delegated fresh, resumed and forked launches', () => {
+  const previous = listTokenSources()
+  const previousSafeMode = config.claude.safe_mode
+  config.claude.safe_mode = { 'claude-sub': ['*'], glm: ['GLM-5.3'] }
+  registerTokenSource({
+    id: 'glm', kind: 'test', agent: 'claude', display: 'GLM', enabled: true,
+    models: ['GLM-5.3', 'GLM-5.3-Flash'].map(model => ({ model, display: model, efforts: ['max'], defaultEffort: 'max' })),
+    defaultModel: 'GLM-5.3', modelCatalogState: { status: 'ready', updatedAt: 1 },
+    refreshModels: async () => {}, resolveSpawnModel: model => `${model}[1m]`,
+    spawnEnv: env => ({ ...env, ANTHROPIC_BASE_URL: 'https://glm.test/api/anthropic' }),
+    readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+  })
+  try {
+    const source = { provider: 'claude' as const, sessionId: 'old-session', cwd: '/tmp' }
+    for (const serviceName of [undefined, 'lodestar-agent']) {
+      for (const launch of [
+        { kind: 'fresh' as const }, { kind: 'resume' as const, source },
+        { kind: 'fork' as const, source, through: { provider: 'claude' as const, kind: 'assistant-message' as const,
+          id: 'checkpoint', source } },
+      ]) {
+        for (const model of [undefined, 'GLM-5.3', 'GLM-5.3-Flash']) {
+          const created = createAgentProcess({ provider: 'claude', tokenSourceId: 'glm', workDir: '/tmp',
+            model, effort: 'max', launch, serviceName }).process as any
+          const translated = model !== 'GLM-5.3-Flash'
+          expect(created.translationEnabled).toBe(translated)
+          expect(Boolean(created.opts.translation)).toBe(translated)
+          expect(Boolean(created.opts.translationContext)).toBe(translated)
+          expect(created.tokenSourceId).toBe('glm')
+          expect(created.opts.model).toBe(`${model ?? 'GLM-5.3'}[1m]`)
+          expect(created.opts.effort).toBe('max')
+          expect(created.opts.transformEnv({}).ANTHROPIC_BASE_URL).toBe('https://glm.test/api/anthropic')
+          expect(created.opts.appendSystemPrompt).toBeUndefined()
+          expect(created.opts.resumeSessionId).toBe(launch.kind === 'fresh' ? undefined : source.sessionId)
+          expect(created.opts.forkSession).toBe(launch.kind === 'fork' ? true : undefined)
+          expect(created.opts.resumeSessionAt).toBe(launch.kind === 'fork' ? 'checkpoint' : undefined)
+        }
+      }
+    }
+  } finally {
+    config.claude.safe_mode = previousSafeMode
+    resetTokenSourceRegistry()
+    for (const source of previous) registerTokenSource(source)
+  }
+})
+
+test('an explicit empty subscription safety list disables the boundary for main and delegated launches', () => {
+  const previous = listTokenSources()
+  const previousSafeMode = config.claude.safe_mode
+  config.claude.safe_mode = { 'claude-sub': [] }
+  registerTokenSource({
+    id: 'claude-sub', kind: 'claude-subscription', agent: 'claude', display: 'Claude', enabled: true,
+    models: [{ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' }],
+    defaultModel: 'opus', modelCatalogState: { status: 'ready', updatedAt: 1 },
+    refreshModels: async () => {}, resolveSpawnModel: model => model, spawnEnv: env => env,
+    readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+  })
+  try {
+    for (const serviceName of [undefined, 'lodestar-agent']) {
+      const created = createAgentProcess({ provider: 'claude', tokenSourceId: 'claude-sub', workDir: '/tmp',
+        effort: 'high', serviceName }).process as any
+      expect(created.translationEnabled).toBe(false)
+      expect(created.opts.translation).toBeUndefined()
+      expect(created.opts.translationContext).toBeUndefined()
+      expect(created.tokenSourceId).toBe('claude-sub')
+    }
+  } finally {
+    config.claude.safe_mode = previousSafeMode
+    resetTokenSourceRegistry()
+    for (const source of previous) registerTokenSource(source)
+  }
+})
 
 test('API Codex launch does not consult or bind a subscription account', () => {
   const script = `

@@ -301,7 +301,9 @@ function briefInput(name: string, input: any): string {
   switch (name) {
     // 与主卡工具面板共用 shell-command 解析:Windows PowerShell 包装 / desc 注释
     // 统一剥掉,steps 里显示中文说明而非 powershell.exe 路径。
-    case 'Bash': return shellCommandDescription(s(input?.command)) || '(空命令)'
+    case 'Bash': return typeof input?.__displayDescription === 'string'
+      ? input.__displayDescription
+      : shellCommandDescription(s(input?.command)) || '(空命令)'
     case 'Read': return s(input?.file_path)
     case 'Edit': return s(input?.file_path)
     case 'Write': return s(input?.file_path)

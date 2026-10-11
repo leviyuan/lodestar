@@ -28,6 +28,9 @@ import {
   NothingToCompactError,
   ModelSettingsUpdateError,
   type AgentReasoningEffort,
+  type AgentTranslationPresentationEvent,
+  type AgentTranslationPresentationPolicy,
+  type AgentTranslationPresentationSurface,
   type ClaudeReasoningEffort,
 } from './agent-process'
 import {
@@ -43,6 +46,9 @@ import type {
 } from './codex-process'
 import { usageFromTokenUsagePayload } from './codex-usage'
 import { observeContextWindow } from './context-window-observe'
+import type { ClaudeTranslation } from './claude-translation'
+import { CLAUDE_TRANSLATION_ORIGINS, type ClaudeTranslationContext } from './claude-translation-context'
+import { ClaudePresentationTranslation, claudeToolInputContext, claudeToolInputOrigin, claudeToolResultContext } from './claude-presentation-translation'
 
 type QueueWaiter<T> = (value: IteratorResult<T>) => void
 
@@ -87,6 +93,9 @@ type PendingUserDialog = {
   resolve: (value: PermissionResult) => void
   request: CanUseToolRequest
   cleanup?: () => void
+  originalInput?: Record<string, unknown>
+  translationSignal?: AbortSignal
+  answering?: boolean
 }
 
 type PendingControl = PendingUserDialog
@@ -123,6 +132,9 @@ export interface ClaudeSpawnOpts extends Omit<SpawnOpts, 'effort'> {
   /** Daemon-owned local plugin containing shared Skills. Loaded only when the
    * effective settingSources omit `user`. */
   managedSkillPluginPath?: string
+  /** Translate host-managed conversation text without changing native tool data. */
+  translation?: ClaudeTranslation
+  translationContext?: ClaudeTranslationContext
 }
 
 export function claudeManagedSkillOptions(
@@ -488,7 +500,7 @@ export function readProjectMcpServers(workDir: string): Record<string, McpServer
   return servers as Record<string, McpServerConfig>
 }
 
-function normalizeDialogQuestions(payload: Record<string, unknown>): Array<Record<string, unknown>> {
+function normalizeDialogQuestions(payload: Record<string, unknown>, preservePreview = false): Array<Record<string, unknown>> {
   const rawQuestions = payload.questions
   const items = Array.isArray(rawQuestions)
     ? rawQuestions
@@ -496,16 +508,16 @@ function normalizeDialogQuestions(payload: Record<string, unknown>): Array<Recor
       ? [rawQuestions]
       : [payload]
   return items
-    .map(item => normalizeDialogQuestion(item))
+    .map(item => normalizeDialogQuestion(item, preservePreview))
     .filter((item): item is Record<string, unknown> => item !== null)
 }
 
-function normalizeDialogQuestion(raw: unknown): Record<string, unknown> | null {
+function normalizeDialogQuestion(raw: unknown, preservePreview: boolean): Record<string, unknown> | null {
   const item = raw && typeof raw === 'object' ? raw as Record<string, unknown> : { question: raw }
   const question = firstString(item.question, item.prompt, item.title, item.message, item.text, item.label)
   if (!question) return null
   if (!question.trim()) return null
-  const options = normalizeDialogOptions(item.options ?? item.choices ?? item.suggestions)
+  const options = normalizeDialogOptions(item.options ?? item.choices ?? item.suggestions, preservePreview)
   return {
     ...item,
     question,
@@ -515,7 +527,7 @@ function normalizeDialogQuestion(raw: unknown): Record<string, unknown> | null {
   }
 }
 
-function normalizeDialogOptions(raw: unknown): Array<Record<string, string>> {
+function normalizeDialogOptions(raw: unknown, preservePreview: boolean): Array<Record<string, string>> {
   if (!Array.isArray(raw)) return []
   const options: Array<Record<string, string>> = []
   for (const item of raw) {
@@ -528,7 +540,8 @@ function normalizeDialogOptions(raw: unknown): Array<Record<string, string>> {
     const label = firstString(obj.label, obj.value, obj.text, obj.title)
     if (!label?.trim()) continue
     const description = firstString(obj.description, obj.detail, obj.preview)
-    options.push(description ? { label, description } : { label })
+    options.push({ label, ...(description ? { description } : {}),
+      ...(preservePreview && typeof obj.preview === 'string' ? { preview: obj.preview } : {}) })
   }
   return options
 }
@@ -562,6 +575,7 @@ export interface BgTaskStartedEvent {
   subagent_type?: string
   workflow_name?: string
   prompt?: string
+  display?: { description?: string; prompt?: string; workflow_name?: string }
 }
 
 export interface BgTaskProgressEvent {
@@ -571,6 +585,7 @@ export interface BgTaskProgressEvent {
   usage?: BgTaskUsage
   last_tool_name?: string
   summary?: string
+  display?: { description?: string; summary?: string }
 }
 
 export interface BgTaskUpdatedEvent {
@@ -583,6 +598,7 @@ export interface BgTaskUpdatedEvent {
     error?: string
     is_backgrounded?: boolean
   }
+  display?: { description?: string; error?: string }
 }
 
 export interface BgTaskSettledEvent {
@@ -591,11 +607,26 @@ export interface BgTaskSettledEvent {
   status: 'completed' | 'failed' | 'stopped'
   summary?: string
   usage?: BgTaskUsage
+  display?: { summary?: string }
+}
+
+type ClaudeMessageDisplay = {
+  texts: Map<number, string>
+  serverToolInputs: Map<string, unknown>
+  toolInputs: Map<string, any>
+  toolResults: Map<string, string>
+  presentations: Map<string, { event: AgentTranslationPresentationEvent; surface: AgentTranslationPresentationSurface }>
+  hidden: Set<string>
+  system?: Record<string, unknown>
+  scheduledText?: string
+  error?: string
+  failed?: boolean
 }
 
 export class ClaudeAgentProcess extends EventEmitter {
   readonly provider = 'claude' as const
   readonly tokenSourceId: string | null
+  readonly translationEnabled: boolean
 
   private opts: ClaudeSpawnOpts
   private input = new AsyncQueue<SDKUserMessage>()
@@ -615,6 +646,8 @@ export class ClaudeAgentProcess extends EventEmitter {
   /** Headless SDK streams do not always emit session_state_changed. A
    * submitted prompt also owns the task until its authoritative result. */
   private inputTurnPending = false
+  /** Actual native submission/running state, excluding pending host translation. */
+  private nativeTurnPending = false
   private steeringInputs = new Set<string>()
   /** A native result can beat a streaming-input write. Keep that native
    * continuation in the same visible task, and retain all result metadata. */
@@ -624,6 +657,17 @@ export class ClaudeAgentProcess extends EventEmitter {
   private emittedToolUseIds = new Set<string>()
   private emittedToolResultIds = new Set<string>()
   private pendingServerToolInputs: PendingServerToolInput[] = []
+  private translationController = new AbortController()
+  private translationInputQueue: Promise<void> = Promise.resolve()
+  private translationFailure: Error | null = null
+  private translationOutputStopped = false
+  private translationContextInitialized = false
+  private translationContextFailure: Error | null = null
+  private readonly presentation?: ClaudePresentationTranslation
+  private presentationPolicy?: AgentTranslationPresentationPolicy
+  private readonly translatedToolNames = new Map<string, string>()
+  private readonly translatedToolInputs = new Map<string, any>()
+  private readonly translatedErrors = new Map<string, string>()
 
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
@@ -644,7 +688,9 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.on('error', () => {})
     this.exitPromise = new Promise(resolve => { this.resolveExit = resolve })
     this.opts = opts
+    this.presentation = opts.translation ? new ClaudePresentationTranslation(opts.translation) : undefined
     this.tokenSourceId = opts.tokenSourceId ?? null
+    this.translationEnabled = !!opts.translation
     this.lastEffort = opts.effort
     this.lastModel = opts.model ? claudeModelKey(opts.model) : null
   }
@@ -687,9 +733,13 @@ export class ClaudeAgentProcess extends EventEmitter {
     // this is a no-op for projects without one. Opt out: load_project_mcp = "false".
     const mcpServers = profile?.loadProjectMcp !== false ? readProjectMcpServers(this.opts.workDir) : undefined
     try {
+      // Validate the local executable before any asynchronous context/GLM work.
+      // Invalid explicit configuration must keep its synchronous error event.
+      const executable = resolveClaudeExecutableConfig()
+      if (this.opts.translation) await this.initializeTranslationContext()
+      if (!this.alive || this.abortController.signal.aborted) return
       // resolveClaudeExecutableConfig 在 [claude].bin 配错路径时同步抛出;
       // 必须在 try 内调用,确保错误走 error/exit 事件而非穿透到调用方。
-      const executable = resolveClaudeExecutableConfig()
       const { query } = await loadClaudeSdk()
       if (!this.alive || this.abortController.signal.aborted) return
       const baseEnv: Record<string, string | undefined> = { ...(process.env as Record<string, string>), PATH: buildClaudeSpawnPath(),
@@ -746,6 +796,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         },
       })
     } catch (e) {
+      if (this.opts.translation && this.expectedExit) return
       const err = e instanceof Error ? e : new Error(String(e))
       this.initializationError = err
       this.emit('error', err)
@@ -764,25 +815,34 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
   }
 
-  sendUserText(text: string, files: string[] = []): void {
+  sendUserText(text: string, files: string[] = [], metadata?: { contextPrefix?: string }): void {
     if (!this.alive) {
       log('claude-agent-process: sendUserText ignored on dead process')
       return
     }
+    if (this.translationContextFailure) { this.failTurnStart(this.translationContextFailure); return }
     if (!this.started) this.sendInitialize()
-    const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
+    const fileHints = (metadata?.contextPrefix ?? '') + (files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : '')
+    if (this.opts.translation) {
+      this.translationOutputStopped = false
+      this.inputTurnPending = true
+      const signal = this.translationController.signal
+      const inputId = randomUUID()
+      void this.queueTranslatedInput(text, signal).then(translated => {
+        if (signal.aborted || !this.alive || this.expectedExit) return
+        this.pushUserText(fileHints + translated, inputId)
+        this.opts.translationContext?.stageInput(inputId, text, translated, this.translationInputOrigin())
+        this.emit('user_input_submitted', {})
+      }).catch(error => {
+        if (signal.aborted || !this.alive || this.expectedExit) return
+        this.invalidateTranslations()
+        this.failTurnStart(this.translationError('input', error))
+      })
+      return
+    }
     try {
       this.inputTurnPending = true
-      this.input.push({
-        type: 'user',
-        session_id: this.sessionId ?? '',
-        message: {
-          role: 'user',
-          content: [{ type: 'text', text: fileHints + text }],
-        },
-        parent_tool_use_id: null,
-        priority: 'now',
-      } as SDKUserMessage)
+      this.pushUserText(fileHints + text)
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e))
       log(`claude-agent-process: sendUserText failed: ${err.message}`)
@@ -794,28 +854,193 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (!this.alive || this.expectedExit) throw new Error('Claude 进程已关闭')
     if (!this.turnActive && !this.inputTurnPending && this.steeringResults.length === 0) return false
     const uuid = inputId
+    const originalText = text
     const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
+    const translationSignal = this.translationController.signal
     this.steeringInputs.add(uuid)
     try {
+      if (this.opts.translation) {
+        text = await this.queueTranslatedInput(text, translationSignal)
+        if (translationSignal.aborted || !this.alive || this.expectedExit) {
+          this.steeringInputs.delete(uuid)
+          return false
+        }
+      }
       this.input.push({ type: 'user', uuid, session_id: this.sessionId ?? '',
         message: { role: 'user', content: [{ type: 'text', text: fileHints + text }] },
         // `now` aborts the current native request. `next` is folded in at
         // a tool boundary, or starts the next native turn if this one ended.
         parent_tool_use_id: null, priority: 'next' })
+      this.nativeTurnPending = true
+      this.opts.translationContext?.stageInput(uuid, originalText, text, this.translationInputOrigin())
     } catch (error) {
       this.steeringInputs.delete(uuid)
+      if (this.opts.translation) {
+        if (translationSignal.aborted || !this.alive || this.expectedExit) return false
+        const failure = this.translationError('additional input', error)
+        this.steeringFailures.push(failure.message)
+        if (!this.steeringInputs.size && !this.inputTurnPending && !this.turnActive && this.deferredSteeringResult) {
+          const deferred = this.deferredSteeringResult
+          this.finishInputResult(deferred.raw, deferred.subtype, deferred.error)
+        }
+        throw failure
+      }
       throw error
     }
     return true
   }
 
+  private pushUserText(text: string, uuid?: string): void {
+    this.input.push({
+      type: 'user', session_id: this.sessionId ?? '', ...(uuid ? { uuid } : {}),
+      message: { role: 'user', content: [{ type: 'text', text }] },
+      parent_tool_use_id: null, priority: 'now',
+    } as SDKUserMessage)
+    this.nativeTurnPending = true
+  }
+
+  private queueTranslatedInput(text: string, signal: AbortSignal): Promise<string> {
+    const operation = this.translationInputQueue.then(async () => {
+      await this.initializeTranslationContext()
+      signal.throwIfAborted()
+      const translated = await this.opts.translation!.toEnglish(text, signal, this.translationInputOrigin())
+      signal.throwIfAborted()
+      return translated
+    })
+    // Each caller handles its own failure. A failed input must not poison the
+    // queue for a subsequent, explicitly submitted user turn.
+    this.translationInputQueue = operation.then(() => {}, () => {})
+    return operation
+  }
+
+  private invalidateTranslations(): void {
+    this.translationController.abort(new Error('Claude translation cancelled'))
+    this.translationController = new AbortController()
+    this.translationInputQueue = Promise.resolve()
+    if (this.translationContextInitialized) this.opts.translationContext?.cancelPendingInputs()
+  }
+
+  private async initializeTranslationContext(): Promise<void> {
+    if (this.translationContextFailure) throw this.translationContextFailure
+    if (!this.opts.translationContext) return
+    await this.opts.translationContext.initialize(this.abortController.signal)
+    this.translationContextInitialized = true
+  }
+
+  async translateDisplayFields(texts: string[], signal = this.translationController.signal,
+    acceptDisplay?: (translated: string[]) => boolean): Promise<string[]> {
+    if (!this.opts.translation) throw new Error('Claude display translation is unavailable')
+    await this.initializeTranslationContext()
+    signal.throwIfAborted()
+    const translated = await this.opts.translation.toChineseFields(texts, signal, CLAUDE_TRANSLATION_ORIGINS.delegatedRequest)
+    signal.throwIfAborted()
+    if (translated.length !== texts.length) throw new Error('展示翻译字段数量不符')
+    if (acceptDisplay?.(translated)) {
+      signal.throwIfAborted()
+      this.opts.translationContext?.recordOutput('delegated-request', texts.join('\n\n'), translated.join('\n\n'),
+        undefined, undefined, CLAUDE_TRANSLATION_ORIGINS.delegatedRequest)
+    }
+    return translated
+  }
+
+  private translationInputOrigin(): string {
+    return this.opts.hostEnv?.LODESTAR_AGENT_ROLE === 'worker'
+      ? CLAUDE_TRANSLATION_ORIGINS.delegatedRequest : CLAUDE_TRANSLATION_ORIGINS.userMessage
+  }
+
+  private translationAnswerOrigin(): string {
+    return this.opts.hostEnv?.LODESTAR_AGENT_ROLE === 'worker'
+      ? CLAUDE_TRANSLATION_ORIGINS.delegatedAnswer : CLAUDE_TRANSLATION_ORIGINS.userAnswer
+  }
+
+  private translationQuestionOrigin(): string {
+    return this.opts.hostEnv?.LODESTAR_AGENT_ROLE === 'worker'
+      ? CLAUDE_TRANSLATION_ORIGINS.delegatedQuestion : CLAUDE_TRANSLATION_ORIGINS.question
+  }
+
+  private translationReplyOrigin(parentToolUseId?: string | null): string {
+    if (parentToolUseId) return CLAUDE_TRANSLATION_ORIGINS.subagentOutput
+    return this.opts.hostEnv?.LODESTAR_AGENT_ROLE === 'worker'
+      ? CLAUDE_TRANSLATION_ORIGINS.delegatedOutput : CLAUDE_TRANSLATION_ORIGINS.reply
+  }
+
+  private translationToolOrigin(name: string, parentToolUseId?: string | null, result = false): string {
+    if (result) return CLAUDE_TRANSLATION_ORIGINS.toolResult
+    const origin = claudeToolInputOrigin(name)
+    if (parentToolUseId || this.opts.hostEnv?.LODESTAR_AGENT_ROLE === 'worker') {
+      return `${this.translationReplyOrigin(parentToolUseId)} Content: ${origin.slice(origin.lastIndexOf(':') + 1).trim()}`
+    }
+    return origin
+  }
+
+  setTranslationPresentationPolicy(policy: AgentTranslationPresentationPolicy): void {
+    this.presentationPolicy = policy
+  }
+
+  private presentationSurface(event: AgentTranslationPresentationEvent): AgentTranslationPresentationSurface | 'hidden' {
+    return this.presentationPolicy ? this.presentationPolicy(event) : event.parentToolUseId ? 'background' : 'main'
+  }
+
+  /** A child can settle while GLM is in flight. Keep its native events, but do
+   * not publish or record text the consumer no longer displays. */
+  private discardHiddenPresentations(display: ClaudeMessageDisplay): void {
+    for (const [key, presentation] of display.presentations) {
+      if (this.presentationSurface(presentation.event) !== 'hidden') continue
+      display.hidden.add(key)
+      display.presentations.delete(key)
+      if (key.startsWith('text:')) display.texts.delete(Number(key.slice(5)))
+      else if (key.startsWith('input:')) {
+        const id = key.slice(6)
+        if (this.translatedToolInputs.get(id) === display.toolInputs.get(id)) this.translatedToolInputs.delete(id)
+        display.toolInputs.delete(id)
+      } else if (key.startsWith('result:')) display.toolResults.delete(key.slice(7))
+      else if (key === 'background') display.system = undefined
+      else if (key === 'scheduled') display.scheduledText = undefined
+    }
+  }
+
+  private translationError(boundary: string, cause: unknown): Error {
+    const label: Record<string, string> = { input: '输入', output: '输出', context: '会话上下文', question: '提问', 'question answer': '回答', 'additional input': '追加输入' }
+    return new Error(`Claude ${label[boundary] ?? boundary}翻译失败：${cause instanceof Error ? cause.message : String(cause)}`, { cause })
+  }
+
+  private reportTranslationFailure(boundary: string, cause: unknown, awaitNativeResult = true): Error {
+    const error = this.translationError(boundary, cause)
+    if (awaitNativeResult) this.translationFailure ??= error
+    log(`claude-agent-process: ${error.message}`)
+    this.emit('error', error)
+    this.emit('turn_input_error', { error: error.message })
+    // Background presentation can outlive the main turn. An idle query will
+    // not produce a result for an interrupt; do not poison the next user turn.
+    if (!awaitNativeResult) return error
+    // The SDK remains alive. Interrupt the actual turn and wait for its native
+    // result; a presentation failure is not evidence of a process exit.
+    this.translationOutputStopped = true
+    this.invalidateTranslations()
+    this.input.clear()
+    this.inputTurnPending = false
+    this.steeringInputs.clear()
+    // Keep usage/errors from native continuation results already received.
+    // Translation failure must not erase work completed earlier in this task.
+    this.requestNativeInterrupt()
+    return error
+  }
+
   sendInterrupt(): void {
+    if (this.opts.translation) {
+      this.translationOutputStopped = true
+      this.invalidateTranslations()
+    }
     this.input.clear()
     this.inputTurnPending = false
     this.steeringInputs.clear()
     this.steeringResults = []
     this.steeringFailures = []
     this.deferredSteeringResult = null
+    this.requestNativeInterrupt()
+  }
+
+  private requestNativeInterrupt(): void {
     // The runtime supports cancel_queued, while the SDK public declaration
     // still omits the options argument. Cancel both already-written messages
     // and the local stream backlog so stop cannot wake another user turn.
@@ -842,6 +1067,12 @@ export class ClaudeAgentProcess extends EventEmitter {
       log(`claude-agent-process: permission response for unknown request ${requestId}`)
       return
     }
+    if (this.opts.translation && pending.originalInput) {
+      if (pending.answering) return
+      pending.answering = true
+      void this.resolveTranslatedPermission(String(requestId), pending, decision, payload)
+      return
+    }
     this.pendingPermissions.delete(String(requestId))
     pending.cleanup?.()
     if (decision === 'allow') {
@@ -864,14 +1095,20 @@ export class ClaudeAgentProcess extends EventEmitter {
     return this.alive
   }
 
+  hasPendingNativeTurn(): boolean {
+    return this.nativeTurnPending || this.turnActive
+  }
+
   async kill(timeoutMs = 5000): Promise<void> {
     if (!this.alive) return
     this.expectedExit = true
+    if (this.opts.translation) this.invalidateTranslations()
     this.denyPendingPermissions('claude process is stopping')
     // Hard process stop: queued user turns belong to the discarded process
     // generation and must never drain during the SDK abort window.
     this.input.abort()
     if (!this.started || !this.query) {
+      if (this.opts.translation && !this.abortController.signal.aborted) this.abortController.abort(new Error('claude process shutdown requested'))
       this.finishExit(null, null)
       return
     }
@@ -957,6 +1194,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     // 不设固定时限；仅明确的 "Not enough messages to compact" 表示无需压缩。
     // result 可能先于 boundary 到达，不能据此提前结束等待。
     if (!this.input) throw new Error('claude thread not initialized')
+    if (this.opts.translation) this.translationOutputStopped = false
     this.input.push({
       type: 'user',
       session_id: this.sessionId ?? '',
@@ -964,11 +1202,12 @@ export class ClaudeAgentProcess extends EventEmitter {
       parent_tool_use_id: null,
       priority: 'now',
     } as SDKUserMessage)
+    const assistantTextEvent = this.opts.translation ? 'assistant_control_text' : 'assistant_text'
     return new Promise<void>((resolve, reject) => {
       let settled = false
       const cleanup = () => {
         this.off('context_compacted', onCompacted)
-        this.off('assistant_text', onAssistantText)
+        this.off(assistantTextEvent, onAssistantText)
         this.off('exit', onExit)
         this.off('error', onError)
       }
@@ -1002,7 +1241,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         reject(e instanceof Error ? e : new Error(String(e)))
       }
       this.on('context_compacted', onCompacted)
-      this.on('assistant_text', onAssistantText)
+      this.on(assistantTextEvent, onAssistantText)
       this.once('exit', onExit)
       this.once('error', onError)
     })
@@ -1020,12 +1259,26 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
     // AskUserQuestion:SDK 把它当权限工具经 canUseTool 下发。host 渲染卡片、等用户
     // 点选,再以 allow + updatedInput.answers 回送,模型据此续跑。
-    const questions = normalizeDialogQuestions(input)
+    const questions = normalizeDialogQuestions(input, !!this.opts.translation)
     if (questions.length === 0) {
       log('claude-agent-process: AskUserQuestion 无有效 questions — allow 原样')
       return Promise.resolve({ behavior: 'allow', updatedInput: input })
     }
     const normalizedInput = { ...input, questions }
+    if (this.opts.translation) return this.translatedDialog(normalizedInput, options)
+    return this.beginDialog(normalizedInput, options)
+  }
+
+  private beginDialog(
+    normalizedInput: Record<string, unknown>,
+    options: { signal: AbortSignal; toolUseID: string },
+    originalInput?: Record<string, unknown>,
+    cleanup?: () => void,
+  ): Promise<PermissionResult> {
+    if (this.opts.translation && options.signal.aborted) {
+      cleanup?.()
+      return Promise.resolve({ behavior: 'deny', message: 'aborted' })
+    }
     const requestId = `claude_perm_${++this.requestCounter}`
     const toolUseId = options.toolUseID || requestId
     const req: CanUseToolRequest = {
@@ -1033,10 +1286,12 @@ export class ClaudeAgentProcess extends EventEmitter {
       tool_name: 'AskUserQuestion',
       input: normalizedInput,
       tool_use_id: toolUseId,
+      ...(originalInput ? { originalInput } : {}),
     }
     const pending = new Promise<PermissionResult>(resolve => {
       const finish = (value: PermissionResult) => {
         options.signal.removeEventListener('abort', abort)
+        cleanup?.()
         resolve(value)
       }
       const abort = () => {
@@ -1044,16 +1299,167 @@ export class ClaudeAgentProcess extends EventEmitter {
         finish({ behavior: 'deny', message: 'aborted' })
       }
       options.signal.addEventListener('abort', abort, { once: true })
-      this.pendingPermissions.set(requestId, { kind: 'dialog', resolve: finish, request: req })
+      this.pendingPermissions.set(requestId, { kind: 'dialog', resolve: finish, request: req,
+        ...(originalInput ? { originalInput, translationSignal: options.signal } : {}) })
     })
-    this.emitToolUseOnce(toolUseId, 'AskUserQuestion', normalizedInput, null)
+    this.emitToolUseOnce(toolUseId, 'AskUserQuestion', originalInput ?? normalizedInput, null, originalInput ? normalizedInput : undefined)
     this.emit('can_use_tool', req)
     return pending
   }
 
+  private async translatedDialog(
+    originalInput: Record<string, unknown>,
+    options: { signal: AbortSignal; toolUseID: string },
+  ): Promise<PermissionResult> {
+    const controller = new AbortController()
+    const signals = [options.signal, this.translationController.signal]
+    const abort = () => controller.abort(new Error('Claude question translation cancelled'))
+    const cleanup = () => signals.forEach(signal => signal.removeEventListener('abort', abort))
+    for (const signal of signals) {
+      if (signal.aborted) abort()
+      else signal.addEventListener('abort', abort, { once: true })
+    }
+    try {
+      await this.initializeTranslationContext()
+      controller.signal.throwIfAborted()
+      const fields: string[] = []
+      const bindings: Array<{ target: Record<string, unknown>; key: string }> = []
+      const bind = (target: Record<string, unknown>, key: string) => {
+        if (typeof target[key] !== 'string') return
+        fields.push(target[key] as string)
+        bindings.push({ target, key })
+      }
+      const questions = (originalInput.questions as Array<Record<string, unknown>>).map(question => {
+        const options = (Array.isArray(question.options) ? question.options as Array<Record<string, unknown>> : []).map(option => ({ ...option }))
+        const translated: Record<string, unknown> & { options: Array<Record<string, unknown>> } = { ...question, options }
+        bind(translated, 'question')
+        for (const option of options) {
+          bind(option, 'label')
+          bind(option, 'description')
+        }
+        return translated
+      })
+      const translatedFields = await this.opts.translation!.toChineseFields(fields, controller.signal, this.translationQuestionOrigin())
+      if (translatedFields.length !== fields.length || translatedFields.some(field => typeof field !== 'string')) {
+        throw new Error('translated question field count or type is invalid')
+      }
+      bindings.forEach(({ target, key }, index) => { target[key] = translatedFields[index]! })
+      controller.signal.throwIfAborted()
+      if (new Set(questions.map(question => question.question)).size !== questions.length) {
+        throw new Error('translated questions are ambiguous')
+      }
+      for (const question of questions) {
+        if (new Set(question.options.map(option => option.label)).size !== question.options.length) {
+          throw new Error('translated question options are ambiguous')
+        }
+      }
+      this.opts.translationContext?.recordOutput('question', fields.join('\n\n'), translatedFields.join('\n\n'), undefined,
+        options.toolUseID ? `question:${options.toolUseID}` : undefined, this.translationQuestionOrigin())
+      return await this.beginDialog({ ...originalInput, questions }, { ...options, signal: controller.signal }, originalInput, cleanup)
+    } catch (cause) {
+      cleanup()
+      if (controller.signal.aborted || !this.alive || this.expectedExit) return { behavior: 'deny', message: 'aborted' }
+      this.reportTranslationFailure('question', cause)
+      return { behavior: 'deny', message: 'The host could not translate or validate this question. The user has been informed and this turn is being interrupted.' }
+    }
+  }
+
+  private async resolveTranslatedPermission(
+    requestId: string,
+    pending: PendingUserDialog,
+    decision: 'allow' | 'deny',
+    payload?: { updatedInput?: Record<string, unknown>; denyMessage?: string },
+  ): Promise<void> {
+    const signal = pending.translationSignal!
+    try {
+      let result: PermissionResult
+      if (decision === 'deny') {
+        const message = payload?.denyMessage ? await this.opts.translation!.toEnglish(payload.denyMessage, signal, this.translationAnswerOrigin()) : ''
+        result = { behavior: 'deny', message }
+      } else {
+        const rawAnswers = payload?.updatedInput?.answers
+        if (!rawAnswers || typeof rawAnswers !== 'object' || Array.isArray(rawAnswers)) {
+          throw new Error('question response has no valid answers object')
+        }
+        const original = pending.originalInput!.questions as Array<Record<string, unknown>>
+        const displayed = pending.request.input.questions as Array<Record<string, unknown>>
+        const answers: Record<string, string> = {}
+        for (const [key, value] of Object.entries(rawAnswers)) {
+          if (typeof value !== 'string') throw new Error('question answer must be text')
+          const index = displayed.findIndex((question, i) => question.question === key || original[i]?.question === key || original[i]?.id === key)
+          if (index < 0) throw new Error('question response references an unknown question')
+          const sourceQuestion = original[index]!
+          const sourceKey = String(sourceQuestion.question)
+          if (Object.hasOwn(answers, sourceKey)) throw new Error('question response contains duplicate answer keys')
+          const visibleOptions = displayed[index]!.options as Array<Record<string, unknown>>
+          const sourceOptions = sourceQuestion.options as Array<Record<string, unknown>>
+          const selections = this.resolveAnswerSelection(value, sourceOptions, visibleOptions, sourceQuestion.multiSelect === true)
+          if (selections) {
+            // Check the native selection representation for ambiguity without
+            // replacing the user's actual answer in the translation request.
+            const sourceLabels = selections.map(selected => String(sourceOptions[selected]!.label)).join(', ')
+            this.resolveAnswerSelection(sourceLabels, sourceOptions, sourceOptions, sourceQuestion.multiSelect === true)
+          }
+          answers[sourceKey] = await this.opts.translation!.toEnglish(value, signal, this.translationAnswerOrigin())
+        }
+        result = { behavior: 'allow', updatedInput: { ...pending.originalInput!, answers } }
+      }
+      signal.throwIfAborted()
+      if (this.pendingPermissions.get(requestId) !== pending || !this.alive || this.expectedExit) return
+      const answerText = (answers: unknown): string => answers && typeof answers === 'object' && !Array.isArray(answers)
+        ? Object.entries(answers).map(([question, value]) => `${question}: ${String(value)}`).join('\n') : String(answers ?? '')
+      this.opts.translationContext?.recordInteraction('user/answer',
+        answerText(payload?.updatedInput?.answers ?? payload?.denyMessage),
+        answerText(result.behavior === 'allow' ? (result.updatedInput as Record<string, unknown>)?.answers : result.message),
+        this.translationAnswerOrigin())
+      this.pendingPermissions.delete(requestId)
+      pending.resolve(result)
+    } catch (cause) {
+      if (this.pendingPermissions.get(requestId) !== pending) return
+      this.pendingPermissions.delete(requestId)
+      if (signal.aborted || !this.alive || this.expectedExit) {
+        pending.resolve({ behavior: 'deny', message: 'aborted' })
+        return
+      }
+      this.reportTranslationFailure('question answer', cause)
+      pending.resolve({ behavior: 'deny', message: 'The host could not translate or validate the answer. The user has been informed and this turn is being interrupted.' })
+    }
+  }
+
+  private resolveAnswerSelection(
+    answer: string,
+    original: Array<Record<string, unknown>>,
+    displayed: Array<Record<string, unknown>>,
+    multiSelect: boolean,
+  ): number[] | null {
+    const matches = new Map<string, number[]>()
+    const visit = (offset: number, selected: number[]) => {
+      if (matches.size > 1) return
+      for (let index = 0; index < original.length; index++) {
+        if (selected.includes(index)) continue
+        for (const label of new Set([String(original[index]!.label), String(displayed[index]!.label)])) {
+          if (!label || !answer.startsWith(label, offset)) continue
+          const next = offset + label.length
+          const selection = [...selected, index]
+          if (next === answer.length) matches.set(selection.join(','), selection)
+          else if (multiSelect && answer[next] === ',') {
+            const separator = answer.slice(next).match(/^,\s*/)?.[0]
+            if (separator) visit(next + separator.length, selection)
+          }
+        }
+      }
+    }
+    visit(0, [])
+    if (matches.size > 1) throw new Error('question answer has ambiguous option labels')
+    return matches.values().next().value ?? null
+  }
+
   private async readLoop(q: Query): Promise<void> {
     try {
-      for await (const message of q) this.handleMessage(message)
+      for await (const message of q) {
+        if (this.opts.translation) await this.handleTranslatedMessage(message)
+        else this.handleMessage(message)
+      }
       this.finishExit(null, null)
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e))
@@ -1071,7 +1477,10 @@ export class ClaudeAgentProcess extends EventEmitter {
   private finishExit(code: number | null, signal: string | null): void {
     if (!this.alive) return
     this.alive = false
+    if (this.opts.translation) this.invalidateTranslations()
+    this.translatedToolInputs.clear()
     this.turnActive = false
+    this.nativeTurnPending = false
     this.inputTurnPending = false
     this.steeringInputs.clear()
     this.steeringResults = []
@@ -1106,18 +1515,270 @@ export class ClaudeAgentProcess extends EventEmitter {
     })
   }
 
-  private handleMessage(message: SDKMessage): void {
+  private observeTranslationContext(raw: any): void {
+    if (!this.translationContextInitialized || !this.opts.translationContext) return
+    const context = this.opts.translationContext
+    if (!raw.parent_tool_use_id && typeof raw.session_id === 'string' && raw.session_id) {
+      context.bindSession(raw.session_id)
+      this.opts.translation?.bindSession?.(raw.session_id)
+    }
+    if (raw.type === 'command_lifecycle' && typeof raw.command_uuid === 'string') {
+      if (raw.state === 'started' || raw.state === 'completed') context.confirmInput(raw.command_uuid)
+      if (raw.state === 'cancelled') context.cancelInput(raw.command_uuid)
+    }
+    if (!raw.parent_tool_use_id) {
+      const ids = Array.isArray(raw.user_message_uuids) ? raw.user_message_uuids : []
+      for (const id of [...ids, raw.user_message_uuid]) if (typeof id === 'string') context.confirmInput(id)
+      if (raw.type === 'user' && typeof raw.uuid === 'string') context.confirmInput(raw.uuid)
+    }
+  }
+
+  private resultErrorText(raw: any): string | null {
+    const subtype = typeof raw.subtype === 'string' ? raw.subtype : raw.is_error ? 'error' : 'success'
+    return raw.is_error === true || subtype !== 'success'
+      ? Array.isArray(raw.errors) && raw.errors.length ? raw.errors.map(String).join('\n')
+        : String(raw.result ?? raw.error ?? raw.api_error_message ?? subtype)
+      : null
+  }
+
+  private userToolOutput(raw: any, block: any): string {
+    const content = textFromToolResultContent(block.content)
+    if (content) return content
+    const result = raw.tool_use_result
+    return result && typeof result === 'object'
+      ? [typeof result.stdout === 'string' ? result.stdout : '', typeof result.stderr === 'string' ? result.stderr : ''].filter(Boolean).join('\n') : ''
+  }
+
+  private async handleTranslatedMessage(message: SDKMessage): Promise<void> {
     const raw = message as any
-    if (typeof raw.session_id === 'string' && raw.session_id) this.sessionId = raw.session_id
+    // Native child-task steps display receipts that main question/task panels omit.
+    const receiptVisible = typeof raw.parent_tool_use_id === 'string' && raw.parent_tool_use_id.length > 0
+    if (raw.type === 'assistant') this.emitAssistantControlText(raw)
+    const scheduled = raw.type === 'user' && raw.isMeta === true && raw.promptSource === 'sdk'
+      && typeof raw.message?.content === 'string' && raw.message.content.trim()
+    if (scheduled) this.translationOutputStopped = false
+    const signal = this.translationController.signal
+    const display: ClaudeMessageDisplay = { texts: new Map(), toolInputs: new Map(), toolResults: new Map(),
+      serverToolInputs: raw.type === 'assistant' ? this.prepareServerToolInputs(raw) : new Map(),
+      presentations: new Map(), hidden: new Set() }
+    const parentToolUseId = typeof raw.parent_tool_use_id === 'string' ? raw.parent_tool_use_id : null
+    const prepare = async <T>(key: string, event: AgentTranslationPresentationEvent,
+      translate: (surface: AgentTranslationPresentationSurface) => Promise<T>): Promise<T | undefined> => {
+      const surface = this.presentationSurface(event)
+      if (surface === 'hidden') { display.hidden.add(key); return undefined }
+      const translated = await translate(surface)
+      signal.throwIfAborted()
+      if (this.presentationSurface(event) === 'hidden') { display.hidden.add(key); return undefined }
+      display.presentations.set(key, { event, surface })
+      return translated
+    }
+    try {
+      if (!this.translationContextFailure) this.observeTranslationContext(raw)
+    } catch (cause) {
+      this.translationContextFailure = this.translationError('context', cause)
+      this.reportTranslationFailure('context', cause)
+    }
+    const canTranslate = !this.translationContextFailure && !this.translationFailure && !this.translationOutputStopped && this.alive && !this.expectedExit
+    try {
+      if (canTranslate) {
+        if (raw.type === 'assistant') {
+          const blocks = Array.isArray(raw.message?.content) ? raw.message.content : []
+          for (let index = 0; index < blocks.length; index++) {
+            const block = blocks[index]
+            if (block?.type === 'text' && typeof block.text === 'string' && block.text && !isServerToolScaffoldText(block.text)) {
+              const translated = await prepare(`text:${index}`, { kind: 'assistant_text', parentToolUseId },
+                () => this.opts.translation!.toChinese(block.text, signal, this.translationReplyOrigin(parentToolUseId)))
+              if (translated !== undefined) display.texts.set(index, translated)
+            } else if ((block?.type === 'tool_use' || block?.type === 'server_tool_use') && typeof block.id === 'string' && typeof block.name === 'string' && block.name !== 'AskUserQuestion') {
+              const name = block.type === 'server_tool_use' ? serverToolName(block.name) : block.name
+              const input = block.type === 'server_tool_use' ? display.serverToolInputs.get(block.id) : block.input ?? {}
+              this.translatedToolNames.set(block.id, name)
+              const translated = await prepare(`input:${block.id}`,
+                { kind: 'tool_input', parentToolUseId, toolUseId: block.id, toolName: name },
+                surface => this.presentation!.toolInput(name, input, signal, surface, this.translationToolOrigin(name, parentToolUseId)))
+              if (translated !== undefined) {
+                display.toolInputs.set(block.id, translated)
+                this.translatedToolInputs.set(block.id, translated)
+              }
+            } else if (block?.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+              const content = textFromServerToolResultContent(block.content)
+              const translated = await prepare(`result:${block.tool_use_id}`, {
+                kind: 'tool_result', parentToolUseId, toolUseId: block.tool_use_id, isError: block.is_error === true,
+                toolName: this.translatedToolNames.get(block.tool_use_id) ?? this.opts.translationContext?.toolName(block.tool_use_id),
+              }, surface => this.presentation!.toolResult(this.toolNameForResult(block.tool_use_id), content,
+                block.is_error === true, signal, receiptVisible, surface, this.translationToolOrigin('', parentToolUseId, true)))
+              if (translated !== undefined) display.toolResults.set(block.tool_use_id, translated)
+            }
+            signal.throwIfAborted()
+          }
+        } else if (raw.type === 'user') {
+          if (scheduled) display.scheduledText = await prepare('scheduled', { kind: 'scheduled_input', parentToolUseId },
+            () => this.opts.translation!.toChinese(raw.message.content, signal, CLAUDE_TRANSLATION_ORIGINS.scheduledPrompt))
+          for (const block of Array.isArray(raw.message?.content) ? raw.message.content : []) {
+            if (block?.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue
+            const content = this.userToolOutput(raw, block)
+            const fromStdout = !textFromToolResultContent(block.content) && raw.tool_use_result
+              && (typeof raw.tool_use_result.stdout === 'string' || typeof raw.tool_use_result.stderr === 'string')
+            const isError = block.is_error === true || raw.tool_use_result?.interrupted === true
+            const name = fromStdout ? 'Bash'
+              : this.translatedToolNames.get(block.tool_use_id) ?? this.opts.translationContext?.toolName(block.tool_use_id)
+            const translated = await prepare(`result:${block.tool_use_id}`, {
+              kind: 'tool_result', parentToolUseId, toolUseId: block.tool_use_id, toolName: name, isError,
+            }, surface => this.presentation!.toolResult(name ?? this.toolNameForResult(block.tool_use_id), content,
+              isError, signal, receiptVisible, surface, this.translationToolOrigin('', parentToolUseId, true)))
+            if (translated !== undefined) display.toolResults.set(block.tool_use_id, translated)
+          }
+        } else if (raw.type === 'system') {
+          const fields = raw.subtype === 'task_started' ? ['description', 'prompt', 'workflow_name']
+            : raw.subtype === 'task_progress' ? ['description', 'summary']
+              : raw.subtype === 'task_notification' ? ['summary'] : raw.subtype === 'task_updated' ? ['description', 'error'] : []
+          const source = raw.subtype === 'task_updated' ? raw.patch ?? {} : raw
+          if (fields.length) display.system = await prepare('background', {
+            kind: 'background', parentToolUseId, subtype: raw.subtype,
+            ...(typeof raw.task_id === 'string' ? { taskId: raw.task_id } : {}),
+          }, () => this.presentation!.naturalFields(source, fields, signal, CLAUDE_TRANSLATION_ORIGINS.backgroundUpdate))
+        } else if (raw.type === 'result') {
+          const error = this.resultErrorText(raw)
+          if (error) {
+            display.error = await this.opts.translation!.toChinese(error, signal, CLAUDE_TRANSLATION_ORIGINS.error)
+            this.translatedErrors.set(error, display.error)
+          }
+        }
+        signal.throwIfAborted()
+      } else display.failed = true
+    } catch (cause) {
+      display.failed = true
+      display.texts.clear()
+      display.toolInputs.clear()
+      display.toolResults.clear()
+      display.system = undefined
+      display.scheduledText = undefined
+      if (!signal.aborted && this.alive && !this.expectedExit) this.reportTranslationFailure('output', cause,
+        this.hasPendingNativeTurn() || raw.type === 'result' || raw.type === 'assistant' && !raw.parent_tool_use_id)
+      if (raw.type === 'result') {
+        const error = this.resultErrorText(raw)
+        if (error) {
+          log(`claude-agent-process: untranslated native error: ${error}`)
+          this.translatedErrors.set(error, '原生错误翻译失败，原始诊断已保留在日志中。')
+        }
+      }
+    }
+    if (raw.type === 'result' && display.failed) {
+      const error = this.resultErrorText(raw)
+      if (error && !this.translatedErrors.has(error)) {
+        log(`claude-agent-process: untranslated native error: ${error}`)
+        this.translatedErrors.set(error, '原生错误未能翻译，原始诊断已保留在日志中。')
+      }
+    }
+    if (!display.failed && !this.translationContextFailure) {
+      try {
+        this.discardHiddenPresentations(display)
+        this.recordDisplayContext(raw, display)
+      }
+      catch (cause) {
+        this.translationContextFailure = this.translationError('context', cause)
+        display.failed = true
+        display.texts.clear(); display.toolInputs.clear(); display.toolResults.clear()
+        display.system = undefined; display.scheduledText = undefined
+        this.reportTranslationFailure('context', cause,
+          this.hasPendingNativeTurn() || raw.type === 'result' || raw.type === 'assistant' && !raw.parent_tool_use_id)
+      }
+    }
+    this.handleMessage(message, display, true)
+  }
+
+  /** Record only the bilingual presentation payload crossing this boundary.
+   * Never ingest SDK user/meta content, thinking, tool payloads or transcripts. */
+  private recordDisplayContext(raw: any, display: ClaudeMessageDisplay): void {
+    const context = this.opts.translationContext
+    if (!context || display.failed) return
+    const receiptVisible = typeof raw.parent_tool_use_id === 'string' && raw.parent_tool_use_id.length > 0
+    const originals: string[] = [], translations: string[] = []
+    const origins = new Set<string>()
+    const tools: Array<{ id: string; name: string }> = []
+    const add = (original: string, translated: string, origin: string) => {
+      if (original.trim()) { originals.push(original); translations.push(translated); origins.add(origin) }
+    }
+    const blocks = Array.isArray(raw.message?.content) ? raw.message.content : []
+    if (raw.type === 'assistant') {
+      for (let index = 0; index < blocks.length; index++) {
+        const block = blocks[index]
+        const text = display.texts.get(index)
+        if (block?.type === 'text' && text !== undefined) add(block.text, text, this.translationReplyOrigin(raw.parent_tool_use_id))
+        if ((block?.type === 'tool_use' || block?.type === 'server_tool_use') && typeof block.id === 'string' && typeof block.name === 'string') {
+          const name = block.type === 'server_tool_use' ? serverToolName(block.name) : block.name
+          tools.push({ id: block.id, name })
+          const shown = display.toolInputs.get(block.id)
+          if (shown !== undefined && !this.emittedToolUseIds.has(block.id)) {
+            const input = block.type === 'server_tool_use' ? display.serverToolInputs.get(block.id) : block.input ?? {}
+            const surface = display.presentations.get(`input:${block.id}`)!.surface
+            add(claudeToolInputContext(name, input, surface).join('\n'), claudeToolInputContext(name, shown, surface).join('\n'),
+              this.translationToolOrigin(name, raw.parent_tool_use_id))
+          }
+        }
+      }
+    }
+    // These results are recorded only when selected for translated display.
+    // Raw file bytes, code, stdout/stderr and opaque JSON are excluded by the
+    // same field selector used to prepare the card's natural-language copy.
+    if (raw.type === 'assistant' || raw.type === 'user') {
+      for (const block of blocks) {
+        if (block?.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue
+        const translated = display.toolResults.get(block.tool_use_id)
+        if (translated === undefined || this.emittedToolResultIds.has(block.tool_use_id)) continue
+        const fromStdout = raw.type === 'user' && !textFromToolResultContent(block.content)
+          && raw.tool_use_result && (typeof raw.tool_use_result.stdout === 'string' || typeof raw.tool_use_result.stderr === 'string')
+        const name = fromStdout ? 'Bash' : this.toolNameForResult(block.tool_use_id)
+        const original = raw.type === 'user' ? this.userToolOutput(raw, block) : textFromServerToolResultContent(block.content)
+        const isError = block.is_error === true || raw.tool_use_result?.interrupted === true
+        const surface = display.presentations.get(`result:${block.tool_use_id}`)!.surface
+        add(claudeToolResultContext(name, original, isError, receiptVisible, surface).join('\n'), claudeToolResultContext(name, translated, isError, receiptVisible, surface).join('\n'),
+          this.translationToolOrigin(name, raw.parent_tool_use_id, true))
+      }
+    }
+    if (display.system) {
+      const keys = raw.subtype === 'task_started' ? ['description', 'prompt', 'workflow_name']
+        : raw.subtype === 'task_progress' ? ['description', 'summary']
+          : raw.subtype === 'task_updated' ? ['description', 'error'] : raw.subtype === 'task_notification' ? ['summary'] : []
+      const source = raw.subtype === 'task_updated' ? raw.patch ?? {} : raw
+      for (const key of keys) if (typeof source[key] === 'string' && typeof display.system[key] === 'string') {
+        add(source[key], display.system[key] as string, CLAUDE_TRANSLATION_ORIGINS.backgroundUpdate)
+      }
+    }
+    if (display.scheduledText !== undefined) add(raw.message.content, display.scheduledText, CLAUDE_TRANSLATION_ORIGINS.scheduledPrompt)
+    if (display.error !== undefined) add(this.resultErrorText(raw) ?? '', display.error, CLAUDE_TRANSLATION_ORIGINS.error)
+    const kind = raw.parent_tool_use_id ? `subagent:${raw.parent_tool_use_id}`
+      : raw.type === 'assistant' ? 'message' : raw.type === 'system' ? 'background'
+        : raw.type === 'result' ? 'error' : display.scheduledText !== undefined ? 'scheduled' : 'tool-result'
+    const uuid = typeof raw.uuid === 'string' ? raw.uuid : undefined
+    context.recordDisplay({ tools,
+      ...(originals.length ? { output: { kind, original: originals.join('\n\n'), display: translations.join('\n\n'), uuid,
+        origin: [...origins].join(' '),
+        ...(uuid ? { key: `${raw.type}:${raw.parent_tool_use_id ?? ''}:${uuid}` } : {}) } } : {}),
+      ...(raw.type === 'assistant' && !raw.parent_tool_use_id && uuid ? { checkpoint: uuid } : {}),
+    })
+  }
+
+  private toolNameForResult(id: string): string {
+    const name = this.translatedToolNames.get(id) ?? this.opts.translationContext?.toolName(id)
+    if (!name) throw new Error(`工具结果来源 MISS，不能判定可翻译字段：${id}`)
+    return name
+  }
+
+  private handleMessage(message: SDKMessage, display?: ClaudeMessageDisplay, contextObserved = false): void {
+    const raw = message as any
+    if (!contextObserved && !this.translationContextFailure) this.observeTranslationContext(raw)
+    if (!this.translationContextFailure && (!this.opts.translation || !raw.parent_tool_use_id)
+      && typeof raw.session_id === 'string' && raw.session_id) this.sessionId = raw.session_id
     switch (raw.type) {
       case 'system':
-        this.handleSystemMessage(raw)
+        this.handleSystemMessage(raw, display)
         return
       case 'assistant':
-        this.handleAssistantMessage(raw)
+        this.handleAssistantMessage(raw, display)
         return
       case 'user':
-        this.handleUserMessage(raw)
+        this.handleUserMessage(raw, display)
         return
       case 'result':
         this.handleResultMessage(raw)
@@ -1130,6 +1791,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         if (raw.state === 'started' || raw.state === 'completed') {
           if (this.steeringInputs.delete(raw.command_uuid)) {
             this.inputTurnPending = true
+            if (raw.state === 'started') this.nativeTurnPending = true
             if (raw.state === 'started') this.emit('user_input_consumed', { inputId: raw.command_uuid })
           }
         }
@@ -1155,7 +1817,12 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
   }
 
-  private handleSystemMessage(raw: any): void {
+  private handleSystemMessage(raw: any, display?: ClaudeMessageDisplay): void {
+    const presentation = (fields: string[], source = raw): Record<string, string> | undefined => {
+      if (!display || display.hidden.has('background')) return undefined
+      return Object.fromEntries(fields.filter(key => typeof source[key] === 'string').map(key => [key,
+        typeof display.system?.[key] === 'string' ? display.system[key] : '翻译失败，详情见本轮错误提示。']))
+    }
     switch (raw.subtype) {
       case 'init':
         if (typeof raw.model === 'string' && raw.model) this.lastModel = claudeModelKey(raw.model)
@@ -1163,6 +1830,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         this.emit('init', { session_id: this.sessionId, raw })
         return
       case 'session_state_changed':
+        if (raw.state === 'running') this.nativeTurnPending = true
         if (raw.state === 'running' && !this.turnActive) {
           this.turnActive = true
           this.lastThinkingTokens = null
@@ -1213,6 +1881,7 @@ export class ClaudeAgentProcess extends EventEmitter {
           subagent_type: typeof raw.subagent_type === 'string' ? raw.subagent_type : undefined,
           workflow_name: typeof raw.workflow_name === 'string' ? raw.workflow_name : undefined,
           prompt: typeof raw.prompt === 'string' ? raw.prompt : undefined,
+          ...(display ? { display: presentation(['description', 'prompt', 'workflow_name']) } : {}),
         })
         return
       case 'task_progress':
@@ -1223,12 +1892,14 @@ export class ClaudeAgentProcess extends EventEmitter {
           usage: raw.usage,
           last_tool_name: typeof raw.last_tool_name === 'string' ? raw.last_tool_name : undefined,
           summary: typeof raw.summary === 'string' ? raw.summary : undefined,
+          ...(display ? { display: presentation(['description', 'summary']) } : {}),
         })
         return
       case 'task_updated':
         this.emit('bg_task_updated', {
           task_id: String(raw.task_id ?? ''),
           patch: raw.patch && typeof raw.patch === 'object' ? raw.patch : {},
+          ...(display ? { display: presentation(['description', 'error'], raw.patch ?? {}) } : {}),
         })
         return
       case 'task_notification':
@@ -1247,6 +1918,7 @@ export class ClaudeAgentProcess extends EventEmitter {
           status: raw.status,
           summary: typeof raw.summary === 'string' ? raw.summary : undefined,
           usage: raw.usage,
+          ...(display ? { display: presentation(['summary']) } : {}),
         })
         return
       default:
@@ -1255,7 +1927,9 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
   }
 
-  private handleAssistantMessage(raw: any): void {
+  private handleAssistantMessage(raw: any, display?: ClaudeMessageDisplay): void {
+    const displayTexts = display?.texts
+    if (this.opts.translation && !displayTexts) this.emitAssistantControlText(raw)
     this.confirmSteeringInputs(raw)
     if (!raw.parent_tool_use_id) this.lastThinkingTokens = null
     const message = raw.message
@@ -1268,37 +1942,52 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (!parentToolUseId && typeof raw.uuid === 'string') this.lastAssistantUuid = raw.uuid
     if (typeof message?.model === 'string' && message.model) this.lastModel = claudeModelKey(message.model)
     const content = Array.isArray(message?.content) ? message.content : []
-    for (const block of content) {
+    for (let index = 0; index < content.length; index++) {
+      const block = content[index]
       if (!block || typeof block !== 'object') continue
       if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
-        const pendingServerToolInput = serverToolInputFromScaffoldText(block.text)
-        if (pendingServerToolInput) {
-          this.pendingServerToolInputs.push(pendingServerToolInput)
-          if (this.pendingServerToolInputs.length > 20) this.pendingServerToolInputs.shift()
-        }
+        if (!display) this.rememberServerToolInput(block.text)
         if (isServerToolScaffoldText(block.text)) continue
+        if (displayTexts && !displayTexts.has(index) && !display?.hidden.has(`text:${index}`)) continue
         const uuid = raw.uuid ?? message?.id
-        this.emit('assistant_text', { uuid, text: block.text, parentToolUseId })
+        this.emit('assistant_text', { uuid, text: block.text, parentToolUseId,
+          ...(displayTexts?.has(index) ? { displayText: displayTexts.get(index)! } : {}) })
         this.emit('assistant_block_stop', { index: uuid, parentToolUseId })
       } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
-        this.emitToolUseOnce(block.id, block.name, block.input ?? {}, parentToolUseId)
+        // canUseTool owns translated question presentation and the original
+        // question/answer mapping. Its callback can arrive after this event.
+        if (this.opts.translation && block.name === 'AskUserQuestion') continue
+        if (display && !display.toolInputs.has(block.id) && !display.hidden.has(`input:${block.id}`)) continue
+        this.emitToolUseOnce(block.id, block.name, block.input ?? {}, parentToolUseId, display?.toolInputs.get(block.id))
       } else if (block.type === 'server_tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
-        this.emitToolUseOnce(block.id, serverToolName(block.name), {
+        if (display && !display.toolInputs.has(block.id) && !display.hidden.has(`input:${block.id}`)) continue
+        this.emitToolUseOnce(block.id, serverToolName(block.name), display ? display.serverToolInputs.get(block.id) : {
           tool: block.name,
           input: this.serverToolInput(block.name, block.input ?? {}),
-        }, parentToolUseId)
+        }, parentToolUseId, display?.toolInputs.get(block.id))
       } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
         this.emitToolResultOnce(
           block.tool_use_id,
           textFromServerToolResultContent(block.content),
           block.is_error === true,
           parentToolUseId,
+          display && !display.hidden.has(`result:${block.tool_use_id}`)
+            ? display.toolResults.get(block.tool_use_id) ?? '工具结果翻译失败。' : undefined,
         )
       }
     }
   }
 
-  private emitToolUseOnce(id: string, name: string, input: any, parentToolUseId: string | null): void {
+  private emitAssistantControlText(raw: any): void {
+    if (raw.parent_tool_use_id) return
+    for (const block of Array.isArray(raw.message?.content) ? raw.message.content : []) {
+      if (block?.type === 'text' && typeof block.text === 'string') {
+        this.emit('assistant_control_text', { text: block.text })
+      }
+    }
+  }
+
+  private emitToolUseOnce(id: string, name: string, input: any, parentToolUseId: string | null, displayInput?: any): void {
     if (this.emittedToolUseIds.has(id)) return
     this.emittedToolUseIds.add(id)
     if (!name.trim()) {
@@ -1307,7 +1996,28 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
     // parentToolUseId:子 agent 内的工具调用 = 触发它的 Task tool_use id;主线程为 null。
     // session 据此把子 agent 的逐步过程累积进对应后台 task 的 steps[]。
-    this.emit('tool_use', { id, name, input, parentToolUseId })
+    if (this.opts.translation) this.translatedToolNames.set(id, name)
+    this.emit('tool_use', { id, name, input, parentToolUseId, ...(displayInput !== undefined ? { displayInput } : {}) })
+  }
+
+  private rememberServerToolInput(text: string): void {
+    const input = serverToolInputFromScaffoldText(text)
+    if (!input) return
+    this.pendingServerToolInputs.push(input)
+    if (this.pendingServerToolInputs.length > 20) this.pendingServerToolInputs.shift()
+  }
+
+  /** Resolve scaffold inputs in native block order once, including scaffolds
+   * from prior messages. Translation, history and events reuse these originals. */
+  private prepareServerToolInputs(raw: any): Map<string, unknown> {
+    const inputs = new Map<string, unknown>()
+    for (const block of Array.isArray(raw.message?.content) ? raw.message.content : []) {
+      if (block?.type === 'text' && typeof block.text === 'string') this.rememberServerToolInput(block.text)
+      else if (block?.type === 'server_tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+        inputs.set(block.id, { tool: block.name, input: this.serverToolInput(block.name, block.input ?? {}) })
+      }
+    }
+    return inputs
   }
 
   private serverToolInput(name: string, rawInput: unknown): unknown {
@@ -1328,18 +2038,21 @@ export class ClaudeAgentProcess extends EventEmitter {
     return structuredInput
   }
 
-  private emitToolResultOnce(toolUseId: string, content: string, isError: boolean, parentToolUseId: string | null): void {
+  private emitToolResultOnce(toolUseId: string, content: string, isError: boolean, parentToolUseId: string | null, displayContent?: string): void {
     if (this.emittedToolResultIds.has(toolUseId)) return
     this.emittedToolResultIds.add(toolUseId)
+    const displayInput = this.translatedToolInputs.get(toolUseId)
+    this.translatedToolInputs.delete(toolUseId)
     this.emit('tool_result', {
       tool_use_id: toolUseId,
       content,
+      ...(displayContent !== undefined ? { displayContent, displayInput } : {}),
       is_error: isError,
       parentToolUseId,
     })
   }
 
-  private handleUserMessage(raw: any): void {
+  private handleUserMessage(raw: any, display?: ClaudeMessageDisplay): void {
     const rawContent = raw.message?.content
     // CronCreate 的 SDK 定时唤醒实测形状:user + isMeta=true +
     // promptSource='sdk' + string content。手动输入是 text block 数组；图片
@@ -1351,8 +2064,10 @@ export class ClaudeAgentProcess extends EventEmitter {
       typeof rawContent === 'string' &&
       rawContent.trim()
     ) {
+      this.translationOutputStopped = false
       this.emit('scheduled_turn_input', {
         text: rawContent,
+        ...(display && !display.hidden.has('scheduled') ? { displayText: display.scheduledText ?? '定时任务提示词翻译失败。' } : {}),
         promptId: typeof raw.promptId === 'string' && raw.promptId ? raw.promptId : null,
       })
     }
@@ -1373,13 +2088,16 @@ export class ClaudeAgentProcess extends EventEmitter {
           ].filter(Boolean).join('\n')
         : ''
       const output = contentText || stdoutStderr
-      this.emitToolResultOnce(block.tool_use_id, output, block.is_error === true || toolResult?.interrupted === true, raw.parent_tool_use_id ?? null)
+      this.emitToolResultOnce(block.tool_use_id, output, block.is_error === true || toolResult?.interrupted === true, raw.parent_tool_use_id ?? null,
+        display && !display.hidden.has(`result:${block.tool_use_id}`)
+          ? display.toolResults.get(block.tool_use_id) ?? '工具结果翻译失败。' : undefined)
     }
   }
 
   private handleResultMessage(raw: any): void {
-    if (typeof raw.session_id === 'string' && raw.session_id) this.sessionId = raw.session_id
+    if (!this.translationContextFailure && typeof raw.session_id === 'string' && raw.session_id) this.sessionId = raw.session_id
     this.turnActive = false
+    this.nativeTurnPending = false
     this.inputTurnPending = false
     const usage = usageFromSdk(raw.usage)
     const modelUsageRaw = raw.modelUsage ?? raw.model_usage
@@ -1437,17 +2155,13 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
     const subtype = typeof raw.subtype === 'string' ? raw.subtype : raw.is_error ? 'error' : 'success'
     this.confirmSteeringInputs(raw)
-    const resultError = raw.is_error === true || subtype !== 'success'
-      ? Array.isArray(raw.errors) && raw.errors.length
-        ? raw.errors.map(String).join('\n')
-        : String(raw.result ?? raw.error ?? raw.api_error_message ?? subtype)
-      : null
+    const resultError = this.resultErrorText(raw)
     if (this.steeringInputs.size || this.steeringResults.length) {
       this.steeringResults.push({ usage, duration: typeof raw.duration_ms === 'number' ? raw.duration_ms : null,
         turns: typeof raw.num_turns === 'number' ? raw.num_turns : 1, error: resultError })
       if (this.steeringInputs.size) {
         this.deferredSteeringResult = { raw, subtype, error: resultError }
-        if (resultError) this.emit('turn_input_error', { error: resultError })
+        if (resultError) this.emit('turn_input_error', { error: resultError, displayError: this.translatedErrors.get(resultError) })
         log(`claude-agent-process: native result has ${this.steeringInputs.size} unconsumed steering inputs`)
         return
       }
@@ -1460,6 +2174,12 @@ export class ClaudeAgentProcess extends EventEmitter {
     const continued = this.steeringResults.splice(0)
     const errors = continued.length ? continued.flatMap(r => r.error ? [r.error] : []) : resultError ? [resultError] : []
     errors.push(...this.steeringFailures.splice(0))
+    const translationFailed = this.translationFailure !== null || this.translationContextFailure !== null
+    if (this.translationContextFailure && !errors.includes(this.translationContextFailure.message)) errors.push(this.translationContextFailure.message)
+    if (this.translationFailure) {
+      errors.push(this.translationFailure.message)
+      this.translationFailure = null
+    }
     if (continued.length) {
       this.lastUsage = continued.every(r => r.usage !== null)
         ? continued.reduce<CodexUsage | null>((total, r) => addUsageTotals(total, r.usage!), null) : null
@@ -1475,7 +2195,9 @@ export class ClaudeAgentProcess extends EventEmitter {
       num_turns: continued.length ? continued.reduce((total, r) => total + r.turns, 0)
         : typeof raw.num_turns === 'number' ? raw.num_turns : 1,
       usage: this.lastUsage,
-      subtype: errors.length && subtype === 'success' ? 'claude_steering_failed' : subtype,
+      subtype: errors.length && subtype === 'success'
+        ? translationFailed ? 'claude_translation_failed' : 'claude_steering_failed'
+        : subtype,
       is_error: errors.length > 0,
     }
     this.emit('result', {
@@ -1483,6 +2205,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       is_error: this.lastResult.is_error,
       ...(this.lastResult.is_error ? {
         error: errors.join('\n'),
+        ...(this.opts.translation ? { displayError: errors.map(error => this.translatedErrors.get(error) ?? error).join('\n') } : {}),
       } : {}),
       duration_ms: this.lastResult.duration_ms,
       usage: this.lastUsage,

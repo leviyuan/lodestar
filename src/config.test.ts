@@ -55,6 +55,78 @@ describe('Claude subscription switch', () => {
   })
 })
 
+describe('Claude translation validation rules', () => {
+  test('does not invent content rules when omitted', () => {
+    const result = loadFreshConfig()
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout).claude.translation_validation_rules).toBeUndefined()
+  })
+
+  test('preserves configured single-line rules and an explicit empty value', () => {
+    const rules = '拒绝包含私钥的输入；允许使用 # 标记普通代码注释。'
+    const configured = loadFreshConfig(`[claude]\ntranslation_validation_rules = "${rules}"`)
+    expect(configured.exitCode).toBe(0)
+    expect(JSON.parse(configured.stdout).claude.translation_validation_rules).toBe(rules)
+
+    const empty = loadFreshConfig('[claude]\ntranslation_validation_rules = ""')
+    expect(empty.exitCode).toBe(0)
+    expect(JSON.parse(empty.stdout).claude.translation_validation_rules).toBe('')
+  })
+})
+
+describe('Claude safe mode selection', () => {
+  test('defaults to all Claude subscription models without enabling other sources', () => {
+    const result = loadFreshConfig()
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout).claude.safe_mode).toEqual({ 'claude-sub': ['*'] })
+  })
+
+  test('adds selected catalog models and preserves the subscription default', () => {
+    const result = loadFreshConfig('[claude.safe_mode]\nglm = "GLM-5.3, GLM-5.3-Flash"\npacky = "*"')
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout).claude.safe_mode).toEqual({
+      'claude-sub': ['*'], glm: ['GLM-5.3', 'GLM-5.3-Flash'], packy: ['*'],
+    })
+  })
+
+  test('an explicit empty source disables its default and does not affect other sources', () => {
+    const result = loadFreshConfig('[claude.safe_mode]\nclaude-sub = ""\nglm = "GLM-5.3"')
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout).claude.safe_mode).toEqual({ 'claude-sub': [], glm: ['GLM-5.3'] })
+  })
+
+  test('can replace all subscription models with one exact model', () => {
+    const result = loadFreshConfig('[claude.safe_mode]\nclaude-sub = "claude-opus-4-6"')
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout).claude.safe_mode).toEqual({ 'claude-sub': ['claude-opus-4-6'] })
+  })
+
+  test.each([
+    'true', 'false', '42', '["GLM-5.3"]', '"GLM-5.3", "GLM-5.3-Flash"',
+    '"GLM-5.3,,GLM-5.3-Flash"', '",GLM-5.3"', '"GLM-5.3,"',
+    '"GLM-5.3,*"', '"GLM-*"', '"GLM 5.3"',
+  ])('rejects an invalid source selection: %s', value => {
+    const result = loadFreshConfig(`[claude.safe_mode]\nglm = ${value}`)
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('[claude.safe_mode].glm')
+  })
+
+  test.each([
+    '[claude]\nsafe_mode = true',
+    '[claude]\nsafe_mode =',
+    '[claude.safe_mode\nglm = "GLM-5.3"',
+    '[[claude.safe_mode]]\nglm = "GLM-5.3"',
+    '[claude.safe_mode.glm]\nmodel = "GLM-5.3"',
+    '[claude.safe_mode]\nglm.model = "GLM-5.3"',
+    '[claude.safe_mode]\nglm =',
+    '[claude.safe_mode]\nglm = "GLM-5.3"\nglm = "*"',
+  ])('rejects malformed safe mode configuration: %s', text => {
+    const result = loadFreshConfig(text)
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('[claude.safe_mode]')
+  })
+})
+
 describe('runtime live_elapsed', () => {
   test('defaults to bucket when omitted', () => {
     const result = loadFreshConfig()

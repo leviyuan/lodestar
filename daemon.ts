@@ -224,6 +224,9 @@ process.on('uncaughtException', e => {
 const sessions = new Map<string, Session>()  // key = chatId
 const agentService = new AgentService()
 const chatActor = new PerKeyActor()
+// Local, opt-in exception for restart verification; no group is enabled by
+// default and the native recovery path still owns the conversation binding.
+const restartContinueChatId = process.env.LODESTAR_RESTART_CONTINUE_CHAT_ID?.trim()
 const sessionRecovery = new DaemonSessionRecovery({
   readMarker: feishu.readAliveMarker,
   writeMarker: feishu.writeAliveMarker,
@@ -232,6 +235,18 @@ const sessionRecovery = new DaemonSessionRecovery({
   sessionFor,
   actor: chatActor,
   isShuttingDown: () => shutdownRequested,
+  restartContinuation: restartContinueChatId ? {
+    chatId: restartContinueChatId,
+    send: async restored => {
+      const session = sessions.get(restartContinueChatId)
+      if (!session || session !== restored) throw new Error('restart continuation session binding changed')
+      try { await session.continueAfterDaemonRestart() }
+      catch (error) {
+        await feishu.sendText(restartContinueChatId, `⚠️ 重启自动续接失败：${error instanceof Error ? error.message : error}`)
+        throw error
+      }
+    },
+  } : undefined,
   log,
 })
 const cardActionDeduper = new ActionDeduper(30_000)

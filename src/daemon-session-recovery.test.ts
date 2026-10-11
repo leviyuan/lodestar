@@ -29,6 +29,7 @@ function harness(initialNames: string[]) {
     actor,
     isShuttingDown: () => shuttingDown,
     log: (message: string) => { logs.push(message) },
+    restartContinuation: undefined as ConstructorParameters<typeof DaemonSessionRecovery>[0]['restartContinuation'],
   }
   const recovery = new DaemonSessionRecovery(deps)
   return { deps, actor, sessions, recovery, writes, logs, marker: () => marker,
@@ -36,6 +37,120 @@ function harness(initialNames: string[]) {
 }
 
 describe('daemon session recovery', () => {
+  test('continues only the exact configured chat after restoration, before admitted messages, once per boot', async () => {
+    const h = harness(['a', 'a-extra'])
+    const restored = deferred()
+    const restoreGate = deferred()
+    const continuationEntered = deferred()
+    const continuationGate = deferred()
+    const events: string[] = []
+    for (const name of ['a', 'a-extra']) {
+      let alive = false
+      h.sessions.set(`chat-${name}`, {
+        sessionName: name,
+        shouldRevive: () => alive,
+        restoreAfterDaemonRestart: async () => {
+          events.push(`restore-${name}`)
+          if (name === 'a') {
+            restored.resolve()
+            await restoreGate.promise
+          }
+          alive = true
+          events.push(`ready-${name}`)
+          return true
+        },
+      })
+    }
+    h.deps.restartContinuation = {
+      chatId: 'chat-a',
+      send: async session => {
+        expect(session).toBe(h.sessions.get('chat-a')!)
+        events.push(`continue-${session.sessionName}`)
+        continuationEntered.resolve()
+        await continuationGate.promise
+        events.push(`submitted-${session.sessionName}`)
+      },
+    }
+    h.recovery.load()
+    const revival = h.recovery.enqueue()
+    expect(h.recovery.enqueue()).toBe(revival)
+    const message = h.actor.enqueue('chat-a', async () => { events.push('message-a') })
+    const other = h.actor.enqueue('chat-a-extra', async () => { events.push('message-a-extra') })
+    await Promise.all([restored.promise, other])
+    expect(events).toEqual(['restore-a', 'restore-a-extra', 'ready-a-extra', 'message-a-extra'])
+    restoreGate.resolve()
+    await continuationEntered.promise
+    expect(events.slice(-2)).toEqual(['ready-a', 'continue-a'])
+    expect(events).not.toContain('message-a')
+    continuationGate.resolve()
+    await Promise.all([revival, message])
+    expect(events.slice(-4)).toEqual(['ready-a', 'continue-a', 'submitted-a', 'message-a'])
+    await h.recovery.enqueue()
+    expect(events.filter(event => event === 'continue-a')).toHaveLength(1)
+    expect(h.marker().sort()).toEqual(['a', 'a-extra'])
+    expect(h.logs.join('\n')).toContain('restart continuation for "a" submitted')
+  })
+
+  test.each(['false', 'throw'] as const)('does not continue when restoration returns %s', async outcome => {
+    const h = harness(['a'])
+    let sends = 0
+    h.sessions.set('chat-a', {
+      sessionName: 'a', shouldRevive: () => true,
+      restoreAfterDaemonRestart: async () => {
+        if (outcome === 'throw') throw new Error('restore failed')
+        return false
+      },
+    })
+    h.deps.restartContinuation = { chatId: 'chat-a', send: async () => { sends++ } }
+    h.recovery.load()
+    await h.recovery.enqueue()
+    expect(sends).toBe(0)
+    expect(h.marker()).toEqual(['a'])
+    expect(h.logs.join('\n')).not.toContain('restart continuation')
+  })
+
+  test('does not continue when shutdown begins during restoration', async () => {
+    const h = harness(['a'])
+    const entered = deferred()
+    const gate = deferred()
+    let sends = 0
+    h.sessions.set('chat-a', {
+      sessionName: 'a', shouldRevive: () => true,
+      restoreAfterDaemonRestart: async () => { entered.resolve(); await gate.promise; return true },
+    })
+    h.deps.restartContinuation = { chatId: 'chat-a', send: async () => { sends++ } }
+    h.recovery.load()
+    const revival = h.recovery.enqueue()
+    await entered.promise
+    h.shutdown()
+    gate.resolve()
+    await revival
+    expect(sends).toBe(0)
+    expect(h.marker()).toEqual(['a'])
+  })
+
+  test('continuation failure keeps successful restoration durable and never retries aliases or enqueue', async () => {
+    const h = harness(['a', 'alias'])
+    let sends = 0
+    h.deps.chatIdForSession = () => 'chat-a'
+    h.sessions.set('chat-a', {
+      sessionName: 'a', shouldRevive: () => true,
+      restoreAfterDaemonRestart: async () => true,
+    })
+    h.deps.restartContinuation = {
+      chatId: 'chat-a', send: async () => { sends++; throw new Error('submission unknown') },
+    }
+    h.recovery.load()
+    await h.recovery.enqueue()
+    await h.recovery.enqueue()
+    expect(sends).toBe(1)
+    expect(h.marker()).toEqual(['a'])
+    expect(h.logs.join('\n')).toContain('revive: "a" restored')
+    expect(h.logs.join('\n')).toContain('restart continuation for "a" failed: Error: submission unknown')
+    expect(h.logs.join('\n')).not.toContain('restore "a" failed')
+    expect(h.logs.join('\n')).not.toContain('continuation for "alias"')
+  })
+
   test('an interrupted early boot and a second restart preserve every unreadied session', async () => {
     const h = harness(['a', 'b'])
     h.recovery.load()

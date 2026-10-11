@@ -132,6 +132,7 @@ export function summarizeToolInput(name: string, input: any): string {
 }
 
 function summarizeServerSideToolInput(name: string, input: any): string {
+  if (typeof input?.__displayDescription === 'string' && input.__displayDescription.trim()) return input.__displayDescription
   const tool = typeof input?.tool === 'string' && input.tool
     ? input.tool
     : serverSideToolName(name)
@@ -170,7 +171,8 @@ function bashPresentation(input: any): { description: string; command: string } 
   const explicit = String(input?.description ?? input?.reason ?? '').trim()
   // desc 注释 / 包装剥离统一走 shell-command 模块,与后台卡、子 agent 简报共用一份解析。
   const info = shellCommandPresentation(rawCommand)
-  return { description: info.description || explicit, command: info.command }
+  const translated = typeof input?.__displayDescription === 'string' ? input.__displayDescription : undefined
+  return { description: translated ?? (info.description || explicit), command: info.command }
 }
 
 function fenceBlock(text: string, lang = ''): string {
@@ -783,12 +785,14 @@ function renderServerSideToolBody(name: string, input: any, output: string | nul
     `**类型**: 模型服务端内置工具`,
     `**tool**: ${inlineCode(typeof input?.tool === 'string' && input.tool ? input.tool : serverSideToolName(name))}`,
   ]
+  if (typeof input?.__displayDescription === 'string' && input.__displayDescription.trim()) lines.push(`**目的**: ${input.__displayDescription}`)
   const rawInput = input?.input
   if (rawInput && typeof rawInput === 'object') {
     lines.push('')
     lines.push('**input**')
     if (Object.keys(rawInput).length > 0) {
-      lines.push(jsonBlock(rawInput, 2000))
+      const { __displayDescription: _displayDescription, ...visibleInput } = rawInput
+      lines.push(jsonBlock(visibleInput, 2000))
     } else {
       lines.push('_provider 未提供结构化 input_')
     }

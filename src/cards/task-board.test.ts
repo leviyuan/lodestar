@@ -22,6 +22,26 @@ describe('asTaskToolName', () => {
 })
 
 describe('applyTaskTool — 累积语义', () => {
+  test('TaskCreate preserves native receipt IDs and uses translated human fields', () => {
+    const input = Object.freeze({ subject: 'Read files', activeForm: 'Reading files', description: 'Inspect source files' })
+    const display = { subject: '读取文件', activeForm: '正在读取文件', description: '检查源文件' }
+    for (const receipt of ['Task #17 created successfully: Read files', JSON.stringify({ task: { id: '17', subject: 'Read files' } })]) {
+      expect(applyTaskTool([], 'TaskCreate', input, receipt, display)).toEqual([
+        { id: '17', subject: '读取文件', activeForm: '正在读取文件', description: '检查源文件', status: 'pending' },
+      ])
+    }
+    expect(input.subject).toBe('Read files')
+  })
+
+  test('batch TaskCreate keeps native IDs while translating each item', () => {
+    const input = { tasks: [{ subject: 'Read files' }, { subject: 'Run tests' }] }
+    const display = { tasks: [{ subject: '读取文件' }, { subject: '运行测试' }] }
+    const output = JSON.stringify({ tasks: [{ id: '7', subject: 'Read files' }, { id: '8', subject: 'Run tests' }] })
+    expect(applyTaskTool([], 'TaskCreate', input, output, display)).toEqual([
+      { id: '7', subject: '读取文件', status: 'pending' }, { id: '8', subject: '运行测试', status: 'pending' },
+    ])
+  })
+
   test('TaskCreate 从 output 抓 id 逐条追加', () => {
     let board: TaskBoardEntry[] = []
     board = applyTaskTool(board, 'TaskCreate', { subject: '读文件' }, JSON.stringify({ task: { id: 'task_1', subject: '读文件' } }))

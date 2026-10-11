@@ -30,6 +30,7 @@
 - 探针必须显式指定目标，不使用硬编码群或 `test1` 默认值。凭据、成员和 debug context 不写进仓库。
 - 复用 `src/feishu.ts`、`src/session.ts` 和 `src/paths.ts`，不复制生产 API、账号路由和状态路径。覆盖说明与实际 provider 一致。
 - 模型回调探针走 debug socket 的 `/model-state` 与 `/model-action`；显式 `chat_id` 必须匹配 debug context，动作还要绑定本应用的真实卡片和当前面板。它复用正常回调处理，不代表真实客户端手势已验证。测试记录写私有临时目录。
+- 翻译验收使用正式 `claude.safe_mode` 配置，在明确目标群通过正常模型面板选择已配置启用安全模式的 Claude Code 来源和模型；`/model-state.translation.enabled` 核对实际进程是否启用翻译层。不设置测试专用启动入口，不得将替代模型验收声称为 Claude 订阅认证验收。
 - npm lifecycle 不启动交互向导；首次向导由 `cli.ts` 在 TTY 中触发。native binary 不可用时由启动路径明确报错。
 - Agent 更新跟随 latest，不以构建时版本或预先通过兼容测试作为用户更新的门槛；测试发现不兼容时修复适配，不能改回旧版本策略。
 - 修改后先运行相关单元测试。npm lifecycle、native 依赖、构建引用或跨平台入口有变动时运行 `bun run build`。真实 smoke 完成后报告发送内容和本地状态变化。

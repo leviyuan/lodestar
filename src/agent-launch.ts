@@ -1,4 +1,8 @@
-import type { ProjectProfile } from './config'
+import { config, type ProjectProfile } from './config'
+import { createClaudeTranslation } from './claude-translation'
+import { ClaudeTranslationContext } from './claude-translation-context'
+import { claudeTranslationModeEnabled } from './claude-translation-mode'
+import { ClaudeTranslationTrace } from './claude-translation-trace'
 import type {
   AgentProcess,
   AgentProvider,
@@ -90,6 +94,16 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
   if (opts.provider === 'claude') {
     assertClaudeCodeAvailable()
     if (!isClaudeReasoningEffort(opts.effort)) throw new Error(`invalid Claude effort: ${opts.effort ?? 'MISS'}`)
+    const translationEnabled = claudeTranslationModeEnabled(source?.id, requestedModel)
+    const translationContext = translationEnabled ? new ClaudeTranslationContext({
+      workDir: opts.workDir,
+      ...(opts.launch && opts.launch.kind !== 'fresh' ? {
+        resumeSessionId: opts.launch.source.sessionId,
+        ...(opts.launch.kind === 'fork' ? { forkSession: true } : {}),
+        ...(opts.launch.kind === 'fork' && opts.launch.through?.provider === 'claude'
+          ? { resumeSessionAt: opts.launch.through.id } : {}),
+      } : {}),
+    }) : undefined
     return {
       process: new ClaudeAgentProcess({
         workDir: opts.workDir,
@@ -112,6 +126,12 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
         ...(source?.validateClaudeAccount ? { validateAccount: source.validateClaudeAccount } : {}),
         ...(opts.managedSkillPluginPath ? { managedSkillPluginPath: opts.managedSkillPluginPath } : {}),
         tokenSourceId: source?.id ?? null,
+        ...(translationContext ? {
+          translationContext,
+          translation: createClaudeTranslation({ validationRules: config.claude.translation_validation_rules,
+            context: () => translationContext.snapshot(),
+            trace: new ClaudeTranslationTrace({ workDir: opts.workDir, sourceId: source?.id }) }),
+        } : {}),
         transformEnv,
         hostEnv: opts.hostEnv,
       }),

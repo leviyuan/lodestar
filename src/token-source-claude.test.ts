@@ -255,6 +255,12 @@ test('Claude subscription gates queued input on native authentication for main a
     import assert from 'node:assert/strict'
     import { mock } from 'bun:test'
     const updates = await import('./src/agent-updates')
+    const translations = []
+    mock.module('./src/claude-translation', () => ({ createClaudeTranslation: () => ({
+      toEnglish: async (text, _signal, kind) => { translations.push({ text, kind }); return 'Translated: ' + text },
+      toChinese: async text => text,
+      toChineseFields: async fields => fields,
+    }) }))
     const queries = []
     let account = { subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
     let releaseAuth
@@ -290,6 +296,7 @@ test('Claude subscription gates queued input on native authentication for main a
     assert.equal(source.modelCatalogState.status, 'ready')
     assert.equal(queries[0].delivered.length, 0)
     assert.equal(queries[0].closed, true)
+    assert.deepEqual(translations, [])
     registerTokenSource(source)
     const { config } = await import('./src/config')
     config.claude.env = {
@@ -322,6 +329,7 @@ test('Claude subscription gates queued input on native authentication for main a
       assert.equal(record.options.disallowedTools?.includes('Agent') ?? false, false)
       releaseAuth()
       await waitFor(() => record.delivered.length === 1)
+      assert.equal(record.delivered[0].message.content[0].text, 'Translated: queued task')
       await proc.kill()
       await record.inputDone
       assert.equal(record.closed, true)
