@@ -71,7 +71,7 @@ const CODEX_REQUEST_TIMEOUT_MS = 30_000
 const CODEX_MATERIALIZATION_VERIFY_TIMEOUT_MS = 10 * 60_000
 const CODEX_TURN_RETRY_BASE_MS = 5_000
 const CODEX_TURN_RETRY_MAX_MS = 60_000
-const CODEX_TRANSIENT_RETRY_LIMIT = 3
+const CODEX_TRANSIENT_RETRY_LIMIT = 10
 // The failed turn already contains the user's input and any completed work.
 // Continue that history instead of replaying the original task and file hints.
 const CODEX_TURN_CONTINUATIONS = {

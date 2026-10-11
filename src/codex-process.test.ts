@@ -542,6 +542,8 @@ describe('codex model capacity recovery', () => {
 })
 
 describe('codex transient failure recovery', () => {
+  const retryDelays = [5000, 10000, 20000, 40000, 60000, 60000, 60000, 60000, 60000, 60000]
+
   test.each([
     ...[
       { message: STREAM_MESSAGE, codexErrorInfo: 'other' },
@@ -609,13 +611,14 @@ describe('codex transient failure recovery', () => {
     })
   })
 
-  test.each([{ message: STREAM_MESSAGE, codexErrorInfo: 'other' }, COMPACT_ERROR, REQUEST_TIMEOUT_ERROR, OVERLOADED_ERROR])('limits transient recovery to three attempts and preserves the final error (%j)', async error => {
+  test.each([{ message: STREAM_MESSAGE, codexErrorInfo: 'other' }, COMPACT_ERROR, REQUEST_TIMEOUT_ERROR, OVERLOADED_ERROR])('limits transient recovery to ten retries and preserves the final error (%j)', async error => {
     await withCapacityClock(async clock => {
-      const { proc, events } = capacityHarness()
+      const { proc, calls, events } = capacityHarness()
       proc.sendUserText('do work')
       await flushCapacityMicrotasks()
-      for (const delay of [5000, 10000, 20000]) {
+      for (const [index, delay] of retryDelays.entries()) {
         completeCapacityTurn(proc, error)
+        expect(proc.turnRetry.attempt).toBe(index + 1)
         expect([...clock.timers.values()].map(timer => timer.delay)).toEqual([delay])
         expect(events.filter(([name]) => name === 'result')).toHaveLength(0)
         await clock.tick()
@@ -623,6 +626,7 @@ describe('codex transient failure recovery', () => {
       completeCapacityTurn(proc, error)
       expect(clock.timers.size).toBe(0)
       expect(proc.turnRetry).toBeNull()
+      expect(calls.filter(call => call.method === 'turn/start')).toHaveLength(11)
       expect(events.filter(([name]) => name === 'result')).toEqual([
         ['result', expect.objectContaining({ is_error: true, error: error.message })],
       ])
@@ -638,13 +642,15 @@ describe('codex transient failure recovery', () => {
       const { proc, events } = capacityHarness()
       proc.sendUserText('do work')
       await flushCapacityMicrotasks()
-      for (const [delay, error] of [[5000, COMPACT_ERROR], [10000, { message: STREAM_MESSAGE }], [20000, REQUEST_TIMEOUT_ERROR]] as const) {
+      const errors = [COMPACT_ERROR, { message: STREAM_MESSAGE }, REQUEST_TIMEOUT_ERROR, OVERLOADED_ERROR]
+      for (const [index, delay] of retryDelays.entries()) {
         for (let i = 0; i < 4; i++) {
           completeCapacityTurn(proc)
           await clock.tick()
         }
-        completeCapacityTurn(proc, error)
+        completeCapacityTurn(proc, errors[index % errors.length]!)
         expect(proc.turnRetry.delayMs).toBe(delay)
+        expect(events.filter(([name]) => name === 'result')).toHaveLength(0)
         await clock.tick()
       }
       completeCapacityTurn(proc, OVERLOADED_ERROR)
@@ -659,7 +665,7 @@ describe('codex transient failure recovery', () => {
       for (let task = 0; task < 2; task++) {
         proc.sendUserText('do work')
         await flushCapacityMicrotasks()
-        for (const delay of [5000, 10000, 20000]) {
+        for (const delay of retryDelays) {
           completeCapacityTurn(proc, error)
           expect(proc.turnRetry.delayMs).toBe(delay)
           await clock.tick()
