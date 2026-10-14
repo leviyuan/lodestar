@@ -4,10 +4,10 @@ import { config } from './config'
 import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, tokenSourceFactories, type TokenSource } from './token-source'
 import './token-source-openrouter'
 
-test('default safety configuration attaches translation to Claude subscriptions without changing routing', () => {
+test.each([false, true])('main and delegated launches translate only explicitly enabled subscriptions (enabled=%s)', enabled => {
   const previous = listTokenSources()
   const previousSafeMode = config.claude.safe_mode
-  config.claude.safe_mode = { 'claude-sub': ['*'] }
+  config.claude.safe_mode = enabled ? { 'claude-sub': ['*'] } : {}
   try {
     for (const id of ['claude-sub', 'glm', 'claude-native']) {
       const source: TokenSource = {
@@ -24,7 +24,7 @@ test('default safety configuration attaches translation to Claude subscriptions 
           const created = createAgentProcess({ provider: 'claude', tokenSourceId: id, workDir: '/tmp',
             model: 'test-model', effort: 'high', serviceName, profile })
           const options = (created.process as any).opts
-          const translated = id === 'claude-sub'
+          const translated = enabled && id === 'claude-sub'
           expect(Boolean(options.translation)).toBe(translated)
           expect(Boolean(options.translationContext)).toBe(translated)
           expect(created.process.translationEnabled).toBe(translated)

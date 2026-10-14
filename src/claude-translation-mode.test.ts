@@ -2,10 +2,10 @@ import { expect, test } from 'bun:test'
 import { claudeTranslationModeEnabled } from './claude-translation-mode'
 import { processUsesClaudeTranslation } from './agent-process'
 
-test('the default configuration enables only the Claude Code subscription source', () => {
-  expect(claudeTranslationModeEnabled('claude-sub')).toBe(true)
-  for (const id of ['glm', 'claude-native', 'deepseek', 'dsh-glm', 'codex-sub', null, undefined]) {
+test('the default configuration disables translation for every source', () => {
+  for (const id of ['claude-sub', 'glm', 'claude-native', 'deepseek', 'openrouter', 'packy', 'packy-secondary', 'packy-codex', 'deepseek-harness', 'dsh-glm', 'codex-sub', null, undefined]) {
     expect(claudeTranslationModeEnabled(id)).toBe(false)
+    expect(claudeTranslationModeEnabled(id, 'any-model')).toBe(false)
   }
 })
 
@@ -35,7 +35,7 @@ test('configured source rules match exact catalog model IDs, including explicit 
   expect(result.exitCode, result.stderr.toString() + result.stdout.toString()).toBe(0)
 })
 
-test('main-session instructions choose translation only for the Claude subscription source', () => {
+test('main-session instructions use untranslated defaults for every source', () => {
   const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', `
     import assert from 'node:assert/strict'
     import { join } from 'node:path'
@@ -47,7 +47,7 @@ test('main-session instructions choose translation only for the Claude subscript
       ['configured-name[feature]', join(process.env.LODESTAR_DATA_DIR, 'configured-name[feature]'), 'glm', 'claude', false],
       ['codex', target, 'codex-sub', 'codex', false],
       ['native', target, 'claude-native', 'claude', false],
-      ['subscription', join(target, 'other'), 'claude-sub', 'claude', true],
+      ['subscription', join(target, 'other'), 'claude-sub', 'claude', false],
     ]
     for (const [sessionName, workDir, selectedTokenSourceId, provider, expected] of cases) {
       const text = spawnDeveloperInstructions({ sessionName, workDir, selectedTokenSourceId,

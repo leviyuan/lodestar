@@ -359,7 +359,7 @@ export function loadConfig(): LodestarConfig {
   if (t.claude?.safe_mode !== undefined) {
     throw new Error('lodestar: safe_mode must use the [claude.safe_mode] table')
   }
-  const claudeSafeMode: LodestarConfig['claude']['safe_mode'] = { 'claude-sub': ['*'] }
+  const claudeSafeMode: LodestarConfig['claude']['safe_mode'] = {}
   for (const [sourceId, value] of Object.entries(t['claude.safe_mode'] ?? {})) {
     const trimmed = value.trim()
     const models = trimmed === '' ? [] : trimmed.split(',').map(model => model.trim())

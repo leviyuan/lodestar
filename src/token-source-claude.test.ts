@@ -299,6 +299,7 @@ test('Claude subscription gates queued input on native authentication for main a
     assert.deepEqual(translations, [])
     registerTokenSource(source)
     const { config } = await import('./src/config')
+    config.claude.safe_mode = { 'claude-sub': ['*'] }
     config.claude.env = {
       ANTHROPIC_API_KEY: 'wrong-key', ANTHROPIC_AUTH_TOKEN: 'wrong-token',
       ANTHROPIC_BASE_URL: 'https://wrong.test', CLAUDE_CODE_OAUTH_TOKEN: 'wrong-oauth',

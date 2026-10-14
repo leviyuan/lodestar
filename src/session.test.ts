@@ -2509,10 +2509,18 @@ describe('Session provider switching', () => {
     expect(instructions).not.toContain('request_user_input')
 
     session.selectedTokenSourceId = 'claude-sub'
-    const english = session.spawnDeveloperInstructions()
-    expect(english).toContain('AskUserQuestion')
-    expect(english).toContain('Lodestar')
-    expect(english).not.toMatch(/\p{Script=Han}/u)
+    expect(session.spawnDeveloperInstructions()).toContain('# desc: <一句中文说明>')
+    const previousSafeMode = config.claude.safe_mode
+    config.claude.safe_mode = { 'claude-sub': ['*'] }
+    try {
+      const english = session.spawnDeveloperInstructions()
+      expect(english).toContain('AskUserQuestion')
+      expect(english).toContain('Lodestar')
+      expect(english).not.toMatch(/\p{Script=Han}/u)
+    } finally {
+      config.claude.safe_mode = previousSafeMode
+      session.dispose()
+    }
   })
 
   test('keeps selected provider resume id from being overwritten by stale backend events', () => {
@@ -2797,6 +2805,8 @@ describe('Session provider switching', () => {
       return turn
     }
     session.closeTurnCard = async (status: string) => { statuses.push(status); session.currentTurn = null }
+    const previousSafeMode = config.claude.safe_mode
+    config.claude.safe_mode = { 'claude-sub': ['*'] }
     try {
       if (queued) {
         session.pendingMidTurnMsgs = [{ text: 'queued task', wireText: 'queued task', userOpenId: '', msgId: '' }]
@@ -2814,7 +2824,10 @@ describe('Session provider switching', () => {
       expect(proc.sentTexts).toHaveLength(1)
       expect(proc.sentTexts[0]).toContain('enabled again')
       expect(proc.killCalls).toBe(0)
-    } finally { session.dispose() }
+    } finally {
+      config.claude.safe_mode = previousSafeMode
+      session.dispose()
+    }
   })
 
   test('MD uses cached models immediately and never waits for catalog I/O', async () => {

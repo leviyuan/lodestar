@@ -128,43 +128,49 @@ function harness(opts: {
 }
 
 test('verified worker presentation stays on live cards without changing native API or history', async () => {
-  const cards: string[] = []
-  const h = harness({
-    identities: [identity('claude-sub')],
-    startWorker: options => {
-      expect(options.callbacks?.onDisplayContext?.({ description: '检查接口', prompt: '检查接口实现' })).toBe(true)
-      return resolvedHandle({ ...result('native-sub', 'Native result'), displayOutput: '检查结果' })
-    },
-    sendCard: async (_chatId, card) => { cards.push(JSON.stringify(card)); return 'message-1' },
-    replaceElementChecked: async (_card, _id, element) => { cards.push(JSON.stringify(element)); return true },
-  })
-  const started = await h.service.startRun(h.root, { identityIds: ['agent:claude-sub'], description: 'Inspect API', prompt: 'Inspect API implementation' })
-  const completed = await waitFor(h.service, h.root, started.runId, 'completed')
-  expect(completed.workers[0]!.output).toBe('Native result')
-  expect(JSON.stringify(completed)).not.toContain('display')
-  expect(completed.workers[0]!.translationEnabled).toBeUndefined()
-  expect(cards[0]).toContain('正在翻译任务说明')
-  expect(cards.every(card => !card.includes('Inspect API'))).toBe(true)
-  expect(cards.some(card => card.includes('检查接口实现') && card.includes('检查结果'))).toBe(true)
-  const durable = h.artifacts.at(-1) as AgentRunSnapshot
-  const worker = durable.workers[0]!
-  expect(worker.output).toBe('')
-  expect(JSON.stringify(h.artifacts)).not.toContain('display')
-  expect(worker.translationEnabled).toBeUndefined()
-  expect(h.textArtifacts.get(join(AGENT_RUNS_DIR, worker.outputArtifact!))).toBe('Native result')
-  expect(h.textArtifacts.size).toBe(2)
-  expect([...h.textArtifacts.keys()].some(path => path.includes('.display-'))).toBe(false)
+  const previousSafeMode = config.claude.safe_mode
+  config.claude.safe_mode = { 'claude-sub': ['*'] }
+  try {
+    const cards: string[] = []
+    const h = harness({
+      identities: [identity('claude-sub')],
+      startWorker: options => {
+        expect(options.callbacks?.onDisplayContext?.({ description: '检查接口', prompt: '检查接口实现' })).toBe(true)
+        return resolvedHandle({ ...result('native-sub', 'Native result'), displayOutput: '检查结果' })
+      },
+      sendCard: async (_chatId, card) => { cards.push(JSON.stringify(card)); return 'message-1' },
+      replaceElementChecked: async (_card, _id, element) => { cards.push(JSON.stringify(element)); return true },
+    })
+    const started = await h.service.startRun(h.root, { identityIds: ['agent:claude-sub'], description: 'Inspect API', prompt: 'Inspect API implementation' })
+    const completed = await waitFor(h.service, h.root, started.runId, 'completed')
+    expect(completed.workers[0]!.output).toBe('Native result')
+    expect(JSON.stringify(completed)).not.toContain('display')
+    expect(completed.workers[0]!.translationEnabled).toBeUndefined()
+    expect(cards[0]).toContain('正在翻译任务说明')
+    expect(cards.every(card => !card.includes('Inspect API'))).toBe(true)
+    expect(cards.some(card => card.includes('检查接口实现') && card.includes('检查结果'))).toBe(true)
+    const durable = h.artifacts.at(-1) as AgentRunSnapshot
+    const worker = durable.workers[0]!
+    expect(worker.output).toBe('')
+    expect(JSON.stringify(h.artifacts)).not.toContain('display')
+    expect(worker.translationEnabled).toBeUndefined()
+    expect(h.textArtifacts.get(join(AGENT_RUNS_DIR, worker.outputArtifact!))).toBe('Native result')
+    expect(h.textArtifacts.size).toBe(2)
+    expect([...h.textArtifacts.keys()].some(path => path.includes('.display-'))).toBe(false)
+  } finally {
+    config.claude.safe_mode = previousSafeMode
+  }
 })
 
-test('unconfigured GLM workers retain their native presentation', async () => {
+test.each(['glm', 'claude-sub'])('unconfigured %s workers retain their native presentation', async source => {
   const cards: string[] = []
-  const h = harness({ identities: [identity('glm')], startWorker: options => {
-    expect(options.identity.tokenSourceId).toBe('glm')
-    return resolvedHandle(result('glm-native', 'English result'))
-  }, sendCard: async (_chat, card) => { cards.push(JSON.stringify(card)); return 'glm-message' } })
-  const run = await h.service.startRun(h.root, { identityIds: ['agent:glm'], description: 'Inspect API', prompt: 'Check the explanation' })
+  const h = harness({ identities: [identity(source)], startWorker: options => {
+    expect(options.identity.tokenSourceId).toBe(source)
+    return resolvedHandle(result(`${source}-native`, 'English result'))
+  }, sendCard: async (_chat, card) => { cards.push(JSON.stringify(card)); return `${source}-message` } })
+  const run = await h.service.startRun(h.root, { identityIds: [`agent:${source}`], description: 'Inspect API', prompt: 'Check the explanation' })
   const completed = await waitFor(h.service, h.root, run.runId, 'completed')
-  expect(completed.workers[0]!.tokenSourceId).toBe('glm')
+  expect(completed.workers[0]!.tokenSourceId).toBe(source)
   expect(completed.workers[0]!.translationEnabled).toBeUndefined()
   expect(completed.workers[0]!.output).toBe('English result')
   expect(cards[0]).toContain('Inspect API')

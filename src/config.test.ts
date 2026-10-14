@@ -75,30 +75,30 @@ describe('Claude translation validation rules', () => {
 })
 
 describe('Claude safe mode selection', () => {
-  test('defaults to all Claude subscription models without enabling other sources', () => {
-    const result = loadFreshConfig()
+  test.each(['', '[claude.safe_mode]'])('defaults to no translated sources with omitted or empty rules: %s', rules => {
+    const result = loadFreshConfig(rules)
     expect(result.exitCode).toBe(0)
-    expect(JSON.parse(result.stdout).claude.safe_mode).toEqual({ 'claude-sub': ['*'] })
+    expect(JSON.parse(result.stdout).claude.safe_mode).toEqual({})
   })
 
-  test('adds selected catalog models and preserves the subscription default', () => {
+  test('enables only explicitly selected sources and catalog models', () => {
     const result = loadFreshConfig('[claude.safe_mode]\nglm = "GLM-5.3, GLM-5.3-Flash"\npacky = "*"')
     expect(result.exitCode).toBe(0)
     expect(JSON.parse(result.stdout).claude.safe_mode).toEqual({
-      'claude-sub': ['*'], glm: ['GLM-5.3', 'GLM-5.3-Flash'], packy: ['*'],
+      glm: ['GLM-5.3', 'GLM-5.3-Flash'], packy: ['*'],
     })
   })
 
-  test('an explicit empty source disables its default and does not affect other sources', () => {
+  test('an explicit empty source stays disabled without affecting other sources', () => {
     const result = loadFreshConfig('[claude.safe_mode]\nclaude-sub = ""\nglm = "GLM-5.3"')
     expect(result.exitCode).toBe(0)
     expect(JSON.parse(result.stdout).claude.safe_mode).toEqual({ 'claude-sub': [], glm: ['GLM-5.3'] })
   })
 
-  test('can replace all subscription models with one exact model', () => {
-    const result = loadFreshConfig('[claude.safe_mode]\nclaude-sub = "claude-opus-4-6"')
+  test.each(['*', 'claude-opus-4-6'])('can explicitly enable subscription models: %s', model => {
+    const result = loadFreshConfig(`[claude.safe_mode]\nclaude-sub = "${model}"`)
     expect(result.exitCode).toBe(0)
-    expect(JSON.parse(result.stdout).claude.safe_mode).toEqual({ 'claude-sub': ['claude-opus-4-6'] })
+    expect(JSON.parse(result.stdout).claude.safe_mode).toEqual({ 'claude-sub': [model] })
   })
 
   test.each([

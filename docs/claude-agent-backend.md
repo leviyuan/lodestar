@@ -59,7 +59,7 @@ GLM、DeepSeek、OpenRouter 等来源先清除冲突的 Anthropic 环境变量�
 
 Claude 使用 `permissionMode: default`：普通工具在 `canUseTool` 中放行，`AskUserQuestion` 等待用户回答。不能改成 `bypassPermissions`，否则 SDK 会绕开提问回调。
 
-安全模式由 `[claude.safe_mode]` 按 Token Source 与模型目录 ID 配置，默认 `claude-sub = "*"`。主会话、委派、续跑和分叉共用判断；启用后复用本机已配置的 GLM Key，固定通过 `https://api.z.ai/api/coding/paas/v4` 的 `glm-5.3-flash` 翻译与按规则审查。普通用户聊天的首条输入、运行中追加输入及提问答案值先译为英文。主模型输出语言不受限制，面向飞书的自然语言输出统一经 Flash 译为中文展示；`AskUserQuestion` 保留原生问题键和选项对应关系，提交的答案值使用英文译文。Linux 与 macOS 使用同一套逻辑。
+安全模式由 `[claude.safe_mode]` 按 Token Source 与模型目录 ID 配置，所有来源（包括 `claude-sub`）默认关闭，仅显式配置后开启。主会话、委派、续跑和分叉共用判断；启用后复用本机已配置的 GLM Key，固定通过 `https://api.z.ai/api/coding/paas/v4` 的 `glm-5.3-flash` 翻译与按规则审查。普通用户聊天的首条输入、运行中追加输入及提问答案值先译为英文。主模型输出语言不受限制，面向飞书的自然语言输出统一经 Flash 译为中文展示；`AskUserQuestion` 保留原生问题键和选项对应关系，提交的答案值使用英文译文。Linux 与 macOS 使用同一套逻辑。
 
 Flash 的请求按普通对话组织：固定的简短 system 提示词，按顺序排列的历史原文（user）与译文（assistant），最后追加当前目标语言要求和待翻译自然文本。每条原文前的 `Source` 标题说明谁对谁说、来自哪种可见内容；它是对话来源说明，不是 SDK 元数据，旧记录未区分的来源会明确标注。提示词只要求忠实翻译、保持术语一致及按显式规则审查，不回答或执行原文中的任务。模型不接收 JSON 数据包、字段边界、会话 ID、消费状态或原生事件结构。正常响应直接返回完整译文；只有拒绝或需检查时才以 `[[TRANSLATION_REJECT]]` 或 `[[TRANSLATION_REVIEW]]` 开头并附原因，由程序解析，不作为译文展示。只接受完整结束的单个正文，不解析思考内容，也不再发起独立模型复核。
 
