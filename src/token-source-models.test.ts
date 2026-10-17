@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 
-test('Codex model discovery retries transient requests on the same account and exposes final failures', () => {
+test('Codex model discovery reads every page, retries the same account and exposes invalid responses', () => {
   // Keep the fake control process and accelerated timers out of the shared test process.
   const script = `
     import { mock } from 'bun:test'
@@ -23,8 +23,10 @@ test('Codex model discovery retries transient requests on the same account and e
           return { account: scenario.signedOut ? null : { type: 'chatgpt' } }
         }
         assert.equal(method, 'model/list')
-        assert.deepEqual(params, {})
-        return scenario.response ?? { data: [model] }
+        assert.equal(params.limit, 100)
+        assert.equal(params.includeHidden, false)
+        assert.ok(params.cursor === null || typeof params.cursor === 'string')
+        return scenario.pages?.[params.cursor ?? 'first'] ?? scenario.response ?? { data: [model], nextCursor: null }
       }
       async close() { this.closed++ }
     }
@@ -54,6 +56,39 @@ test('Codex model discovery retries transient requests on the same account and e
       assert.equal(count('account/read'), 2); assert.equal(count('model/list'), 3)
       assert.deepEqual(delays, [1000, 1000, 4000]); assertClosed()
 
+      reset({ pages: {
+        first: { data: [{ ...model, hidden: true }], nextCursor: 'second' },
+        second: { data: [model], nextCursor: 'third' },
+        third: { data: [{ ...model, id: 'gpt-6-astra', displayName: 'GPT-6-Astra' }], nextCursor: null },
+      } })
+      assert.deepEqual((await fetchCodexModels('named-account')).map(row => row.model), ['catalog-model', 'gpt-6-astra'])
+      assert.deepEqual(calls.filter(call => call.method === 'model/list').map(call => call.params.cursor), [null, 'second', 'third'])
+      assert.equal(count('account/read'), 1); assertClosed()
+
+      for (const nextCursor of [undefined, 42, {}, []]) {
+        reset({ pages: {
+          first: { data: [model], nextCursor: 'second' },
+          second: { data: [model], nextCursor },
+        } })
+        await assert.rejects(fetchCodexModels('named-account'), /无效 nextCursor/)
+        assert.equal(count('model/list'), 2); assertClosed()
+      }
+
+      reset({ pages: {
+        first: { data: [model], nextCursor: 'second' },
+        second: { data: [model], nextCursor: 'third' },
+        third: { data: [model], nextCursor: 'second' },
+      } })
+      await assert.rejects(fetchCodexModels('named-account'), /重复 nextCursor/)
+      assert.equal(count('model/list'), 3); assertClosed()
+
+      reset({ pages: {
+        first: { data: [model], nextCursor: 'second' },
+        second: { nextCursor: null },
+      } })
+      await assert.rejects(fetchCodexModels('named-account'), /缺少 data 数组/)
+      assert.equal(count('model/list'), 2); assertClosed()
+
       reset({ modelFailures: Array.from({ length: 3 }, () => new Error('HTTP 503 model service unavailable')) })
       await assert.rejects(fetchCodexModels('named-account'), error => {
         assert.match(error.message, /模型查询失败（已尝试 3 次）.*HTTP 503 model service unavailable/)
@@ -73,8 +108,8 @@ test('Codex model discovery retries transient requests on the same account and e
       await assert.rejects(fetchCodexModels('named-account'), error => error.code === 'CODEX_AUTH_MISSING')
       assert.equal(count('model/list'), 0); assert.deepEqual(delays, []); assertClosed()
 
-      for (const response of [{}, { data: [] }, { data: [{ ...model, hidden: true }] },
-        { data: [{ ...model, supportedReasoningEfforts: [] }] }]) {
+      for (const response of [{}, { data: [], nextCursor: null }, { data: [{ ...model, hidden: true }], nextCursor: null },
+        { data: [{ ...model, supportedReasoningEfforts: [] }], nextCursor: null }]) {
         reset({ response })
         await assert.rejects(fetchCodexModels('named-account'), /缺少 data 数组|未返回可用模型/)
         assert.equal(count('model/list'), 1); assert.deepEqual(delays, []); assertClosed()

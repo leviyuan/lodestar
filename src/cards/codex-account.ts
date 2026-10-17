@@ -150,7 +150,7 @@ function accountRows(view: CodexAccountCardView): object[] {
     if (entry.duplicateOf) { row.push(muted(`与「${entry.duplicateOf}」同一账号，合计只计一次`)); continue }
     if (schedule && schedule.state !== 'ready') {
       row.push(muted(schedule.state === 'exhausted' ? '⏳ 暂不可用'
-          : schedule.state === 'excluded' ? 'Ultra 自动排除 Plus'
+          : schedule.state === 'excluded' ? 'Plus 无可用积分 · 不参与 Ultra'
           : schedule.state === 'waiting' ? `⏳ 周余量 ${schedule.remaining?.toPrecision(3)} 份 · 未达 0.5 份`
           : 'MISS · 无法排序'))
       if (schedule.reason && usage.state === 'ok') row.push({ tag: 'collapsible_panel', expanded: false,

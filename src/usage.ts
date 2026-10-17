@@ -442,13 +442,18 @@ export function snapshotFromReadResponse(limitsRes: any, planType?: string | nul
   const { buckets, defaultLimitId } = bucketsFromReadResponse(limitsRes)
   const def = buckets.find(b => b.limitId === defaultLimitId) ?? buckets[0]
   if (!def) return { state: 'network', reason: 'empty rate limit response' }
-  const subscriptionType = planType ?? limitsRes?.rateLimits?.planType ?? undefined
+  const quotaPlanType = limitsRes?.rateLimits?.planType
+  const subscriptionType = quotaPlanType ?? planType ?? undefined
+  const accountFingerprint = typeof limitsRes?.accountId === 'string' && limitsRes.accountId
+    ? createHash('sha256').update(limitsRes.accountId).digest('hex') : undefined
+  if (quotaPlanType != null && planType != null && quotaPlanType !== planType) {
+    log(`usage: codex plan mismatch account=${accountFingerprint ?? 'MISS'} account/read=${JSON.stringify(planType)} account/rateLimits/read=${JSON.stringify(quotaPlanType)}; using quota plan`)
+  }
   def.fiveHour = plusFiveHourWindow(subscriptionType, def.fiveHour)
   return {
     state: 'ok',
     subscriptionType,
-    ...(typeof limitsRes?.accountId === 'string' && limitsRes.accountId
-      ? { accountFingerprint: createHash('sha256').update(limitsRes.accountId).digest('hex') } : {}),
+    ...(accountFingerprint ? { accountFingerprint } : {}),
     ...(typeof limitsRes?.ordinaryUsageAllowed === 'boolean' ? { ordinaryUsageAllowed: limitsRes.ordinaryUsageAllowed } : {}),
     rateLimitReachedType: def.rateLimitReachedType,
     spendControlReached: def.spendControlReached,

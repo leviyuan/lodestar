@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events'
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { resetFeishuMock, sentCards, sentRawTexts, sentTexts } from './feishu-test-mock'
+import { clearedResumes, resetFeishuMock, resumeRefs, sentCards, sentRawTexts, sentTexts, turnAnchorsBySession } from './feishu-test-mock'
 import { Session } from './session'
 import { bindProcessCodexAccount, codexAccounts, CodexAccounts, reserveCodexLogin } from './codex-accounts'
 import { codexLogins } from './codex-login'
@@ -158,7 +158,7 @@ describe('bare Codex account commands', () => {
   test.each([
     'Codex 账号检查失败，无法自动选账号（MISS）；默认：额度查询失败：HTTP 503',
     '没有配置 Codex 账号',
-    '没有符合条件的 Codex 账号；默认：Ultra 自动选择不使用 Plus',
+    '没有符合条件的 Codex 账号；默认：Ultra 自动选择 Plus 需要可用积分',
   ])('blocking account selection failures remain visible: %s', async failure => {
     const s = session()
     Object.defineProperty(s, 'workDir', { value: root })
@@ -292,6 +292,153 @@ describe('bare Codex account commands', () => {
     await runAndSettle(s, 'hi next', 'owner')
     expect(cardViews.at(-1)?.message).toContain('native auth failed')
     expect(store.preferred(s.sessionName)).toBeNull(); expect(s.codexStartAccountOverride).toBeUndefined()
+  })
+  test('hi named resumes the stopped conversation without clearing its history or turn anchors', async () => {
+    const account = store.ensure('next')
+    const s = session()
+    const old = new Proc(); procs.push(old); bindProcessCodexAccount(old, 'default'); s.proc = old; s.wireProc(old)
+    const ref = { provider: 'codex' as const, sessionId: old.sessionId, cwd: s.workDir }
+    const anchor = { checkpoint: { provider: 'codex' as const, kind: 'turn' as const, id: 'completed-turn', source: ref },
+      preview: 'completed work', ts: 1, writes: [] }
+    turnAnchorsBySession.set(s.sessionName, [anchor])
+    await s.stop('已取消额度恢复', { announce: false })
+    expect(s.proc).toBeNull()
+    let resumed: unknown
+    s.spawnAgent = (source: unknown) => {
+      resumed = source
+      const proc = new Proc(); procs.push(proc); bindProcessCodexAccount(proc, s.codexStartAccountOverride)
+      proc.sendInitialize = () => { proc.emit('init', { session_id: proc.sessionId }) }
+      return proc
+    }
+    spies.push(spyOn(s, 'showConsole').mockResolvedValue(undefined))
+    await runAndSettle(s, 'hi next', 'owner')
+    expect(resumed).toEqual(ref)
+    expect(s.lastSessionRef).toEqual(ref)
+    expect(resumeRefs.get(`${s.sessionName}:codex`)).toEqual(ref)
+    expect(turnAnchorsBySession.get(s.sessionName)).toEqual([anchor])
+    expect(clearedResumes).toEqual([])
+    expect(s.codexAccountId()).toBe(account.id)
+  })
+  test.each([
+    ['resume', false], ['resume', true], ['fork', false], ['fork', true],
+  ] as const)('hi named retains a %s launch waiting for its first account (stopped: %s)', async (kind, stopped) => {
+    const account = store.ensure('next')
+    const s = session()
+    const prior = { provider: 'codex' as const, sessionId: 'prior-thread', cwd: s.workDir }
+    s.lastSessionRef = prior; s.lastSessionId = prior.sessionId
+    resumeRefs.set(`${s.sessionName}:codex`, prior)
+    const launch = { kind, source: { provider: 'codex' as const, sessionId: 'selected-history', cwd: s.workDir } }
+    const waiting = new Proc() as any; procs.push(waiting)
+    waiting.sessionId = null; waiting.launchKind = kind
+    waiting.isConversationResumable = () => false
+    waiting.quotaWaitPromise = () => Promise.resolve()
+    waiting.initializationPromise = () => new Promise(() => {})
+    waiting.turnRetry = { reason: 'quota', phase: 'waiting', message: '等待额度恢复', attempt: 0, delayMs: 60_000 }
+    s.spawnAgent = () => waiting
+    expect(await s.rollbackTo(launch, undefined, { announce: false })).toBe(true)
+    expect(s.status).toBe('starting')
+    if (stopped) await s.stop('已取消额度恢复', { announce: false })
+    let restarted: unknown
+    s.spawnAgent = () => {
+      restarted = s.pendingConversationLaunch
+      const proc = new Proc(); procs.push(proc); bindProcessCodexAccount(proc, s.codexStartAccountOverride)
+      proc.launchKind = kind; proc.sessionId = kind === 'fork' ? 'forked-history' : launch.source.sessionId
+      proc.sendInitialize = () => { proc.emit('init', { session_id: proc.sessionId }) }
+      return proc
+    }
+    spies.push(spyOn(s, 'showConsole').mockResolvedValue(undefined))
+    await runAndSettle(s, 'hi next', 'owner')
+    expect(restarted).toEqual(launch)
+    expect(s.lastSessionId).toBe(kind === 'fork' ? 'forked-history' : launch.source.sessionId)
+    expect(clearedResumes).toEqual([])
+    expect(waiting.killCalls).toBe(1)
+    expect(s.codexAccountId()).toBe(account.id)
+    const materializedId = s.lastSessionId
+    await s.stop('再次换号', { announce: false })
+    let resumed: any
+    s.spawnAgent = (ref: unknown) => {
+      resumed = ref
+      expect(s.pendingConversationLaunch).toBeNull()
+      const proc = new Proc(); procs.push(proc); bindProcessCodexAccount(proc, s.codexStartAccountOverride)
+      proc.sessionId = materializedId
+      proc.sendInitialize = () => { proc.emit('init', { session_id: proc.sessionId }) }
+      return proc
+    }
+    await runAndSettle(s, 'hi default', 'owner')
+    expect(resumed).toEqual({ provider: 'codex', sessionId: materializedId, cwd: s.workDir })
+    expect(clearedResumes).toEqual([])
+  })
+  test('an explicit fresh start after cancelling a quota wait still clears the old conversation', async () => {
+    const s = session()
+    const prior = { provider: 'codex' as const, sessionId: 'prior-thread', cwd: s.workDir }
+    s.lastSessionRef = prior; s.lastSessionId = prior.sessionId
+    resumeRefs.set(`${s.sessionName}:codex`, prior)
+    const waiting = new Proc() as any; procs.push(waiting)
+    waiting.sessionId = null; waiting.isConversationResumable = () => false
+    waiting.quotaWaitPromise = () => Promise.resolve()
+    waiting.initializationPromise = () => new Promise(() => {})
+    waiting.turnRetry = { reason: 'quota', phase: 'waiting', message: '等待额度恢复', attempt: 0, delayMs: 60_000 }
+    s.spawnAgent = () => waiting
+    await s.rollbackTo({ kind: 'fork', source: prior }, undefined, { announce: false })
+    await s.stop('已取消额度恢复', { announce: false })
+    const fresh = new Proc(); procs.push(fresh)
+    fresh.launchKind = 'fresh'; fresh.sessionId = 'fresh-thread'; fresh.isConversationResumable = () => false
+    fresh.sendInitialize = () => { fresh.emit('init', { session_id: fresh.sessionId }) }
+    s.spawnAgent = (ref: unknown) => { expect(ref).toBeUndefined(); expect(s.pendingConversationLaunch).toBeNull(); return fresh }
+    expect(await s.start({ announce: false })).toBe(true)
+    expect(s.lastSessionRef).toBeNull()
+    expect(resumeRefs.has(`${s.sessionName}:codex`)).toBe(false)
+    expect(s.codexQuotaWaitLaunch).toBeNull()
+  })
+  test.each(['resume', 'fork'] as const)('restart retains a pending %s launch after the quota wait is stopped', async kind => {
+    const s = session()
+    const launch = { kind, source: { provider: 'codex' as const, sessionId: 'selected-history', cwd: s.workDir } }
+    const waiting = new Proc() as any; procs.push(waiting)
+    waiting.sessionId = null; waiting.isConversationResumable = () => false
+    waiting.quotaWaitPromise = () => Promise.resolve()
+    waiting.initializationPromise = () => new Promise(() => {})
+    waiting.turnRetry = { reason: 'quota', phase: 'waiting', message: '等待额度恢复', attempt: 0, delayMs: 60_000 }
+    s.spawnAgent = () => waiting
+    await s.rollbackTo(launch, undefined, { announce: false })
+    await s.stop('已取消额度恢复', { announce: false })
+    let restarted: unknown
+    s.spawnAgent = (_ref: unknown, explicitLaunch: unknown) => {
+      restarted = explicitLaunch
+      const proc = new Proc(); procs.push(proc)
+      proc.launchKind = kind; proc.sessionId = kind === 'fork' ? 'forked-history' : launch.source.sessionId
+      proc.sendInitialize = () => { proc.emit('init', { session_id: proc.sessionId }) }
+      return proc
+    }
+    expect(await s.restart(true, { announce: false })).toBe(true)
+    expect(restarted).toEqual(launch)
+    expect(s.lastSessionId).toBe(kind === 'fork' ? 'forked-history' : launch.source.sessionId)
+    expect(clearedResumes).toEqual([])
+  })
+  test.each(['claude', 'codex'] as const)('leaving the subscription for %s discards its unmaterialized fork intent', async provider => {
+    const s = session()
+    const prior = { provider: 'codex' as const, sessionId: 'prior-thread', cwd: s.workDir }
+    s.lastSessionRef = prior; s.lastSessionId = prior.sessionId
+    resumeRefs.set(`${s.sessionName}:codex`, prior)
+    const waiting = new Proc() as any; procs.push(waiting)
+    waiting.sessionId = null; waiting.isConversationResumable = () => false
+    waiting.quotaWaitPromise = () => Promise.resolve()
+    waiting.initializationPromise = () => new Promise(() => {})
+    waiting.turnRetry = { reason: 'quota', phase: 'waiting', message: '等待额度恢复', attempt: 0, delayMs: 60_000 }
+    s.spawnAgent = () => waiting
+    await s.rollbackTo({ kind: 'fork', source: { ...prior, sessionId: 'discarded-fork-source' } }, undefined, { announce: false })
+    await s.stop('切换来源', { announce: false })
+    const alternate = { ...source(), id: 'alternate', agent: provider }
+    registerTokenSource(alternate)
+    await s.applyModelSelection(provider, 'shared-model', 'high', alternate.id)
+    let resumed: unknown
+    s.spawnAgent = (ref: unknown, explicitLaunch: unknown) => {
+      resumed = ref; expect(explicitLaunch).toBeUndefined()
+      const proc = new Proc(); procs.push(proc); bindProcessCodexAccount(proc, s.codexStartAccountOverride)
+      return proc
+    }
+    spies.push(spyOn(s, 'showConsole').mockResolvedValue(undefined))
+    await runAndSettle(s, 'hi default', 'owner')
+    expect(resumed).toEqual(prior)
   })
   test('named hi with embedded newlines is not consumed as an account command', async () => {
     const s = session()

@@ -69,7 +69,7 @@ describe('weekly quota scheduling', () => {
     h.input.subscription = quota('plus', 100)
     expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('unlimited')
   })
-  test('credits lift the Pro Ultra reserve gate but preserve plan, model and spending restrictions', async () => {
+  test('credits lift Ultra plan and reserve gates but preserve model and spending restrictions', async () => {
     const credits = { hasCredits: true, unlimited: false, balance: 100 }
     for (const plan of ['prolite', 'pro']) {
       expect(rankCodexQuota({ ...quota(plan, 99.9), credits }, 'model', NOW, 'ultra').state).toBe('ready')
@@ -77,16 +77,73 @@ describe('weekly quota scheduling', () => {
       expect(rankCodexQuota(quota(plan, 99.9), 'model', NOW, 'ultra').state).toBe('waiting')
       expect(rankCodexQuota({ ...quota(plan, 99.9), credits: null }, 'model', NOW, 'ultra').state).toBe('miss')
     }
-    expect(rankCodexQuota({ ...quota('plus'), credits }, 'model', NOW, 'ultra').state).toBe('excluded')
+    expect(rankCodexQuota({ ...quota('plus'), credits }, 'model', NOW, 'ultra').state).toBe('ready')
     for (const restriction of [{ spendControlReached: true }, ...[
       'workspace_owner_credits_depleted', 'workspace_member_credits_depleted',
       'workspace_owner_usage_limit_reached', 'workspace_member_usage_limit_reached', 'unknown_limit',
     ].map(rateLimitReachedType => ({ rateLimitReachedType }))]) {
-      expect(rankCodexQuota({ ...quota('pro', 100), credits, ...restriction }, 'model', NOW).state).toBe('exhausted')
+      for (const plan of ['pro', 'plus']) {
+        expect(rankCodexQuota({ ...quota(plan, 100), credits, ...restriction }, 'model', NOW, 'ultra').state).toBe('exhausted')
+      }
     }
-    const h = harness({ pro: { ...quota('pro', 100), credits } })
+    const h = harness({ pro: { ...quota('pro', 100), credits }, plus: { ...quota('plus', 100), credits } })
     h.unavailable.set('pro', 'model unavailable')
-    expect((await h.scheduler.choose({ model: 'model' })).selected).toBeNull()
+    h.unavailable.set('plus', 'effort unavailable')
+    expect((await h.scheduler.choose({ model: 'model', effort: 'ultra' })).selected).toBeNull()
+  })
+  test('Plus Ultra requires known available credits and preserves the actual subscription or credit ranking', async () => {
+    const credits = { hasCredits: true, unlimited: false, balance: 100 }
+    expect(rankCodexQuota(quota('plus'), 'model', NOW, 'ultra')).toMatchObject({
+      state: 'excluded', reason: 'Ultra 自动选择 Plus 需要可用积分',
+    })
+    expect(rankCodexQuota({ ...quota('plus'), credits: null }, 'model', NOW, 'ultra')).toMatchObject({
+      state: 'miss', reason: 'Ultra 自动选择 Plus 的积分 MISS',
+    })
+    const subscription = { ...quota('plus', 27), credits }
+    expect(rankCodexQuota(subscription, 'model', NOW, 'ultra')).toEqual(rankCodexQuota(subscription, 'model', NOW, 'max'))
+    const h = harness({ subscription, plusCredit: { ...quota('plus', 100), credits: { ...credits, balance: 300 } },
+      proCredit: { ...quota('pro', 100), credits: { ...credits, balance: 200 } } })
+    const choice = await h.scheduler.choose({ model: 'model', effort: 'ultra' })
+    expect(choice.selected?.account.id).toBe('subscription')
+    expect(choice.selected?.funding).toBeUndefined()
+    expect(choice.candidates.find(c => c.account.id === 'plusCredit')).toMatchObject({
+      state: 'ready', funding: 'credits', score: null, credits: { balance: 300 },
+    })
+    h.input.subscription = { ...subscription, weekly: quota('plus', 100).weekly }
+    expect((await h.scheduler.choose({ model: 'model', effort: 'ultra' })).selected?.account.id).toBe('plusCredit')
+  })
+  test('Plus Ultra cannot borrow main or other model credits to pass its own meter gate', () => {
+    const empty = { hasCredits: false, unlimited: false, balance: 0 }
+    const funded = { hasCredits: true, unlimited: false, balance: 100 }
+    const usage = { ...quota('plus', 27), defaultLimitId: 'codex', credits: funded,
+      buckets: [{ limitId: 'separate', limitName: 'separate', fiveHour: null, weekly: quota('plus', 27).weekly,
+        credits: empty as typeof empty | null }] }
+    expect(rankCodexQuota(usage, 'model', NOW, 'ultra').state).toBe('ready')
+    expect(rankCodexQuota(usage, 'separate', NOW, 'ultra').state).toBe('excluded')
+    usage.buckets[0].credits = null
+    expect(rankCodexQuota(usage, 'separate', NOW, 'ultra')).toMatchObject({ state: 'miss', reason: 'Ultra 自动选择 Plus 的积分 MISS' })
+    usage.credits = empty
+    usage.buckets[0].credits = funded
+    expect(rankCodexQuota(usage, 'model', NOW, 'ultra').state).toBe('excluded')
+    expect(rankCodexQuota(usage, 'separate', NOW, 'ultra').state).toBe('ready')
+  })
+  test('Pro-to-Plus renewal retains credits without bypassing confirmed exhaustion recovery', async () => {
+    const usage = { ...quota('pro', 100), credits: { hasCredits: true, unlimited: false, balance: 100 } }
+    const h = harness({ renewed: usage })
+    const first = await h.scheduler.choose({ model: 'model', effort: 'ultra' })
+    expect(first.selected?.account.id).toBe('renewed')
+    const renewed = { ...usage, subscriptionType: 'plus', readStartedAt: NOW + 1 }
+    h.input.renewed = renewed
+    const afterRenewal = await h.scheduler.choose({ model: 'model', effort: 'ultra' })
+    expect(afterRenewal.selected).toMatchObject({ identity: first.selected!.identity,
+      state: 'ready', funding: 'credits', credits: usage.credits, account: { id: 'renewed' } })
+    h.scheduler.block(afterRenewal.selected!, 'model')
+    h.input.renewed = { ...renewed, readStartedAt: NOW + 2 }
+    const unchanged = await h.scheduler.choose({ model: 'model', effort: 'ultra' })
+    expect(unchanged.selected).toBeNull()
+    expect(unchanged.candidates[0]).toMatchObject({ state: 'exhausted', reason: '上次请求已确认额度耗尽，等待接口确认恢复' })
+    h.input.renewed = { ...renewed, credits: { ...usage.credits, balance: 101 }, readStartedAt: NOW + 3 }
+    expect((await h.scheduler.choose({ model: 'model', effort: 'ultra' })).selected?.account.id).toBe('renewed')
   })
   test('consumable credits stay on their native meter and cannot unblock a separate model quota', () => {
     const usage = { ...quota('pro', 100), credits: { hasCredits: true, unlimited: false, balance: 100 },
@@ -327,6 +384,22 @@ describe('weekly quota scheduling', () => {
     expect(choice.retryAt).toBeUndefined()
     expect(choice.candidates.every(c => c.state === 'miss' && c.score === null)).toBe(true)
   })
+  test('a known Pro plan with a monthly window cannot be scored as twenty weekly shares', async () => {
+    const usage = { ...quota('pro', 0, 720),
+      weekly: { ...quota('pro', 0, 720).weekly!, durationMins: 43200 },
+      credits: { hasCredits: true, unlimited: false, balance: 12345.67 } }
+    const h = harness({ monthly: usage })
+    const choice = await h.scheduler.choose({ model: 'model', effort: 'ultra' })
+    expect(choice.selected).toBeNull()
+    expect(choice.candidates[0]).toMatchObject({ state: 'miss', score: null, remaining: null,
+      reason: '周额度窗口时长不匹配：43200 分钟（需要 10080 分钟）',
+      usage: { weekly: { percent: 0, durationMins: 43200 }, credits: { balance: 12345.67 } } })
+    // Credit-only ranking does not apply the weekly-share formula.
+    usage.weekly.percent = 100
+    expect(rankCodexQuota(usage, 'model', NOW, 'ultra')).toMatchObject({
+      state: 'ready', funding: 'credits', score: null, remaining: null, credits: usage.credits,
+    })
+  })
   test('all exhausted windows must reset; choose the first account that can recover', async () => {
     const plus = quota('plus', 100, 20)
     plus.fiveHour = { percent: 100, resetsAt: new Date(NOW + 3600_000), durationMins: 300 }
@@ -432,7 +505,7 @@ describe('weekly quota scheduling', () => {
     plus.fiveHour = { percent: 50, resetsAt: null }
     expect(rankCodexQuota(plus, 'model', NOW).state).toBe('miss')
   })
-  test('Ultra excludes Plus, accepts exactly 0.5 weekly shares, and waits below that threshold', async () => {
+  test('Ultra excludes Plus without credits, accepts exactly 0.5 Pro weekly shares, and waits below that threshold', async () => {
     const h = harness({ plus: quota('plus'), five: quota('prolite', 90), twenty: quota('pro', 97.5) })
     const choice = await h.scheduler.choose({ model: 'model', effort: 'ultra' })
     expect(choice.candidates[0].state).toBe('excluded')

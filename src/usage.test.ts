@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
 import { snapshotFromReadResponse, observeRateLimitsNotification, refreshUsageFromConnection, readUsage, readUsageForDisplay, peekUsage, peekSuccessfulUsage, captureCodexUsageCache, invalidateCodexUsage, requestCodexControlWithRetry } from './usage'
 import { rankCodexQuota, unusedCodexWeek } from './codex-quota'
+import * as logModule from './log'
 
 let quotaNow: number
 let quotaClock: ReturnType<typeof spyOn>
@@ -42,8 +43,8 @@ describe('quota account isolation', () => {
     if (snapshot.state !== 'ok') throw new Error('expected successful snapshot')
     expect(snapshot.fiveHour).toEqual({ percent: 0, resetsAt: null, durationMins: 300, unreportedFull: true })
     expect(snapshot.buckets?.[0].fiveHour).toEqual(snapshot.fiveHour)
-    const pro = snapshotFromReadResponse(input, 'pro')
-    expect(pro.state === 'ok' && pro.fiveHour).toBeNull()
+    const staleProIdentity = snapshotFromReadResponse(input, 'pro')
+    expect(staleProIdentity).toMatchObject({ subscriptionType: 'plus', fiveHour: snapshot.fiveHour })
     expect(snapshotFromReadResponse({}, 'plus').state).toBe('network')
   })
   test('separate accounts never share in-flight requests or cached snapshots', async () => {
@@ -204,6 +205,37 @@ describe('quota transient failures', () => {
 })
 
 describe('usage read snapshot semantics', () => {
+  test('quota plan overrides a conflicting account identity consistently for standalone and live reads', async () => {
+    const account = 'quota-plan-conflict'
+    const raw = { accountId: 'quota-plan-conflict-native', ordinaryUsageAllowed: true, rateLimits: {
+      limitId: 'codex', planType: 'free',
+      primary: { usedPercent: 0, windowDurationMins: 43200, resetsAt: (quotaNow + 30 * 86400_000) / 1000 },
+      secondary: null, credits: { hasCredits: true, unlimited: false, balance: '12345.67' },
+    } }
+    const logged = spyOn(logModule, 'log').mockImplementation(() => {})
+    try {
+      const standalone = snapshotFromReadResponse(raw, 'pro', quotaNow)
+      const live = await refreshUsageFromConnection(async () => raw, account)
+      expect(live).toEqual(standalone)
+      expect(standalone).toMatchObject({ state: 'ok', subscriptionType: 'free',
+        weekly: { percent: 0, durationMins: 43200 },
+        credits: { hasCredits: true, unlimited: false, balance: 12345.67 } })
+      expect(rankCodexQuota(standalone, 'model', quotaNow)).toMatchObject({ state: 'miss',
+        score: null, shares: null, reason: '未知周额度套餐：free' })
+      if (standalone.state !== 'ok') throw new Error('expected quota snapshot')
+      expect(logged.mock.calls.some(([line]) => line.includes(`account=${standalone.accountFingerprint}`)
+        && line.includes('account/read="pro"') && line.includes('account/rateLimits/read="free"'))).toBe(true)
+    } finally { logged.mockRestore(); invalidateCodexUsage(account) }
+  })
+  test('a missing quota plan retains the explicitly read identity without inventing a plan', () => {
+    const raw = { rateLimits: { limitId: 'codex', primary: {
+      usedPercent: 0, windowDurationMins: 10080, resetsAt: (quotaNow + 7 * 86400_000) / 1000,
+    } } }
+    expect(snapshotFromReadResponse(raw, 'pro')).toMatchObject({ subscriptionType: 'pro' })
+    expect(snapshotFromReadResponse({ rateLimits: { ...raw.rateLimits, planType: null } }, 'plus'))
+      .toMatchObject({ subscriptionType: 'plus' })
+    expect(snapshotFromReadResponse(raw)).toMatchObject({ subscriptionType: undefined })
+  })
   test('reads consumable credits per native meter, separate from reset credits', () => {
     const main = { limitId: 'codex', primary: { usedPercent: 100, windowDurationMins: 10080 },
       credits: { hasCredits: true, unlimited: false, balance: '62500.25' } }

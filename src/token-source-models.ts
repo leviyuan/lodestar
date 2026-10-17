@@ -59,24 +59,36 @@ export async function fetchCodexModels(accountId = 'default'): Promise<TokenSour
     const account = await requestCodexControlWithRetry(() => app.request('account/read', { refreshToken: false }), '账号查询')
     observeCodexAccountEmail(accountId, account?.account, revision)
     if (account?.account?.type !== 'chatgpt') throw Object.assign(new Error('Codex 订阅未登录；发送 codex-login 或 codex-login 备注完成授权'), { code: 'CODEX_AUTH_MISSING' })
-    const res = await requestCodexControlWithRetry(() => app.request('model/list', {}), '模型查询')
-    if (!Array.isArray(res?.data)) throw new Error('Codex model/list 缺少 data 数组')
-    const data: any[] = res.data
     const out: TokenSourceModel[] = []
-    for (const m of data) {
-      if (!m || m.hidden || !m.id) continue
-      const efforts = (Array.isArray(m.supportedReasoningEfforts) ? m.supportedReasoningEfforts : [])
-        .map((e: any) => codexEffort(e?.reasoningEffort))
-        .filter((e: AgentReasoningEffort | null): e is AgentReasoningEffort => e !== null)
-      if (!efforts.length) continue
-      const defaultEffort = codexEffort(m.defaultReasoningEffort) ?? efforts[0]
-      out.push({
-        model: String(m.id),
-        display: typeof m.displayName === 'string' && m.displayName ? String(m.displayName) : String(m.id),
-        efforts,
-        defaultEffort,
-      })
-    }
+    const seenCursors = new Set<string>()
+    let cursor: string | null = null
+    do {
+      const res = await requestCodexControlWithRetry(() => app.request('model/list', {
+        cursor, limit: 100, includeHidden: false,
+      }), '模型查询')
+      if (!Array.isArray(res?.data)) throw new Error('Codex model/list 缺少 data 数组')
+      for (const m of res.data) {
+        if (!m || m.hidden || !m.id) continue
+        const efforts = (Array.isArray(m.supportedReasoningEfforts) ? m.supportedReasoningEfforts : [])
+          .map((e: any) => codexEffort(e?.reasoningEffort))
+          .filter((e: AgentReasoningEffort | null): e is AgentReasoningEffort => e !== null)
+        if (!efforts.length) continue
+        const defaultEffort = codexEffort(m.defaultReasoningEffort) ?? efforts[0]
+        out.push({
+          model: String(m.id),
+          display: typeof m.displayName === 'string' && m.displayName ? String(m.displayName) : String(m.id),
+          efforts,
+          defaultEffort,
+        })
+      }
+      const nextCursor = res.nextCursor
+      if (nextCursor !== null && typeof nextCursor !== 'string') throw new Error('Codex model/list 返回无效 nextCursor')
+      cursor = nextCursor || null
+      if (cursor) {
+        if (seenCursors.has(cursor)) throw new Error('Codex model/list 返回重复 nextCursor')
+        seenCursors.add(cursor)
+      }
+    } while (cursor)
     if (!out.length) throw new Error('Codex model/list 未返回可用模型')
     return out
   } finally {

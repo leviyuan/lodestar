@@ -909,6 +909,8 @@ export class Session {
 
   /** Explicit one-shot launch intent owned by startForked/rollbackTo. */
   private pendingConversationLaunch: ConversationLaunch | null = null
+  /** A historical launch waiting for its first Codex process must survive stop + hi <account>. */
+  private codexQuotaWaitLaunch: Exclude<ConversationLaunch, { kind: 'fresh' }> | null = null
   /** Durable Claude fork intent until first SDK init returns a new session id. */
   private pendingConversationMaterialization: PendingConversationLaunch | null = null
   /** 最近一个 turn 的用户输入预览(首条文本,recordTurnAnchor 用;openTurnCard 时设)。 */
@@ -941,7 +943,7 @@ export class Session {
     throw new Error('pending Claude fork has no safe launch target')
   }
 
-  private spawnAgent(resumeRef?: ConversationRef): AgentProcess {
+  private spawnAgent(resumeRef?: ConversationRef, explicitLaunch?: ConversationLaunch): AgentProcess {
     this.agentCapability = randomBytes(32).toString('base64url')
     const hostEnv = {
       LODESTAR_AGENT_URL: agentApiUrl(config.notify.bind, config.notify.port),
@@ -949,7 +951,7 @@ export class Session {
       LODESTAR_AGENT_SESSION: this.sessionName,
       LODESTAR_AGENT_ROLE: 'main',
     }
-    const launch: ConversationLaunch = this.pendingConversationLaunch
+    const launch: ConversationLaunch = explicitLaunch ?? this.pendingConversationLaunch
       ?? this.pendingMaterializationLaunch()
       ?? (resumeRef
         ? { kind: 'resume', source: resumeRef }
@@ -1034,6 +1036,7 @@ export class Session {
       throw error
     }
     if (previousConversation) this.pendingConversationMaterialization = null
+    if (provider !== 'codex' || nextSourceId !== 'codex-sub') this.codexQuotaWaitLaunch = null
     this.selectedProvider = provider
     this.selectedTokenSourceId = nextSourceId
     this.selectedModel = nextModel
@@ -1471,6 +1474,7 @@ export class Session {
   // ── Lifecycle ──────────────────────────────────────────────────────
   private resetFreshConversationState(): void {
     this.daemonRestoreRequired = false
+    this.codexQuotaWaitLaunch = null
     this.turnCounter = 0
     this.pendingConversationMaterialization = null
     feishu.replaceTurnAnchors(this.sessionName, [], { kind: 'fresh' }, null)
@@ -1510,14 +1514,21 @@ export class Session {
         this.selectedTokenSourceId = 'codex-sub'
       }
       this.codexStartAccountOverride = accountId
+      const previousLaunch = this.pendingConversationLaunch
+      this.pendingConversationLaunch ??= this.codexQuotaWaitLaunch
       try {
         if (this.proc?.isAlive() && this.proc.provider === 'codex' && processCodexAccount(this.proc) === accountId
           && this.proc.turnRetry?.reason !== 'quota') {
           opts.onStatus?.(`✅ 正在使用「${codexAccounts.get(accountId).name}」`)
           return true
         }
-        return this.proc?.isAlive() ? await this.restartUnlocked(true, opts) : await this.startUnlocked(opts)
-      } finally { this.codexStartAccountOverride = undefined }
+        const resume = this.pendingConversationLaunch?.kind !== 'fresh'
+          && !!(this.proc?.isAlive() || this.lastSessionRef || this.pendingConversationLaunch)
+        return resume ? await this.restartUnlocked(true, opts) : await this.startUnlocked(opts)
+      } finally {
+        this.pendingConversationLaunch = previousLaunch
+        this.codexStartAccountOverride = undefined
+      }
     })
   }
 
@@ -1671,6 +1682,9 @@ export class Session {
     }
 
     if (init.state === 'waiting_quota') {
+      if (this.pendingConversationLaunch && this.pendingConversationLaunch.kind !== 'fresh') {
+        this.codexQuotaWaitLaunch = this.pendingConversationLaunch
+      }
       this.status = 'starting'
       this.startedAt = Date.now()
       this.opts.onLifecycleChange?.()
@@ -1983,7 +1997,9 @@ export class Session {
       feishu.setPendingConversationLaunchChecked(this.sessionName, null)
       this.pendingConversationMaterialization = null
     }
-    const explicitLaunch = this.pendingConversationLaunch ?? this.pendingMaterializationLaunch()
+    const explicitLaunch = this.pendingConversationLaunch
+      ?? (resume ? this.codexQuotaWaitLaunch : null)
+      ?? this.pendingMaterializationLaunch()
     let prevSessionRef = this.lastSessionRef
     if (resume && !explicitLaunch && prevSessionRef?.cwd === null) {
       try {
@@ -2173,7 +2189,7 @@ export class Session {
       report?.(this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}`))
       let proc: AgentProcess
       try {
-        proc = this.spawnAgent(prevSessionRef ?? undefined)
+        proc = this.spawnAgent(prevSessionRef ?? undefined, explicitLaunch ?? undefined)
       } catch (e) {
         const finalStatus = `❌ ${this.backendLabel()} 恢复失败: ${messageOf(e)}`
         log(`session "${this.sessionName}": ${this.selectedProvider} resume failed before spawn: ${messageOf(e)}`)
@@ -2251,6 +2267,10 @@ export class Session {
           ? `✅ 已准备恢复上一会话 thread=${prevThreadLabel}`
           : `✅ 已恢复上一会话 thread=${prevThreadLabel}`,
       ))
+      if (init.state === 'waiting_quota') {
+        const launch = explicitLaunch ?? (prevSessionRef ? { kind: 'resume' as const, source: prevSessionRef } : null)
+        if (launch && launch.kind !== 'fresh') this.codexQuotaWaitLaunch = launch
+      }
       report?.(msg)
       if (announceText) await feishu.sendText(this.chatId, msg)
       this.status = init.state === 'waiting_quota' ? 'starting' : 'idle'
@@ -2351,6 +2371,7 @@ export class Session {
       const previousBranchBase: ConversationBranchBase = feishu.getSessionBranchBase(this.sessionName)
       const previousPendingLaunch = feishu.getPendingConversationLaunch(this.sessionName)
       const previousState = {
+        codexQuotaWaitLaunch: this.codexQuotaWaitLaunch,
         turnCounter: this.turnCounter,
         currentGoal: this.currentGoal,
         cumStats: { ...this.cumStats },
@@ -2379,6 +2400,7 @@ export class Session {
           previousPendingLaunch,
         )
         this.pendingConversationMaterialization = previousPendingLaunch
+        this.codexQuotaWaitLaunch = previousState.codexQuotaWaitLaunch
         this.turnCounter = previousState.turnCounter
         this.currentGoal = previousState.currentGoal
         this.cumStats = previousState.cumStats
@@ -3312,6 +3334,9 @@ export class Session {
       if (fatal) throw error
       return error.message
     }
+    // A replacement may have materialized the pending fork under a new
+    // account. Its confirmed id supersedes the original waiting owner's intent.
+    if (proc.provider === 'codex') this.codexQuotaWaitLaunch = null
     const ref: ConversationRef = { provider: proc.provider, sessionId, cwd: this.workDir }
     if (
       pendingMaterialization

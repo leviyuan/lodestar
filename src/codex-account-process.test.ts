@@ -120,9 +120,9 @@ describe('Codex account process ownership and recovery', () => {
     const empty = harness([{ selected: null, candidates: [] }])
     await expect(empty.proc.initializationPromise()).rejects.toThrow('没有配置 Codex 账号')
     const row: CodexAccountCandidate = { ...candidate('plus'), state: 'excluded', score: null,
-      reason: 'Ultra 自动选择不使用 Plus' }
+      reason: 'Ultra 自动选择 Plus 需要可用积分' }
     const excluded = harness([{ selected: null, candidates: [row] }])
-    await expect(excluded.proc.initializationPromise()).rejects.toThrow('没有符合条件的 Codex 账号；plus：Ultra 自动选择不使用 Plus')
+    await expect(excluded.proc.initializationPromise()).rejects.toThrow('没有符合条件的 Codex 账号；plus：Ultra 自动选择 Plus 需要可用积分')
     expect(empty.children).toHaveLength(0)
     expect(excluded.children).toHaveLength(0)
   })
