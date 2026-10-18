@@ -60,6 +60,7 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
   const source = getTokenSourceForAccount(opts.tokenSourceId, accountId)
   const manual = opts.provider === 'codex' && opts.tokenSourceId === 'codex-sub' && opts.codexManualAccount === true
   if (opts.tokenSourceId && !source) throw new Error(`token source not found: ${opts.tokenSourceId}`)
+  if (opts.provider === 'claude' && !source) throw new Error('Claude 账号来源未选择，请通过 md 选择 Claude Code 订阅或已配置的第三方账号')
   if (source && !source.enabled && !manual) throw new Error(`token source disabled: ${source.id}`)
   if (source && source.agent !== opts.provider) {
     throw new Error(`token source ${source.id} belongs to ${source.agent}, not ${opts.provider}`)

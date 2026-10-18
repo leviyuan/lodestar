@@ -65,14 +65,11 @@ export async function onTokenSourceEnable(s: Session, sourceId: string): Promise
     await feishu.sendText(s.chatId, config.token_sources['claude-sub']?.enabled === false
       ? 'Claude Code 订阅已在 Lodestar 中禁用。发送 `claude-sub on` 启用，所有群共用，本机登录态保持不变。'
       : ts.modelCatalogState?.error ?? '请在运行 Lodestar 的本机执行 `claude auth login` 登录 Claude 订阅，完成后等待后台刷新，发送 `md` 查看状态。')
-  } else if (ts.kind === 'claude-native') {
-    // native 凭本机 Claude 配置自动启用/禁用,无独立「启用」操作(它就是默认通路)。
-    await feishu.sendText(s.chatId, `${ts.display} 直接使用本机 Claude Code 配置,无需单独启用。`)
   }
 }
 
 /** `<source>-setup <args>` generic:解析 → 校验候选凭据 → 写 config + 全量刷新 models。
- *  commandSuffix 不匹配 / 无 setup → 报错(codex login / native 无此命令)。 */
+ *  commandSuffix 不匹配 / 无 setup → 报错(订阅登录无此命令)。 */
 export async function runTokenSourceSetup(s: Session, sourceId: string, args: string): Promise<void> {
   const def = tokenSourceFactories().find(d => d.setup?.commandSuffix === sourceId || d.usageSetup?.commandSuffix === sourceId)
   const usageOnly = def?.usageSetup?.commandSuffix === sourceId

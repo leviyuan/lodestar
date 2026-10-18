@@ -2,7 +2,7 @@
 
 Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个群对应一个 `Session`，通过 Codex app-server、Claude Agent SDK 或 DeepSeek Harness 执行任务，以 Feishu Card Kit schema 2.0 展示结果。
 
-维护说明以 `AGENTS.md` 为入口。Codex、Claude、GLM、DeepSeek、OpenRouter 和 Claude native 都是受支持能力；文档清理、缺少本机凭据或维护工具选择不构成删除后端的理由。
+维护说明以 `AGENTS.md` 为入口。Codex、Claude Code 订阅、GLM、DeepSeek、OpenRouter、PackyAPI 和 DeepSeek Harness 都是受支持能力；文档清理、缺少本机凭据或维护工具选择不构成删除后端的理由。
 
 ## 目录
 
@@ -28,7 +28,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 
 ## 模块边界
 
-- 一个群只有一个 Session 和一个当前主进程。Codex 使用 app-server JSON-RPC，Claude/GLM/DeepSeek/native 使用 Agent SDK streaming input，DSH 使用独立 Node 子进程和 Cordis stdio 桥接；不引入 tmux、JSONL 队列或旁路进程控制。
+- 一个群只有一个 Session 和一个当前主进程。Codex 使用 app-server JSON-RPC，Claude Code 及其第三方来源使用 Agent SDK streaming input，DSH 使用独立 Node 子进程和 Cordis stdio 桥接；不引入 tmux、JSONL 队列或旁路进程控制。
 - DSH 的 `deepseek-harness` 与 Claude 兼容的 `deepseek` 共用 DeepSeek 凭据和平台地址；`dsh-glm` 与 `glm` 共用 GLM Coding Plan 账号，前者通过原生 pi-ai 适配器接入。共享凭据只存一份，模型、effort 和可见性按 Agent 保留；旧配置冲突必须明确报错，任一 setup 入口均更新共享账号。运行时经更新器选择 latest，子进程需要 Node 22.19+（22.x）或 24+；`src/dsh-bridge.ts` 仅在该子进程加载。
 - `agent-updates.ts` 按 `[runtime.agent_auto_update]` 的 `codex`、`claude`、`dsh` 三个独立开关每 6 小时更新对应 Agent，首次检查也在 6 小时后；三项默认关闭，各自防止重叠执行，失败互不阻塞。旧布尔总开关按原值兼容转换并提示迁移，不与新表混用。`lodestar-update --agents-only` 可立即安装/更新。实际程序和 SDK 从独立版本目录加载；安装成功直接启用，新进程使用新版，已有进程保留其运行目录。Windows 不覆盖或删除使用中的 EXE/DLL；安装取消按精确 PID 终止安装器进程树，未确认退出不得清理其临时目录。文件占用有限重试，最终错误必须显示。安装或查询失败只记录更新日志并向手动更新调用方返回失败，不修改当前安装记录，不影响已有安装的启动和 `lodestar-version`；已开启自动更新的 Agent 在下一个 6 小时周期再试。旧状态中的更新错误不参与启动判断或版本展示。首次未安装、安装损坏或旧版已清掉选择记录时按实际安装状态报错，不扫描目录猜测版本。自动更新 Agent 不重启 daemon。
 - Token Source 统一管理账号、凭据、模型目录、启动环境和额度。Claude Code 订阅（`claude-sub`）独立复用本机原生登录态，可与第三方来源共存。模型与 Agent 身份动态读取该目录，沿用目录声明的 effort；来源禁用或刷新失败显示 `MISS`。新增来源通过 factory 注册。

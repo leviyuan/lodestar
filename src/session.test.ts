@@ -888,7 +888,7 @@ describe('Session cloud file receipts', () => {
   })
 
   test('nontranslated Claude sources retain their existing failed-input and interrupt handling', async () => {
-    for (const sourceId of ['claude-native', 'glm', 'deepseek']) {
+    for (const sourceId of ['claude-sub', 'glm', 'deepseek']) {
       const session = new Session(`plain-${sourceId}`, 'chat') as any
       const proc = new FakeAgentProc('claude', `${sourceId}-session`, sourceId) as any
       proc.hasPendingNativeTurn = () => false
@@ -2756,21 +2756,23 @@ describe('Session provider switching', () => {
   })
 
   test.each(['stopped', 'idle', 'working'])('disabled Claude subscription rejects new input while %s without stopping the process', async state => {
+    const sourceId = 'claude-sub'
     const session = new Session('subscription-off', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'existing-conversation', 'claude-sub')
+    const proc = new FakeAgentProc('claude', 'existing-conversation', sourceId)
     session.selectedProvider = 'claude'
-    session.selectedTokenSourceId = 'claude-sub'
+    session.selectedTokenSourceId = sourceId
     session.selectedModel = 'sonnet'
     session.selectedEffort = 'high'
     session.proc = state === 'stopped' ? null : proc
     session.currentTurn = state === 'working' ? turnState('running-subscription') : null
     session.status = state
     const turn = session.currentTurn
-    session.tokenSource = () => ({ id: 'claude-sub', kind: 'claude-subscription', enabled: false,
-      modelCatalogState: { status: 'disabled', error: 'Claude Code 订阅已禁用；发送 claude-sub on 启用' } })
+    const hint = 'Claude Code 订阅已禁用；发送 claude-sub on 启用'
+    session.tokenSource = () => ({ id: sourceId, kind: 'claude-subscription', enabled: false,
+      modelCatalogState: { status: 'disabled', error: hint } })
     try {
       await session.onUserMessage('new task', [], 'ou_user', 'om_new')
-      expect(sentTexts.at(-1)).toContain('claude-sub on')
+      expect(sentTexts.at(-1)).toContain(hint)
       expect(sentTexts.at(-1)).toContain('消息未送给 Agent')
       expect(proc.sentTexts).toEqual([])
       expect(proc.killCalls).toBe(0)
@@ -3127,7 +3129,7 @@ describe('Session provider switching', () => {
   })
 
   test('GLM→DeepSeek (same provider, different token source) respawns to swap base_url/env', async () => {
-    // 跨 token source 切换(GLM↔DeepSeek↔native,同 provider='claude')env(base_url/凭据)不同,
+    // 跨 token source 切换(GLM↔DeepSeek↔Claude 订阅,同 provider='claude')env(base_url/凭据)不同,
     // 必须杀进程重启换 env —— setModelSettings 只改 model 不重注入 env,留着旧进程会拿
     // deepseek 模型名打到 GLM 端点(base URL 错)。故 onModelEffortSelect 跳过热切换,
     // applyModelSelection→stopIdleMismatchedProcess 据 proc.tokenSourceId 判 mismatch 并杀。
@@ -7405,7 +7407,7 @@ describe('Session lifecycle reliability', () => {
       previousSessionId: 'previous-session',
     }
     modelSelections.set(pendingName, {
-      provider: 'claude', model: 'claude-opus-4-6', effort: 'high', tokenSourceId: 'claude-native',
+      provider: 'claude', model: 'claude-opus-4-6', effort: 'high', tokenSourceId: 'claude-sub',
     })
     resumeRefs.set(`${pendingName}:claude`, {
       provider: 'claude', sessionId: 'previous-session', cwd: pendingCwd,
@@ -7424,7 +7426,7 @@ describe('Session lifecycle reliability', () => {
       previousSessionId: 'previous-session',
     }
     modelSelections.set(materializedName, {
-      provider: 'claude', model: 'claude-opus-4-6', effort: 'high', tokenSourceId: 'claude-native',
+      provider: 'claude', model: 'claude-opus-4-6', effort: 'high', tokenSourceId: 'claude-sub',
     })
     resumeRefs.set(`${materializedName}:claude`, {
       provider: 'claude', sessionId: 'new-materialized-session', cwd: materializedCwd,

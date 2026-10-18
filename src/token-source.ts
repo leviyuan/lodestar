@@ -137,7 +137,7 @@ export interface TokenSource {
   resolveSpawnModel(model: string): string | undefined
   /** 该 source spawn 的 claude 子进程 settingSources(覆盖 DEFAULT_SETTING_SOURCES)。
    *  注入 env 的 source(glm/deepseek)不设 → DEFAULT(['project','local'],spawnEnv 权威);
-   *  透传型 source(native)设 ['user','project','local'] → 读本机 Claude Code 配置。 */
+   *  Claude 订阅设 ['user','project','local']，通过进程级 settings 隔离账号路由。 */
   settingSources?: readonly string[]
   /** Claude 来源的进程级设置覆盖；不修改本机 settings 文件。 */
   claudeSettings?: Settings
@@ -194,11 +194,11 @@ export interface TokenSourceFactoryDef {
   /** config.toml 里该 source 的 section id(如 'glm');undefined = 无 config(codex 走本地 login) */
   configSectionId?: string
   build: (cfg: TokenSourceConfig, detected?: Partial<TokenSourceConfig> | null) => TokenSource
-  /** 飞书 setup 命令接入(可选;codex login / native 无独立 setup)。 */
+  /** 飞书 setup 命令接入(可选;订阅登录无独立 setup)。 */
   setup?: TokenSourceSetup
   /** 独立的余额凭据配置，校验通过后才保存；不改变推理凭据。 */
   usageSetup?: TokenSourceSetup
-  /** 本机 settings.json 探测(可选;codex / native 无)—— 命中 host 则自动启用。 */
+  /** 本机 settings.json 探测(可选;订阅无)—— 命中 host 则自动启用。 */
   detect?: TokenSourceDetection
 }
 

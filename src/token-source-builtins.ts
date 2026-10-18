@@ -17,7 +17,6 @@ import { cachedTokenSource, disposeCachedTokenSource } from './token-source-cach
 // provider 模块 —— import 即登记到 factory registry(副作用)。
 import './token-source-codex'
 import './token-source-glm'
-import './token-source-native'
 import './token-source-claude'
 import './token-source-deepseek'
 import './token-source-openrouter'
@@ -48,18 +47,7 @@ export function buildTokenSourcesFromConfig(): number {
     }
     return { cfg, detected, create, initial: create() }
   })
-  // native 的旧激活规则只看第三方来源；新增订阅探测不能改变本机配置通路。
-  const hasClaudeSource = definitions.some(({ initial: s }) => s.agent === 'claude' && s.enabled
-      && s.kind !== 'claude-native' && s.kind !== 'claude-subscription')
   const sources = definitions.map(({ cfg, detected, create, initial }) => {
-    const build = () => {
-      const source = create()
-      if (source.kind === 'claude-native') {
-        source.enabled = !hasClaudeSource
-        source.modelCatalogState = { status: source.enabled ? 'idle' : 'disabled', updatedAt: Date.now() }
-      }
-      return source
-    }
     const routing = (value: Partial<TokenSourceConfig> | null) => {
       const { display, model, effort, models, hidden_models, shown_models, custom_models, slots, default: _default, ...identity } = value ?? {}
       return identity
@@ -67,10 +55,9 @@ export function buildTokenSourcesFromConfig(): number {
     const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value, (_key, item) =>
       item && typeof item === 'object' && !Array.isArray(item)
         ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item)).digest('hex')
-    const nativeEnabled = initial.kind === 'claude-native' ? !hasClaudeSource : undefined
-    return cachedTokenSource(build, cfg,
-      hash([initial.id, routing(cfg), routing(detected), nativeEnabled]),
-      hash([cfg, detected, nativeEnabled]), previous.get(initial.id))
+    return cachedTokenSource(create, cfg,
+      hash([initial.id, routing(cfg), routing(detected)]),
+      hash([cfg, detected]), previous.get(initial.id))
   })
   resetTokenSourceRegistry()
   for (const s of sources) registerTokenSource(s)

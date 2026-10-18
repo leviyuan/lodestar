@@ -70,10 +70,13 @@ test('Claude subscription coexists with other accounts and refreshes authoritati
     assert.equal(source.modelCatalogState.status, 'ready')
     assert.match(source.modelCatalogState.error, /目录为空/)
 
-    // Independent subscription detection must not disable the legacy local-config route.
+    // The retired local-config source is not registered, even with an old enabled flag.
     config.token_sources = {}
     buildTokenSourcesFromConfig()
-    assert.equal(registry.getTokenSource('claude-native').enabled, true)
+    assert.equal(registry.getTokenSource('claude-native'), undefined)
+    config.token_sources['claude-native'] = { enabled: true }
+    buildTokenSourcesFromConfig()
+    assert.equal(registry.getTokenSource('claude-native'), undefined)
   `)
 })
 

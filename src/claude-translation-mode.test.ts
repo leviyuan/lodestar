@@ -3,7 +3,7 @@ import { claudeTranslationModeEnabled } from './claude-translation-mode'
 import { processUsesClaudeTranslation } from './agent-process'
 
 test('the default configuration disables translation for every source', () => {
-  for (const id of ['claude-sub', 'glm', 'claude-native', 'deepseek', 'openrouter', 'packy', 'packy-secondary', 'packy-codex', 'deepseek-harness', 'dsh-glm', 'codex-sub', null, undefined]) {
+  for (const id of ['claude-sub', 'glm', 'deepseek', 'openrouter', 'packy', 'packy-secondary', 'packy-codex', 'deepseek-harness', 'dsh-glm', 'codex-sub', null, undefined]) {
     expect(claudeTranslationModeEnabled(id)).toBe(false)
     expect(claudeTranslationModeEnabled(id, 'any-model')).toBe(false)
   }
@@ -46,7 +46,6 @@ test('main-session instructions use untranslated defaults for every source', () 
       ['configured-name', join(target, 'subdir'), 'glm', 'claude', false],
       ['configured-name[feature]', join(process.env.LODESTAR_DATA_DIR, 'configured-name[feature]'), 'glm', 'claude', false],
       ['codex', target, 'codex-sub', 'codex', false],
-      ['native', target, 'claude-native', 'claude', false],
       ['subscription', join(target, 'other'), 'claude-sub', 'claude', false],
     ]
     for (const [sessionName, workDir, selectedTokenSourceId, provider, expected] of cases) {

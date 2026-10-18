@@ -123,7 +123,7 @@ export interface ClaudeSpawnOpts extends Omit<SpawnOpts, 'effort'> {
   profile?: ProjectProfile
   /** 覆盖 settingSources(优先于 profile / DEFAULT_SETTING_SOURCES)。
    *  注入 env 的 token source(glm/deepseek)不传 → DEFAULT(['project','local'],不读 user settings env,spawnEnv 权威);
-   *  透传型 source(native)传 ['user','project','local'] → 读本机 Claude Code 配置(settings.json env / .credentials)。 */
+   *  Claude 订阅传 ['user','project','local']，配合进程级 settings 和原生账号验证隔离认证。 */
   settingSources?: readonly string[]
   settings?: Settings
   validateAccount?: (account: AccountInfo) => void

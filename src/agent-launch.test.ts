@@ -4,12 +4,17 @@ import { config } from './config'
 import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, tokenSourceFactories, type TokenSource } from './token-source'
 import './token-source-openrouter'
 
+test('Claude launches reject an unbound local-config route', () => {
+  expect(() => createAgentProcess({ provider: 'claude', tokenSourceId: null,
+    workDir: '/tmp', model: 'opus', effort: 'high' })).toThrow('Claude 账号来源未选择')
+})
+
 test.each([false, true])('main and delegated launches translate only explicitly enabled subscriptions (enabled=%s)', enabled => {
   const previous = listTokenSources()
   const previousSafeMode = config.claude.safe_mode
   config.claude.safe_mode = enabled ? { 'claude-sub': ['*'] } : {}
   try {
-    for (const id of ['claude-sub', 'glm', 'claude-native']) {
+    for (const id of ['claude-sub', 'glm']) {
       const source: TokenSource = {
         id, kind: id === 'claude-sub' ? 'claude-subscription' : 'test', agent: 'claude', display: id, enabled: true,
         models: [{ model: 'test-model', display: 'Test', efforts: ['high'], defaultEffort: 'high' }],

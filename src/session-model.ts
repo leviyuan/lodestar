@@ -128,9 +128,6 @@ async function changeLiveModelSettings(
 function providerChoices(s: Session): cards.ProviderChoice[] {
   const cur = s.currentTokenSource()
   return listTokenSources().map(source => s.tokenSource(source.id)!)
-    // native 是兜底项:仅在 enabled 时露面(本机未命中 Pro provider → 作为默认通路);
-    // disabled 说明本机已用 GLM,此时它没意义,不显示灰项干扰选择。
-    .filter(ts => ts.enabled || ts.kind !== 'claude-native')
     .map(ts => ({
       provider: ts.agent as AgentProvider,
       sourceId: ts.id,
@@ -653,7 +650,7 @@ export async function onModelEffortSelect(
     // (SDK 记新 model,下轮/下次生效)。不再 stopIdle respawn —— 那基于旧 env-alias 假设,
     // 且会静默打断用户(发 model 选个模型就把 claude 进程杀了,离谱)。
     // 同 provider 且同 source 才热切换(env 没变,setModelSettings 改 model 即够);
-    // 跨 source(GLM↔DeepSeek↔native,即使同 provider)env 变了 → 跳过热切换,交给
+    // 跨 source(GLM↔DeepSeek↔Claude 订阅,即使同 provider)env 变了 → 跳过热切换,交给
     // applyModelSelection→stopIdleMismatchedProcess 杀进程重启换 env。热切换只改 model
     // 不重注入 env,跨 source 会打到上一个 source 的 base_url(silent divergence)。
     if (s.proc?.isAlive() && s.proc.provider === provider && !sourceChanged && !environmentChanged && !processNeedsStop) {

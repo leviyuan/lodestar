@@ -531,7 +531,7 @@ describe('session-temp Codex stopped-session history', () => {
     h.session.lastSessionId = 'current-claude-session'
     h.state.routing = {
       provider: 'claude',
-      tokenSourceId: 'claude-native',
+      tokenSourceId: 'claude-sub',
       model: 'claude-opus-4-6',
       effort: 'high',
     }

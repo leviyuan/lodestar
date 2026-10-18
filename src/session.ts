@@ -598,7 +598,7 @@ export class Session {
       && this.stoppingProc !== this.proc
       && this.blockedProc !== this.proc)
   }
-  /** 从持久化 selection 推导 tokenSourceId;无匹配返回 default 或 null(走旧路径)。 */
+  /** 保留显式账号；未选择时使用已启用来源，无可用 Claude 来源时明确失败。 */
   private deriveTokenSourceId(selection: { tokenSourceId?: string | null; provider?: string; model?: string | null } | null): string | null {
     const explicit = selection?.tokenSourceId
     // An explicit persisted account is part of the user's routing choice.
@@ -607,15 +607,16 @@ export class Session {
     // different account of the same provider.
     if (typeof explicit === 'string' && explicit.trim()) return explicit.trim()
     const provider: AgentProvider = (selection?.provider as AgentProvider) ?? this.selectedProvider
-    // 只认 enabled source:disabled 的不参与 spawn,避免未配置凭据注入子进程把 claude 搞挂。
-    // claude 侧 native 与 GLM 严格互斥,恒有一个 enabled;codex 侧 codex-sub 未登录时为空(走 ~/.codex)。
     const list = listEnabledTokenSourcesByAgent(provider)
-    // provider 侧无 enabled source → 返回 null(走旧路径:claude 透传 / codex 走 ~/.codex),
-    // 不跨界 fallback 到别的 provider 的 default —— 否则 codex-sub 未登录会把 provider 误切成 claude。
+    const configuredDefault = list.find(source => config.token_sources?.[source.id]?.default === true)
+    if (configuredDefault) return configuredDefault.id
+    // 没有可用 Claude 来源时仍保留订阅绑定并报错，不走无来源的本机透传路径。
+    if (provider === 'claude' && !list.length && getTokenSource('claude-sub')) return 'claude-sub'
+    // 不跨 provider 使用其他默认账号；无来源的 Codex 仍由原生认证处理，Claude 启动会拒绝。
     return list[0]?.id ?? null
   }
 
-  /** 当前 token source(账号);未配返回 undefined → 调用方走旧路径 fallback。 */
+  /** 当前 token source(账号)；未配或已删除时返回 undefined。 */
   currentTokenSource(): TokenSource | undefined {
     return this.tokenSource(this.selectedTokenSourceId)
   }
@@ -956,14 +957,20 @@ export class Session {
         : { kind: 'fresh' })
     validateConversationLaunch(launch, this.selectedProvider, this.workDir)
     // 只让 enabled source 参与 spawn。显式选择过但当前 disabled/missing 的
-    // source 必须 fail closed；只有从未绑定 source 的 legacy 路径才允许裸跑。
+    // source 必须 fail closed；无来源的 Claude 同样由共享启动入口拒绝。
     const raw = this.currentTokenSource()
     const codexPool = this.selectedProvider === 'codex' && this.selectedTokenSourceId === 'codex-sub'
     if (this.selectedTokenSourceId && (!raw || (!raw.enabled && !codexPool))) {
-      throw new Error(`token source "${this.selectedTokenSourceId}" 不可用，请重新配置或在 model 面板选择其他账号`)
+      throw new Error(raw?.modelCatalogState?.error
+        ?? `token source "${this.selectedTokenSourceId}" 不可用，请重新配置或在 model 面板选择其他账号`)
     }
     const ts = raw?.enabled || codexPool ? raw : undefined
     const fileDeliveryMode = this.currentTurn?.fileDeliveryMode ?? this.getFileDeliveryMode()
+    // 固定首次启动选定的账号，避免仅落盘 resume 后按新的默认来源重选账号。
+    // 使用 checked 写入且先于进程创建；失败不启动、也不把会话悄悄切到别的来源。
+    if (this.selectedProvider === 'claude' && ts && !feishu.getSessionModelSelection(this.sessionName)?.tokenSourceId) {
+      feishu.bindSessionModelChecked(this.sessionName, 'claude', this.selectedModel, this.selectedEffort, ts.id)
+    }
     const created = createAgentProcess({
       provider: this.selectedProvider,
       workDir: this.workDir,
@@ -1082,7 +1089,7 @@ export class Session {
     effort = this.selectedEffort,
   ): Promise<void> {
     // provider 或 token source 任一变化 = 进程 env 不再匹配 → idle 时杀掉,下轮重 spawn 换 env。
-    // 同 provider 跨 source(GLM↔DeepSeek↔native)env(base_url/凭据)不同也必须重启,
+    // 同 provider 跨 source(GLM↔DeepSeek↔Claude 订阅)env(base_url/凭据)不同也必须重启,
     // 否则热切换只改 model 不换 env → 模型名打到上一个 source 的 base_url(silent divergence)。
     if (!this.proc || !this.modelSelectionNeedsProcessStop(provider, tokenSourceId, model, effort)) return
     if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return
@@ -2921,7 +2928,7 @@ export class Session {
     this.proc.sendInterrupt()
   }
 
-  private disabledSubscriptionMessage(sourceId = this.selectedTokenSourceId): string | null {
+  private disabledClaudeSourceMessage(sourceId = this.selectedTokenSourceId): string | null {
     const source = this.tokenSource(sourceId)
     return source?.kind === 'claude-subscription' && !source.enabled
       ? source.modelCatalogState?.error ?? 'Claude Code 订阅未启用，请发送 claude-sub 查看状态'
@@ -2935,7 +2942,7 @@ export class Session {
     const settingsBlocked = this.modelSettingsBlockReason()
     if (settingsBlocked) throw new Error(settingsBlocked)
     // 其他群可能在开卡期间关闭全局开关；真正送入进程前再检查一次。
-    const blocked = this.disabledSubscriptionMessage(proc.tokenSourceId)
+    const blocked = this.disabledClaudeSourceMessage(proc.tokenSourceId)
     if (blocked) {
       const message = `❌ ${blocked}。消息未送给 Agent，请启用后重发或通过 md 切换来源。`
       this.pendingTurnInputs = []
@@ -3028,7 +3035,7 @@ export class Session {
       if (resumedProc) throw new Error(settingsBlocked)
       return
     }
-    const subscriptionDisabled = this.disabledSubscriptionMessage()
+    const subscriptionDisabled = this.disabledClaudeSourceMessage()
     if (subscriptionDisabled) {
       await feishu.sendText(this.chatId, `❌ ${subscriptionDisabled}。消息未送给 Agent，请启用后重发或通过 md 切换来源。`)
       if (resumedProc) throw new Error(subscriptionDisabled)
@@ -4299,7 +4306,7 @@ export class Session {
       && this.steeringGeneration === generation && proc.isAlive()
     const operation = Promise.resolve().then(async () => {
       if (!ownsInput()) return
-      const blocked = this.disabledSubscriptionMessage(proc.tokenSourceId)
+      const blocked = this.disabledClaudeSourceMessage(proc.tokenSourceId)
       if (blocked) throw new Error(blocked)
       accepted = await proc.steerUserText!(batch.map(msg => msg.wireText).join('\n\n'), [], inputId)
       if (!ownsInput()) return

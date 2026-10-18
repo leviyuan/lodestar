@@ -96,9 +96,9 @@ export type AgentTranslationPresentationPolicy = (
 export interface AgentProcess extends EventEmitter {
   readonly provider: AgentProvider
   /** 该进程 spawn 时绑定的 token source id(= spawnEnv 注入 env 的那个 source)。
-   *  GLM/DeepSeek/native 同为 provider='claude' 但 env(base_url/凭据)不同;
+   *  GLM/DeepSeek/Claude 订阅同为 provider='claude' 但 env(base_url/凭据)不同;
    *  stopIdleMismatchedProcess 据此判定跨 source 切换要杀进程换 env(同 provider 也要杀)。
-   *  null = 无 source(透传型 native 在 spawn 时仍带 'claude-native' id;null 仅用于无 ts 的裸跑)。 */
+   *  null 仅用于不绑定来源的底层协议或控制查询。 */
   readonly tokenSourceId: string | null
   /** Verified translation applies to this process's user-facing boundaries. */
   readonly translationEnabled?: boolean

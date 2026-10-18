@@ -928,7 +928,7 @@ describe('Claude behavior with translation disabled', () => {
   })
 
   test('keeps the existing nontranslated question option normalization', async () => {
-    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high', tokenSourceId: 'claude-native' }) as any
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high', tokenSourceId: 'claude-sub' }) as any
     const requests: any[] = []
     proc.on('can_use_tool', (request: any) => {
       requests.push(request)

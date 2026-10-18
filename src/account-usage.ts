@@ -24,7 +24,7 @@ function cacheKey(): string {
 export function readAllAccountUsage(): Promise<AccountUsage[]> {
   const key = cacheKey()
   if (pending?.key === key) return pending.promise
-  const order = ['codex-sub', 'claude-sub', 'glm', 'dsh-glm', 'deepseek', 'deepseek-harness', 'openrouter', 'claude-native']
+  const order = ['codex-sub', 'claude-sub', 'glm', 'dsh-glm', 'deepseek', 'deepseek-harness', 'openrouter']
   const position = (id: string) => order.includes(id) ? order.indexOf(id) : order.length
   const sources = listTokenSources().filter(source => source.enabled
     || source.kind === 'codex-subscription' && codexAccounts.list().some(account => account.id !== 'default'))

@@ -33,7 +33,8 @@ Token Source 管理账号凭据、模型目录、启动环境、默认模型、e
 | PackyAPI | `[token_source.packy]`、`[token_source.packy-secondary]`；按令牌目录筛选模型，Claude 入口默认精选 MiniMax M、Opus、Fable、Qwen Max 家族最新版；Codex 入口精选 Kimi K、Grok 家族最新版，主令牌与 `packy-codex` 共用凭据 |
 | DeepSeek Harness | `[token_source.deepseek-harness]`；模型、effort 与上下文容量来自当前安装的 DSH 原生目录 |
 | DSH GLM Coding Plan | `[token_source.dsh-glm]` 或复用 `glm`；账号接口返回模型，DSH 原生适配器提供能力和推理档位 |
-| Claude native | 沿用本机 Claude 配置，目录来自 SDK `supportedModels()`；有已启用的第三方 Claude 侧来源时让位 |
+
+Claude 订阅统一由 `claude-sub` 管理登录验证、模型目录和额度，在 `md` 中选择“Claude Code 订阅”。
 
 `model` 按 Claude Code、Codex、DeepSeek Harness 分组，组 ID 由 `ELEMENTS.modelAgentGroup` 生成。两个 Agent 下的 DeepSeek 来源都显示为 DeepSeek，协议 id 保持不变。选账号后进入模型列表；多个档位才展示 effort 卡，只有一个档位时直接应用，获取失败显示 `MISS`。同 provider/source 的切换调用 `setModelSettings`：Claude 和 DSH 从后续 turn 使用，Codex 保存选择并在重启进程后应用。跨 provider/source 或需要变更项目启动配置时，只能在空闲状态更换进程。
 
@@ -51,7 +52,7 @@ OpenRouter 和 PackyAPI 默认按指定家族从兼容目录筛选最新数字�
 
 ## Claude 启动配置
 
-GLM、DeepSeek、OpenRouter 等来源先清除冲突的 Anthropic 环境变量（含模型角色、OAuth 和云供应商选择），再注入各自凭据；默认读取 `project`、`local` settings。Claude Code 订阅读取 `user`、`project`、`local`，通过进程级 `settings` 覆盖冲突路由和 API key helper，不改本机文件；SDK `accountInfo()` 确认第一方订阅后才向 streaming input 放行用户输入。Claude native 沿用本机环境并读取 `user`、`project`、`local`。Token Source 指定的 settings 来源优先；未绑定 Token Source 时才使用项目 `setting_sources`。给注入凭据的来源加上 `user` 会重新引入本机 settings 中的路由。
+GLM、DeepSeek、OpenRouter 等来源先清除冲突的 Anthropic 环境变量（含模型角色、OAuth 和云供应商选择），再注入各自凭据；默认读取 `project`、`local` settings。Claude Code 订阅读取 `user`、`project`、`local`，通过进程级 `settings` 覆盖冲突路由和 API key helper，不改本机文件；SDK `accountInfo()` 确认第一方订阅后才向 streaming input 放行用户输入。Token Source 指定的 settings 来源优先；未绑定 Token Source 时才使用项目 `setting_sources`。给注入凭据的来源加上 `user` 会重新引入本机 settings 中的路由。
 
 `[projects.<name>]` 的 `cwd` 对所有后端生效；`setting_sources`、`strict_mcp` 用于 Claude，`tools`、`load_project_mcp` 用于 Claude 和 DSH 主会话。Claude 主会话默认发现项目 `.mcp.json`。排除 user settings 的 Claude 会话通过 SDK 本地插件加载 daemon 管理的 Skill，安装内容统一由 `managed-skills.ts` 生成。
 
