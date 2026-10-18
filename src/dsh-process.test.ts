@@ -130,6 +130,12 @@ function nextResult(proc: DshProcess): Promise<any> {
   return promise
 }
 
+function gate() {
+  let release!: () => void
+  const promise = new Promise<void>(resolve => { release = resolve })
+  return { promise, release }
+}
+
 describe('DSH native runtime through Lodestar bridge', () => {
   test('shared official DeepSeek accounts retain the native protocol endpoint', async () => {
     const f = await fixture(() => completion({ content: 'official route replied' }))
@@ -471,6 +477,248 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(await result).toMatchObject({ is_error: false })
   }, 30_000)
 
+  test('steering is unavailable before startup and while idle without submitting a prompt', async () => {
+    const f = await fixture(() => completion({ content: 'ordinary task completed' }))
+    const proc = f.processFor()
+    expect(await proc.steerUserText('before startup', [], 'early-input')).toBe(false)
+    await proc.initializationPromise()
+    expect(await proc.steerUserText('while idle', [], 'idle-input')).toBe(false)
+    expect(f.requests).toHaveLength(0)
+    const done = nextResult(proc)
+    proc.sendUserText('ordinary task')
+    expect(await done).toMatchObject({ is_error: false })
+    expect(await proc.steerUserText('after completion', [], 'late-input')).toBe(false)
+    expect(f.requests).toHaveLength(1)
+    expect(requestUserTexts(f.requests[0])).not.toContain('before startup')
+    expect(requestUserTexts(f.requests[0])).not.toContain('while idle')
+  }, 30_000)
+
+  test('consumes consecutive steering inputs together without interrupting the model, before or after their acknowledgements', async () => {
+    const firstRequest = gate()
+    const finishFirst = gate()
+    const secondAccepted = gate()
+    const acknowledgeSecond = gate()
+    const bothConsumed = gate()
+    const f = await fixture(async (_body, count) => {
+      if (count === 1) { firstRequest.release(); await finishFirst.promise }
+      return completion({ content: count === 1 ? 'original request finished' : 'both additions applied' })
+    })
+    const proc = f.processFor()
+    const order: string[] = []
+    const consumed: string[] = []
+    let resultCount = 0
+    proc.on('user_input_consumed', ({ inputId }) => {
+      consumed.push(inputId); order.push(`consumed:${inputId}`)
+      if (consumed.length === 2) bothConsumed.release()
+    })
+    proc.on('input_batch_end', () => { if (consumed.length) order.push('batch-end') })
+    proc.on('assistant_text', ({ text }) => order.push(`text:${text}`))
+    proc.on('result', () => { resultCount++; order.push('result') })
+    await proc.initializationPromise()
+    const runtime = (proc as any).runtime
+    const request = runtime.request.bind(runtime)
+    const requests = spyOn(runtime, 'request').mockImplementation(async (...args: any[]) => {
+      const result = await request(...args)
+      if (args[0] === 'session/prompt' && args[1].inputId === 'steer-second') {
+        secondAccepted.release()
+        await acknowledgeSecond.promise
+      }
+      return result
+    })
+    try {
+      const done = nextResult(proc)
+      proc.sendUserText('original task')
+      await firstRequest.promise
+      expect(await proc.steerUserText('first addition', [], 'steer-first')).toBe(true)
+      order.push('ack:first')
+      expect(consumed).toEqual([])
+      const second = proc.steerUserText('second addition', [], 'steer-second').then(accepted => {
+        order.push('ack:second'); return accepted
+      })
+      await secondAccepted.promise
+      expect(f.requests).toHaveLength(1)
+      expect(consumed).toEqual([])
+      finishFirst.release()
+      await bothConsumed.promise
+      expect(consumed).toEqual(['steer-first', 'steer-second'])
+      expect(order.indexOf('text:original request finished')).toBeLessThan(order.indexOf('consumed:steer-first'))
+      expect(order.indexOf('ack:first')).toBeLessThan(order.indexOf('consumed:steer-first'))
+      expect(order).not.toContain('ack:second')
+      acknowledgeSecond.release()
+      expect(await second).toBe(true)
+      expect(await done).toMatchObject({ is_error: false })
+      expect(f.requests).toHaveLength(2)
+      expect(requestUserTexts(f.requests[0])).toContain('original task')
+      expect(requestUserTexts(f.requests[0])).not.toContain('first addition')
+      expect(requestUserTexts(f.requests[1])).toEqual(expect.arrayContaining(['original task', 'first addition', 'second addition']))
+      expect(order.indexOf('consumed:steer-second')).toBeLessThan(order.indexOf('batch-end'))
+      expect(order.indexOf('batch-end')).toBeLessThan(order.indexOf('text:both additions applied'))
+      expect(order.indexOf('consumed:steer-second')).toBeLessThan(order.indexOf('ack:second'))
+      expect(resultCount).toBe(1)
+    } finally {
+      finishFirst.release(); acknowledgeSecond.release(); requests.mockRestore()
+    }
+  }, 30_000)
+
+  test('stopping discards accepted steering and does not replay it in the next task', async () => {
+    const firstRequest = gate()
+    const f = await fixture((_body, count) => {
+      if (count !== 1) return completion({ content: 'fresh task completed' })
+      firstRequest.release()
+      return new Response(new ReadableStream({ start(controller) {
+        controller.enqueue(new TextEncoder().encode(': waiting\n\n'))
+      } }), { headers: { 'content-type': 'text/event-stream' } })
+    })
+    const proc = f.processFor()
+    const consumed: string[] = []
+    proc.on('user_input_consumed', ({ inputId }) => consumed.push(inputId))
+    await proc.initializationPromise()
+    let done = nextResult(proc)
+    proc.sendUserText('wait before stopping')
+    await firstRequest.promise
+    expect(await proc.steerUserText('discard this pending addition', [], 'discard-on-stop')).toBe(true)
+    expect(consumed).toEqual([])
+    proc.sendInterrupt()
+    expect(await done).toMatchObject({ is_error: true, subtype: 'aborted' })
+    expect(proc.isAlive()).toBe(true)
+    done = nextResult(proc)
+    proc.sendUserText('fresh task after stop')
+    expect(await done).toMatchObject({ is_error: false })
+    expect(f.requests).toHaveLength(2)
+    expect(requestUserTexts(f.requests[1])).toContain('fresh task after stop')
+    expect(requestUserTexts(f.requests[1])).not.toContain('discard this pending addition')
+    expect(consumed).toEqual([])
+  }, 30_000)
+
+  for (const ending of ['completed', 'cancelled'] as const) test(`steering admission cannot revive a ${ending} turn`, async () => {
+    const firstRequest = gate()
+    const finishFirst = gate()
+    const admissionStarted = gate()
+    const finishAdmission = gate()
+    const turnEnded = gate()
+    const f = await fixture(async (_body, count) => {
+      if (count === 1) { firstRequest.release(); await finishFirst.promise }
+      return completion({ content: 'request completed' })
+    })
+    const admissionServer = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch() {
+      admissionStarted.release()
+      await finishAdmission.promise
+      return new Response('admission released')
+    } })
+    cleanups.push(async () => { await admissionServer.stop(true) })
+    const pluginPath = join(f.dir, 'slow-admission.mjs')
+    await writeFile(pluginPath, `export const inject = ['attachments'];
+      export function apply(ctx) {
+        const original = ctx.attachments.admitPromptContent;
+        ctx.attachments.admitPromptContent = async function(content) {
+          if (content.some(part => part.type === 'text' && part.text.includes('slow admission addition'))) {
+            const response = await fetch('http://127.0.0.1:${admissionServer.port}/admission');
+            await response.text();
+          }
+          return original.call(this, content);
+        };
+      }`)
+    const patchPath = join(f.dir, 'slow-admission.patch.json')
+    await writeFile(patchPath, JSON.stringify([{ insert: [{ id: 'slow-admission', name: pluginPath }] }]))
+    const proc = f.processFor(undefined, { runtimeOptions: { ...f.opts.runtimeOptions, patches: [patchPath] } })
+    const consumed: string[] = []
+    proc.on('user_input_consumed', ({ inputId }) => consumed.push(inputId))
+    await proc.initializationPromise()
+    ;(proc as any).runtime.on('notification', ({ method, params }: any) => {
+      if (method === 'session.event' && params.sessionId === proc.sessionId && params.event.type === 'turn/end') turnEnded.release()
+    })
+    try {
+      let done = nextResult(proc)
+      proc.sendUserText('finish before attachment admission')
+      await firstRequest.promise
+      const steering = proc.steerUserText('slow admission addition', [], `late-${ending}`).catch(error => error)
+      await admissionStarted.promise
+      if (ending === 'cancelled') proc.sendInterrupt()
+      else finishFirst.release()
+      await turnEnded.promise
+      finishAdmission.release()
+      const accepted = await steering
+      if (ending === 'cancelled') {
+        expect(accepted).toBeInstanceOf(Error)
+        expect(accepted.message).toContain('cancelled before submission')
+      } else expect(accepted).toBe(false)
+      expect(await done).toMatchObject({ is_error: ending === 'cancelled', subtype: ending === 'cancelled' ? 'aborted' : 'completed' })
+      expect(f.requests).toHaveLength(1)
+      done = nextResult(proc)
+      proc.sendUserText('fresh task after admission race')
+      expect(await done).toMatchObject({ is_error: false })
+      expect(f.requests).toHaveLength(2)
+      expect(requestUserTexts(f.requests[1])).not.toContain('slow admission addition')
+      expect(consumed).toEqual([])
+    } finally { finishFirst.release(); finishAdmission.release() }
+  }, 30_000)
+
+  test('a failed native turn discards accepted but unconsumed steering before the next task', async () => {
+    const firstRequest = gate()
+    const failFirst = gate()
+    const f = await fixture(async (_body, count) => {
+      if (count !== 1) return completion({ content: 'next task completed' })
+      firstRequest.release(); await failFirst.promise
+      return Response.json({ error: { message: 'test credential rejected', type: 'authentication_error' } }, { status: 401 })
+    })
+    const proc = f.processFor()
+    const consumed: string[] = []
+    proc.on('user_input_consumed', ({ inputId }) => consumed.push(inputId))
+    await proc.initializationPromise()
+    try {
+      let done = nextResult(proc)
+      proc.sendUserText('fail the current model request')
+      await firstRequest.promise
+      expect(await proc.steerUserText('addition owned by failed task', [], 'failed-turn-input')).toBe(true)
+      failFirst.release()
+      expect(await done).toMatchObject({ is_error: true, subtype: 'error' })
+      done = nextResult(proc)
+      proc.sendUserText('new task after upstream error')
+      expect(await done).toMatchObject({ is_error: false })
+      expect(f.requests).toHaveLength(2)
+      expect(requestUserTexts(f.requests[1])).not.toContain('addition owned by failed task')
+      expect(consumed).toEqual([])
+    } finally { failFirst.release() }
+  }, 30_000)
+
+  for (const failure of ['rejected', 'missing-ack', 'mismatched-ack'] as const) test(`steering ${failure} is reported without replaying the input`, async () => {
+    const firstRequest = gate()
+    const finishFirst = gate()
+    const f = await fixture(async (_body, count) => {
+      if (count === 1) { firstRequest.release(); await finishFirst.promise }
+      return completion({ content: 'ordinary task completed' })
+    })
+    const proc = f.processFor()
+    const consumed: string[] = []
+    proc.on('user_input_consumed', ({ inputId }) => consumed.push(inputId))
+    await proc.initializationPromise()
+    const runtime = (proc as any).runtime
+    const request = runtime.request.bind(runtime)
+    let attempts = 0
+    const requests = spyOn(runtime, 'request').mockImplementation((...args: any[]) => {
+      if (args[0] !== 'session/prompt' || args[1].mode !== 'steer') return request(...args)
+      attempts++
+      if (failure === 'rejected') return Promise.reject(new Error('native input rejected'))
+      return Promise.resolve(failure === 'missing-ack' ? {} : { accepted: true, messageId: 'message-id', inputId: 'different-input' })
+    })
+    try {
+      let done = nextResult(proc)
+      proc.sendUserText('original request')
+      await firstRequest.promise
+      await expect(proc.steerUserText('never replay this addition', [], 'rejected-input')).rejects.toThrow(
+        failure === 'rejected' ? 'native input rejected' : 'submission state is unknown')
+      finishFirst.release()
+      expect(await done).toMatchObject({ is_error: false })
+      done = nextResult(proc)
+      proc.sendUserText('ordinary next task')
+      expect(await done).toMatchObject({ is_error: false })
+      expect(attempts).toBe(1)
+      expect(f.requests).toHaveLength(2)
+      expect(requestUserTexts(f.requests[1])).not.toContain('never replay this addition')
+      expect(consumed).toEqual([])
+    } finally { finishFirst.release(); requests.mockRestore() }
+  }, 30_000)
+
   test('surfaces authentication failure and output limits instead of reporting success', async () => {
     const f = await fixture((_body, count) => count === 1
       ? Response.json({ error: { message: 'test credential rejected', type: 'authentication_error' } }, { status: 401 })
@@ -569,6 +817,49 @@ describe('DSH native runtime through Lodestar bridge', () => {
       expect(images[0]).toMatchObject({ source: { type: 'base64', media_type: 'image/jpeg' } })
       expect(images[0].source.data.length).toBeGreaterThan(0)
     }
+  }, 30_000)
+
+  test('steering admits file-marker images with the same byte detection and deduplication as ordinary input', async () => {
+    const model = 'lodestar-image-steering-probe'
+    const firstRequest = gate()
+    const finishFirst = gate()
+    const f = await fixture(async (_body, count) => {
+      if (count === 1) { firstRequest.release(); await finishFirst.promise }
+      return completion({ content: count === 1 ? 'original image task' : 'steering image accepted' }, 'stop', model)
+    })
+    const patchPath = join(f.dir, 'image-steering.patch.json')
+    await writeFile(patchPath, JSON.stringify([{ id: 'llm-deepseek', config: {
+      models: [{ id: model, inputModalities: ['text', 'image'] }],
+    } }]))
+    const image = join(f.dir, 'steered-feishu-download.png')
+    await writeFile(image, Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAAEAAQDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAABgf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCaAK+Kv//Z', 'base64'))
+    const proc = f.processFor(undefined, { model,
+      runtimeOptions: { ...f.opts.runtimeOptions, patches: [patchPath] } })
+    const consumed: string[] = []
+    proc.on('user_input_consumed', ({ inputId }) => consumed.push(inputId))
+    await proc.initializationPromise()
+    const done = nextResult(proc)
+    proc.sendUserText('start an image task')
+    try {
+      await firstRequest.promise
+      expect(await proc.steerUserText(`inspect this image [file: ${image}]`, [image], 'image-steering')).toBe(true)
+      expect(consumed).toEqual([])
+      finishFirst.release()
+      expect(await done).toMatchObject({ is_error: false })
+      expect(consumed).toEqual(['image-steering'])
+      expect(f.requests).toHaveLength(2)
+      expect(requestUserTexts(f.requests[1]).join('\n')).toContain(`[file: ${image}]`)
+      const imageType = f.protocols[1] === 'chat-completions' ? 'image_url' : 'image'
+      const images = f.requests[1].messages.flatMap((message: any) => Array.isArray(message.content)
+        ? message.content.filter((block: any) => block.type === imageType) : [])
+      expect(images).toHaveLength(1)
+      if (f.protocols[1] === 'chat-completions') {
+        expect(images[0].image_url.url).toMatch(/^data:image\/jpeg;base64,\S+$/)
+      } else {
+        expect(images[0]).toMatchObject({ source: { type: 'base64', media_type: 'image/jpeg' } })
+        expect(images[0].source.data.length).toBeGreaterThan(0)
+      }
+    } finally { finishFirst.release() }
   }, 30_000)
 
   test('uses native manual compaction and keeps the compacted session resumable', async () => {

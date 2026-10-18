@@ -7,7 +7,7 @@ import { realpath } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, LlmCallConfig } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, LlmCallConfig, MessageId } from '@deepseek-ai/dsh-llm'
 import { SessionLogOffset } from '@deepseek-ai/dsh-session'
 import type { SessionId, SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
@@ -46,6 +46,8 @@ export function apply(ctx: Context): void {
   let turnFailure: string | undefined
   let settledSeq = -1
   let settling: Promise<void> | undefined
+  let inputGeneration = 0
+  const steeringInputs = new Map<MessageId, string>()
   const questions = new Map<string, { resolve: (answer: any) => void; reject: (error: Error) => void }>()
   const notify = (method: string, params: unknown): void => {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n')
@@ -75,13 +77,21 @@ export function apply(ctx: Context): void {
     }
     if (settling || !lastEnd || !root || root.agent.status !== 'idle' || lastEnd.seq <= settledSeq) return
     const end = lastEnd
+    // A rejected native step can leave steering parked. Once its turn has
+    // ended, it must not silently execute with a later, unrelated user task.
+    for (const messageId of steeringInputs.keys()) root.agent.inbox.remove(messageId)
+    steeringInputs.clear()
     settling = ctx.sessionPersistence.flush().then(() => {
       settledSeq = end.seq
+      if (root?.agent.status !== 'idle' || lastEnd !== end || activeTurn !== end.data.turn) return
       notify('settled', { sessionId: rootId, event: end })
     }).catch(error => { settledSeq = end.seq; fail(error) }).finally(() => { settling = undefined; settle() })
   }
   ctx.on('session/event', (session, event) => {
-    notify('session.event', { sessionId: session.id, event })
+    const inputId = session.id === rootId && event.type === 'user/message'
+      ? steeringInputs.get(event.data.id) : undefined
+    if (inputId && event.type === 'user/message') steeringInputs.delete(event.data.id)
+    notify('session.event', { sessionId: session.id, event, ...(inputId ? { inputId } : {}) })
     if (session.id === rootId && event.type === 'turn/start') {
       turnRoute = selected
       if (root) Object.assign(root.agent.options, selected)
@@ -272,22 +282,43 @@ export function apply(ctx: Context): void {
       }
       case 'session/prompt': {
         const agent = live()
+        const generation = inputGeneration
+        const isSteering = params.mode === 'steer'
+        if (isSteering && (typeof params.inputId !== 'string' || !params.inputId
+          || typeof params.expectedTurnId !== 'string')) throw new Error('invalid DSH steering input identity')
+        const acceptsSteering = () => agent.status === 'running'
+          && String(activeTurn) === params.expectedTurnId && lastEnd?.data.turn !== activeTurn
+        if (isSteering && !acceptsSteering()) return { accepted: false }
         if (!Array.isArray(params.content) || !params.content.length) throw new Error('empty DSH prompt')
         if (params.content.some((part: any) => part.type === 'image')) {
-          const routeInfo = await ctx.llm.resolveModelInfo(PROVIDER, selected!.model)
-          if (!routeInfo.inputModalities?.includes('image')) throw new Error(`DSH model ${selected!.model} does not accept images`)
+          const model = (isSteering ? turnRoute : selected)!.model
+          const routeInfo = await ctx.llm.resolveModelInfo(PROVIDER, model)
+          if (!routeInfo.inputModalities?.includes('image')) throw new Error(`DSH model ${model} does not accept images`)
         }
         const content = await ctx.attachments.admitPromptContent(params.content)
+        // Admission is asynchronous; cancel/shutdown or turn completion may
+        // have passed it. Native steer on an idle/aborted agent wakes a new turn.
+        if (closing || generation !== inputGeneration) throw new Error('DSH prompt cancelled before submission')
+        if (isSteering && !acceptsSteering()) return { accepted: false }
         const message = createUserMessage({ content: content as ContentBlock[], source: { kind: 'user' } })
         const delivery = params.mode === 'auto' ? agent.status === 'running' ? 'steer' : 'queue' : params.mode
-        if (delivery === 'steer') agent.steer(message)
+        if (delivery === 'steer') {
+          if (isSteering) steeringInputs.set(message.id, params.inputId)
+          try { agent.steer(message) }
+          catch (error) { steeringInputs.delete(message.id); throw error }
+        }
         else if (delivery === 'queue') agent.followup(message)
         else throw new Error('invalid DSH input mode')
-        return { messageId: message.id }
+        return { messageId: message.id, ...(isSteering ? { accepted: true, inputId: params.inputId } : {}) }
       }
       // Node fetch attaches a non-enumerable stack accessor to a mutable abort
       // reason. DSH persists this exact cause and requires lossless JSON.
-      case 'session/cancel': live().cancel(Object.freeze({ kind: 'user' as const }), { keepInbox: true }); return {}
+      case 'session/cancel': {
+        inputGeneration++
+        steeringInputs.clear()
+        live().cancel(Object.freeze({ kind: 'user' as const }))
+        return {}
+      }
       case 'question/answer': {
         const pending = questions.get(params.id)
         if (!pending) throw new Error('DSH question no longer pending')
@@ -305,6 +336,8 @@ export function apply(ctx: Context): void {
       }
       case 'shutdown': {
         closing = true
+        inputGeneration++
+        steeringInputs.clear()
         lifecycle.abort(Object.freeze({ kind: 'disposed' as const }))
         if (opening) {
           try { await opening }

@@ -286,7 +286,7 @@ describe('Session in-flight user guidance', () => {
     return { session, proc, turn }
   }
 
-  for (const provider of ['codex', 'claude'] as const) {
+  for (const provider of ['codex', 'claude', 'dsh'] as const) {
     test(`${provider} waits for native consumption before changing the presentation card`, async () => {
       const { session, proc, turn } = running(provider)
       const steered: any[] = []
@@ -513,7 +513,7 @@ describe('Session in-flight user guidance', () => {
     } finally { await session.closeTurnCard('测试收尾') }
   })
 
-  for (const provider of ['codex', 'claude'] as const) {
+  for (const provider of ['codex', 'claude', 'dsh'] as const) {
     test(`${provider} combines the consecutive consumed 2–10 messages into one supplemental card`, async () => {
       const { session, proc, turn } = running(provider)
       const ids: string[] = []
@@ -535,7 +535,7 @@ describe('Session in-flight user guidance', () => {
           await new Promise(resolve => setTimeout(resolve, 2))
           expect(sentCards).toEqual([])
         }
-        if (provider === 'codex') proc.emit('input_batch_end', { itemId: 'reasoning-for-all-inputs' })
+        if (provider !== 'claude') proc.emit('input_batch_end', { itemId: 'reasoning-for-all-inputs' })
         proc.emit('assistant_text', { text: '收到，测试消息 1–10 均已接收。', parentToolUseId: null })
         proc.emit('assistant_block_stop', { parentToolUseId: null })
         await waitUntil(() => session.steeringBoundary === null)
@@ -643,8 +643,9 @@ describe('Session in-flight user guidance', () => {
     expect(sentRawTexts.some(text => text.includes('缺少原生处理位置确认'))).toBe(true)
   })
 
-  test('backends without steering retain the existing next-turn input batch', async () => {
-    const { session, proc } = running('dsh')
+  test('a process without the steering capability retains the existing next-turn input batch', async () => {
+    const { session, proc } = running()
+    proc.steerUserText = undefined
     try {
       await session.onUserMessage('next task')
       expect(session.pendingMidTurnMsgs.map((msg: any) => msg.text)).toEqual(['next task'])

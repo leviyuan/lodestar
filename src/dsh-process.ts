@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { randomUUID } from 'node:crypto'
 import { join, isAbsolute, extname, basename } from 'node:path'
 import { readFile } from 'node:fs/promises'
 import type { AgentModel, AgentProcess, AgentReasoningEffort, DshReasoningEffort } from './agent-process'
@@ -60,6 +61,9 @@ export class DshProcess extends EventEmitter implements AgentProcess {
   private ready?: Promise<void>
   private models: DshModel[] = []
   private busy = false
+  private activeTurnId: string | null = null
+  private inputGeneration = 0
+  private steeringInputs = new Set<string>()
   private closing = false
   private startedAt = 0
   private questionInputs = new Map<string, any[]>()
@@ -119,28 +123,66 @@ export class DshProcess extends EventEmitter implements AgentProcess {
   }
   isAlive(): boolean { return this.runtime.isAlive() }
   isConversationResumable(): boolean { return this.sessionId !== null }
-  kill(timeoutMs?: number): Promise<void> { this.closing = true; return this.runtime.close(timeoutMs) }
+  kill(timeoutMs?: number): Promise<void> {
+    this.closing = true
+    this.inputGeneration++
+    this.steeringInputs.clear()
+    return this.runtime.close(timeoutMs)
+  }
+  private async inputContent(text: string, files: string[]): Promise<object[]> {
+    if (files.some(file => !isAbsolute(file))) throw new Error('DSH file inputs must use absolute paths')
+    const content: object[] = [{ type: 'text', text: [text, ...files.map(file => `[file: ${file}]`)].join('\n') }]
+    const referenced = new Set([...files, ...Array.from(text.matchAll(/\[file: ([^\]\r\n]+)\]/g), match => match[1])])
+    const imageExtensions = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif'])
+    for (const path of referenced) {
+      if (!imageExtensions.has(extname(path).toLowerCase())) continue
+      const bytes = await readFile(path)
+      content.push({ type: 'image', mediaType: imageMediaType(bytes), name: basename(path), data: bytes.toString('base64') })
+    }
+    return content
+  }
   sendUserText(text: string, files: string[] = []): void {
     if (!this.isAlive() || this.closing) throw new Error('DSH process is closed')
     if (files.some(file => !isAbsolute(file))) throw new Error('DSH file inputs must use absolute paths')
     if (this.terminalError) throw this.terminalError
     this.pendingInputs++
     void this.initializationPromise().then(async () => {
-      const content: object[] = [{ type: 'text', text: [text, ...files.map(file => `[file: ${file}]`)].join('\n') }]
-      const referenced = new Set([...files, ...Array.from(text.matchAll(/\[file: ([^\]\r\n]+)\]/g), match => match[1])])
-      const imageExtensions = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif'])
-      for (const path of referenced) {
-        if (!imageExtensions.has(extname(path).toLowerCase())) continue
-        const bytes = await readFile(path)
-        content.push({ type: 'image', mediaType: imageMediaType(bytes), name: basename(path), data: bytes.toString('base64') })
-      }
+      const content = await this.inputContent(text, files)
       await this.runtime.request('session/prompt', {
         mode: 'auto', content,
       })
       this.pendingInputs--
     }).catch(error => this.fail(error))
   }
-  sendInterrupt(): void { void this.runtime.request('session/cancel').catch(error => this.fail(error)) }
+  async steerUserText(text: string, files: string[] = [], inputId: string = randomUUID()): Promise<boolean> {
+    if (!this.isAlive() || this.closing) throw new Error('DSH process is closed')
+    if (this.terminalError) throw this.terminalError
+    const turnId = this.activeTurnId
+    if (!turnId) return false
+    const generation = this.inputGeneration
+    const content = await this.inputContent(text, files)
+    if (generation !== this.inputGeneration || this.activeTurnId !== turnId || this.closing) return false
+    this.steeringInputs.add(inputId)
+    // Register before writing: native consumption may arrive before the RPC ACK.
+    // A rejected or uncertain submission is reported by Session, never replayed.
+    const result = await this.runtime.request('session/prompt', {
+      mode: 'steer', content, inputId, expectedTurnId: turnId,
+    })
+    if (result?.accepted === false) {
+      this.steeringInputs.delete(inputId)
+      return false
+    }
+    if (result?.accepted !== true || result.inputId !== inputId || typeof result.messageId !== 'string') {
+      throw new Error('DSH did not confirm the additional input; submission state is unknown')
+    }
+    return true
+  }
+  sendInterrupt(): void {
+    this.inputGeneration++
+    this.activeTurnId = null
+    this.steeringInputs.clear()
+    void this.runtime.request('session/cancel').catch(error => this.fail(error))
+  }
   sendPermissionResponse(requestId: string | number, decision: 'allow' | 'deny', payload?: { updatedInput?: Record<string, unknown>; denyMessage?: string }): void {
     const id = String(requestId)
     const questions = this.questionInputs.get(id)
@@ -234,7 +276,13 @@ export class DshProcess extends EventEmitter implements AgentProcess {
       case 'assistant.frame': {
         const frame = params.frame
         const key = `${params.sessionId}:${frame.attemptId}`
-        if (frame.type === 'start') { this.frames.set(key, { revision: frame.revision, nextIndex: 0 }); return }
+        if (frame.type === 'start') {
+          this.frames.set(key, { revision: frame.revision, nextIndex: 0 })
+          // request/header is omitted when the route stays unchanged. Every
+          // model attempt still marks the end of its preceding user batch.
+          if (!sub) this.emit('input_batch_end', { itemId: frame.attemptId })
+          return
+        }
         const state = this.frames.get(key)
         if (!state || state.revision + 1 !== frame.revision || state.nextIndex !== frame.index) throw new Error('DSH assistant stream sequence mismatch')
         state.revision = frame.revision
@@ -260,14 +308,22 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         if (!e || !data || typeof e.type !== 'string') throw new Error('invalid DSH session event')
         if (e.type === 'turn/start' && !sub) {
           this.busy = true; this.startedAt = Date.now(); this.lastUsage = null
+          this.activeTurnId = String(data.turn)
           this.lastResult = emptyResult()
           this.emit('scheduled_turn_input', { text: 'DeepSeek Harness 继续执行', promptId: `dsh-turn-${data.turn}` })
           this.emit('turn_started', { turn_id: String(data.turn), thread_id: this.sessionId })
         } else if (e.type === 'turn/start' && sub && this.settledChildren.delete(params.sessionId)) {
           this.emit('bg_task_started', { task_id: params.sessionId, description: 'DeepSeek Harness 子 Agent', task_type: 'agent', tool_use_id: params.sessionId })
-        } else if (e.type === 'request/header' && !sub && data.header?.config) {
-          this.lastModel = data.header.config.model; this.lastEffort = data.header.config.reasoningEffort
-          this.lastContextWindow = this.models.find(m => m.model === this.lastModel)?.contextWindow ?? null
+        } else if (e.type === 'user/message' && !sub && typeof params.inputId === 'string') {
+          if (this.steeringInputs.delete(params.inputId)) this.emit('user_input_consumed', { inputId: params.inputId })
+        } else if (e.type === 'request/header' && !sub) {
+          this.emit('input_batch_end', { itemId: String(e.seq) })
+          if (data.header?.config) {
+            this.lastModel = data.header.config.model; this.lastEffort = data.header.config.reasoningEffort
+            this.lastContextWindow = this.models.find(m => m.model === this.lastModel)?.contextWindow ?? null
+          }
+        } else if (e.type === 'turn/end' && !sub) {
+          this.activeTurnId = null
         } else if (e.type === 'tool/call') {
           const input = JSON.parse(data.arguments)
           const name = toolAliases[data.name] ?? data.name
@@ -313,6 +369,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
       case 'settled': {
         if (sub) throw new Error('DSH settled a different root session')
         this.busy = false
+        this.steeringInputs.clear()
         const event = params.event
         const reason = event.data.reason
         this.lastCompletedTurnId = String(event.seq)
