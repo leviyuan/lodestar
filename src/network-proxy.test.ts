@@ -54,6 +54,36 @@ describe('shared outbound proxy policy', () => {
     expect(resolveProxy(target, { NO_PROXY: '*' }, { unsupported: 'PAC' })).toBeUndefined()
   })
 
+  test('abbreviated IPv4 CIDRs preserve network boundaries in system and environment bypass rules', () => {
+    for (const [range, inside, outside] of [
+      ['169.254/16', '169.254.42.9', '169.255.42.9'],
+      ['10/8', '10.255.255.255', '11.0.0.0'],
+      ['172.16/12', '172.31.255.255', '172.32.0.0'],
+      ['192.168.1/24', '192.168.1.255', '192.168.2.0'],
+    ]) {
+      const insideUrl = new URL(`https://${inside}`)
+      const outsideUrl = new URL(`https://${outside}`)
+      expect(resolveProxy(insideUrl, {}, { https: proxy, bypass: range })).toBeUndefined()
+      expect(resolveProxy(outsideUrl, {}, { https: proxy, bypass: range })).toBe(proxy)
+      expect(resolveProxy(insideUrl, { HTTPS_PROXY: proxy, NO_PROXY: range })).toBeUndefined()
+      expect(resolveProxy(outsideUrl, { HTTPS_PROXY: proxy, NO_PROXY: range })).toBe(proxy)
+      expect(bypassProxy(target, range)).toBe(false)
+      expect(bypassProxy(new URL('https://[fd00::42]'), range)).toBe(false)
+    }
+    for (const range of ['256.254/16', '169.254/33', '169..254/16', '169.254/-1', '169.254/16/8', 'https://example.com']) {
+      expect(() => resolveProxy(target, {}, { https: proxy, bypass: range })).toThrow('invalid IP range')
+      expect(() => resolveProxy(target, { HTTPS_PROXY: proxy, NO_PROXY: range })).toThrow('invalid IP range')
+    }
+  })
+
+  test('system bypass rules only apply when a proxy is enabled for the requested protocol', () => {
+    const system = { http: proxy, bypass: 'not-a-network/99' }
+    expect(resolveProxy(target, {}, system)).toBeUndefined()
+    expect(resolveProxy(target, {}, { bypass: system.bypass })).toBeUndefined()
+    expect(() => resolveProxy(new URL('http://example.com'), {}, system)).toThrow('invalid IP range')
+    expect(() => resolveProxy(target, {}, { all: proxy, bypass: system.bypass })).toThrow('invalid IP range')
+  })
+
   test('system discovery is shared and environment remains authoritative after discovery', async () => {
     let reads = 0
     const env: Record<string, string> = {}
@@ -121,6 +151,40 @@ describe('desktop system proxy settings', () => {
     expect(settings).toEqual({ http: 'http://127.0.0.1:7890', https: 'http://[::1]:7891', bypass: '*.local,10.0.0.0/8,<local>' })
     expect(parseMacProxy('ProxyAutoConfigEnable : 1').unsupported).toContain('PAC')
     expect(() => parseMacProxy('HTTPEnable : 1\nHTTPProxy : host\nHTTPPort : 0')).toThrow('invalid host or port')
+  })
+
+  test('macOS without enabled proxies connects directly despite its default exceptions', async () => {
+    const text = `<dictionary> {
+      ExceptionsList : <array> {
+        0 : *.local
+        1 : 169.254/16
+      }
+      FTPPassive : 1
+    }`
+    const settings = parseMacProxy(text)
+    expect(settings).toEqual({})
+    const resolve = createProxyResolver(async () => settings, {})
+    expect(await resolve(new URL('https://registry.npmjs.org/@anthropic-ai%2Fclaude-code/latest'))).toBeUndefined()
+    expect(await resolve(new URL('http://example.com'))).toBeUndefined()
+
+    const disabled = parseMacProxy(`HTTPEnable : 0\nHTTPProxy : stale\nHTTPPort : 0
+      HTTPSEnable : 0\nHTTPSProxy : stale\nHTTPSPort : 0\nSOCKSEnable : 0
+      ExceptionsList : <array> {
+        0 : not-a-network/99
+      }`)
+    expect(resolveProxy(target, {}, disabled)).toBeUndefined()
+  })
+
+  test('macOS enabled proxy accepts its abbreviated default network exception', () => {
+    const settings = parseMacProxy(`HTTPSEnable : 1\nHTTPSProxy : 127.0.0.1\nHTTPSPort : 7890
+      ExceptionsList : <array> {
+        0 : *.local
+        1 : 169.254/16
+      }`)
+    expect(resolveProxy(new URL('https://registry.npmjs.org'), {}, settings)).toBe(proxy)
+    expect(resolveProxy(new URL('https://169.254.1.2'), {}, settings)).toBeUndefined()
+    expect(resolveProxy(new URL('https://169.255.1.2'), {}, settings)).toBe(proxy)
+    expect(resolveProxy(new URL('https://printer.local'), {}, settings)).toBeUndefined()
   })
 
   test('GNOME manual/shared proxy preserves authentication and bypass', () => {

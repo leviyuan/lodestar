@@ -36,7 +36,12 @@ export function bypassProxy(url: URL, bypass = ''): boolean {
     if (entry === '*') return true
     if (entry === '<local>') return !host.includes('.') && !host.includes(':')
     if (entry.includes('/')) {
-      if (Address4.isValid(entry)) return Address4.isValid(host) && new Address4(host).isInSubnet(new Address4(entry))
+      // macOS uses abbreviated networks such as 169.254/16; omitted trailing octets are zero.
+      const abbreviated = entry.match(/^(\d{1,3}(?:\.\d{1,3}){0,2})\/(\d{1,2})$/)
+      const ipv4 = abbreviated
+        ? `${abbreviated[1]}${'.0'.repeat(4 - abbreviated[1]!.split('.').length)}/${abbreviated[2]}`
+        : entry
+      if (Address4.isValid(ipv4)) return Address4.isValid(host) && new Address4(host).isInSubnet(new Address4(ipv4))
       if (Address6.isValid(entry)) return Address6.isValid(host) && new Address6(host).isInSubnet(new Address6(entry))
       throw new Error('network proxy: invalid IP range in bypass list')
     }
@@ -67,9 +72,9 @@ export function resolveProxy(url: URL, env: Environment, system: ProxySettings =
   const explicit = envValue(env, scheme) || envValue(env, 'ALL_PROXY')
   if (explicit) return checkedProxy(explicit, 'environment')
   if (system.unsupported) throw new Error(`network proxy: ${system.unsupported}`)
-  if (bypassProxy(url, system.bypass)) return undefined
   const value = (url.protocol === 'https:' ? system.https : system.http) || system.all
-  return value ? checkedProxy(value, 'system settings') : undefined
+  if (!value || bypassProxy(url, system.bypass)) return undefined
+  return checkedProxy(value, 'system settings')
 }
 
 function endpoint(host: unknown, port: unknown, protocol = 'http'): string {
@@ -107,6 +112,7 @@ export function parseMacProxy(text: string): ProxySettings {
   if (value('HTTPEnable') === '1') result.http = endpoint(value('HTTPProxy'), value('HTTPPort'))
   if (value('HTTPSEnable') === '1') result.https = endpoint(value('HTTPSProxy'), value('HTTPSPort'))
   if (value('SOCKSEnable') === '1') result.all = endpoint(value('SOCKSProxy'), value('SOCKSPort'), 'socks')
+  if (!result.http && !result.https && !result.all) return result
   const exceptions = text.match(/ExceptionsList\s*:\s*<array>\s*\{([^}]*)\}/)?.[1] ?? ''
   result.bypass = [...exceptions.matchAll(/^\s*\d+\s*:\s*(.*?)\s*$/gm)].map(match => match[1]).join(',')
   if (value('ExcludeSimpleHostnames') === '1') result.bypass += ',<local>'
