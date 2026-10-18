@@ -3,7 +3,6 @@ import type { AgentProvider } from './agent-process'
 import { getTokenSource } from './token-source'
 import { channelInstructions } from './instructions'
 import { claudeTranslationModeEnabled } from './claude-translation-mode'
-import type { FileDeliveryMode } from './file-delivery-types'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
@@ -23,10 +22,10 @@ export function worktreeSessionDir(s: Session): string {
   return feishu.resolveProjectDir(s.sessionName)
 }
 
-export function spawnDeveloperInstructions(s: Session, mode: FileDeliveryMode, provider: AgentProvider = s.currentProvider()): string {
+export function spawnDeveloperInstructions(s: Session, provider: AgentProvider = s.currentProvider()): string {
   const model = s.selectedModel ?? (s.selectedTokenSourceId ? getTokenSource(s.selectedTokenSourceId)?.defaultModel : undefined)
   const translate = provider === 'claude' && claudeTranslationModeEnabled(s.selectedTokenSourceId, model)
-  const base = channelInstructions(provider, mode, translate ? 'en' : 'zh')
+  const base = channelInstructions(translate ? 'en' : 'zh')
   const extra = worktreeExtraInstruction(s)
   return extra ? `${base}\n${extra}` : base
 }

@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
+import { channelInstructions } from './instructions'
 
-test('main Agent launches select the directory delivery rules for Codex, Claude and DSH', () => {
+test('main Agent launches share channel instructions while capturing directory delivery modes', () => {
   // Isolate module mocks so no real Agent or Feishu service is started.
   const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', `
     import { mock } from 'bun:test'
@@ -24,6 +25,7 @@ test('main Agent launches select the directory delivery rules for Codex, Claude 
         session.selectedEffort = 'high'
         session.getFileDeliveryMode = () => mode
         const proc = session.spawnAgent()
+        launches.at(-1).deliveryMode = session.procFileDeliveryModes.get(proc)
         session.sendClaimedUserText(proc, '生成报告')
         session.sendClaimedUserText(proc, '继续')
       }
@@ -39,20 +41,13 @@ test('main Agent launches select the directory delivery rules for Codex, Claude 
   expect(error).toBe('group config unreadable')
   expect(launches).toHaveLength(6)
   for (const [index, launch] of launches.entries()) {
-    expect(launch.instructions).toContain('[[send: /abs/path]]')
+    expect(launch.instructions).toBe(channelInstructions())
     expect(launch.inputs).toEqual(['生成报告', '继续'])
-    if (index % 2 === 0) {
-      expect(launch.instructions).toContain('30 × 1024 × 1024')
-      expect(launch.instructions).toContain('交付前检查文件大小')
-    } else {
-      expect(launch.instructions).not.toMatch(/30|大小|压缩|分卷|分片/)
-    }
-    const questionTool = { codex: 'request_user_input', claude: 'AskUserQuestion', dsh: 'ask_user_question' }[launch.provider as 'codex' | 'claude' | 'dsh']
-    expect(launch.instructions).toContain(questionTool)
+    expect(launch.deliveryMode).toBe(index % 2 === 0 ? 'chat' : 'drive')
   }
 })
 
-test('BTW launches first with migrated directory settings; WT launches with its own profile and delivery rules', () => {
+test('BTW uses migrated directory settings and WT keeps its own profile and delivery mode with the same instructions', () => {
   const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', `
     import { mock } from 'bun:test'
     import { writeFileSync } from 'node:fs'
@@ -81,7 +76,8 @@ test('BTW launches first with migrated directory settings; WT launches with its 
         session.selectedTokenSourceId = null
         session.selectedModel = 'test-model'
         session.selectedEffort = 'high'
-        session.spawnAgent()
+        const proc = session.spawnAgent()
+        launches.at(-1).deliveryMode = session.procFileDeliveryModes.get(proc)
       }
     }
     console.log(JSON.stringify({ launches, mainDir, wtDir }))
@@ -94,6 +90,7 @@ test('BTW launches first with migrated directory settings; WT launches with its 
     expect(launch.workDir).toBe(wt ? wtDir : mainDir)
     expect(launch.profile.tools).toBe(wt ? 'Read,Edit' : 'Read')
     expect(launch.profile.loadProjectMcp).toBe(wt)
-    expect(launch.developerInstructions.includes('30 × 1024 × 1024')).toBe(wt)
+    expect(launch.developerInstructions).toBe(channelInstructions())
+    expect(launch.deliveryMode).toBe(wt ? 'chat' : 'drive')
   }
 })

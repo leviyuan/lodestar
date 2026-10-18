@@ -1,45 +1,25 @@
 import { describe, expect, test } from 'bun:test'
-import { channelInstructions, fileDeliveryAgentContext, fileDeliveryInstructions } from './instructions'
+import { channelInstructions } from './instructions'
 
-describe('host instruction languages', () => {
-  test('keeps Chinese as the default for existing callers', () => {
-    expect(channelInstructions('claude', 'chat')).toBe(channelInstructions('claude', 'chat', 'zh'))
-    expect(fileDeliveryInstructions('drive')).toBe(fileDeliveryInstructions('drive', 'zh'))
-    expect(fileDeliveryAgentContext('chat')).toBe(fileDeliveryAgentContext('chat', 'zh'))
-    expect(channelInstructions('claude', 'chat')).toContain('# desc: <一句中文说明>')
+describe('channel instructions', () => {
+  test('uses the approved Chinese wording verbatim by default', () => {
+    expect(channelInstructions()).toBe(`你现在通过飞书通道插件与用户协作，需要遵守以下约定
+- 收到的消息中，\`[file: /abs/path]\` 表示附件，有需要可以直接读取
+- 需要交付文件时，检查文件后独占一行输出 \`[[send: /实际绝对路径]]\`
+- Bash / shell 命令首行写 \`# desc: <一句中文说明>\`
+- 所有飞书相关的内容由通道插件处理，除了以上约定，你不需要做任何额外的事情`)
+    expect(channelInstructions()).toBe(channelInstructions('zh'))
   })
 
-  test('English instructions retain the host identity, file protocol, and native questions', () => {
-    const instructions = channelInstructions('claude', 'chat', 'en')
+  test('the English version keeps the same channel contract without extra policies', () => {
+    const instructions = channelInstructions('en')
     expect(instructions).not.toMatch(/\p{Script=Han}/u)
-    expect(instructions).toContain('Lodestar handles uploads, permissions, and cards')
+    expect(instructions.split('\n')).toHaveLength(5)
+    expect(instructions).toContain('Feishu channel plugin')
     expect(instructions).toContain('`[file: /abs/path]`')
-    expect(instructions).toContain('`[[send: /abs/path]]`')
-    expect(instructions).toContain('`files`, `files on`, and `files off`')
-    expect(instructions).toContain('AskUserQuestion')
+    expect(instructions).toContain('`[[send: /absolute/path]]`')
     expect(instructions).toContain('# desc: <brief description>')
-    expect(instructions).toContain('it does not prove that the upload succeeded')
-    expect(instructions).toContain('must not call these Feishu APIs directly')
-  })
-
-  test('the attachment limit applies only to chat in both languages and live updates', () => {
-    for (const language of ['zh', 'en'] as const) {
-      for (const render of [fileDeliveryInstructions, fileDeliveryAgentContext]) {
-        expect(render('chat', language)).toContain('30 MB')
-        expect(render('drive', language)).not.toContain('30 MB')
-      }
-      expect(channelInstructions('claude', 'chat', language)).toContain('30 MB')
-      expect(channelInstructions('claude', 'drive', language)).not.toContain('30 MB')
-    }
-    const update = fileDeliveryAgentContext('drive', 'en')
-    expect(update).not.toMatch(/\p{Script=Han}/u)
-    expect(update).toContain('[Lodestar File delivery instructions update]')
-    expect(update).toContain('fully replace the previous file delivery instructions')
-    expect(update).toContain('`[[send: /abs/path]]`')
-  })
-
-  test('English instructions preserve each provider question tool', () => {
-    expect(channelInstructions('codex', 'drive', 'en')).toContain('request_user_input')
-    expect(channelInstructions('dsh', 'drive', 'en')).toContain('ask_user_question')
+    expect(instructions).toContain('Beyond these conventions, you do not need to do anything else.')
+    expect(instructions).not.toMatch(/Lodestar|30 MB|AskUserQuestion|request_user_input|ask_user_question|files on|image generation|permissions|credentials/)
   })
 })

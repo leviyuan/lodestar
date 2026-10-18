@@ -51,7 +51,7 @@ test('main-session instructions use untranslated defaults for every source', () 
     ]
     for (const [sessionName, workDir, selectedTokenSourceId, provider, expected] of cases) {
       const text = spawnDeveloperInstructions({ sessionName, workDir, selectedTokenSourceId,
-        currentProvider: () => provider }, 'chat')
+        currentProvider: () => provider })
       assert.equal(text.includes('# desc: <brief description>'), expected)
       assert.equal(text.includes('# desc: <一句中文说明>'), !expected)
     }
@@ -75,7 +75,7 @@ test('main-session instructions follow configured models and subscription opt-ou
     for (const [selectedTokenSourceId, selectedModel, provider, expected] of cases) {
       const text = spawnDeveloperInstructions({ sessionName: 'configured-safe-mode',
         workDir: process.env.LODESTAR_DATA_DIR, selectedTokenSourceId, selectedModel,
-        currentProvider: () => provider }, 'chat')
+        currentProvider: () => provider })
       assert.equal(text.includes('# desc: <brief description>'), expected)
       assert.equal(text.includes('# desc: <一句中文说明>'), !expected)
     }

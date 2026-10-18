@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { fileDeliveryAgentContext } from './instructions'
+import { channelInstructions } from './instructions'
 import { FileDeliveryBatch } from './file-delivery'
 import { GroupFileDelivery } from './group-file-delivery'
 import type { FileDeliverySnapshot } from './file-delivery-types'
@@ -745,7 +745,7 @@ describe('Session cloud file receipts', () => {
         await registry.disable(main.chatId, main.workDir)
         btw.sendClaimedUserText(proc, 'second')
         btw.sendClaimedUserText(proc, 'third')
-        expect(proc.sentTexts).toEqual(['first', `${fileDeliveryAgentContext('chat')}\n\nsecond`, 'third'])
+        expect(proc.sentTexts).toEqual(['first', "second", 'third'])
       } finally { mode.mockRestore(); main.dispose(); btw.dispose(); wt.dispose() }
     })
   }
@@ -781,7 +781,7 @@ describe('Session cloud file receipts', () => {
     expect(cloudPaths).toEqual(['/tmp/third.pdf'])
   })
 
-  test('updates delivery rules only when the group mode changes, without repeating startup rules', () => {
+  test('changes delivery mode without adding instructions to user input', () => {
     const session = new Session('file-mode-context', 'chat') as any
     const proc = new FakeAgentProc('codex')
     let mode = 'drive'
@@ -795,9 +795,9 @@ describe('Session cloud file receipts', () => {
     session.sendClaimedUserText(proc, '生成视频')
     expect(proc.sentTexts).toEqual([
       '生成大文件',
-      `${fileDeliveryAgentContext('chat')}\n\n继续交付`,
+      "继续交付",
       '生成报告',
-      `${fileDeliveryAgentContext('drive')}\n\n生成视频`,
+      "生成视频",
     ])
     expect(proc.sentTexts[3]).not.toMatch(/30|大小|压缩|分卷/)
   })
@@ -821,10 +821,10 @@ describe('Session cloud file receipts', () => {
     session.sendClaimedUserText(proc, '生成报告')
     session.sendOutboundPath('/tmp/report.pdf', 'send marker')
     expect(sentLocalFiles).toEqual([['chat', '/tmp/report.pdf']])
-    expect(proc.sentTexts).toEqual(['生成视频', `${fileDeliveryAgentContext('chat')}\n\n生成报告`])
+    expect(proc.sentTexts).toEqual(['生成视频', "生成报告"])
   })
 
-  test('keeps the injected delivery mode if the backend opens its card after the group switch changed', () => {
+  test('keeps the captured delivery mode if the backend opens its card after the group switch changed', () => {
     const session = new Session('file-mode-late-card', 'chat') as any
     const proc = new FakeAgentProc('codex')
     session.proc = proc
@@ -841,7 +841,7 @@ describe('Session cloud file receipts', () => {
     expect(sentLocalFiles).toEqual([])
   })
 
-  test('retries a delivery-rule update after the backend rejects its input write', () => {
+  test('restores the previous delivery mode after the backend rejects its input write', () => {
     const session = new Session('file-mode-write-error', 'chat') as any
     const proc = new FakeAgentProc('codex')
     session.procFileDeliveryModes.set(proc, 'drive')
@@ -853,10 +853,10 @@ describe('Session cloud file receipts', () => {
     expect(session.procFileDeliveryModes.get(proc)).toBe('drive')
     proc.sendUserText = send
     session.sendClaimedUserText(proc, '生成报告')
-    expect(proc.sentTexts).toEqual([`${fileDeliveryAgentContext('chat')}\n\n生成报告`])
+    expect(proc.sentTexts).toEqual(["生成报告"])
   })
 
-  test('an async translation rejection releases the input claim and resends unsent delivery context', async () => {
+  test('an async translation rejection preserves the previous delivery mode without adding context', async () => {
     const session = new Session('translation-delivery-failure', 'chat') as any
     const proc = new FakeAgentProc('claude', 'translation-session', 'claude-sub') as any
     proc.translationEnabled = true
@@ -873,8 +873,8 @@ describe('Session cloud file receipts', () => {
     expect(session.procFileDeliveryModes.get(proc)).toBe('drive')
     await session.sendClaimedUserText(proc, 'second')
     expect(proc.sentTexts).toEqual([
-      `${fileDeliveryAgentContext('chat', 'en')}\n\nfirst`,
-      `${fileDeliveryAgentContext('chat', 'en')}\n\nsecond`,
+      "first",
+      "second",
     ])
     proc.emit('user_input_submitted', {})
     expect(session.procFileDeliveryModes.get(proc)).toBe('chat')
@@ -883,7 +883,7 @@ describe('Session cloud file receipts', () => {
     session.interrupt()
     expect(session.userInterrupted).toBe(false)
     expect(session.procFileDeliveryModes.get(proc)).toBe('chat')
-    expect(session.procFileDeliveryNeedsUpdate.has(proc)).toBe(true)
+    expect(session.procPendingFileDeliveryModes.has(proc)).toBe(false)
     session.dispose()
   })
 
@@ -902,7 +902,7 @@ describe('Session cloud file receipts', () => {
       session.userInterrupted = true
       session.interrupt()
       expect(session.userInterrupted).toBe(true)
-      expect(session.procFileDeliveryNeedsUpdate.has(proc)).toBe(false)
+      expect(session.procPendingFileDeliveryModes.has(proc)).toBe(false)
       session.dispose()
     }
   })
@@ -2497,26 +2497,22 @@ describe('Session provider switching', () => {
   })
   afterAll(() => resetTokenSourceRegistry())
 
-  test('uses provider-specific ask instructions', () => {
+  test('uses the same channel instructions across backends and English in safe mode', () => {
     const session = new Session('probe', 'chat_id') as any
 
-    session.selectedProvider = 'codex'
-    expect(session.spawnDeveloperInstructions()).toContain('request_user_input')
+    for (const provider of ['codex', 'claude', 'dsh']) {
+      session.selectedProvider = provider
+      expect(session.spawnDeveloperInstructions()).toBe(channelInstructions())
+    }
 
     session.selectedProvider = 'claude'
-    const instructions = session.spawnDeveloperInstructions()
-    expect(instructions).toContain('AskUserQuestion')
-    expect(instructions).not.toContain('request_user_input')
-
     session.selectedTokenSourceId = 'claude-sub'
-    expect(session.spawnDeveloperInstructions()).toContain('# desc: <一句中文说明>')
+    expect(session.spawnDeveloperInstructions()).toBe(channelInstructions())
     const previousSafeMode = config.claude.safe_mode
     config.claude.safe_mode = { 'claude-sub': ['*'] }
     try {
       const english = session.spawnDeveloperInstructions()
-      expect(english).toContain('AskUserQuestion')
-      expect(english).toContain('Lodestar')
-      expect(english).not.toMatch(/\p{Script=Han}/u)
+      expect(english).toBe(channelInstructions('en'))
     } finally {
       config.claude.safe_mode = previousSafeMode
       session.dispose()
@@ -3561,7 +3557,7 @@ describe('Session provider switching', () => {
     try {
       await session.startColdUserTurn('hello', 'hello', 'ou_user')
 
-      expect(proc.sentTexts).toEqual([`${fileDeliveryAgentContext('chat')}\n\nhello`])
+      expect(proc.sentTexts).toEqual(["hello"])
       expect(session.currentTurn).not.toBeNull()
       expect(session.status).toBe('working')
     } finally {
@@ -5072,7 +5068,7 @@ describe('Session SDK-initiated bg-task resume turns', () => {
       const userCardId = session.currentTurn.cardId
       await cardkit.flush(userCardId)
 
-      expect(proc.sentTexts).toEqual([`${fileDeliveryAgentContext('chat')}\n\n请只讲直接结论`])
+      expect(proc.sentTexts).toEqual(["请只讲直接结论"])
       expect(sentTexts.some(text => text.includes('后台轮输出'))).toBe(false)
       expect(calls.some(call =>
         call.path === `/cards/${userCardId}/elements` &&
@@ -6251,7 +6247,7 @@ describe('Session lifecycle reliability', () => {
       await message
       expect(spawnCount).toBe(1)
       expect(proc.killCalls).toBe(0)
-      expect(proc.sentTexts).toEqual([`${fileDeliveryAgentContext('chat')}\n\n重启期间收到的消息`])
+      expect(proc.sentTexts).toEqual(["重启期间收到的消息"])
       expect(session.lastSessionId).toBe(ref.sessionId)
     } finally {
       await session.stop('测试收尾', { announce: false })
@@ -7971,7 +7967,7 @@ describe('Session lifecycle reliability', () => {
 
     releaseOpen()
     await message
-    expect(proc.sentTexts).toEqual([`${fileDeliveryAgentContext('chat')}\n\nfirst`])
+    expect(proc.sentTexts).toEqual(["first"])
     expect(await restart).toBe(true)
     expect(proc.killCalls).toBe(1)
     expect(session.proc).toBe(spawned[0])

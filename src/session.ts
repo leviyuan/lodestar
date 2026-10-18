@@ -109,7 +109,6 @@ import * as sessionTasklist from './session-tasklist'
 import { createFileDelivery, groupFileDelivery } from './file-delivery-runtime'
 import type { FileDeliveryHandle, FileDeliveryMode } from './file-delivery-types'
 import { runFileDeliveryCommand } from './file-delivery-command'
-import { fileDeliveryAgentContext } from './instructions'
 import * as sessionWorktree from './session-worktree'
 import * as sessionTemp from './session-temp'
 import {
@@ -289,10 +288,9 @@ export class Session {
    * Same source id with rotated credentials/base URL must still replace the
    * idle child after the registry is rebuilt. Weak keys avoid lifecycle leaks. */
   private readonly procSourceRevisions = new WeakMap<AgentProcess, string | null>()
-  /** Delivery rules actually given to each process, including later group changes. */
+  /** Delivery mode for each process's last submitted input and background work. */
   private readonly procFileDeliveryModes = new WeakMap<AgentProcess, FileDeliveryMode>()
   private readonly procPendingFileDeliveryModes = new WeakMap<AgentProcess, FileDeliveryMode>()
-  private readonly procFileDeliveryNeedsUpdate = new WeakSet<AgentProcess>()
   currentTurn: TurnState | null = null
   /** Item-scoped compaction ownership survives a turn-card close so a late
    * completion cannot attach itself to the next turn. Completed receipts keep
@@ -977,7 +975,7 @@ export class Session {
         ? this.dshEffortForSpawn()
         : this.selectedProvider === 'claude' ? this.claudeEffortForSpawn() : this.effortForSpawn(),
       launch,
-      developerInstructions: this.spawnDeveloperInstructions(fileDeliveryMode),
+      developerInstructions: this.spawnDeveloperInstructions(),
       profile: feishu.projectProfileForDirectory(this.workDir),
       ...(process.env.LODESTAR_DISABLE_SKILL_SYNC === '1' ? {} : { managedSkillPluginPath: MANAGED_CLAUDE_PLUGIN_DIR }),
       hostEnv,
@@ -2602,8 +2600,8 @@ export class Session {
     return sessionWorktree.worktreeProjectDir(this)
   }
 
-  private spawnDeveloperInstructions(mode: FileDeliveryMode = this.getFileDeliveryMode()): string {
-    return sessionWorktree.spawnDeveloperInstructions(this, mode, this.currentProvider())
+  private spawnDeveloperInstructions(): string {
+    return sessionWorktree.spawnDeveloperInstructions(this, this.currentProvider())
   }
 
   delegatedAgentDeveloperInstructions(provider: AgentProvider): string {
@@ -2913,11 +2911,9 @@ export class Session {
     this.steeringBoundary = null
     if (!this.proc) return
     log(`session "${this.sessionName}": interrupt`)
-    // Keep the last submitted policy for background work. A cancelled update
-    // is retried only as context on the next explicit user input.
+    // Keep the last submitted delivery mode for background work.
     if (processUsesClaudeTranslation(this.proc)) {
       this.procPendingFileDeliveryModes.delete(this.proc)
-      this.procFileDeliveryNeedsUpdate.add(this.proc)
     }
     // Local translation has no native result to acknowledge this stop. Do not
     // consume the next actual task's result as a stale interrupt receipt.
@@ -2951,15 +2947,12 @@ export class Session {
     const turn = this.currentTurn
     const mode = turn ? (turn.fileDeliveryMode ??= this.getFileDeliveryMode()) : this.getFileDeliveryMode()
     const previousMode = this.procFileDeliveryModes.get(proc)
-    const context = previousMode === mode && !this.procFileDeliveryNeedsUpdate.has(proc)
-      ? '' : `${fileDeliveryAgentContext(mode, processUsesClaudeTranslation(proc) ? 'en' : 'zh')}\n\n`
     // Capture before the write: synchronous backend events can open a card or deliver a file.
     if (processUsesClaudeTranslation(proc)) this.procPendingFileDeliveryModes.set(proc, mode)
     else this.procFileDeliveryModes.set(proc, mode)
     this.pendingUserMessageCount++
     try {
-      if (processUsesClaudeTranslation(proc)) proc.sendUserText(text, [], { contextPrefix: context })
-      else proc.sendUserText(context + text, [])
+      proc.sendUserText(text, [])
     } catch (error) {
       this.pendingUserMessageCount = Math.max(0, this.pendingUserMessageCount - 1)
       this.procPendingFileDeliveryModes.delete(proc)
@@ -3671,7 +3664,6 @@ export class Session {
       if (mode === undefined) return
       this.procFileDeliveryModes.set(p, mode)
       this.procPendingFileDeliveryModes.delete(p)
-      this.procFileDeliveryNeedsUpdate.delete(p)
     })
     on('init', () => {
       if (p.provider === 'codex' && p.quotaWaitPromise) {
@@ -4021,7 +4013,7 @@ export class Session {
     on('result', (result: any, snapshot) => {
       if (processUsesClaudeTranslation(p) && result?.subtype === 'claude_turn_start_failed') {
         // Async validation can reject before native init/turn_started consumes
-        // the claim. Its delivery context was not submitted either.
+        // the claim. Keep the delivery mode from the last submitted input.
         this.pendingUserMessageCount = Math.max(0, this.pendingUserMessageCount - 1)
         this.procPendingFileDeliveryModes.delete(p)
       }
@@ -4692,8 +4684,8 @@ export class Session {
       cardRotationFailed: false,
       outboundSeenPaths: new Set(),
       outboundSentPaths: new Set(),
-      // Eager user cards get their policy when input is handed to the Agent.
-      // Backend-driven turns keep the policy the process has already received.
+      // Eager user cards capture their delivery mode when input is submitted.
+      // Backend-driven turns keep the mode of the last submitted input.
       fileDeliveryMode: trigger === 'user_message' && this.pendingUserMessageCount === 0
         ? undefined
         : this.proc ? this.procFileDeliveryModes.get(this.proc) : undefined,
@@ -5813,8 +5805,8 @@ export class Session {
     }
     log(`session "${this.sessionName}": outbound send from ${source}: ${p}`)
     try {
-      // Input can reach the backend before its card opens. Reuse its injected
-      // policy even if the group switch changed during that opening window.
+      // Input can reach the backend before its card opens. Reuse its captured
+      // mode even if the group switch changed during that opening window.
       const mode = turn?.fileDeliveryMode
         ?? (this.proc ? this.procFileDeliveryModes.get(this.proc) : undefined)
         ?? this.getFileDeliveryMode()
