@@ -11,6 +11,13 @@ registerTokenSourceFactory({
   build(cfg) {
     const apiKey = cfg.api_key?.trim() ?? ''
     const baseUrl = cfg.base_url?.trim() || 'https://api.deepseek.com'
+    const url = new URL(baseUrl)
+    // DSH owns the official endpoint for its native protocol (Chat Completions
+    // in older runtimes, Messages in newer ones). Never overwrite that route
+    // with the shared account's API root. Custom endpoints remain explicit.
+    const nativeOfficialEndpoint = url.origin === 'https://api.deepseek.com'
+      && !url.username && !url.password && !url.search && !url.hash
+      && ['', '/v1', '/anthropic', '/anthropic/v1'].includes(url.pathname.replace(/\/+$/, ''))
     const source: TokenSource = {
       id: 'deepseek-harness', kind: 'deepseek-harness', agent: 'dsh', display: cfg.display?.trim() || 'DeepSeek',
       enabled: !!apiKey, models: [], defaultModel: cfg.model?.trim() ?? '',
@@ -19,7 +26,7 @@ registerTokenSourceFactory({
         const env = scrubDshEnv(base)
         if (!apiKey) throw new Error('DeepSeek Harness API key is missing')
         env.DEEPSEEK_API_KEY = apiKey
-        env.DEEPSEEK_BASE_URL = baseUrl
+        if (!nativeOfficialEndpoint) env.DEEPSEEK_BASE_URL = baseUrl
         env.LODESTAR_DSH_PROVIDER = 'deepseek-official'
         if (cfg.bin) env.LODESTAR_DSH_NODE = cfg.bin
         return env

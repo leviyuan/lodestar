@@ -2,10 +2,14 @@ import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { DshProcess } from './dsh-process'
 import type { DshSpawnOptions } from './dsh-process'
 import type { ConversationLaunch } from './conversation'
 import { queryDshRuntime } from './dsh-runtime'
+import { sharedTokenSourceConfigs } from './token-source-accounts'
+import { tokenSourceFactories } from './token-source'
+import './token-source-dsh'
 import { emptyBgStore, applyBgTaskStarted, applyBgTaskSettled, applyBgToolUse, applyBgToolResult, promotePendingOnAdvance } from './cards/background'
 
 const cleanups: Array<() => Promise<void>> = []
@@ -127,6 +131,45 @@ function nextResult(proc: DshProcess): Promise<any> {
 }
 
 describe('DSH native runtime through Lodestar bridge', () => {
+  test('shared official DeepSeek accounts retain the native protocol endpoint', async () => {
+    const f = await fixture(() => completion({ content: 'official route replied' }))
+    const requestsPath = join(f.dir, 'official-requests.jsonl')
+    const preloadPath = join(f.dir, 'official-fetch.mjs')
+    await writeFile(requestsPath, '')
+    // Observe the URL selected by the real adapter before redirecting transport
+    // to our fixture. A permissive /messages mock hid the missing /anthropic.
+    await writeFile(preloadPath, `import { appendFileSync } from 'node:fs';
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input);
+        appendFileSync(${JSON.stringify(requestsPath)}, JSON.stringify(url.href) + '\\n');
+        if (url.origin !== 'https://api.deepseek.com' ||
+            !['/chat/completions', '/anthropic/v1/messages'].includes(url.pathname) || url.search) {
+          return new Response('Unexpected official DeepSeek endpoint: ' + url.href, { status: 404 });
+        }
+        const target = new URL(url.pathname, ${JSON.stringify(f.baseUrl)});
+        return originalFetch(input instanceof Request ? new Request(target, input) : target, init);
+      };`)
+    const configs = sharedTokenSourceConfigs({ deepseek: {
+      api_key: 'local-test-key', base_url: 'https://api.deepseek.com/anthropic',
+    } })
+    const source = tokenSourceFactories().find(entry => entry.kind === 'deepseek-harness')!
+      .build(configs['deepseek-harness']!)
+    const proc = f.processFor(undefined, { transformEnv: env => source.spawnEnv({ ...env,
+      NODE_OPTIONS: [env.NODE_OPTIONS, `--import=${pathToFileURL(preloadPath).href}`].filter(Boolean).join(' '),
+    }) })
+    await proc.initializationPromise()
+    const done = nextResult(proc)
+    proc.sendUserText('verify the shared official account endpoint')
+    expect(await done).toMatchObject({ is_error: false })
+    expect(f.requests).toHaveLength(1)
+    expect((await readFile(requestsPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line))).toEqual([
+      f.protocols[0] === 'chat-completions'
+        ? 'https://api.deepseek.com/chat/completions'
+        : 'https://api.deepseek.com/anthropic/v1/messages',
+    ])
+  }, 30_000)
+
   test('starts a turn without the removed native cwd prompt variable', async () => {
     const f = await fixture(() => completion({ content: 'prompt assembled' }))
     const pluginPath = join(f.dir, 'without-cwd.mjs')

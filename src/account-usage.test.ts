@@ -76,7 +76,7 @@ test('shared DeepSeek and GLM configuration makes both Agents read the same quot
     const harnessDeepseek = registry.getTokenSource('deepseek-harness').spawnEnv({})
     assert.equal(claudeDeepseek.ANTHROPIC_API_KEY, harnessDeepseek.DEEPSEEK_API_KEY)
     assert.equal(claudeDeepseek.ANTHROPIC_BASE_URL, 'https://api.deepseek.com/anthropic')
-    assert.equal(harnessDeepseek.DEEPSEEK_BASE_URL, 'https://api.deepseek.com')
+    assert.equal(harnessDeepseek.DEEPSEEK_BASE_URL, undefined)
     assert.equal(registry.getTokenSource('glm').spawnEnv({}).ANTHROPIC_AUTH_TOKEN,
       registry.getTokenSource('dsh-glm').spawnEnv({}).LODESTAR_DSH_GLM_API_KEY)
     const requests = []
