@@ -7,7 +7,7 @@ import { agentOwnerKey, agentRunOwner, requireAgentDescription, requireAgentWork
 import * as feishu from './feishu'
 import { config } from './config'
 import { claudeTranslationModeEnabled } from './claude-translation-mode'
-import { getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
+import { assertAgentIdentityIdAllowed, assertAgentSourceAllowed, getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
 import { AgentWorkerFailure, startAgentWorker, type AgentWorkerHandle } from './agent-runner'
 import { agentApiUrl } from './agent-runtime'
 import { workspaceKey } from './workspace'
@@ -161,8 +161,10 @@ export class AgentService {
   }
 
   private requireIdentity(principal: AgentPrincipal, id: string): AgentIdentity {
+    assertAgentIdentityIdAllowed(id)
     const identity = this.deps.getCatalog(agentPrincipalContext(principal).codexAccountId).identities.find(item => item.id === id)
     if (!identity) throw new Error(`agent identity not found: ${id}`)
+    assertAgentSourceAllowed(identity.tokenSourceId)
     if (identity.status !== 'ready') throw new Error(`${identity.displayName}: ${identity.reason ?? identity.status}`)
     return identity
   }
@@ -173,6 +175,10 @@ export class AgentService {
   ): Promise<AgentRunSnapshot> {
     const context = agentPrincipalContext(principal)
     this.assertResumeProject(principal, history.run)
+    if (!selected) {
+      assertAgentIdentityIdAllowed(history.worker.identityId)
+      assertAgentSourceAllowed(history.worker.tokenSourceId)
+    }
     const identity = selected ?? this.requireIdentity(principal, history.worker.identityId)
     if (identity.provider !== history.worker.provider) throw new Error('native session belongs to a different Agent backend')
     const sameOwner = agentOwnerKey(agentRunOwner(history.run.snapshot)) === agentOwnerKey(context.owner)
@@ -255,7 +261,7 @@ export class AgentService {
     const run = this.runs.get(runId)
     if (!run || agentRunOwner(run.snapshot).kind !== 'project' || !userId || !messageId
       || run.snapshot.chatId !== chatId || run.snapshot.cardMessageId !== messageId) {
-      throw new Error('项目任务卡片无效或不属于当前群')
+      throw new Error('项目任务卡片无效或不属于当前对话 ID（chat_id）')
     }
     return this.cancelRun(this.projectPrincipal({ owner: agentRunOwner(run.snapshot) }), runId, '用户通过项目任务卡取消')
   }
@@ -368,8 +374,10 @@ export class AgentService {
     const codexAccountId = context.codexAccountId
     const catalog = this.deps.getCatalog(codexAccountId)
     const identities = request.identityIds.map(id => {
+      assertAgentIdentityIdAllowed(id)
       const identity = catalog.identities.find(item => item.id === id)
       if (!identity) throw new Error(`agent identity not found: ${id}`)
+      assertAgentSourceAllowed(identity.tokenSourceId)
       if (identity.status !== 'ready') throw new Error(`${identity.displayName}: ${identity.reason ?? identity.status}`)
       return identity
     })
@@ -785,7 +793,7 @@ export class AgentService {
     const caller = agentPrincipalContext(principal).owner
     const origin = agentRunOwner(run.snapshot)
     if (caller.chatId !== origin.chatId || workspaceKey(caller.workDir) !== workspaceKey(origin.workDir)) {
-      throw new Error('agent session belongs to a different project or group; cross-project and cross-group resume is not allowed')
+      throw new Error('agent session belongs to a different project or conversation ID (chat_id); resuming across projects or conversation IDs is not allowed')
     }
   }
 
@@ -795,12 +803,12 @@ export class AgentService {
     const matches = [...this.runs.values()].flatMap(run => run.snapshot.workers
       .filter(worker => worker.sessionId === sessionId)
       .map(worker => ({ run, worker })))
-    if (!matches.length) throw new Error('agent session project/group ownership is unknown; only registered sessions in this project and group can be resumed')
+    if (!matches.length) throw new Error('agent session ownership is unknown; only sessions registered under this project and conversation ID (chat_id) can be resumed')
     for (const { run } of matches) this.assertResumeProject(principal, run)
     if (new Set(matches.map(({ worker }) => worker.provider)).size > 1) {
       throw new Error('native session id has conflicting backend records; its unique identity cannot be established')
     }
-    // Session/project bindings can share a native id within one project and group, without joining cancellation trees.
+    // Session/project bindings can share a native id within one project and conversation ID (chat_id), without joining cancellation trees.
     const parents = new Set(matches.flatMap(({ run }) => [run.snapshot.resumedFromRunId, run.snapshot.parentRunId]))
     const latest = matches.filter(({ run }) => !parents.has(run.snapshot.runId))
       .sort((a, b) => Date.parse(b.run.snapshot.createdAt) - Date.parse(a.run.snapshot.createdAt))[0]

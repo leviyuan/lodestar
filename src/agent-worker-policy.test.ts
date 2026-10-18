@@ -41,7 +41,7 @@ test('new and resumed workers use caller-owned delivery and binding-specific inp
     import { mock } from 'bun:test'
     import { EventEmitter } from 'node:events'
     const captured = []
-    mock.module('./src/token-source', () => ({ getTokenSourceForAccount: () => ({ id: 'test-source' }) }))
+    mock.module('./src/token-source', () => ({ listTokenSources: () => [], getTokenSourceForAccount: () => ({ id: 'test-source' }) }))
     mock.module('./src/agent-session-registry', () => ({ rememberAgentSession() {} }))
     mock.module('./src/agent-launch', () => ({ createAgentProcess: options => {
       captured.push({ allowUserInput: options.allowUserInput, instructions: options.developerInstructions,
@@ -59,7 +59,7 @@ test('new and resumed workers use caller-owned delivery and binding-specific inp
     for (const provider of ['codex', 'claude', 'dsh']) {
       for (const projectBound of [false, true]) {
         for (const resumeSessionId of [undefined, 'test-session']) {
-          await startAgentWorker({ identity: { tokenSourceId: 'test-source', provider, model: 'worker-model', supportedEfforts: ['high'] },
+          await startAgentWorker({ identity: { id: 'agent:test', tokenSourceId: 'test-source', provider, model: 'worker-model', supportedEfforts: ['high'] },
             projectBound, resumeSessionId, effort: 'high', codexAccountId: 'named-work', workDir: process.cwd(),
             prompt: 'task', developerInstructions: 'project rule', hostEnv: { LODESTAR_AGENT_ROLE: 'main' } }).done
         }

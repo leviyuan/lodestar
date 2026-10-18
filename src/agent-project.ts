@@ -10,7 +10,7 @@ export function resolveAgentProject(name: string, deps: Pick<typeof feishu,
     throw new Error('请指定项目或 worktree 名称，不能指定 BTW/FK 临时会话')
   }
   const chatId = deps.chatIdForSession(project)
-  if (!chatId) throw new Error(`项目 ${project} 没有明确的群绑定`)
+  if (!chatId) throw new Error(`项目 ${project} 没有明确的对话 ID（chat_id）绑定`)
   const workDir = realpathSync(deps.resolveProjectDir(project))
   if (!statSync(workDir).isDirectory()) throw new Error(`项目工作目录不是文件夹: ${workDir}`)
   return { owner: { kind: 'project', name: project, chatId, workDir } }

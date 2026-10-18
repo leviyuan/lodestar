@@ -42,7 +42,7 @@ describe('project Agent client', () => {
       expect(main).toEqual({ owner: { kind: 'project', name: 'repo', chatId: 'main-chat', workDir: join(dir, 'main') } })
       expect(resolveAgentProject('repo[feature]', deps).owner.workDir).toBe(join(dir, 'wt'))
       expect(resolveAgentProject('alias', deps).owner.workDir).toBe(main.owner.workDir)
-      expect(() => resolveAgentProject('unknown', deps)).toThrow('群绑定')
+      expect(() => resolveAgentProject('unknown', deps)).toThrow('对话 ID（chat_id）绑定')
       expect(() => resolveAgentProject('repo*0101-1200', deps)).toThrow('临时会话')
       expect(() => resolveAgentProject('../repo', deps)).toThrow('项目或 worktree')
       rmSync(join(dir, 'wt'), { recursive: true })

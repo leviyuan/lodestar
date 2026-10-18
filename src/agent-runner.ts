@@ -1,6 +1,6 @@
 import type { AgentProcess, AgentReasoningEffort, AgentTurnRetry } from './agent-process'
 import { processUsesClaudeTranslation } from './agent-process'
-import type { AgentIdentity } from './agent-identities'
+import { assertAgentIdentityIdAllowed, assertAgentSourceAllowed, type AgentIdentity } from './agent-identities'
 import { createAgentProcess } from './agent-launch'
 import { rememberAgentSession } from './agent-session-registry'
 import type { AgentInputQuestion, AgentInputRequest, AgentStep } from './agent-run-types'
@@ -70,6 +70,9 @@ export function startAgentWorker(opts: {
   if (opts.identity.spawnRevision && source.spawnRevision !== opts.identity.spawnRevision) {
     throw new Error(`agent token source changed after identity discovery: ${source.id}`)
   }
+  assertAgentIdentityIdAllowed(opts.identity.id)
+  assertAgentSourceAllowed(opts.identity.tokenSourceId)
+  assertAgentSourceAllowed(source.kind === 'claude-subscription' ? 'claude-sub' : source.id)
   if (!opts.identity.supportedEfforts.includes(opts.effort)) {
     throw new Error(`${opts.identity.displayName} does not support effort ${opts.effort}`)
   }

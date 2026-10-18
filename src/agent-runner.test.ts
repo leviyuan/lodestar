@@ -33,6 +33,77 @@ class FakeProcess extends EventEmitter {
   isAlive() { return this.alive }
 }
 
+test('worker startup rejects Claude subscriptions before creating a process while third-party Claude remains available', () => {
+  const run = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', `
+    import { mock } from 'bun:test'
+    import { EventEmitter } from 'node:events'
+    let currentSource
+    const launches = [], rejected = [], accepted = []
+    mock.module('./src/token-source', () => ({ listTokenSources: () => [], getTokenSourceForAccount: () => currentSource }))
+    mock.module('./src/agent-session-registry', () => ({ rememberAgentSession() {} }))
+    mock.module('./src/agent-launch', () => ({ createAgentProcess: options => {
+      launches.push(options)
+      const proc = new EventEmitter()
+      Object.assign(proc, { provider: options.provider, sessionId: 'native-session', alive: true,
+        isAlive() { return this.alive }, sendInitialize() {},
+        sendUserText() { queueMicrotask(() => this.emit('result', { is_error: false })) },
+        async kill() { this.alive = false; this.emit('exit', { code: 0 }) },
+      })
+      return { process: proc }
+    } }))
+    const { startAgentWorker } = await import('./src/agent-runner')
+    const { agentIdentityId } = await import('./src/agent-identities')
+    const denied = [
+      { source: 'claude-sub', model: 'opus' },
+      { source: 'disguised-subscription', kind: 'claude-subscription', model: 'unmarked-model' },
+      { source: 'claude-subscription', model: 'unmarked-model' },
+      { source: 'packy', model: 'unmarked-model', id: agentIdentityId('claude-sub', 'opus') },
+    ]
+    for (const projectBound of [false, true]) {
+      for (const resumeSessionId of [undefined, 'native-session']) {
+        for (const entry of denied) {
+          currentSource = { id: entry.source, kind: entry.kind ?? 'api', resolveSpawnModel: () => { throw new Error('admission must not resolve models') } }
+          const count = launches.length
+          try {
+            const handle = startAgentWorker({
+              identity: { id: entry.id ?? agentIdentityId(entry.source, entry.model), tokenSourceId: entry.source,
+                provider: 'claude', model: entry.model, modelDisplay: entry.display ?? entry.model, supportedEfforts: ['high'] },
+              projectBound, resumeSessionId, effort: 'high', workDir: process.cwd(), prompt: 'task', hostEnv: {},
+            })
+            await handle.done
+            rejected.push({ error: 'unexpected success', started: launches.length !== count })
+          } catch (error) { rejected.push({ error: error.message, started: launches.length !== count }) }
+        }
+        for (const entry of [
+          { source: 'glm', model: 'GLM-5.3-Flash', provider: 'claude' },
+          { source: 'deepseek', model: 'deepseek-chat', provider: 'claude' },
+          { source: 'codex-sub', model: 'gpt-5', provider: 'codex' },
+          { source: 'dsh-glm', model: 'GLM-5.3-Flash', provider: 'dsh' },
+          { source: 'packy', model: 'claude-opus-4-6', provider: 'claude' },
+          { source: 'openrouter', model: 'anthropic/claude-sonnet-4.6', provider: 'claude' },
+          { source: 'packy-secondary', model: 'custom-model', provider: 'claude', display: 'Claude Fable 5' },
+        ]) {
+          currentSource = { id: entry.source, kind: 'api', resolveSpawnModel: () => { throw new Error('admission must not resolve models') } }
+          await startAgentWorker({
+            identity: { id: agentIdentityId(entry.source, entry.model), tokenSourceId: entry.source,
+              provider: entry.provider, model: entry.model, modelDisplay: entry.display ?? entry.model, supportedEfforts: ['high'] },
+            projectBound, resumeSessionId, effort: 'high', workDir: process.cwd(), prompt: 'task', hostEnv: {},
+          }).done
+          accepted.push(entry.source)
+        }
+      }
+    }
+    console.log(JSON.stringify({ rejected, accepted, launches: launches.length }))
+  `], { cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'test' }, stdout: 'pipe', stderr: 'pipe' })
+  expect(run.exitCode, run.stderr.toString()).toBe(0)
+  const result = JSON.parse(run.stdout.toString().trim().split('\n').at(-1)!)
+  expect(result.rejected).toHaveLength(16)
+  expect(result.rejected.every((entry: { error: string; started: boolean }) => entry.error
+    === "Lodestar Agent does not support Claude subscription calls; comply with Claude's user agreement." && !entry.started)).toBe(true)
+  expect(result.launches).toBe(28)
+  expect(result.accepted).toEqual(Array.from({ length: 4 }, () => ['glm', 'deepseek', 'codex-sub', 'dsh-glm', 'packy', 'openrouter', 'packy-secondary']).flat())
+})
+
 describe('full delegated Agent runner', () => {
   test('only visible worker prose and progress enter translation and conversation history', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'worker-presentation-context-'))

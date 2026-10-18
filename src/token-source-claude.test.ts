@@ -80,7 +80,7 @@ test('Claude subscription coexists with other accounts and refreshes authoritati
   `)
 })
 
-test('disabled Claude subscription skips native queries and discovery until explicitly enabled', () => {
+test('Claude subscription remains excluded from Lodestar Agent when explicitly enabled', () => {
   isolated(`
     import assert from 'node:assert/strict'
     import { mock } from 'bun:test'
@@ -116,7 +116,7 @@ test('disabled Claude subscription skips native queries and discovery until expl
       assert.notEqual((await source.readUsage()).state, 'ok')
       const catalog = await buildAgentSkillIdentityCatalog([source])
       assert.deepEqual(catalog.identities, [])
-      assert.equal(catalog.sourceFailures[0].status, 'disabled')
+      assert.deepEqual(catalog.sourceFailures, [])
       assert.throws(() => createAgentProcess({ provider: 'claude', workDir: '/tmp', tokenSourceId: source.id,
         model: 'sonnet', effort: 'high' }), /token source disabled/)
     }
@@ -129,7 +129,9 @@ test('disabled Claude subscription skips native queries and discovery until expl
     assert.equal(enabled.enabled, true)
     assert.equal(enabled.modelCatalogState.status, 'ready')
     await (await import('./src/token-source-cache')).refreshTokenSourceUsage(enabled)
-    assert.equal((await buildAgentSkillIdentityCatalog([enabled])).identities.length, 2)
+    assert.equal((await buildAgentSkillIdentityCatalog([enabled])).identities.length, 0)
+    assert.equal(enabled.models.length, 2)
+    assert.equal(enabled.enabled, true)
     assert.equal(modelQueries, 1)
     assert.equal(usageQueries, 1)
   `)

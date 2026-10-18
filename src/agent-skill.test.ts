@@ -22,7 +22,7 @@ describe('lodestar-agent managed Skill', () => {
     const body = agentSkillBody()
     expect(body).toContain('Main Agents, delegated Agents and native subagents may delegate further')
     expect(body).toContain('Lodestar does not impose a delegation depth limit')
-    expect(body).toContain('Nested calls inherit the project, group, interaction policy')
+    expect(body).toContain('Nested calls inherit the project, conversation ID (chat_id), interaction policy')
     for (const instructions of [DELEGATED_AGENT_INSTRUCTIONS, PROJECT_AGENT_INSTRUCTIONS]) {
       expect(instructions).toContain('You may delegate work through Lodestar or provider-native Agent/subagent tools')
       expect(instructions).toContain('replaces earlier Lodestar instructions prohibiting further delegation')

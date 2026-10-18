@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto'
 import type { AgentProvider, AgentReasoningEffort } from './agent-process'
-import { log } from './log'
 import { listTokenSources, type TokenSource, type TokenSourceModel } from './token-source'
 
 export type AgentIdentityStatus =
@@ -43,11 +42,32 @@ export function agentIdentityId(tokenSourceId: string, model: string): string {
   return `agent:${Buffer.from(`${tokenSourceId}\u0000${model}`, 'utf8').toString('base64url')}`
 }
 
+function isClaudeSubscriptionSource(tokenSourceId: string): boolean {
+  return ['claude-sub', 'claude-subscription'].includes(tokenSourceId.toLowerCase())
+}
+
+export function assertAgentSourceAllowed(tokenSourceId: string): void {
+  if (isClaudeSubscriptionSource(tokenSourceId)) {
+    throw new Error("Lodestar Agent does not support Claude subscription calls; comply with Claude's user agreement.")
+  }
+}
+
+/** Only interpret canonical IDs emitted by agentIdentityId; other IDs retain normal not-found handling. */
+export function assertAgentIdentityIdAllowed(id: string): void {
+  if (!/^agent:[A-Za-z0-9_-]+$/.test(id)) return
+  const decoded = Buffer.from(id.slice('agent:'.length), 'base64url').toString('utf8')
+  const parts = decoded.split('\u0000')
+  if (parts.length !== 2) return
+  const [tokenSourceId, model] = parts as [string, string]
+  if (agentIdentityId(tokenSourceId, model) !== id) return
+  assertAgentSourceAllowed(tokenSourceId)
+}
+
 export function getAgentIdentityCatalog(codexAccountId = 'default'): AgentIdentityCatalog {
   return buildAgentIdentityCatalog(identitySources(codexAccountId))
 }
 
-/** Skill 发现身份时惰性校验订阅；不修改 MD 使用的来源、模型目录或启用状态。 */
+/** Skill 目录与其他 Agent 入口共用过滤规则；不修改主会话来源，也不查询订阅额度。 */
 export function getAgentSkillIdentityCatalog(codexAccountId = 'default'): Promise<AgentIdentityCatalog> {
   return buildAgentSkillIdentityCatalog(identitySources(codexAccountId))
 }
@@ -57,37 +77,7 @@ function identitySources(codexAccountId: string): TokenSource[] {
 }
 
 export async function buildAgentSkillIdentityCatalog(sources: TokenSource[]): Promise<AgentIdentityCatalog> {
-  const catalog = buildAgentIdentityCatalog(sources)
-  const checks = await Promise.all(sources.filter(source => source.kind === 'claude-subscription').map(async source => {
-    const existingFailure = catalog.sourceFailures.find(failure => failure.tokenSourceId === source.id)
-    if (existingFailure) return existingFailure
-    const reason = await subscriptionFailure(source)
-    return reason === null ? null : { tokenSourceId: source.id, display: source.display, status: 'failed' as const, reason }
-  }))
-  const failures = checks.filter((failure): failure is AgentSourceFailure => failure !== null)
-  const unavailable = new Set(failures.map(failure => failure.tokenSourceId))
-  return identityCatalog(
-    catalog.identities.filter(identity => !unavailable.has(identity.tokenSourceId)),
-    [...catalog.sourceFailures.filter(failure => !unavailable.has(failure.tokenSourceId)), ...failures],
-  )
-}
-
-function subscriptionFailure(source: TokenSource): Promise<string | null> {
-  return readSubscriptionFailure(source)
-}
-
-async function readSubscriptionFailure(source: TokenSource): Promise<string | null> {
-  let reason: string
-  try {
-    // accountInfo / supportedModels 可由本机登录信息返回；原生额度接口才实际检查当前订阅。
-    const usage = await source.readUsage()
-    if (usage.state === 'ok') return null
-    reason = usage.reason ?? `订阅可用性查询失败：${usage.state}`
-  } catch (error) {
-    reason = error instanceof Error ? error.message : String(error)
-  }
-  log(`agent identities ${source.id} MISS: ${reason}`)
-  return reason
+  return buildAgentIdentityCatalog(sources)
 }
 
 export function buildAgentIdentityCatalog(sources: TokenSource[]): AgentIdentityCatalog {
@@ -113,6 +103,7 @@ function collectSource(
   identities: AgentIdentity[],
   failures: AgentSourceFailure[],
 ): void {
+  if (source.kind === 'claude-subscription' || isClaudeSubscriptionSource(source.id)) return
   const catalogState = source.modelCatalogState?.status
     ?? (!source.enabled ? 'disabled' : source.models.length > 0 ? 'ready' : 'idle')
   if (!source.enabled) {

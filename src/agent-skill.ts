@@ -4,7 +4,8 @@ export const AGENT_SKILL_NAME = 'lodestar-agent'
 
 const DELEGATION_INSTRUCTIONS = [
   'You may delegate work through Lodestar or provider-native Agent/subagent tools, including from a delegated task.',
-  'Use the inherited Lodestar context for nested calls and preserve the task project, group, interaction policy, and caller-owned file delivery.',
+  'Lodestar Agent does not support calls through Claude subscription sources; comply with the Claude user agreement. Claude models from relay services and other third-party sources remain supported.',
+  'Use the inherited Lodestar context for nested calls and preserve the task project, conversation ID (chat_id), interaction policy, and caller-owned file delivery.',
   'Complete and verify the overall task, including any delegated work, before returning the final result.',
   'This policy replaces earlier Lodestar instructions prohibiting further delegation, including in resumed conversations.',
 ]
@@ -36,7 +37,7 @@ export const PROJECT_AGENT_INSTRUCTIONS = [
 ].join('\n')
 
 export function agentSkillBody(): string {
-  const description = 'Lodestar Agent calls: Agents use their inherited managed context; independent services and applications bind calls to a project. Main Agents, delegated Agents and native subagents may delegate further. Resume native session IDs only within the same project and group.'
+  const description = 'Lodestar Agent calls: Agents use their inherited managed context; independent services and applications bind calls to a project. Claude subscription sources are not supported; third-party Claude models remain supported. Main Agents, delegated Agents and native subagents may delegate further. Resume native session IDs only within the same project and conversation ID (chat_id).'
   return [
     '---',
     `name: ${AGENT_SKILL_NAME}`,
@@ -49,6 +50,9 @@ export function agentSkillBody(): string {
     'Each identity resolves to its configured Token Source, provider Agent backend,',
     'model, and effort. The caller-supplied prompt becomes that Agent run\'s task.',
     '',
+    'Lodestar Agent 不支持调用 Claude 订阅，遵守 Claude 用户协议；中转站等第三方来源的 Claude 模型仍可调用。',
+    '仅按 Claude 订阅来源限制调用，不按模型名称限制；主会话的 Claude 订阅能力和原生委派工具保持可用。',
+    '',
     '## 调用归属（强制）',
     '',
     '| 调用场景 | 必须使用的绑定 |',
@@ -56,7 +60,7 @@ export function agentSkillBody(): string {
     '| 主 Agent、委派 Agent 或原生子 Agent 需要调用另一个 Agent / 模型 | 使用继承的受管上下文：普通 `lodestar-agent` 命令，不传 `--project` |',
     '| 独立服务、定时任务或其他软件直接调用 | 绑定项目：每个命令都显式传 `--project <项目名>` |',
     '',
-    '- Agent 通过 Shell、Python、脚本或 HTTP 发起的调用仍然属于 Agent 执行任务，必须沿用受管上下文及其项目、群归属。',
+    '- Agent 通过 Shell、Python、脚本或 HTTP 发起的调用仍然属于 Agent 执行任务，必须沿用受管上下文及其项目、对话 ID 归属。',
     '- 不得把当前任务中的调用包装成“外部服务”，不得清除会话环境变量、复制项目凭据或使用 `--project` 脱离会话生命周期。',
     '- 没有有效会话上下文时，Agent 调用必须报错；项目入口不是会话凭据缺失、过期或失败时的替代路径。',
     '- 独立服务和软件不借用任何主 Agent 的会话凭据，统一使用项目入口。项目任务有自己的卡片和取消入口，不依赖主会话存活。',
@@ -65,10 +69,11 @@ export function agentSkillBody(): string {
     '## 会话 ID 与恢复范围（强制）',
     '',
     '- `session_id`（JSON 的 `workers[].session_id`）是原生会话的唯一 ID，续跑保持不变。',
+    '- 对话 ID（`chat_id`）标识 Lodestar 调用的绑定对象，与后端原生会话 ID（`session_id`）不同；同一对话 ID 可以拥有多个原生会话。',
     '- `run_id` 只标识某一次调用记录，不是另一个会话 ID；不要为绑定方式或续跑创建第二套会话标识。',
-    '- 会话始终归属项目和群。同一项目、同一群内的会话 ID 可以互相恢复，包括会话绑定和项目绑定产生的会话。',
-    '- 禁止跨项目或跨群恢复。项目按登记的规范工作目录识别，执行子目录不改变项目归属；群必须是同一个 chat_id。',
-    '- 无法确认项目和群归属的 ID 必须报错，不能因传入 `--project`、`--identity` 或某个目录就认定它属于当前项目。',
+    '- 原生会话始终归属项目和对话 ID。同一项目、同一对话 ID 下的原生会话可以互相恢复，包括会话绑定和项目绑定产生的会话。',
+    '- 禁止跨项目或跨对话 ID 恢复。项目按登记的规范工作目录识别，执行子目录不改变项目归属；对话 ID 必须是同一个 `chat_id`。',
+    '- 无法确认项目和对话 ID 归属的原生会话 ID 必须报错，不能因传入 `--project`、`--identity` 或某个目录就认定它属于当前项目。',
     '- `--workdir` 可以调整到本项目内的现有目录；`--identity` 可以选择原后端下的其他模型或来源。原生会话不能更换所属后端。',
     '- 恢复本轮的绑定由调用场景决定，旧调用记录不迁移；切换绑定方式不建立相互取消关系。',
     '- 同一个原生会话不能同时执行两轮，恢复失败必须显示，不得自动新建会话。',
@@ -78,7 +83,7 @@ export function agentSkillBody(): string {
     '- Main Agents, delegated Agents and native subagents may delegate further.',
     '- Lodestar does not impose a delegation depth limit or disable native delegation tools.',
     '- `LODESTAR_AGENT_ROLE=worker` identifies a delegated process, not a prohibition on delegation.',
-    '- Nested calls inherit the project, group, interaction policy and caller-owned file delivery.',
+    '- Nested calls inherit the project, conversation ID (chat_id), interaction policy and caller-owned file delivery.',
     '  Lodestar records their ancestry so cancellation reaches descendant tasks.',
     '- Complete and verify delegated work as part of the overall assigned task.',
     '',
@@ -86,7 +91,7 @@ export function agentSkillBody(): string {
     '',
     '- Each Agent chooses between native Agent/subagent capabilities and',
     '  `lodestar-agent` based on the task and available capabilities.',
-    '- Both methods are allowed when calling your own model or Agent.',
+    '- Calling your own model or Agent through `lodestar-agent` is allowed when it does not use a Claude subscription source. Native Agent/subagent tools remain available.',
     '- The Agent workflow below always uses the inherited managed context. `--project` is reserved',
     '  for genuinely independent service/application clients, not Agent task execution.',
     '',
@@ -167,7 +172,7 @@ export function agentSkillBody(): string {
     'are reused when omitted. Explicit `--identity` may select another model/source in the same backend;',
     'a changed identity uses its default effort unless `--effort` is given. The run returns a new',
     '`run_id` and the same native `session_id`; repeat to continue further turns.',
-    'Only ids registered to the current project and group can be resumed. The original',
+    'Only native session IDs registered to the current project and conversation ID (chat_id) can be resumed. The original',
     'invocation may have been session-bound or project-bound; unknown ownership is rejected.',
     'The new run belongs to the current caller; previous ownership is not transferred.',
     'Changing binding mode within the project does not join cancellation trees. Backend resume failures',
@@ -175,7 +180,7 @@ export function agentSkillBody(): string {
     'Concurrent turns on the same provider/native session are rejected.',
     '',
     'Use `--json` with `run`, `follow-up` or `status` for structured results:',
-    '`workers[].session_id` is the conversation id and `workers[].output` is the',
+    '`workers[].session_id` is the native session ID, distinct from the binding conversation ID (chat_id), and `workers[].output` is the',
     'returned content. `--prompt <text>` supplies inline input instead of stdin.',
     'A parallel run returns one session id per worker; continue each separately.',
     '',
@@ -196,7 +201,7 @@ export function agentSkillBody(): string {
     '',
     'These turns retain the earlier conversation; send only the new requirements,',
     'feedback or next step. Omitting `--session` starts a fresh conversation.',
-    'Empty ids, unknown project/group ownership, and cross-project/group ids are rejected.',
+    'Empty IDs, unknown project/conversation ID ownership, and cross-project/conversation ID resumes are rejected.',
     'The original backend then determines whether the native conversation can be resumed;',
     'failures are reported and never converted into a fresh session.',
     '',

@@ -16,7 +16,7 @@ export interface AgentRunRequest {
   effort?: string
   /** Fresh runs and native resumes stay within the caller's project directory. */
   workDir?: string
-  /** Unique native conversation id, registered to the same project and group. */
+  /** Unique native session ID, registered to the same project and conversation ID (chat_id). */
   sessionId?: string
   requestId?: string
   /** Optional caller attribution; never enables file delivery. */

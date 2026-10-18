@@ -1,7 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import { agentIdentityId, buildAgentIdentityCatalog, buildAgentSkillIdentityCatalog } from './agent-identities'
-import type { TokenSource, UsageSnapshotUnified } from './token-source'
-import { cachedTokenSource, disposeCachedTokenSource, refreshTokenSourceUsage } from './token-source-cache'
+import { agentIdentityId, assertAgentIdentityIdAllowed, assertAgentSourceAllowed, buildAgentIdentityCatalog, buildAgentSkillIdentityCatalog } from './agent-identities'
+import type { TokenSource } from './token-source'
 
 function source(overrides: Partial<TokenSource> = {}): TokenSource {
   return {
@@ -45,125 +44,117 @@ describe('Agent identity catalog', () => {
   })
 })
 
-describe('Agent skill subscription availability', () => {
-  test('removes unavailable subscriptions only from skill results and keeps the failure visible', async () => {
+describe('Lodestar Agent Claude subscription exclusion', () => {
+  test('excludes subscription sources by source ID or kind without changing the source catalog', async () => {
     let checks = 0
-    const subscription = source({
-      id: 'claude-sub', kind: 'claude-subscription', display: 'Claude Code 订阅',
-      readUsage: async () => {
-        checks++
-        return { state: 'network', windows: [], reason: 'Claude 原生额度接口未返回 rate_limits 数据' }
-      },
-    })
-    const other = source({ readUsage: async () => { throw new Error('must not query third-party usage') } })
-    const models = subscription.models
-    const sources = [subscription, other]
-    const before = buildAgentIdentityCatalog(sources)
-    const catalog = await buildAgentSkillIdentityCatalog(sources)
-
-    expect(checks).toBe(1)
-    expect(catalog.identities).toEqual(before.identities.filter(identity => identity.tokenSourceId === other.id))
-    expect(catalog.sourceFailures).toEqual([{
-      tokenSourceId: subscription.id, display: subscription.display, status: 'failed',
-      reason: 'Claude 原生额度接口未返回 rate_limits 数据',
-    }])
-    expect(catalog.catalogGeneration).not.toBe(before.catalogGeneration)
-    expect(buildAgentIdentityCatalog(sources)).toEqual(before)
-    expect(subscription.models).toBe(models)
-    expect(subscription.enabled).toBe(true)
-    expect(subscription.modelCatalogState?.status).toBe('ready')
-  })
-
-  test('availability follows the shared usage cache without a second thirty-minute cache', async () => {
-    let usage: UsageSnapshotUnified = { state: 'ok', windows: [] }
-    const subscription = source({ id: 'claude-sub', kind: 'claude-subscription', readUsage: async () => usage })
-    const ready = await buildAgentSkillIdentityCatalog([subscription])
-    usage = { state: 'no_credentials', windows: [], reason: 'subscription expired' }
-    const failed = await buildAgentSkillIdentityCatalog([subscription])
-    expect(failed.identities).toEqual([])
-    expect(failed.sourceFailures[0]?.reason).toBe('subscription expired')
-    usage = { state: 'ok', windows: [] }
-    expect(await buildAgentSkillIdentityCatalog([subscription])).toEqual(ready)
-  })
-
-  test('surfaces thrown availability errors without dropping other sources', async () => {
-    let checks = 0
-    const subscription = source({
-      id: 'claude-sub', kind: 'claude-subscription',
-      readUsage: async () => { checks++; throw new Error('subscription query timed out') },
-    })
-    const sources = [subscription, source()]
-    const catalog = await buildAgentSkillIdentityCatalog(sources)
-    expect(catalog.identities).toHaveLength(2)
-    expect(catalog.sourceFailures).toMatchObject([{
-      tokenSourceId: 'claude-sub', status: 'failed', reason: 'subscription query timed out',
-    }])
-    expect(await buildAgentSkillIdentityCatalog(sources)).toEqual(catalog)
-    expect(checks).toBe(2)
-  })
-
-  test('identity discovery responds from cache while subscription refresh is blocked', async () => {
-    let checks = 0
-    let finish!: () => void
-    let barrier = Promise.resolve()
-    const subscription = cachedTokenSource(() => source({ id: 'claude-sub', kind: 'claude-subscription',
-      readUsage: async () => { checks++; await barrier; return { state: 'ok', windows: [] } },
-    }), {}, 'identity-cache-test', 'identity-cache-test')
-    try {
-      await refreshTokenSourceUsage(subscription)
-      barrier = new Promise(resolve => { finish = resolve })
-      const refreshing = refreshTokenSourceUsage(subscription)
-      const catalogs = await Promise.all([buildAgentSkillIdentityCatalog([subscription]), buildAgentSkillIdentityCatalog([subscription])])
-      expect(catalogs[0].identities).toHaveLength(2)
-      expect(catalogs[1]).toEqual(catalogs[0])
-      expect(checks).toBe(2)
-      finish()
-      await refreshing
-    } finally { finish?.(); disposeCachedTokenSource(subscription) }
-  })
-
-  test('caches only availability and does not retain an old model list', async () => {
-    let checks = 0
-    const subscription = source({
-      id: 'claude-sub', kind: 'claude-subscription',
-      readUsage: async () => { checks++; return { state: 'ok', windows: [] } },
-    })
-    const first = await buildAgentSkillIdentityCatalog([subscription])
-    subscription.models = [subscription.models[1]!]
-    const updated = await buildAgentSkillIdentityCatalog([subscription])
-    expect(updated.identities).toEqual([first.identities[1]!])
-    expect(updated.catalogGeneration).not.toBe(first.catalogGeneration)
-    expect(checks).toBe(2)
-  })
-
-  test('rebuilt sources do not reuse an earlier subscription check with the same source id', async () => {
-    const original = source({
-      id: 'claude-sub', kind: 'claude-subscription',
-      readUsage: async () => ({ state: 'no_credentials', windows: [], reason: 'old subscription expired' }),
-    })
-    expect((await buildAgentSkillIdentityCatalog([original])).identities).toEqual([])
-    let checks = 0
-    const rebuilt = { ...original, readUsage: async (): Promise<UsageSnapshotUnified> => {
-      checks++
-      return { state: 'ok', windows: [] }
-    } }
-    expect((await buildAgentSkillIdentityCatalog([rebuilt])).identities).toHaveLength(2)
-    expect(checks).toBe(1)
-  })
-
-  test('removes subscriptions with catalog failures while preserving their diagnostics', async () => {
-    for (const status of ['disabled', 'loading', 'failed'] as const) {
-      let checks = 0
-      const subscription = source({
-        id: 'claude-sub', kind: 'claude-subscription', enabled: status !== 'disabled',
-        modelCatalogState: { status, updatedAt: 1, ...(status === 'failed' ? { error: 'catalog failed' } : {}) },
-        readUsage: async () => { checks++; return { state: 'ok', windows: [] } },
-      })
-      const before = buildAgentIdentityCatalog([subscription])
-      const catalog = await buildAgentSkillIdentityCatalog([subscription])
-      expect(catalog.identities).toEqual([])
-      expect(catalog.sourceFailures).toEqual(before.sourceFailures)
-      expect(checks).toBe(0)
+    const subscriptions = [
+      source({ id: 'claude-sub', kind: 'claude-subscription' }),
+      source({ id: 'claude-subscription', kind: 'other' }),
+      source({ id: 'renamed-subscription', kind: 'claude-subscription' }),
+      source({ id: 'claude-sub', kind: 'other' }),
+    ]
+    for (const subscription of subscriptions) {
+      subscription.readUsage = async () => { checks++; throw new Error('must not query subscription usage') }
+      const models = subscription.models
+      const state = subscription.modelCatalogState
+      const others = source({ readUsage: async () => { checks++; throw new Error('must not query other usage') } })
+      const expected = buildAgentIdentityCatalog([others])
+      expect(buildAgentIdentityCatalog([subscription, others])).toEqual(expected)
+      expect(await buildAgentSkillIdentityCatalog([subscription, others])).toEqual(expected)
+      expect(subscription.models).toBe(models)
+      expect(subscription.modelCatalogState).toBe(state)
+      expect(subscription.enabled).toBe(true)
     }
+    expect(checks).toBe(0)
+  })
+
+  test('preserves all Claude families and other models from third-party sources', async () => {
+    const mixed = source({ id: 'packy', kind: 'packy', models: [
+      { model: 'claude-opus-5-5', display: 'Opus', efforts: ['high'], defaultEffort: 'high' },
+      { model: 'anthropic/new-model', display: 'New model', efforts: ['high'], defaultEffort: 'high' },
+      { model: 'OPUS5.5', display: 'Premium', efforts: ['high'], defaultEffort: 'high' },
+      { model: 'vendor/sonnet-4', display: 'Premium', efforts: ['high'], defaultEffort: 'high' },
+      { model: 'haiku', display: 'Premium', efforts: ['high'], defaultEffort: 'high' },
+      { model: 'fable-5-1', display: 'Premium', efforts: ['high'], defaultEffort: 'high' },
+      { model: 'opaque-model', display: 'Claude model', efforts: ['high'], defaultEffort: 'high' },
+      { model: 'opaque-family', display: 'Fable 5.1', efforts: ['high'], defaultEffort: 'high' },
+      { model: 'MiniMax-M3', display: 'MiniMax M3', efforts: ['default'], defaultEffort: 'default' },
+      { model: 'DeepSeek-V4', display: 'DeepSeek V4', efforts: ['high'], defaultEffort: 'high' },
+      { model: 'GLM-5.3', display: 'GLM 5.3', efforts: ['max'], defaultEffort: 'max' },
+    ] })
+    const models = structuredClone(mixed.models)
+    const catalog = buildAgentIdentityCatalog([mixed])
+    expect(catalog.identities.map(identity => identity.model)).toEqual(models.map(model => model.model))
+    expect(catalog.identities.every(identity => identity.provider === 'claude')).toBe(true)
+    expect(await buildAgentSkillIdentityCatalog([mixed])).toEqual(catalog)
+    expect(mixed.models).toEqual(models)
+  })
+
+  test('refreshing or rebuilding sources keeps subscriptions excluded and updates third-party Claude models', async () => {
+    const subscription = source({ id: 'claude-sub', kind: 'claude-subscription' })
+    const mixed = source({ id: 'openrouter', kind: 'openrouter', models: [
+      { model: 'claude-sonnet-4', display: 'Sonnet 4', efforts: ['high'], defaultEffort: 'high' },
+      { model: 'glm-5.3', display: 'GLM 5.3', efforts: ['max'], defaultEffort: 'max' },
+    ] })
+    const first = await buildAgentSkillIdentityCatalog([subscription, mixed])
+    subscription.models.push({ model: 'future-subscription-model', display: 'Future', efforts: ['high'], defaultEffort: 'high' })
+    subscription.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
+    mixed.models = [
+      { model: 'claude-fable-6', display: 'Fable 6', efforts: ['high'], defaultEffort: 'high' },
+      { model: 'deepseek-v4', display: 'DeepSeek V4', efforts: ['high'], defaultEffort: 'high' },
+    ]
+    const updated = await buildAgentSkillIdentityCatalog([{ ...subscription }, { ...mixed }])
+    expect(first.identities.map(identity => identity.model)).toEqual(['claude-sonnet-4', 'glm-5.3'])
+    expect(updated.identities.map(identity => identity.model)).toEqual(['claude-fable-6', 'deepseek-v4'])
+    expect(updated.catalogGeneration).not.toBe(first.catalogGeneration)
+  })
+
+  test.each(['disabled', 'loading', 'failed'] as const)('keeps %s diagnostics for supported sources only', async status => {
+    const state = { status, updatedAt: 1, ...(status === 'failed' ? { error: 'catalog failed' } : {}) }
+    const subscription = source({ id: 'claude-sub', kind: 'claude-subscription', enabled: status !== 'disabled', modelCatalogState: state })
+    const other = source({ enabled: status !== 'disabled', modelCatalogState: state })
+    const expected = buildAgentIdentityCatalog([other])
+    const catalog = await buildAgentSkillIdentityCatalog([subscription, other])
+    expect(catalog).toEqual(expected)
+    expect(catalog.sourceFailures).toHaveLength(1)
+    expect(catalog.sourceFailures[0]?.tokenSourceId).toBe('glm')
+    expect(catalog.sourceFailures[0]?.status).toBe(status)
+  })
+
+  test.each([
+    ['claude-sub', 'default'],
+    ['claude-sub', 'sonnet'],
+    ['claude-sub', 'GLM-5.3'],
+    ['claude-subscription', 'opaque'],
+  ])('rejects subscription %s/%s regardless of model name', (sourceId, model) => {
+    const message = "Lodestar Agent does not support Claude subscription calls; comply with Claude's user agreement."
+    expect(() => assertAgentSourceAllowed(sourceId!)).toThrow(message)
+    expect(() => assertAgentIdentityIdAllowed(agentIdentityId(sourceId!, model!))).toThrow(message)
+  })
+
+  test.each([
+    ['packy', 'claude-opus-5-5'],
+    ['openrouter', 'anthropic/model'],
+    ['packy', 'SONNET4.6'],
+    ['packy', 'opus[1m]'],
+    ['packy', 'haiku'],
+    ['packy', 'fable-5-1'],
+    ['glm', 'GLM-5.3'],
+    ['deepseek', 'DeepSeek-V4'],
+    ['packy', 'MiniMax-M3'],
+    ['codex', 'gpt-6'],
+  ])('allows non-subscription %s/%s in direct and encoded identity guards', (sourceId, model) => {
+    expect(() => assertAgentSourceAllowed(sourceId!)).not.toThrow()
+    expect(() => assertAgentIdentityIdAllowed(agentIdentityId(sourceId!, model!))).not.toThrow()
+  })
+
+  test('leaves unknown or malformed identity IDs to normal not-found handling', () => {
+    const malformed = [
+      'agent:a', 'claude-sub', 'other:claude', 'agent:$$$',
+      `agent:${Buffer.from('claude-sub').toString('base64url')}`,
+      `agent:${Buffer.from('claude-sub\u0000sonnet\u0000extra').toString('base64url')}`,
+      `${agentIdentityId('claude-sub', 'sonnet')}=`,
+    ]
+    for (const id of malformed) expect(() => assertAgentIdentityIdAllowed(id)).not.toThrow()
   })
 })
