@@ -27,18 +27,20 @@ import { syncManagedSkill } from './managed-skills'
 export const NOTIFY_SKILL_NAME = 'feishu-notify'
 
 export function notifySkillBody(port: number): string {
-  const description = `Push a one-shot notification card to a Feishu (Lark) group via the local lodestar daemon's HTTP endpoint. Auto-trigger whenever the user asks to "通知飞书", "推送到飞书", "推到飞书群", "飞书推送", "发到飞书", "脚本跑完通知我", "进程完成发个消息", "send to feishu", "feishu notify", "lodestar notify", "post to lark group", or wants any local script / cron / long-running process to ping a Feishu group (build done, deploy finished, trade filled, monitor alert, error caught). Encodes the call shape — POST http://127.0.0.1:${port}/notify with \`{project, text, level}\` — so consumers do not have to re-derive it. Also covers interactive buttons: add \`buttons\` and either pledge a loopback \`callback\` URL (daemon POSTs the click back) or omit it and poll \`GET /notify/result/NOTIFY_ID\`; all on localhost.`
+  const description = `Send a one-shot notification card to a project's bound Feishu (Lark) conversation through the local Lodestar daemon. Use for "通知飞书", "推送到飞书", "推送到对话", "飞书推送", "发到飞书", "脚本跑完通知我", "进程完成发个消息", "send to feishu", "feishu notify", "lodestar notify", "post to lark conversation", or notifications from scripts, cron jobs, and services. POST http://127.0.0.1:${port}/notify accepts {project, text, level}; project is a name resolved to a conversation ID (chat_id). Supports local images, interactive buttons: supply buttons, and free-text replies: set allow_reply:true for a fixed 回复 button. Receive results through a loopback callback or GET /notify/result/NOTIFY_ID.`
   return `---
 name: ${NOTIFY_SKILL_NAME}
-description: ${JSON.stringify(description + ' Also receive free-text replies with allow_reply:true: a fixed 回复 button opens a waiting card, then the user types in the group and the daemon returns the text through the same callback or result endpoint.')}
+description: ${JSON.stringify(description)}
 ---
 
 # feishu-notify
 
-Push a one-shot card into a Feishu (Lark) group via the local lodestar
-daemon. The daemon binds each group to a project name (= group name);
-once the daemon has seen at least one inbound message in that group,
-\`POST /notify\` with the project name routes a card to it.
+Push a one-shot card into a Feishu (Lark) conversation via the local lodestar
+daemon. The daemon resolves a project/session name to its bound conversation
+ID (\`chat_id\`); \`POST /notify\` with that project name routes a card to
+the conversation. The \`project\` request field remains a name, not a
+conversation ID. \`chat_id\` identifies the notification destination and
+is distinct from an Agent backend's native session ID (\`session_id\`).
 
 ## Three card types
 
@@ -64,18 +66,18 @@ Body (JSON):
 
 | field | required | meaning |
 |---|---|---|
-| \`project\` | ✅ | Feishu group name (= session name = working-directory name) |
+| \`project\` | ✅ | Project/session name used to resolve the bound conversation ID (\`chat_id\`); do not pass a \`chat_id\` here |
 | \`text\` | ✅ | Feishu schema-2.0 markdown — \`**bold**\`, \`\` \`code\` \`\`, \`[link](url)\`, \`<font color='red'>…</font>\` |
 | \`title\` |   | Card header, defaults to \`project\` |
 | \`level\` |   | \`info\` (blue, default) / \`warn\` (yellow) / \`error\` (red) |
 | \`images\` |   | Array of local image paths \`["/abs/a.png"]\` — uploaded to Feishu and embedded above the text (failed uploads surface inline in red, never dropped silently) |
 | \`buttons\` |   | Array of \`{id, text, type?}\` — renders one button per row (vertical stack, any count). \`id\`: \`^[A-Za-z0-9_-]{1,64}$\`, unique. \`text\`: ≤ 64 chars (a short phrase is fine — each button owns its full row). \`type\`: \`default\` / \`primary\` / \`danger\` (default \`default\`). |
-| \`allow_reply\` |   | Boolean, default false. Selects the custom text reply type; cannot be combined with nonempty \`buttons\`. Only this type has a fixed 「回复」 button at the bottom. Clicking sends a separate 「等待用户输入」 card; the clicker's next text in that group is returned to the caller. |
+| \`allow_reply\` |   | Boolean, default false. Selects the custom text reply type; cannot be combined with nonempty \`buttons\`. Only this type has a fixed 「回复」 button at the bottom. Clicking sends a separate 「等待用户输入」 card; the clicker's next text in that conversation is returned to the caller. |
 | \`callback\` |   | Optional loopback HTTP URL (e.g. \`http://127.0.0.1:9999/hook\`) — **push mode**: the daemon POSTs the button choice or submitted text here. Must be \`http://\` on \`127.0.0.1\` / \`localhost\` / \`::1\`. Omit for **pull mode** (see below). |
 
 Response: \`200 {ok, chat_id, message_id, notify_id?}\` (notify_id returned
-when buttons are present or allow_reply is true) / \`400\` bad params / \`404\` group not
-bound / \`413\` JSON body exceeds 4 MiB / \`502\` Feishu API rejected.
+when buttons are present or allow_reply is true) / \`400\` bad params / \`404\` project not
+bound to a conversation ID / \`413\` JSON body exceeds 4 MiB / \`502\` Feishu API rejected.
 
 \`GET /notify/result/<notify_id>\` — pull the verdict with no callback
 server: \`{notify_id, project, message_id, resolved, unknown, button?,
@@ -223,7 +225,7 @@ curl -fsS -X POST http://127.0.0.1:${port}/notify \\
 
 Only this custom-reply card places 「回复」 at the bottom. Clicking it
 sends a separate 「等待用户输入」 card mentioning the clicker. Their
-next text message in the same group becomes the response. This new
+next text message in the same conversation becomes the response. This new
 card updates in place to show the entered text and delivery outcome;
 the original notification also shows completion.
 
@@ -253,21 +255,21 @@ In pull mode, the result contains the same \`response\`, plus
 body described above; it is displayed on the receipt card. That body
 is the script's acknowledgement, distinct from the user's response.
 
-- Each group has one current notification reply. Clicking another
+- Each conversation ID has one current notification reply. Clicking another
   notification's 「回复」 abandons the previous waiting reply and updates
   its card; only the newest clicker's input is accepted. Abandonment
   does not POST an answer. Repeated clicks on the current reply do not
   create duplicate waiting cards. A reply already sending cannot be switched.
 - Plain text and text-only rich-text messages work. The current reply
   takes precedence even if the message quotes an older card. Attachments
-  keep their normal route; group control commands retain priority.
+  keep their normal route; conversation control commands retain priority.
 - Text input priority is notification reply → Agent question → ordinary
   Agent input. Agent questions wait while a notification reply is pending,
   then resume after it ends. One question is answerable at a time; further
   questions queue. An input is never submitted to two destinations.
-- Only the current reply's clicker can submit or cancel it. A different
-  group member can select another notification's reply, replacing the
-  current waiting reply. Old cancel buttons cannot affect a newer attempt.
+- Only the current reply's clicker can submit or cancel it. Another
+  participant in the same conversation can select another notification's
+  reply, replacing the current waiting reply. Old cancel buttons cannot affect a newer attempt.
 - The waiting card includes 「取消回复」. A click alone does not POST
   anything. A completed custom-reply notification accepts one text response.
 - Callback failure stays visible on the receipt; click 「回复」 on the
@@ -281,9 +283,9 @@ is the script's acknowledgement, distinct from the user's response.
 
 - For free-text input, use \`allow_reply:true\` as above; do not manufacture
   a caller-defined button named "reply" or ask users to type before clicking.
-- The group must have received at least one message after the daemon
-  started (the daemon learns chat_id → name binding from inbound
-  events). If you see \`404\` send any message in the group and retry.
+- The project must have a known conversation ID (\`chat_id\`) binding.
+  The daemon records the binding from inbound messages. If you see
+  \`404\`, send a message in the intended conversation and retry.
 - This skill is auto-installed by the lodestar daemon on every boot.
   Hand-edits will be overwritten — set
   \`LODESTAR_DISABLE_SKILL_SYNC=1\` and restart the daemon if you want

@@ -411,7 +411,7 @@ export async function handleNotifyRequest(
   if (req.method === 'GET' && url.pathname === '/') {
     return sendText(200,
       'lodestar notify\n' +
-      'POST /notify        body={project,text,title?,level?,images?,buttons?,allow_reply?,callback?}  → push card to group\n' +
+      'POST /notify        body={project,text,title?,level?,images?,buttons?,allow_reply?,callback?}  → push card to the project\'s bound conversation ID (chat_id)\n' +
       'GET  /notify/result/<notify_id>  → poll a button choice or text reply (pull mode, no callback server)\n' +
       'GET  /agents/identities; POST/GET/DELETE /agents/runs[/<id>]  → capability-protected delegated Agents\n' +
       'levels: info|warn|error (default info); images=[/abs/*.png] uploaded + embedded\n' +
@@ -480,7 +480,7 @@ export async function handleNotifyRequest(
   if (!chatId) {
     log(`notify: project "${project}" (sanitized "${sessionName}") has no chat binding → 404`)
     return sendText(404,
-      `project "${project}" not bound — send any message in that Feishu group at least once after the daemon started, then retry`)
+      `project "${project}" has no conversation ID (chat_id) binding — send a message in the intended Feishu conversation, then retry`)
   }
 
   const imageInputs = Array.isArray(body.images) ? body.images : []

@@ -1433,7 +1433,7 @@ export class CodexProcess extends EventEmitter {
             question: q.question,
             options: Array.isArray(q.options) && q.options.length
               ? q.options.map((o: any) => ({ label: o.label, description: o.description }))
-              : [{ label: '自定义回答', description: q.isSecret ? '请直接在群里回复' : '可直接在群里回复' }],
+              : [{ label: '自定义回答', description: q.isSecret ? '请直接在当前对话中回复' : '可直接在当前对话中回复' }],
           })),
         }
         this.emit('tool_use', { id: p.itemId, name: 'AskUserQuestion', input })

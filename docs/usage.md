@@ -185,7 +185,7 @@ HTTP 使用原 `/agents/…` 路径并增加 `?project=<项目名>`，Bearer 凭
 
 ## 本机通知
 
-脚本可通过 HTTP 向项目群发送通知，支持 `info`、`warn`、`error`，以及本地图片、交互按钮或文字回复：
+脚本可通过 HTTP 向项目绑定的对话发送通知，支持 `info`、`warn`、`error`，以及本地图片、交互按钮或文字回复：
 
 ```bash
 curl -sS -X POST http://127.0.0.1:9876/notify \
