@@ -118,7 +118,11 @@ export class DshRuntime extends EventEmitter {
       ...['sdk-jsonrpc-server', 'session-title-llm', 'session-telemetry-otel', 'settings', 'credentials', 'llm-pi-ai'].map(id => ({ id, disabled: true })),
       { id: 'approval', config: { policy: 'ask' } },
       { id: 'permission', config: { defaultPreset: 'lodestar', presets: { lodestar: { sandbox: 'danger-full-access', approval: 'ask' } } } },
-      { id: 'system-prompt', config: { personaPrefix: 'You are a coding agent powered by {{model}}.', personaSuffix: 'Your working directory is {{cwd}}.' } },
+      // Keep native descendants able to delegate when DSH changes its default depth limit.
+      { id: 'tool-subagent', config: { provider: 'spawn', toolName: 'subagent', backgroundMode: 'continuable', maxDepth: 'provider-managed' } },
+      { id: 'tool-subagent-fork', config: { provider: 'fork', toolName: 'subagent_fork', backgroundMode: 'one-shot', maxDepth: 'provider-managed' } },
+      // DSH supplies working-directory context; newer releases no longer register {{cwd}}.
+      { id: 'system-prompt', config: { personaPrefix: 'You are a coding agent powered by {{model}}.', personaSuffix: '' } },
       { id: 'skill-filesystem', config: { includeDefaultRoots: true, ...(opts.managedSkillDir ? { customSkillDirs: [opts.managedSkillDir] } : {}) } },
       { insert: [{ id: 'lodestar-bridge', name: bridge },
         { id: 'lodestar-ask-user', name: '@deepseek-ai/dsh-tool-ask-user' }, ...mcp] },

@@ -20,6 +20,32 @@ afterEach(async () => {
 type ModelProtocol = 'chat-completions' | 'messages'
 type FixtureResponse = Response | ((protocol: ModelProtocol) => Response)
 
+function expectRequestEffort(body: any, protocol: ModelProtocol, effort: string): void {
+  expect(body).toMatchObject(protocol === 'chat-completions'
+    ? { reasoning_effort: effort } : { output_config: { effort } })
+}
+
+function requestToolNames(body: any, protocol: ModelProtocol): string[] {
+  expect(Array.isArray(body.tools)).toBe(true)
+  return body.tools.map((tool: any) => {
+    const name = protocol === 'chat-completions' ? tool.function.name : tool.name
+    expect(typeof name).toBe('string')
+    return name
+  })
+}
+
+/** Both protocols permit user text as a string or as text blocks alongside other content. */
+function requestUserTexts(body: any): string[] {
+  return body.messages.filter((message: any) => message.role === 'user').flatMap((message: any) => {
+    if (typeof message.content === 'string') return [message.content]
+    expect(Array.isArray(message.content)).toBe(true)
+    return message.content.filter((block: any) => block.type === 'text').map((block: any) => {
+      expect(typeof block.text).toBe('string')
+      return block.text
+    })
+  })
+}
+
 function completion(delta: { content?: string; tool_calls?: any[] }, finish = 'stop', model = 'deepseek-v4-flash'): FixtureResponse {
   return protocol => {
     if (protocol === 'chat-completions') return new Response([
@@ -58,17 +84,19 @@ function completion(delta: { content?: string; tool_calls?: any[] }, finish = 's
   }
 }
 
-async function fixture(reply: (body: any, count: number) => FixtureResponse | Promise<FixtureResponse>) {
+async function fixture(reply: (body: any, count: number, protocol: ModelProtocol) => FixtureResponse | Promise<FixtureResponse>) {
   const dir = await mkdtemp(join(tmpdir(), 'lodestar-dsh-test-'))
   cleanups.push(() => rm(dir, { recursive: true, force: true }))
   const requests: any[] = []
+  const protocols: ModelProtocol[] = []
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
     const path = new URL(req.url).pathname
     const protocol = path.endsWith('/chat/completions') ? 'chat-completions' : path.endsWith('/messages') ? 'messages' : null
     if (!protocol) return new Response('unexpected endpoint', { status: 404 })
     const body = await req.json()
     requests.push(body)
-    const response = await reply(body, requests.length)
+    protocols.push(protocol)
+    const response = await reply(body, requests.length, protocol)
     return typeof response === 'function' ? response(protocol) : response
   } })
   cleanups.push(async () => { await server.stop(true) })
@@ -84,7 +112,7 @@ async function fixture(reply: (body: any, count: number) => FixtureResponse | Pr
     cleanups.push(() => proc.kill())
     return proc
   }
-  return { dir, opts, requests, processFor, baseUrl: `http://127.0.0.1:${server.port}` }
+  return { dir, opts, requests, protocols, processFor, baseUrl: `http://127.0.0.1:${server.port}` }
 }
 
 function nextResult(proc: DshProcess): Promise<any> {
@@ -99,6 +127,28 @@ function nextResult(proc: DshProcess): Promise<any> {
 }
 
 describe('DSH native runtime through Lodestar bridge', () => {
+  test('starts a turn without the removed native cwd prompt variable', async () => {
+    const f = await fixture(() => completion({ content: 'prompt assembled' }))
+    const pluginPath = join(f.dir, 'without-cwd.mjs')
+    await writeFile(pluginPath, `export const inject = ['systemPrompt'];
+      export function apply(ctx) {
+        ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
+          const assembly = await next();
+          const { cwd, ...variables } = assembly.variables;
+          return { ...assembly, variables };
+        });
+      }`)
+    const patchPath = join(f.dir, 'without-cwd.patch.json')
+    await writeFile(patchPath, JSON.stringify([{ insert: [{ id: 'without-cwd', name: pluginPath }] }]))
+    const proc = f.processFor(undefined, { runtimeOptions: { ...f.opts.runtimeOptions, patches: [patchPath] } })
+    await proc.initializationPromise()
+    const result = nextResult(proc)
+    proc.sendUserText('start with the native prompt variables')
+    expect(await result).toMatchObject({ is_error: false })
+    expect(f.requests).toHaveLength(1)
+    expect(JSON.stringify(f.requests[0])).toContain('You are a coding agent powered by deepseek-v4-flash.')
+  }, 30_000)
+
   test('a manually entered DeepSeek model outside the native list resolves effort and runs', async () => {
     const model = 'deepseek-manual-catalog-probe'
     const f = await fixture(() => completion({ content: 'custom model replied' }, 'stop', model))
@@ -109,7 +159,8 @@ describe('DSH native runtime through Lodestar bridge', () => {
     const done = nextResult(proc)
     proc.sendUserText('use the manually entered model')
     expect(await done).toMatchObject({ is_error: false })
-    expect(f.requests[0]).toMatchObject({ model, reasoning_effort: 'max' })
+    expect(f.requests[0]).toMatchObject({ model })
+    expectRequestEffort(f.requests[0], f.protocols[0]!, 'max')
     expect(f.requests[0].dsh_plugin_packages?.packages.some((entry: any) => entry.name === '@leviyuan/lodestar' && entry.version)).toBe(true)
   }, 30_000)
 
@@ -123,7 +174,8 @@ describe('DSH native runtime through Lodestar bridge', () => {
     const done = nextResult(proc)
     proc.sendUserText('use the model missing from the installed catalog')
     expect(await done).toMatchObject({ is_error: false })
-    expect(f.requests[0]).toMatchObject({ model, reasoning_effort: 'high', thinking: { type: 'enabled' } })
+    expect(f.requests[0]).toMatchObject({ model, thinking: { type: 'enabled' } })
+    expectRequestEffort(f.requests[0], f.protocols[0]!, 'high')
   }, 30_000)
 
   test('GLM Coding Plan runs tools, changes effort and resumes through the native pi-ai adapter', async () => {
@@ -140,7 +192,8 @@ describe('DSH native runtime through Lodestar bridge', () => {
     proc.sendUserText('remember the GLM lighthouse and run the tool')
     expect(await done).toMatchObject({ is_error: false })
     expect(JSON.stringify(f.requests[1].messages)).toContain('glm-tool-proof')
-    expect(f.requests[0]).toMatchObject({ model: 'glm-5.3', reasoning_effort: 'low', thinking: { type: 'enabled' } })
+    expect(f.requests[0]).toMatchObject({ model: 'glm-5.3', thinking: { type: 'enabled' } })
+    expectRequestEffort(f.requests[0], f.protocols[0]!, 'low')
     const requests = spyOn((proc as any).runtime, 'request')
     try {
       await proc.setModelSettings('glm-5.3', 'max')
@@ -148,7 +201,7 @@ describe('DSH native runtime through Lodestar bridge', () => {
     } finally { requests.mockRestore() }
     done = nextResult(proc); proc.sendUserText('continue at max')
     expect(await done).toMatchObject({ is_error: false })
-    expect(f.requests[2].reasoning_effort).toBe('max')
+    expectRequestEffort(f.requests[2], f.protocols[2]!, 'max')
     const sessionId = proc.sessionId!
     await proc.kill()
     const resumed = f.processFor({ kind: 'resume', source: { provider: 'dsh', sessionId, cwd: f.dir } }, overrides)
@@ -163,7 +216,7 @@ describe('DSH native runtime through Lodestar bridge', () => {
     let parentRequests = 0
     let childRequests = 0
     const f = await fixture(async body => {
-      const child = body.messages.some((m: any) => m.role === 'user' && typeof m.content === 'string' && m.content.startsWith('background-child-probe'))
+      const child = requestUserTexts(body).some(text => text.startsWith('background-child-probe'))
       if (child) {
         childRequests++
         if (childRequests === 1) {
@@ -345,7 +398,7 @@ describe('DSH native runtime through Lodestar bridge', () => {
       const result = nextResult(proc)
       proc.sendUserText('execute without further input')
       expect(await result).toMatchObject({ is_error: false })
-      const tools = f.requests.at(-1).tools.map((tool: any) => tool.function.name)
+      const tools = requestToolNames(f.requests.at(-1), f.protocols.at(-1)!)
       expect(tools).toContain('bash')
       expect(tools.includes('ask_user_question')).toBe(allowUserInput)
       sessionId = proc.sessionId!
@@ -391,8 +444,8 @@ describe('DSH native runtime through Lodestar bridge', () => {
 
   test('stages model changes for the next turn while retaining native delegation', async () => {
     let proc!: DshProcess
-    const f = await fixture(async (body, count) => {
-      const names = body.tools.map((tool: any) => tool.function.name)
+    const f = await fixture(async (body, count, protocol) => {
+      const names = requestToolNames(body, protocol)
       expect(names).toContain('subagent')
       if (count === 1) {
         await proc.setModelSettings('deepseek-v4-pro', 'off')
@@ -408,7 +461,7 @@ describe('DSH native runtime through Lodestar bridge', () => {
     proc.sendUserText('change the next turn model')
     expect(await result).toMatchObject({ is_error: false })
     expect(f.requests[1].model).toBe('deepseek-v4-flash')
-    expect(f.requests[1].reasoning_effort).toBe('high')
+    expectRequestEffort(f.requests[1], f.protocols[1]!, 'high')
     result = nextResult(proc)
     proc.sendUserText('now use the new selection')
     expect(await result).toMatchObject({ is_error: false })
@@ -448,15 +501,31 @@ describe('DSH native runtime through Lodestar bridge', () => {
   }, 30_000)
 
   test('admits a JPEG downloaded by Feishu under a .png filename', async () => {
-    const f = await fixture(() => completion({ content: 'image accepted' }))
+    const model = 'lodestar-image-probe'
+    const f = await fixture(() => completion({ content: 'image accepted' }, 'stop', model))
+    const patchPath = join(f.dir, 'image-model.patch.json')
+    await writeFile(patchPath, JSON.stringify([{ id: 'llm-deepseek', config: {
+      models: [{ id: model, inputModalities: ['text', 'image'] }],
+    } }]))
     const image = join(f.dir, 'feishu-download.png')
     await writeFile(image, Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAAEAAQDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAABgf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCaAK+Kv//Z', 'base64'))
-    const proc = f.processFor(undefined, { model: 'deepseek-v4-flash-vision-exp' })
+    const proc = f.processFor(undefined, { model,
+      runtimeOptions: { ...f.opts.runtimeOptions, patches: [patchPath] } })
     await proc.initializationPromise()
     const result = nextResult(proc)
     proc.sendUserText('inspect the supplied image', [image])
     expect(await result).toMatchObject({ is_error: false })
     expect(f.requests).toHaveLength(1)
+    const imageType = f.protocols[0] === 'chat-completions' ? 'image_url' : 'image'
+    const images = f.requests[0].messages.flatMap((message: any) => Array.isArray(message.content)
+      ? message.content.filter((block: any) => block.type === imageType) : [])
+    expect(images).toHaveLength(1)
+    if (f.protocols[0] === 'chat-completions') {
+      expect(images[0].image_url.url).toMatch(/^data:image\/jpeg;base64,\S+$/)
+    } else {
+      expect(images[0]).toMatchObject({ source: { type: 'base64', media_type: 'image/jpeg' } })
+      expect(images[0].source.data.length).toBeGreaterThan(0)
+    }
   }, 30_000)
 
   test('uses native manual compaction and keeps the compacted session resumable', async () => {
@@ -486,19 +555,17 @@ describe('DSH native runtime through Lodestar bridge', () => {
     let rootRequests = 0
     let childRequests = 0
     let grandchildRequests = 0
-    const f = await fixture(body => {
-      const grandchild = body.messages.some((message: any) => message.role === 'user'
-        && typeof message.content === 'string' && message.content.startsWith('grandchild-scope-check'))
+    const f = await fixture((body, _count, protocol) => {
+      const grandchild = requestUserTexts(body).some(text => text.startsWith('grandchild-scope-check'))
       if (grandchild) {
         grandchildRequests++
-        expect(body.tools.map((tool: any) => tool.function.name)).toContain('subagent')
+        expect(requestToolNames(body, protocol)).toContain('subagent')
         return completion({ content: 'grandchild-finished' })
       }
-      const child = body.messages.some((message: any) => message.role === 'user'
-        && typeof message.content === 'string' && message.content.startsWith('child-scope-check'))
+      const child = requestUserTexts(body).some(text => text.startsWith('child-scope-check'))
       if (child) {
         childRequests++
-        const names = body.tools.map((tool: any) => tool.function.name)
+        const names = requestToolNames(body, protocol)
         expect(names).toContain('subagent')
         expect(names).toContain('send_message')
         if (childRequests === 1) return completion({ tool_calls: [{ index: 0, id: 'child-shell', type: 'function', function: {
@@ -523,6 +590,22 @@ describe('DSH native runtime through Lodestar bridge', () => {
     const background: any[] = []
     const toolResults: any[] = []
     const rootText: string[] = []
+    const descendantsDone = new Promise<void>((resolve, reject) => {
+      const completed = new Set<string>()
+      proc.on('tool_result', event => {
+        if (event.is_error) reject(new Error(`Native delegation tool ${event.tool_use_id} failed: ${JSON.stringify(event.content)}`))
+      })
+      proc.on('bg_task_settled', event => {
+        if (event.status !== 'completed') {
+          reject(new Error(`Native child ${event.task_id} ended ${event.status}: ${event.summary}`))
+          return
+        }
+        completed.add(event.task_id)
+        if (completed.size === 2) resolve()
+      })
+      proc.once('exit', () => reject(new Error('runtime exited before both native descendants completed')))
+    })
+    void descendantsDone.catch(() => {})
     proc.on('bg_task_started', value => background.push(value))
     proc.on('tool_result', value => toolResults.push(value))
     proc.on('assistant_text', value => { if (!value.parentToolUseId) rootText.push(value.text) })
@@ -530,6 +613,7 @@ describe('DSH native runtime through Lodestar bridge', () => {
     const result = nextResult(proc)
     proc.sendUserText('delegate a scoped task')
     expect(await result).toMatchObject({ is_error: false })
+    await descendantsDone
     expect(childRequests).toBe(3)
     expect(grandchildRequests).toBe(1)
     expect(background).toHaveLength(2)
