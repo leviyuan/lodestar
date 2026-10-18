@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
-import { consoleUnifiedUsageContent, consoleUsageElement, unifiedUsageSummary } from './console'
+import { consoleUnifiedUsageContent, consoleUsageContent, consoleUsageElement, unifiedUsageSummary } from './console'
 import { codexUsageToUnified } from '../token-source-codex'
 import { snapshotFromReadResponse } from '../usage'
 
@@ -8,6 +8,31 @@ describe('compact hi account quota panel', () => {
   // Fixtures and countdown formatting must observe the same hour/day boundary.
   beforeEach(() => { clock = spyOn(Date, 'now').mockReturnValue(1_900_000_000_000) })
   afterEach(() => { clock.mockRestore() })
+
+  test.each(['plus', 'prolite', 'pro'])('omits an absent short window from %s hi and legacy summaries', planType => {
+    const raw = snapshotFromReadResponse({ rateLimits: { limitId: 'codex', planType,
+      primary: { usedPercent: 24, windowDurationMins: 10080, resetsAt: (Date.now() + 3 * 86400_000) / 1000 },
+      credits: { hasCredits: false, unlimited: false, balance: '0' },
+    }, rateLimitResetCredits: { availableCount: 0 } })
+    const usage = codexUsageToUnified(raw)
+    expect(consoleUnifiedUsageContent(usage)).toBe('周 24%/3.0d · 重置 0')
+    expect(consoleUsageContent(raw)).not.toMatch(/5h|满窗/)
+    expect(unifiedUsageSummary(usage)).not.toMatch(/5h|满窗/)
+  })
+
+  test('reported short windows retain real zero usage and missing field diagnostics', () => {
+    const main = { limitId: 'codex', planType: 'plus',
+      primary: { usedPercent: 0, windowDurationMins: 300, resetsAt: (Date.now() + 3600_000) / 1000 },
+      secondary: { usedPercent: 24, windowDurationMins: 10080, resetsAt: (Date.now() + 3 * 86400_000) / 1000 },
+      credits: { hasCredits: false, unlimited: false, balance: '0' },
+    }
+    const render = (primary: object) => consoleUnifiedUsageContent(codexUsageToUnified(snapshotFromReadResponse({
+      rateLimits: { ...main, primary }, rateLimitResetCredits: { availableCount: 0 },
+    })))
+    expect(render(main.primary)).toBe('5h 0%/1.0h · 周 24%/3.0d · 重置 0')
+    expect(render({ usedPercent: 0, windowDurationMins: 300 })).toBe('5h 0%/MISS · 周 24%/3.0d · 重置 0')
+    expect(render({ windowDurationMins: 300 })).toBe('5h MISS/MISS · 周 24%/3.0d · 重置 0')
+  })
 
   test('hi and unified summaries show main consumable credits alongside unchanged percentages', () => {
     const main = { limitId: 'codex', primary: { usedPercent: 100, windowDurationMins: 10080 },

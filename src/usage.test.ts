@@ -36,15 +36,22 @@ describe('quota account isolation', () => {
       expect(rankCodexQuota(snapshot, 'model', quotaNow).state).toBe('miss')
     }
   })
-  test('successful Plus reads without 5h consistently expose a full short window to footer and hi', () => {
-    const input = { rateLimits: { limitId: 'codex', planType: 'plus', primary: {
-      usedPercent: 20, windowDurationMins: 10080, resetsAt: 1_900_000_000 }, secondary: null } }
+  test('successful Plus reads preserve absent short windows in both main and model meters', () => {
+    const main = { limitId: 'codex', planType: 'plus', primary: {
+      usedPercent: 20, windowDurationMins: 10080, resetsAt: 1_900_000_000 }, secondary: null }
+    const input = { rateLimits: main, rateLimitsByLimitId: {
+      codex: main,
+      model: { limitId: 'model', primary: null, secondary: {
+        usedPercent: 40, windowDurationMins: 10080, resetsAt: 1_900_000_000 } },
+    } }
     const snapshot = snapshotFromReadResponse(input)
     if (snapshot.state !== 'ok') throw new Error('expected successful snapshot')
-    expect(snapshot.fiveHour).toEqual({ percent: 0, resetsAt: null, durationMins: 300, unreportedFull: true })
-    expect(snapshot.buckets?.[0].fiveHour).toEqual(snapshot.fiveHour)
+    expect(snapshot.fiveHour).toBeNull()
+    expect(snapshot.weekly).toEqual({ percent: 20, resetsAt: new Date(1_900_000_000_000), durationMins: 10080 })
+    expect(snapshot.buckets?.map(bucket => [bucket.limitId, bucket.fiveHour, bucket.weekly?.percent]))
+      .toEqual([['codex', null, 20], ['model', null, 40]])
     const staleProIdentity = snapshotFromReadResponse(input, 'pro')
-    expect(staleProIdentity).toMatchObject({ subscriptionType: 'plus', fiveHour: snapshot.fiveHour })
+    expect(staleProIdentity).toMatchObject({ subscriptionType: 'plus', fiveHour: null })
     expect(snapshotFromReadResponse({}, 'plus').state).toBe('network')
   })
   test('separate accounts never share in-flight requests or cached snapshots', async () => {
@@ -340,10 +347,26 @@ describe('usage read snapshot semantics', () => {
     expect(snap.weekly?.percent).toBe(17)
   })
 
+  test('Plus retains a returned short window in either slot, including secondary without primary', () => {
+    for (const slot of ['primary', 'secondary']) {
+      const main = { limitId: 'codex', planType: 'plus', [slot]: {
+        usedPercent: 7, windowDurationMins: 300, resetsAt: 1_900_000_000,
+      } }
+      const snap = snapshotFromReadResponse({ rateLimits: main,
+        rateLimitsByLimitId: { codex: main, model: { ...main, limitId: 'model' } } })
+      if (snap.state !== 'ok') throw new Error('expected ok snapshot')
+      expect(snap.fiveHour).toEqual({ percent: 7, durationMins: 300, resetsAt: new Date(1_900_000_000_000) })
+      expect(snap.weekly).toBeNull()
+      expect(snap.buckets?.map(bucket => [bucket.fiveHour?.percent, bucket.weekly]))
+        .toEqual([[7, null], [7, null]])
+    }
+  })
+
   test('不把缺失的 usedPercent 强转成 0', () => {
     const snap = snapshotFromReadResponse({
       rateLimits: {
         limitId: 'codex',
+        planType: 'plus',
         primary: { windowDurationMins: 300 },
         secondary: { windowDurationMins: 10_080 },
       },

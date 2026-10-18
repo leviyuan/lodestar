@@ -44,8 +44,7 @@ export function usageWindowElements(
   }
   const filled = Math.round(value / 100 * 6)
   const color = value >= 100 ? 'red' : value >= 80 ? 'orange' : 'green'
-  const reset = window.unreportedFull ? '满窗 · 0.15 份'
-    : window.resetsAt && Number.isFinite(window.resetsAt.getTime()) ? `${fmtResetIn(window.resetsAt)} 重置`
+  const reset = window.resetsAt && Number.isFinite(window.resetsAt.getTime()) ? `${fmtResetIn(window.resetsAt)} 重置`
     : '重置时间 MISS'
   return [
     { tag: 'markdown', content: `**${title} · ${Math.round(value)}%${counts}**\n<font color='${color}'>${'▰'.repeat(filled)}${'▱'.repeat(6 - filled)}</font>` },

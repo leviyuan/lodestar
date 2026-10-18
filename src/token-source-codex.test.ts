@@ -3,16 +3,21 @@ import { codexUsageToUnified } from './token-source-codex'
 import { consoleUnifiedUsageContent, consoleUsageElement, unifiedUsageSummary } from './cards/console'
 import type { UsageSnapshot } from './usage'
 
-test('hi preserves a Plus main full-window annotation through unified conversion', () => {
-  const snapshot = codexUsageToUnified({ state: 'ok', weekly: null, fetchedAt: 1,
-    fiveHour: { percent: 0, resetsAt: null, unreportedFull: true },
-    defaultLimitId: 'codex', buckets: [{ limitId: 'codex', limitName: null, weekly: null,
-      fiveHour: { percent: 0, resetsAt: null, unreportedFull: true } }],
+test('Plus unified quota preserves absent windows and missing fields in returned windows', () => {
+  const snapshot = codexUsageToUnified({ state: 'ok', subscriptionType: 'plus', fetchedAt: 1,
+    fiveHour: null, weekly: { percent: 20, resetsAt: null },
   })
-  expect(snapshot.windows[0]).toMatchObject({ label: '5h 窗口', percent: 0, resetsAt: null, unreportedFull: true })
+  expect(snapshot.windows).toEqual([{ kind: 'weekly', label: '周配额', percent: 20, resetsAt: null }])
   const content = consoleUnifiedUsageContent(snapshot)
-  expect(content).toContain('5h 0%（满窗）')
-  expect(content).not.toContain('重置时间')
+  expect(content).toContain('20%')
+  expect(content).not.toMatch(/5h|满窗/)
+  const missing = codexUsageToUnified({ state: 'ok', subscriptionType: 'plus', fetchedAt: 1,
+    fiveHour: { percent: null, resetsAt: null }, weekly: null,
+  })
+  expect(missing.windows).toEqual([{ kind: 'fiveHour', label: '5h 窗口', percent: null, resetsAt: null }])
+  expect(consoleUnifiedUsageContent(missing)).toContain('MISS')
+  expect(codexUsageToUnified({ state: 'network', reason: 'quota read failed' }))
+    .toMatchObject({ state: 'network', windows: [], reason: 'quota read failed' })
 })
 
 test('Codex quota displays only main windows, regardless of model-specific buckets', () => {

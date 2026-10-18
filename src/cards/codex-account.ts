@@ -113,13 +113,12 @@ export function codexAccountPanel(view: CodexAccountCardView): object {
     ...(view.phase === 'accounts' ? { vertical_spacing: '8px' } : {}), elements }
 }
 
-function accountUsageWindow(window: UsageWindow | null, label: string): object {
-  const value = window?.percent
+function accountUsageWindow(window: UsageWindow, label: string): object {
+  const value = window.percent
   if (value == null || !Number.isFinite(value) || value < 0 || value > 100) return md(`${label}　MISS`)
   const filled = Math.round(value / 100 * 6)
   const color = value >= 100 ? 'red' : value >= 80 ? 'orange' : 'green'
-  const reset = window!.unreportedFull ? '满窗'
-    : window!.resetsAt && Number.isFinite(window!.resetsAt.getTime()) ? fmtResetIn(window!.resetsAt) : 'MISS'
+  const reset = window.resetsAt && Number.isFinite(window.resetsAt.getTime()) ? fmtResetIn(window.resetsAt) : 'MISS'
   return md(`${label}　<font color='${color}'>${'▰'.repeat(filled)}${'▱'.repeat(6 - filled)}</font>　${Math.round(value)}% <font color='grey'>「${reset}」</font>`)
 }
 
@@ -162,7 +161,7 @@ function accountRows(view: CodexAccountCardView): object[] {
         header: { title: { tag: 'plain_text', content: '查询错误' } }, elements: [md(text(usage.reason))] })
       continue
     }
-    row.push(accountUsageWindow(usage.weekly, '周'))
+    if (usage.weekly) row.push(accountUsageWindow(usage.weekly, '周'))
     if (usage.fiveHour) row.push(accountUsageWindow(usage.fiveHour, '5h'))
     const credits = codexCreditsSummary(usage.credits)
     if (credits) row.push(md(credits))

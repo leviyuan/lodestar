@@ -158,7 +158,7 @@ describe('bare Codex account commands', () => {
   test.each([
     'Codex 账号检查失败，无法自动选账号（MISS）；默认：额度查询失败：HTTP 503',
     '没有配置 Codex 账号',
-    '没有符合条件的 Codex 账号；默认：Ultra 自动选择 Plus 需要可用积分',
+    '没有符合条件的 Codex 账号；默认：Ultra 自动选择有短窗的 Plus 需要可用积分',
   ])('blocking account selection failures remain visible: %s', async failure => {
     const s = session()
     Object.defineProperty(s, 'workDir', { value: root })

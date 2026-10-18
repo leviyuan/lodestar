@@ -16,7 +16,6 @@ import { StringDecoder } from 'node:string_decoder'
 import { createHash } from 'node:crypto'
 import { config } from './config'
 import { bindProcessCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
-import { plusFiveHourWindow } from './codex-quota'
 import { UsageReadCache, USAGE_FRESH_MS, isUsageAuthError, isUsageRateLimitError } from './usage-cache'
 import { observeCodexAccountEmail } from './codex-account-info'
 import { parseCodexCredits, type CodexCredits } from './codex-credits'
@@ -27,8 +26,6 @@ export interface UsageWindow {
   percent: number | null
   resetsAt: Date | null
   durationMins?: number | null
-  /** Successful Plus response omitted 5h; full window per the configured product rule, reset time unknown. */
-  unreportedFull?: boolean
 }
 
 /** 额度快照里单个计量桶(read 端点 rateLimitsByLimitId 的一个条目)。 */
@@ -339,9 +336,8 @@ function windowFromRateLimit(w: any): UsageWindow | null {
   }
 }
 
-/** 窗口归类:按 windowDurationMins 真实时长归类(短窗→5h 档,周量级→weekly),
- * 位置只作 fallback。不硬编码"当前套餐必然 300/10080"——只把时长最接近
- * 5h 量级的认作 fiveHour,其余(含缺失时长)按 primary/secondary 位置。 */
+/** 按接口实际返回的时长归类：短窗归 fiveHour，长窗归 weekly；
+ * 时长不能区分两个窗口时保留 primary/secondary 位置，不创建未返回的窗口。 */
 function classifyWindows(limits: any): { fiveHour: UsageWindow | null; weekly: UsageWindow | null } {
   const primary = windowFromRateLimit(limits?.primary)
   const secondary = windowFromRateLimit(limits?.secondary)
@@ -351,6 +347,7 @@ function classifyWindows(limits: any): { fiveHour: UsageWindow | null; weekly: U
     w?.durationMins != null && w.durationMins > 720
   if (isShort(primary) && isLong(secondary)) return { fiveHour: primary, weekly: secondary }
   if (isShort(secondary) && isLong(primary)) return { fiveHour: secondary, weekly: primary }
+  if (isShort(secondary) && !primary) return { fiveHour: secondary, weekly: null }
   if (isLong(primary) && !secondary) return { fiveHour: null, weekly: primary }
   if (isLong(secondary) && !primary) return { fiveHour: null, weekly: secondary }
   // 时长缺失或均为短窗:按位置(primary=5h 档,secondary=周)
@@ -449,7 +446,6 @@ export function snapshotFromReadResponse(limitsRes: any, planType?: string | nul
   if (quotaPlanType != null && planType != null && quotaPlanType !== planType) {
     log(`usage: codex plan mismatch account=${accountFingerprint ?? 'MISS'} account/read=${JSON.stringify(planType)} account/rateLimits/read=${JSON.stringify(quotaPlanType)}; using quota plan`)
   }
-  def.fiveHour = plusFiveHourWindow(subscriptionType, def.fiveHour)
   return {
     state: 'ok',
     subscriptionType,

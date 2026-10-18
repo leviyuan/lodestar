@@ -172,6 +172,8 @@ export class CodexAccountScheduler {
         const replenished = freshCredits && codexCreditsReplenished(block.credits, quota.credits)
         const resetObserved = fresh && rank.funding !== 'credits' && block.windows.some(old => {
           const w = quota[old.kind]
+          // A successful read can remove a limit; do not wait for that absent window to reset.
+          if (w === null) return true
           return w && w.percent !== null && ((old.percent !== null && w.percent < old.percent)
             || (old.reset !== null && old.reset <= now && (w.resetsAt?.getTime() ?? 0) > old.reset))
         })

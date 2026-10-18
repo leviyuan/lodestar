@@ -20,7 +20,6 @@ function windowContent(window: UsageWindowUnified): string {
   const label = labels[window.kind] ?? window.label.replace(/\s*周额度$/, '周')
   const value = `${escape(label)} ${percent(window.percent)}`
   if (window.kind === 'monthly') return value
-  if (window.unreportedFull) return `${value}（满窗）`
   return `${value}/${window.resetsAt && Number.isFinite(window.resetsAt.getTime()) ? fmtResetIn(window.resetsAt) : 'MISS'}`
 }
 
