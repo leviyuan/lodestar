@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.leviyuan.codex-reset-monitor</string>
+  <key>ProgramArguments</key><array><string>__PYTHON__</string><string>__PROJECT__/scripts/codex-reset-monitor/monitor.py</string></array>
+  <key>WorkingDirectory</key><string>__PROJECT__</string>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>300</integer>
+  <key>Umask</key><integer>63</integer>
+  <key>EnvironmentVariables</key><dict>
+    <key>CODEX_RESET_BUN</key><string>__BUN__</string>
+    <key>CODEX_RESET_STATE_PATH</key><string>__STATE__/state.json</string>
+    <key>PYTHONDONTWRITEBYTECODE</key><string>1</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+    <key>PATH</key><string>__PATH__</string>
+  </dict>
+  <key>StandardOutPath</key><string>__STATE__/monitor.log</string>
+  <key>StandardErrorPath</key><string>__STATE__/monitor-error.log</string>
+</dict></plist>

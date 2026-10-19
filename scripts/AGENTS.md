@@ -4,6 +4,7 @@
 
 | 脚本 | 副作用 |
 | --- | --- |
+| `codex-reset-monitor/monitor.py` | 独立定时读取公开重置公告、调用已配置 GLM 分类并通过本机 `/notify` 推送；`--dry-run` 仅读取和比较，不写状态、不调用模型、不通知，`--check-source` 只读来源；服务配置和迁移基线均留在本机，详见同目录 README |
 | `smoke.ts`、`test-all.ts` | 在真实群发送文本、卡片、reaction 和文件，自行创建 Session |
 | `test-inject.ts` | 向 debug context 指定的群发送可见消息，再注入正在运行的 daemon |
 | `test-mid-turn-rotation.ts` | 通过 debug socket 发送 `kill` 和长任务，读取日志 |
