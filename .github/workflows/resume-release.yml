@@ -1,0 +1,162 @@
+name: 续发已验收版本
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 已验收的版本标签，例如 v0.21.9
+        required: true
+        type: string
+      run_id:
+        description: 原发布工作流的运行 ID
+        required: true
+        type: string
+      attempt:
+        description: 已完成验收并保存制品的尝试次数
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: lodestar-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: 复用验收制品续发两个包仓库
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出当前发布脚本
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.2
+      - name: 核验原运行与指定尝试的验收证据
+        id: verified
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_RUN_ID: ${{ inputs.run_id }}
+          RELEASE_ATTEMPT: ${{ inputs.attempt }}
+        with:
+          script: |
+            const assert = require('node:assert/strict');
+            const { RELEASE_TAG: tag, RELEASE_RUN_ID: runId, RELEASE_ATTEMPT: attempt } = process.env;
+            assert.equal(context.ref, 'refs/heads/main', '仅允许从 main 运行续发工作流');
+            assert.match(tag, /^v\d+\.\d+\.\d+$/);
+            assert.match(runId, /^[1-9]\d*$/);
+            assert.match(attempt, /^[1-9]\d*$/);
+            assert(Number.isSafeInteger(Number(runId)) && Number.isSafeInteger(Number(attempt)));
+            const repo = context.repo;
+            const expectedRepository = `${repo.owner}/${repo.repo}`.toLowerCase();
+            let object = (await github.rest.git.getRef({ ...repo, ref: `tags/${tag}` })).data.object;
+            for (let depth = 0; object.type === 'tag'; depth++) {
+              assert(depth < 8, '标签引用层数异常');
+              object = (await github.rest.git.getTag({ ...repo, tag_sha: object.sha })).data.object;
+            }
+            assert.equal(object.type, 'commit', '标签未指向提交');
+            const run = (await github.request('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}', {
+              ...repo, run_id: Number(runId), attempt_number: Number(attempt),
+            })).data;
+            assert.equal(run.id, Number(runId));
+            assert.equal(run.run_attempt, Number(attempt));
+            assert.equal(run.repository.full_name.toLowerCase(), expectedRepository);
+            assert.equal(run.head_repository.full_name.toLowerCase(), expectedRepository);
+            assert.equal(run.path.split('@')[0], '.github/workflows/release.yml');
+            assert.equal(run.head_sha, object.sha, '原验收提交与版本标签不一致');
+            assert.equal(run.status, 'completed', '原运行尚未结束');
+            const jobs = await github.paginate('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs', {
+              ...repo, run_id: Number(runId), attempt_number: Number(attempt), per_page: 100,
+            });
+            const matches = jobs.filter(job => job.name === '验收并发布两个包仓库');
+            assert.equal(matches.length, 1, '原验收作业必须唯一');
+            const job = matches[0];
+            assert.equal(job.run_id, Number(runId));
+            assert.equal(job.run_attempt, Number(attempt));
+            assert.equal(job.head_sha, object.sha);
+            assert.equal(job.status, 'completed');
+            for (const name of ['校验标签与版本', '执行发布前完整检查', '打包并验收实际安装结果', '保存已验收的发布包']) {
+              const steps = job.steps.filter(step => step.name === name);
+              assert.equal(steps.length, 1, `验收步骤缺失或重复：${name}`);
+              assert.equal(steps[0].status, 'completed', `验收步骤未完成：${name}`);
+              assert.equal(steps[0].conclusion, 'success', `验收步骤未通过：${name}`);
+            }
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              ...repo, run_id: Number(runId), per_page: 100,
+            });
+            const name = `lodestar-${tag}-${attempt}`;
+            const selected = artifacts.filter(artifact => artifact.name === name);
+            assert.equal(selected.length, 1, '指定尝试的制品必须唯一');
+            const artifact = selected[0];
+            assert.equal(artifact.expired, false, '已验收制品已过期');
+            assert(artifact.size_in_bytes > 0, '已验收制品为空');
+            assert.equal(artifact.workflow_run.id, Number(runId));
+            assert.equal(artifact.workflow_run.head_sha, object.sha);
+            assert.equal(artifact.workflow_run.repository_id, run.repository.id);
+            assert.equal(artifact.workflow_run.head_repository_id, run.repository.id);
+            core.setOutput('artifact_id', String(artifact.id));
+            core.info(`验收证据通过：${tag}，运行 ${runId}，尝试 ${attempt}，制品 ${artifact.id}`);
+      - name: 下载唯一的已验收制品
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.verified.outputs.artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.run_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/lodestar-release/pack
+      - name: 核对原始发布包并生成续发清单
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          # desc: 校验下载的原始发布包并生成哈希清单
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          import { execFileSync } from 'node:child_process';
+          const directory = join(process.env.RUNNER_TEMP, 'lodestar-release', 'pack');
+          const files = readdirSync(directory, { withFileTypes: true });
+          assert.equal(files.length, 1, '验收制品必须只包含一个发布包');
+          assert(files[0].isFile() && files[0].name.endsWith('.tgz'), '制品不是普通 tgz 文件');
+          const filename = files[0].name;
+          const tarball = join(directory, filename);
+          const pkg = JSON.parse(execFileSync('tar', ['-xOf', tarball, 'package/package.json'], { encoding: 'utf8', maxBuffer: 1024 * 1024 }));
+          assert.equal(pkg.name, '@leviyuan/lodestar');
+          assert.match(pkg.version, /^\d+\.\d+\.\d+$/);
+          assert.equal(process.env.RELEASE_TAG, `v${pkg.version}`);
+          const bytes = readFileSync(tarball);
+          const integrity = `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
+          const shasum = createHash('sha1').update(bytes).digest('hex');
+          writeFileSync(join(directory, '..', 'pack.json'), JSON.stringify([{ name: pkg.name, version: pkg.version, filename, integrity, shasum, size: bytes.length }]), { mode: 0o600 });
+          console.log(`原始制品已核对：${pkg.name}@${pkg.version}，${bytes.length} 字节，${integrity}`);
+          NODE
+      - name: 核验或续发 npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # desc: 核验或续发同一份 npm 发布包
+          test -n "$NODE_AUTH_TOKEN"
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/lodestar-release/npmrc"
+          trap 'rm -f "$NPM_CONFIG_USERCONFIG"' EXIT
+          printf '%s\n' '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}' > "$NPM_CONFIG_USERCONFIG"
+          node scripts/publish-verified-package.mjs "$RUNNER_TEMP/lodestar-release/pack.json" "$RUNNER_TEMP/lodestar-release/pack" https://registry.npmjs.org
+      - name: 核验或续发 GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+        run: |
+          # desc: 核验或续发同一份 GitHub Packages 发布包
+          test -n "$NODE_AUTH_TOKEN"
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/lodestar-release/github-npmrc"
+          trap 'rm -f "$NPM_CONFIG_USERCONFIG"' EXIT
+          printf '%s\n' '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' > "$NPM_CONFIG_USERCONFIG"
+          node scripts/publish-verified-package.mjs "$RUNNER_TEMP/lodestar-release/pack.json" "$RUNNER_TEMP/lodestar-release/pack" https://npm.pkg.github.com
