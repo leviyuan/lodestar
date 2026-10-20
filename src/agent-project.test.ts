@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, mkdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { acceptsProjectCapability, createAgentProjectClient, readAgentProjectClient } from './agent-project-client'
@@ -28,7 +28,7 @@ describe('project Agent client', () => {
   })
 
   test('resolves registered project and worktree bindings without starting or reading a Session', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'lodestar-project-owner-'))
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'lodestar-project-owner-')))
     mkdirSync(join(dir, 'main'))
     mkdirSync(join(dir, 'wt'))
     symlinkSync(join(dir, 'main'), join(dir, 'alias'))

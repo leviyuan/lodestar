@@ -437,6 +437,9 @@ describe('bare Codex account commands', () => {
       return proc
     }
     spies.push(spyOn(s, 'showConsole').mockResolvedValue(undefined))
+    // Named hi now follows the selected Agent; explicitly return to Codex
+    // before testing its preserved resume point after leaving the source.
+    if (provider === 'claude') await s.applyModelSelection('codex', 'shared-model', 'high', 'codex-sub')
     await runAndSettle(s, 'hi default', 'owner')
     expect(resumed).toEqual(prior)
   })

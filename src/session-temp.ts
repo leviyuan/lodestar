@@ -19,9 +19,9 @@ import {
   type ConversationRouting,
   type ConversationSummary,
 } from './conversation'
-import { closeSync, openSync, readSync, readdirSync, statSync } from 'node:fs'
+import { closeSync, openSync, readSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { join } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { diagnosticIdLabel } from './session-util'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -121,6 +121,7 @@ function sameRouting(a: ConversationRouting, b: ConversationRouting): boolean {
   return a.provider === b.provider
     && (a.codexAccountId ?? 'default') === (b.codexAccountId ?? 'default')
     && !!a.codexAccountAutomatic === !!b.codexAccountAutomatic
+    && (a.claudeAccountId ?? 'default') === (b.claudeAccountId ?? 'default')
     && a.tokenSourceId === b.tokenSourceId
     && a.model === b.model
     && a.effort === b.effort
@@ -203,8 +204,8 @@ function usableBranchBase(s: Session): ConversationBranchBase {
 
 // ── Claude stopped-session history catalog ───────────────────────────
 
-export function listClaudeSessions(workDir: string): ConversationSummary[] {
-  const dir = claudeTranscriptDir(workDir)
+export function listClaudeSessions(workDir: string, options?: { configDir?: string; projectDirName?: string }): ConversationSummary[] {
+  const dir = claudeTranscriptDir(workDir, options)
   let names: string[]
   try {
     names = readdirSync(dir)
@@ -214,10 +215,12 @@ export function listClaudeSessions(workDir: string): ConversationSummary[] {
   }
   const all: ConversationSummary[] = []
   for (const name of names) {
-    if (!name.endsWith('.jsonl')) continue
+    if (!name.endsWith('.jsonl') || name.includes('.orphaned-') || name.includes('.superseded-')) continue
     const sessionId = name.slice(0, -6)
     if (isAgentSession('claude', sessionId)) continue
     const full = join(dir, name)
+    const preview = firstUserSummary(full, workDir)
+    if (preview === null) continue
     let mtime: number
     try { mtime = statSync(full).mtimeMs } catch (error: any) {
       throw new Error(`读取 Claude 会话元数据失败 (${name}): ${error?.message ?? error}`)
@@ -226,7 +229,7 @@ export function listClaudeSessions(workDir: string): ConversationSummary[] {
       provider: 'claude',
       sessionId,
       cwd: workDir,
-      preview: firstUserSummary(full),
+      preview,
       ts: mtime,
     })
   }
@@ -240,7 +243,7 @@ function recentHistory(entries: ConversationSummary[]): ConversationSummary[] {
   return ordered.slice(0, Math.min(HISTORY_CARD_MAX, Math.max(10, withinCount)))
 }
 
-function firstUserSummary(path: string): string {
+function firstUserSummary(path: string, workDir?: string): string | null {
   let text = ''
   let fd: number | null = null
   try {
@@ -254,21 +257,30 @@ function firstUserSummary(path: string): string {
     if (fd !== null) closeSync(fd)
   }
   let fallback = ''
+  let queued = ''
+  let checkedCwd = false
+  const canonical = (path: string): string => { try { return realpathSync(path) } catch { return resolve(path) } }
   for (const raw of text.split('\n')) {
     const line = raw.trim()
     if (!line) continue
     let data: any
     try { data = JSON.parse(line) } catch { continue }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+    if (data.isSidechain === true) return null
+    if (!checkedCwd && workDir && typeof data.cwd === 'string' && isAbsolute(data.cwd)) {
+      if (canonical(data.cwd) !== canonical(workDir)) return null
+      checkedCwd = true
+    }
     if (data.type === 'queue-operation' && data.operation === 'enqueue' && typeof data.content === 'string') {
       const content = data.content.trim()
-      if (content) return content.slice(0, 80)
+      if (content && !queued) queued = content
     }
     if (!fallback && data.type === 'user' && data.message) {
       const userText = userMessageText(data.message)
       if (userText) fallback = userText
     }
   }
-  return fallback.slice(0, 80)
+  return (queued || fallback).slice(0, 80)
 }
 
 function userMessageText(message: any): string {
@@ -348,7 +360,7 @@ export async function showResumeList(s: Session, userOpenId: string): Promise<vo
   try {
     history = s.selectedProvider === 'codex'
       ? await s.listCodexConversations()
-      : s.selectedProvider === 'dsh' ? await s.listDshConversations() : listClaudeSessions(s.workDir)
+      : s.selectedProvider === 'dsh' ? await s.listDshConversations() : listClaudeSessions(s.workDir, s.claudeHistoryOptions())
   } catch (error) {
     await feishu.sendTextRaw(s.chatId, `❌ 历史会话读取失败: ${error instanceof Error ? error.message : error}`)
     return

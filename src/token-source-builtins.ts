@@ -42,7 +42,7 @@ export function buildTokenSourcesFromConfig(): number {
     const detected = def.configSectionId ? detectedConfigs[def.configSectionId] ?? null : null
     const create = () => {
       const source = withModelVisibility(def.build(cfg, detected), cfg)
-      source.spawnRevision = tokenSourceSpawnRevision(def.kind, cfg, detected)
+      source.spawnRevision = JSON.stringify([tokenSourceSpawnRevision(def.kind, cfg, detected), source.spawnRevision ?? null])
       return source
     }
     return { cfg, detected, create, initial: create() }

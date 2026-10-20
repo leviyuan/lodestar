@@ -59,6 +59,8 @@ export interface ConversationRouting {
   provider: AgentProvider
   codexAccountId?: string
   codexAccountAutomatic?: boolean
+  /** Snapshot for the first launch of a temporary Claude subscription session. */
+  claudeAccountId?: string
   tokenSourceId: string | null
   model: string | null
   effort: AgentReasoningEffort | null

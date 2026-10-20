@@ -52,6 +52,55 @@ describe('Claude subscription usage response', () => {
   })
 })
 
+test('native quota cache separates accounts and rejects late snapshots after identity changes', () => {
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', `
+    import assert from 'node:assert/strict'
+    import { mock } from 'bun:test'
+    const calls = []
+    let release
+    let barrier = Promise.resolve()
+    let percent = 10
+    mock.module('./src/claude-agent-process', () => ({ ClaudeAgentProcess: class {
+      constructor(options) { this.options = options; assert.equal(options.controlOnly, true) }
+      on() {}
+      isAlive() { return false }
+      async readSubscriptionUsage() {
+        const captured = percent
+        calls.push(this.options.tokenSourceId)
+        await barrier
+        return { subscription_type: 'max', rate_limits_available: true, rate_limits: {
+          five_hour: { utilization: captured, resets_at: null }, seven_day: { utilization: captured, resets_at: null },
+        } }
+      }
+      async kill() {}
+    } }))
+    const { fetchClaudeSubscriptionUsage, invalidateClaudeSubscriptionUsage } = await import('./src/claude-usage')
+    let generation = 'one'
+    const first = () => fetchClaudeSubscriptionUsage({ tokenSourceId: 'A' }, { accountId: 'A', revision: generation })
+    const [a, simultaneous] = await Promise.all([first(), first()])
+    assert.equal(a, simultaneous); assert.deepEqual(calls, ['A'])
+    percent = 70
+    const b = await fetchClaudeSubscriptionUsage({ tokenSourceId: 'B' }, { accountId: 'B', revision: 'one' })
+    assert.equal(b.windows[0].percent, 70)
+    assert.equal((await first()).windows[0].percent, 10)
+    invalidateClaudeSubscriptionUsage('A')
+    barrier = new Promise(resolve => { release = resolve })
+    const pending = fetchClaudeSubscriptionUsage({ tokenSourceId: 'A-old' },
+      { accountId: 'A', revision: 'one', current: () => generation === 'one' })
+    for (let tick = 0; tick < 100 && !calls.includes('A-old'); tick++) await new Promise(resolve => setTimeout(resolve, 0))
+    assert.ok(calls.includes('A-old'))
+    generation = 'two'; invalidateClaudeSubscriptionUsage('A'); percent = 20
+    barrier = Promise.resolve()
+    const current = await first()
+    release()
+    assert.equal((await pending).state, 'no_credentials')
+    assert.equal(current.windows[0].percent, 20)
+    assert.equal((await first()).windows[0].percent, 20)
+    assert.equal(b.windows[0].percent, 70)
+  `], { cwd: process.cwd(), stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: 20_000 })
+  expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+})
+
 describe('Claude weekly quota selection', () => {
   const snapshot = () => claudeUsageSnapshot(response({
     five_hour: { utilization: 10, resets_at: reset },

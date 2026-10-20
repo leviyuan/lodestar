@@ -103,13 +103,13 @@ test('Claude subscription commands persist a global switch and report auth and s
     import { join } from 'node:path'
     const { sentTexts } = await import('./src/feishu-test-mock')
     const nativeModels = await import('./src/token-source-models')
-    let account = { subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
+    let account = { email: 'setup@example.test', organization: 'test-org', subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
     let modelQueries = 0
     mock.module('./src/token-source-models', () => ({ ...nativeModels,
       fetchNativeClaudeModels: async options => {
         modelQueries++
         options.validateAccount(account)
-        return [{ model: 'sonnet', display: 'Sonnet', efforts: ['high'], defaultEffort: 'high' }]
+        return [{ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' }]
       },
     }))
     const { config, loadConfig } = await import('./src/config')

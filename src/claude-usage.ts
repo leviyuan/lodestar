@@ -7,6 +7,12 @@ import { UsageReadCache, isUsageRateLimitError } from './usage-cache'
 
 const TIMEOUT_MS = 30_000
 const usageReads = new UsageReadCache<UsageSnapshotUnified>()
+const usageKeys = new Map<string, Set<string>>()
+
+export function invalidateClaudeSubscriptionUsage(accountId: string): void {
+  for (const key of usageKeys.get(accountId) ?? []) usageReads.invalidate(key)
+  usageKeys.delete(accountId)
+}
 type JsonObject = Record<string, unknown>
 
 function object(value: unknown): value is JsonObject {
@@ -28,7 +34,7 @@ function usageWindow(value: unknown, kind: string, label: string): UsageWindowUn
 }
 
 /** 同一模型族的 alias、完整模型 ID 和 SDK 显示名使用同一个额度桶。 */
-function modelFamily(model: string): string {
+export function claudeModelFamily(model: string): string {
   return model.trim().toLowerCase()
     .replace(/^claude:/, '').replace(/\[1m\]$/, '')
     .replace(/^claude[-\s]+/, '')
@@ -41,13 +47,13 @@ function modelFamily(model: string): string {
 export function claudeWeeklyUsageWindow(snapshot: UsageSnapshotUnified, model: string | null): UsageWindowUnified | null {
   if (snapshot.state !== 'ok' || !model?.trim()) return null
   // default/旧 profile 别名与真实启动共用解析；未提供模型时不猜默认账号模型。
-  const family = modelFamily(resolveClaudeSdkModel(model.trim()))
+  const family = claudeModelFamily(resolveClaudeSdkModel(model.trim()))
   if (!family || family === 'default') return null
   const matching = snapshot.windows.filter(window => {
     const scope = window.kind.startsWith('modelWeekly:') ? window.kind.slice('modelWeekly:'.length)
       : window.kind === 'seven_day_opus' ? 'opus'
       : window.kind === 'seven_day_sonnet' ? 'sonnet' : null
-    return scope !== null && modelFamily(scope) === family
+    return scope !== null && claudeModelFamily(scope) === family
   })
   if (matching.length > 1) {
     log(`Claude weekly usage MISS: ${model} 匹配多个模型专属周额度窗口`)
@@ -98,16 +104,32 @@ export function claudeUsageSnapshot(data: unknown): UsageSnapshotUnified {
 
 /** 沿用订阅来源的认证隔离；独立控制查询用完即关，瞬态失败沿用最近成功快照。 */
 export async function fetchClaudeSubscriptionUsage(options: Pick<ClaudeSpawnOpts,
-  'settingSources' | 'settings' | 'transformEnv' | 'validateAccount' | 'tokenSourceId'>): Promise<UsageSnapshotUnified> {
-  return usageReads.readStale('claude-subscription', () => requestClaudeSubscriptionUsage(options))
+  'settingSources' | 'settings' | 'transformEnv' | 'validateAccount' | 'tokenSourceId'>,
+  binding: { accountId: string; revision: string; acquireUse?(): () => void; current?(): boolean }
+    = { accountId: 'default', revision: 'legacy-default' }): Promise<UsageSnapshotUnified> {
+  const key = JSON.stringify(['claude-subscription', binding.accountId, binding.revision])
+  const keys = usageKeys.get(binding.accountId) ?? new Set<string>()
+  keys.add(key); usageKeys.set(binding.accountId, keys)
+  const stale = (): UsageSnapshotUnified => ({ state: 'no_credentials', windows: [], reason: 'Claude 账号认证身份已变化，等待后台刷新' })
+  if (binding.current && !binding.current()) return stale()
+  const result = await usageReads.readStale(key, async () => {
+    const snapshot = await requestClaudeSubscriptionUsage(options, binding.acquireUse)
+    return !binding.current || binding.current() ? snapshot : stale()
+  })
+  return !binding.current || binding.current() ? result : stale()
 }
 
 async function requestClaudeSubscriptionUsage(options: Pick<ClaudeSpawnOpts,
-  'settingSources' | 'settings' | 'transformEnv' | 'validateAccount' | 'tokenSourceId'>): Promise<UsageSnapshotUnified> {
+  'settingSources' | 'settings' | 'transformEnv' | 'validateAccount' | 'tokenSourceId'>,
+  acquireUse?: () => () => void): Promise<UsageSnapshotUnified> {
   try {
     const { ClaudeAgentProcess } = await import('./claude-agent-process')
-    const proc = new ClaudeAgentProcess({ workDir: homedir(), effort: 'default',
-      profile: { loadProjectMcp: false }, ...options })
+    const release = acquireUse?.()
+    let proc: InstanceType<typeof ClaudeAgentProcess>
+    try { proc = new ClaudeAgentProcess({ workDir: homedir(), effort: 'default',
+      profile: { loadProjectMcp: false }, ...options, controlOnly: true }) }
+    catch (error) { release?.(); throw error }
+    if (release) proc.once('exit', release)
     proc.on('error', error => log(`Claude subscription usage MISS: ${error.message}`))
     let timer: ReturnType<typeof setTimeout> | undefined
     let failure: Error | undefined
@@ -129,7 +151,7 @@ async function requestClaudeSubscriptionUsage(options: Pick<ClaudeSpawnOpts,
         if (failure) throw new AggregateError([failure, error],
           `${failure.message}；额度查询进程关闭失败：${error instanceof Error ? error.message : String(error)}`)
         throw error
-      }
+      } finally { if (!proc.isAlive()) release?.() }
     }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)

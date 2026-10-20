@@ -126,9 +126,9 @@ export interface AgentProcess extends EventEmitter {
 
   /** Start backend initialization. */
   sendInitialize(): void
-  /** Codex exposes the exact readiness transaction so Session can surface
-   * method-specific RPC failures before teardown. Claude stream init is
-   * deferred until first input and therefore does not implement this hook. */
+  /** Backend readiness before accepting user input. Codex awaits its native
+   * thread transaction; Claude awaits SDK setup and subscription validation,
+   * without waiting for the stream init that requires the first input. */
   initializationPromise?(): Promise<void>
   /** Explicit waiting state releases the Session actor while quota resets; never claims native init. */
   quotaWaitPromise?(): Promise<void>

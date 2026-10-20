@@ -99,8 +99,13 @@ export function scrubDshEnv(base: Env): Env {
 
 export interface TokenSource {
   id: string
-  /** One visible Codex source, with a separate native auth/catalog binding for each named account. */
+  /** One visible source, with separate native auth/catalog bindings for each account. */
   forAccount?(accountId: string): TokenSource
+  listAccounts?(): Array<{ id: string; name: string }>
+  accountRevision?(accountId: string): string
+  accountId?: string
+  /** The root exposes committed account catalogs; its quota is never borrowed from one account. */
+  aggregateAccountCatalog?: boolean
   /** Stable fingerprint of fields that affect spawned process routing/env.
    * Registry rebuilds with the same effective config keep the same value;
    * credential/base-url/slot changes force an idle process replacement. */
@@ -235,6 +240,15 @@ export function getTokenSourceForAccount(id: string | null | undefined, accountI
   return source?.forAccount ? source.forAccount(accountId) : source
 }
 
+export function tokenSourceAccounts(source: TokenSource): Array<{ id: string; name: string }> {
+  return source.listAccounts?.() ?? (source.kind === 'codex-subscription' ? codexAccounts.list() : [])
+}
+
+export function tokenSourceAccountRevision(source: TokenSource, accountId: string): string {
+  return source.accountRevision?.(accountId)
+    ?? (source.kind === 'codex-subscription' ? codexAccounts.revision(accountId) : accountId)
+}
+
 export function listTokenSources(): TokenSource[] {
   return [...registry.values()]
 }
@@ -267,7 +281,9 @@ let refreshAllInFlight: { generation: number; promise: Promise<void> } | null = 
 export function refreshAllTokenSourceModels(): Promise<void> {
   const generation = registryGeneration
   if (refreshAllInFlight?.generation === generation) return refreshAllInFlight.promise
-  const promise = Promise.allSettled(listTokenSourceAccounts().map(async ts => {
+  const targets = listTokenSources().flatMap(source => source.aggregateAccountCatalog ? [source]
+    : source.forAccount ? tokenSourceAccounts(source).map(account => source.forAccount!(account.id)) : [source])
+  const promise = Promise.allSettled(targets.map(async ts => {
     await ts.refreshModels()
     log(`token-source ${ts.id}: ${ts.models.length} models loaded`)
   }))
@@ -282,7 +298,7 @@ export function refreshAllTokenSourceModels(): Promise<void> {
 /** Account views have independent caches and refreshes; one slow login cannot block another. */
 export function listTokenSourceAccounts(): TokenSource[] {
   return listTokenSources().flatMap(source => source.forAccount
-    ? codexAccounts.list().map(account => source.forAccount!(account.id)) : [source])
+    ? tokenSourceAccounts(source).map(account => source.forAccount!(account.id)) : [source])
 }
 
 /** Startup/diagnostic barrier. Interactive discovery must read the committed cache instead. */

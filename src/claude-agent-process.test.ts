@@ -1,5 +1,5 @@
 import { homedir, tmpdir } from 'node:os'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, unlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, unlinkSync, symlinkSync, realpathSync } from 'node:fs'
 import { delimiter, join, win32 } from 'node:path'
 import { beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
@@ -8,6 +8,7 @@ const {
   CLAUDE_PERMISSION_MODE,
   ClaudeAgentProcess,
   claudeTranscriptPath,
+  claudeTranscriptDir,
   readLastCallUsageFromTranscript,
   readProjectMcpServers,
   resetClaudeContextWindowCache,
@@ -21,10 +22,192 @@ const {
 } = await import('./claude-models')
 const { config } = await import('./config')
 const agentUpdates = await import('./agent-updates')
+const { acquireClaudeSessionLease } = await import('./claude-session-lease')
 
 // context window 是 daemon 全局缓存(按路由 key 跨 session 共享),
 // 每个用例前重置,避免互相污染。
 beforeEach(() => resetClaudeContextWindowCache())
+
+describe('Claude native initialization and shared writer ownership', () => {
+  function sdkFixture(closeMode: 'exit' | 'stay' = 'exit') {
+    const captures: any[] = []
+    const queries: any[] = []
+    const spy = spyOn(agentUpdates, 'loadClaudeSdk').mockResolvedValue({
+      query({ options }: any) {
+        captures.push(options)
+        let finish!: () => void
+        const ended = new Promise<void>(resolve => { finish = resolve })
+        const q = {
+          accountInfo: async () => ({ subscriptionType: 'max', email: 'synthetic@example.invalid' }),
+          supportedModels: async () => [],
+          usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({ rate_limits_available: false, rate_limits: null }),
+          close() { if (closeMode === 'exit') finish() },
+          finish,
+          async *[Symbol.asyncIterator]() { await ended },
+        }
+        queries.push(q)
+        return q
+      },
+    } as any)
+    return { spy, captures, queries }
+  }
+  function directories() {
+    const root = mkdtempSync(join(tmpdir(), 'claude-process-lease-'))
+    mkdirSync(join(root, 'shared'))
+    for (const name of ['A', 'B']) {
+      mkdirSync(join(root, name))
+      symlinkSync(join(root, 'shared'), join(root, name, 'projects'), 'junction')
+    }
+    return { root, a: join(root, 'A'), b: join(root, 'B'), history: join(root, 'shared'), cleanup: () => rmSync(root, { recursive: true, force: true }) }
+  }
+
+  test('pins fresh native IDs before query and refuses another account until confirmed exit', async () => {
+    const sdk = sdkFixture(), d = directories()
+    const first = new ClaudeAgentProcess({ workDir: d.root, effort: 'max', transformEnv: env => ({ ...env, CLAUDE_CONFIG_DIR: d.a }) })
+    let second: InstanceType<typeof ClaudeAgentProcess> | undefined
+    try {
+      await first.initializationPromise()
+      const id = sdk.captures[0].sessionId
+      expect(id).toMatch(/^[0-9a-f-]{36}$/)
+      second = new ClaudeAgentProcess({ workDir: d.root, effort: 'max', resumeSessionId: id, transformEnv: env => ({ ...env, CLAUDE_CONFIG_DIR: d.b }) })
+      await expect(second.initializationPromise()).rejects.toThrow('会话正在使用')
+      expect(sdk.captures).toHaveLength(1)
+      await first.kill()
+      const again = acquireClaudeSessionLease({ historyRoot: join(d.b, 'projects'), sessionId: id })
+      again.release()
+    } finally { await first.kill(); await second?.kill(); sdk.spy.mockRestore(); d.cleanup() }
+  })
+
+  test('control-only account/models/usage queries do not lock or accept model input', async () => {
+    const sdk = sdkFixture(), d = directories()
+    const writer = acquireClaudeSessionLease({ historyRoot: d.history, sessionId: 'owned-session' })
+    const control = new ClaudeAgentProcess({ workDir: d.root, effort: 'max', controlOnly: true, resumeSessionId: 'owned-session', transformEnv: env => ({ ...env, CLAUDE_CONFIG_DIR: d.b }) })
+    try {
+      await expect(control.readAccountInfo()).resolves.toMatchObject({ subscriptionType: 'max' })
+      await expect(control.listModels()).resolves.toEqual([])
+      await expect(control.readSubscriptionUsage()).resolves.toMatchObject({ rate_limits_available: false })
+      expect(sdk.captures[0].sessionId).toBeUndefined()
+      const errors: Error[] = []
+      control.on('error', error => errors.push(error))
+      control.sendUserText('must not reach native input')
+      expect(errors.at(-1)?.message).toContain('控制查询')
+      expect((control as any).input.items).toHaveLength(0)
+      await expect(control.compactThread()).rejects.toThrow('控制查询')
+    } finally { await control.kill(); writer.release(); sdk.spy.mockRestore(); d.cleanup() }
+  })
+
+  test('initialization waits for async account validation and preserves its rejection', async () => {
+    const sdk = sdkFixture(), d = directories()
+    let allow!: () => void
+    const validation = new Promise<void>(resolve => { allow = resolve })
+    const proc = new ClaudeAgentProcess({ workDir: d.root, effort: 'max', controlOnly: true, validateAccount: () => validation })
+    let settled = false
+    try {
+      const ready = proc.initializationPromise().then(() => { settled = true })
+      await new Promise(resolve => setTimeout(resolve, 1))
+      expect(settled).toBe(false)
+      allow()
+      await ready
+      expect(settled).toBe(true)
+      await proc.kill()
+      const rejected = new ClaudeAgentProcess({ workDir: d.root, effort: 'max', controlOnly: true,
+        validateAccount: async () => { throw new Error('native identity mismatch') } })
+      await expect(rejected.initializationPromise()).rejects.toThrow('native identity mismatch')
+      await expect(rejected.readAccountInfo()).rejects.toThrow('native identity mismatch')
+      expect(rejected.isAlive()).toBe(false)
+    } finally { allow(); await proc.kill(); sdk.spy.mockRestore(); d.cleanup() }
+  })
+
+  test('unconfirmed SDK shutdown keeps ownership until the read loop really exits', async () => {
+    const sdk = sdkFixture('stay'), d = directories()
+    const proc = new ClaudeAgentProcess({ workDir: d.root, effort: 'max', resumeSessionId: 'shutdown-session', transformEnv: env => ({ ...env, CLAUDE_CONFIG_DIR: d.a }) }) as any
+    try {
+      await proc.initializationPromise()
+      await expect(proc.kill(2)).rejects.toThrow('did not exit')
+      expect(() => acquireClaudeSessionLease({ historyRoot: join(d.b, 'projects'), sessionId: 'shutdown-session' })).toThrow('会话正在使用')
+      sdk.queries[0].finish()
+      await proc.exitPromise
+      const next = acquireClaudeSessionLease({ historyRoot: d.history, sessionId: 'shutdown-session' })
+      next.release()
+    } finally { sdk.queries[0]?.finish(); await proc.exitPromise; sdk.spy.mockRestore(); d.cleanup() }
+  })
+
+  test('fork reserves its source through native initialization and uses a separate native destination ID', async () => {
+    const sdk = sdkFixture(), d = directories()
+    const fork = new ClaudeAgentProcess({ workDir: d.root, effort: 'max', resumeSessionId: 'source-session', forkSession: true,
+      transformEnv: env => ({ ...env, CLAUDE_CONFIG_DIR: d.b }) }) as any
+    try {
+      await fork.initializationPromise()
+      const options = sdk.captures[0]
+      expect(options.resume).toBe('source-session')
+      expect(options.sessionId).not.toBe('source-session')
+      expect(options.forkSession).toBe(true)
+      expect(() => acquireClaudeSessionLease({ historyRoot: d.history, sessionId: 'source-session' })).toThrow('会话正在使用')
+      fork.handleMessage({ type: 'system', subtype: 'init', session_id: options.sessionId })
+      const source = acquireClaudeSessionLease({ historyRoot: d.history, sessionId: 'source-session' })
+      source.release()
+      expect(() => acquireClaudeSessionLease({ historyRoot: d.history, sessionId: options.sessionId })).toThrow('会话正在使用')
+    } finally { await fork.kill(); sdk.spy.mockRestore(); d.cleanup() }
+  })
+
+  test('stopping a pending SDK load never starts a late process or retains its lease', async () => {
+    const d = directories()
+    let load!: (sdk: any) => void, calls = 0
+    const spy = spyOn(agentUpdates, 'loadClaudeSdk').mockImplementation(() => new Promise(resolve => { load = resolve }) as any)
+    const proc = new ClaudeAgentProcess({ workDir: d.root, effort: 'max', resumeSessionId: 'pending-session', transformEnv: env => ({ ...env, CLAUDE_CONFIG_DIR: d.a }) }) as any
+    try {
+      proc.sendInitialize()
+      await proc.kill()
+      load({ query() { calls++; throw new Error('late native spawn') } })
+      await proc.queryStart
+      expect(calls).toBe(0)
+      const next = acquireClaudeSessionLease({ historyRoot: d.history, sessionId: 'pending-session' })
+      next.release()
+    } finally { spy.mockRestore(); d.cleanup() }
+  })
+
+  test('usage reads the effective child config directory instead of the daemon environment', async () => {
+    const sdk = sdkFixture(), d = directories()
+    const proc = new ClaudeAgentProcess({ workDir: d.root, effort: 'max',
+      transformEnv: env => ({ ...env, CLAUDE_CONFIG_DIR: d.a, CLAUDE_CODE_PROJECT_DIR_NAME: 'usage-project' }) }) as any
+    try {
+      await proc.initializationPromise()
+      const id = sdk.captures[0].sessionId
+      const dir = claudeTranscriptDir(d.root, { configDir: d.a, projectDirName: 'usage-project' })
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(join(dir, `${id}.jsonl`), JSON.stringify({ type: 'assistant', message: { model: 'GLM-5.3-Flash', usage: { input_tokens: 177, output_tokens: 2 } } }))
+      proc.handleMessage({ type: 'result', subtype: 'success', session_id: id, usage: { input_tokens: 999, output_tokens: 2 }, duration_ms: 10, num_turns: 1 })
+      expect(proc.lastContextTokens).toBe(177)
+    } finally { await proc.kill(); sdk.spy.mockRestore(); d.cleanup() }
+  })
+
+  test('a living idle parent supports full forks and a busy parent supports an earlier checkpoint fork', async () => {
+    const sdk = sdkFixture(), d = directories()
+    const parent = new ClaudeAgentProcess({ workDir: d.root, effort: 'max', transformEnv: env => ({ ...env, CLAUDE_CONFIG_DIR: d.a }) }) as any
+    const forks: any[] = []
+    try {
+      await parent.initializationPromise()
+      const id = sdk.captures[0].sessionId
+      parent.handleMessage({ type: 'system', subtype: 'init', session_id: id })
+      parent.sendUserText('first turn')
+      parent.handleMessage({ type: 'result', subtype: 'success', session_id: id, usage: { input_tokens: 10, output_tokens: 2 } })
+      const options = { workDir: d.root, effort: 'max' as const, resumeSessionId: id, forkSession: true,
+        transformEnv: (env: Record<string, string | undefined>) => ({ ...env, CLAUDE_CONFIG_DIR: d.b }) }
+      const idle = new ClaudeAgentProcess(options) as any; forks.push(idle)
+      await idle.initializationPromise()
+      expect(parent.isAlive()).toBe(true)
+      idle.handleMessage({ type: 'system', subtype: 'init', session_id: sdk.captures.at(-1).sessionId })
+      parent.sendUserText('a later turn is pending')
+      const full = new ClaudeAgentProcess(options); forks.push(full)
+      await expect(full.initializationPromise()).rejects.toThrow('暂时不能分叉')
+      const checkpoint = new ClaudeAgentProcess({ ...options, resumeSessionAt: 'first-completed-checkpoint' }); forks.push(checkpoint)
+      await checkpoint.initializationPromise()
+      expect(sdk.captures.at(-1).resumeSessionAt).toBe('first-completed-checkpoint')
+      expect(parent.isAlive()).toBe(true)
+      expect(() => acquireClaudeSessionLease({ historyRoot: d.history, sessionId: id })).toThrow('会话正在使用')
+    } finally { await Promise.all(forks.map(proc => proc.kill())); await parent.kill(); sdk.spy.mockRestore(); d.cleanup() }
+  })
+})
 
 describe('Claude native steering', () => {
   function running() {
@@ -1304,6 +1487,34 @@ describe('Claude transcript context tokens', () => {
   test('claudeTranscriptPath encodes cwd slashes to dashes', () => {
     const p = claudeTranscriptPath('/home/leviyuan/feishu', 'sid-1')
     expect(p.endsWith('projects/-home-leviyuan-feishu/sid-1.jsonl')).toBe(true)
+  })
+
+  test('history lookup canonicalizes a cwd alias and honors an explicit account directory', () => {
+    const root = mkdtempSync(join(tmpdir(), 'claude-history-path-'))
+    try {
+      const work = join(root, 'work'), alias = join(root, 'alias')
+      mkdirSync(work)
+      symlinkSync(work, alias, 'junction')
+      const options = { configDir: join(root, 'account-B'), projectDirName: '' }
+      expect(claudeTranscriptPath(alias, 'sid', options)).toBe(claudeTranscriptPath(realpathSync(work), 'sid', options))
+      expect(claudeTranscriptDir(work, options).startsWith(options.configDir)).toBe(true)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test.skipIf(process.platform === 'win32')('long native project names retain the exact native signed-hash suffix', () => {
+    const cwd = '/home/user/' + 'segment-'.repeat(40) + 'repo'
+    const dir = claudeTranscriptDir(cwd, { configDir: '/isolated/claude', projectDirName: '' })
+    expect(dir).toBe('/isolated/claude/projects/' + cwd.replace(/[^a-zA-Z0-9]/g, '-').slice(0, 200) + '-aq3j7p')
+  })
+
+  test('native project-name overrides are restricted to valid names and an explicit config directory', () => {
+    const cwd = join(tmpdir(), 'history-project')
+    expect(claudeTranscriptDir(cwd, { configDir: '/isolated/claude', projectDirName: 'named-project' })).toBe(join('/isolated/claude/projects', 'named-project'))
+    const fallback = claudeTranscriptDir(cwd, { configDir: '/isolated/claude', projectDirName: '' })
+    for (const projectDirName of ['../outside', 'CON', 'x'.repeat(65)]) {
+      expect(claudeTranscriptDir(cwd, { configDir: '/isolated/claude', projectDirName })).toBe(fallback)
+    }
+    expect(claudeTranscriptDir(cwd, { configDir: '', projectDirName: 'ignored' })).toBe(claudeTranscriptDir(cwd, { configDir: '', projectDirName: '' }))
   })
 
   test('readLastCallUsageFromTranscript returns the last assistant per-call usage', () => {

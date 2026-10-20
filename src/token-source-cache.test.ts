@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { cachedTokenSource, disposeCachedTokenSource, refreshTokenSourceUsage } from './token-source-cache'
+import { cachedTokenSource, disposeCachedTokenSource, refreshTokenSourceUsage, peekTokenSourceUsage } from './token-source-cache'
 import type { TokenSource, UsageSnapshotUnified } from './token-source'
 import { withModelVisibility } from './token-source-visibility'
 import type { TokenSourceConfig } from './config'
@@ -39,6 +39,54 @@ function fixture() {
 }
 
 describe('Token Source cache boundary', () => {
+  test('account catalogs and quota are fenced by each account revision, including a late default-account refresh', async () => {
+    const revisions: Record<string, string> = { default: 'old', named: 'stable' }
+    let barrier = Promise.resolve()
+    const make = (id: string): TokenSource => {
+      const bound = revisions[id]!
+      const source: TokenSource = {
+        id: 'account-cache-test', kind: 'claude-subscription', agent: 'claude', accountId: id,
+        accountRevision: account => revisions[account]!, display: id, enabled: true,
+        defaultModel: 'opus', models: [], modelCatalogState: { status: 'idle', updatedAt: null },
+        spawnEnv: env => env, resolveSpawnModel: model => model,
+        async refreshModels() {
+          await barrier
+          source.models = [{ model: bound, display: bound, efforts: ['high'], defaultEffort: 'high' }]
+          source.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
+        },
+        async readUsage() { await barrier; return { state: 'ok', windows: [{ kind: 'weekly', label: id,
+          percent: bound === 'old' ? 10 : 50, resetsAt: null }] } },
+      }
+      return source
+    }
+    const create = (): TokenSource => ({ ...make('default'), accountId: undefined, aggregateAccountCatalog: true,
+      listAccounts: () => Object.keys(revisions).map(id => ({ id, name: id })), forAccount: make })
+    const root = cachedTokenSource(create, {}, 'account-cache', 'same')
+    const old = root.forAccount!('default'), named = root.forAccount!('named')
+    const blocked = gate()
+    try {
+      await root.refreshModels(); await refreshTokenSourceUsage(root)
+      expect(peekTokenSourceUsage(old)?.windows[0]?.percent).toBe(10)
+      barrier = blocked.promise
+      const pendingModels = old.refreshModels(), pendingQuota = refreshTokenSourceUsage(old)
+      await Promise.resolve(); await Promise.resolve()
+      revisions.default = 'new'
+      const fresh = root.forAccount!('default')
+      expect(fresh).not.toBe(old)
+      expect(root.forAccount!('named')).toBe(named)
+      expect(peekTokenSourceUsage(old)?.state).toBe('no_credentials')
+      expect(fresh.models).toEqual([])
+      blocked.release(); await Promise.all([pendingModels, pendingQuota])
+      expect(fresh.models).toEqual([])
+      expect(peekTokenSourceUsage(fresh)).toBeUndefined()
+      barrier = Promise.resolve()
+      await fresh.refreshModels(); await refreshTokenSourceUsage(fresh)
+      expect(fresh.models[0]?.model).toBe('new')
+      expect(peekTokenSourceUsage(fresh)?.windows[0]?.percent).toBe(50)
+      expect((await root.readUsage()).state).toBe('not_applicable')
+    } finally { blocked.release(); disposeCachedTokenSource(root) }
+  })
+
   test('slow model and quota refreshes never clear or block the committed snapshot', async () => {
     const { create, state } = fixture()
     const source = cachedTokenSource(create, {}, 'slow', 'slow')

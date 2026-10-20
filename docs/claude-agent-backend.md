@@ -36,6 +36,10 @@ Token Source 管理账号凭据、模型目录、启动环境、默认模型、e
 
 Claude 订阅统一由 `claude-sub` 管理登录验证、模型目录和额度，在 `md` 中选择“Claude Code 订阅”。
 
+`claude-accounts.ts` 管理默认及按 `hi 备注` 首次收录的账号元数据，原生登录由用户手动完成；来源内部使用独立账号视图、模型目录和额度缓存。MD 汇总可用账号目录，启动时再校验实际选中的账号；默认账号未登录不会遮住已收录的可用账号。`claude-account-selection.ts` 只在启动时选号，不负责耗尽轮换。主会话首次提交输入前完成原生身份验证，账号实际变化会使旧模型/额度缓存失效。
+
+各账号共享默认目录下的 `projects`、`tasks`、`file-history`、`plans`，凭据与账号设置各自独立。`claude-session-lease.ts` 按共享历史真实路径和原生 session ID 管理 daemon 内的写入互斥：新会话和分叉先分配原生 UUID，恢复沿用原 ID，分叉在原生初始化完成前还保护源会话。只有确认原生进程退出才释放写入权；纯账号/模型/额度控制查询不取得写入权，不允许提交用户任务。历史路径按实际 cwd 归一化，兼容长路径编码及原生项目目录名覆盖。
+
 `model` 按 Claude Code、Codex、DeepSeek Harness 分组，组 ID 由 `ELEMENTS.modelAgentGroup` 生成。两个 Agent 下的 DeepSeek 来源都显示为 DeepSeek，协议 id 保持不变。选账号后进入模型列表；多个档位才展示 effort 卡，只有一个档位时直接应用，获取失败显示 `MISS`。同 provider/source 的切换调用 `setModelSettings`：Claude 和 DSH 从后续 turn 使用，Codex 保存选择并在重启进程后应用。跨 provider/source 或需要变更项目启动配置时，只能在空闲状态更换进程。
 
 OpenRouter 和 PackyAPI 默认按指定家族从兼容目录筛选最新数字版本；显隐保存增量，显式 `models` 仍保留为固定列表，不自动切换运行模型。其余来源由 `withModelVisibility` 在真实接口目录上应用 `hidden_models`。接口项通过显示/隐藏调整可见性，新增上游模型自动进入列表。所有来源都支持用 `custom_models` 补录列表外模型，`origin` 区分接口项和补录项；GLM / DeepSeek 会先做端点验证，补录模型可直接选择请求档位使用，DSH 原生解析目录外模型，其余来源使用 Agent 请求档位；不能用目录白名单挡住用户补录。接口收录同名模型后按接口项管理，不重复展示。

@@ -34,12 +34,19 @@ function codexEffort(e: unknown): AgentReasoningEffort | null {
 
 export const CLAUDE_EFFORTS: AgentReasoningEffort[] = ['max', 'xhigh', 'high', 'medium', 'low']
 
+type NativeClaudeModelOptions = Pick<ClaudeSpawnOpts,
+  'settingSources' | 'settings' | 'transformEnv' | 'validateAccount' | 'tokenSourceId'> & { acquireUse?(): () => void }
+
 /** SDK 控制接口不发送用户输入；目录读取后关闭这个独立查询进程。 */
-export async function fetchNativeClaudeModels(options: Pick<ClaudeSpawnOpts,
-  'settingSources' | 'settings' | 'transformEnv' | 'validateAccount' | 'tokenSourceId'> = {}): Promise<TokenSourceModel[]> {
+export async function fetchNativeClaudeModels(options: NativeClaudeModelOptions = {}): Promise<TokenSourceModel[]> {
   const { ClaudeAgentProcess } = await import('./claude-agent-process')
-  const proc = new ClaudeAgentProcess({ workDir: homedir(), effort: 'high',
-    settingSources: ['user'], profile: { loadProjectMcp: false }, ...options })
+  const { acquireUse, ...spawn } = options
+  const release = acquireUse?.()
+  let proc: InstanceType<typeof ClaudeAgentProcess>
+  try { proc = new ClaudeAgentProcess({ workDir: homedir(), effort: 'high',
+    settingSources: ['user'], profile: { loadProjectMcp: false }, ...spawn, controlOnly: true }) }
+  catch (error) { release?.(); throw error }
+  if (release) proc.once('exit', release)
   proc.on('error', error => log(`Claude model catalog MISS: ${error.message}`))
   try {
     const catalog = await withTimeout(proc.listModels())
@@ -47,7 +54,10 @@ export async function fetchNativeClaudeModels(options: Pick<ClaudeSpawnOpts,
     return catalog.map(model => ({ model: model.model.replace(/^claude:/, ''), display: model.displayName,
       efforts: model.supportedReasoningEfforts.map(item => item.reasoningEffort as AgentReasoningEffort),
       defaultEffort: model.defaultReasoningEffort as AgentReasoningEffort }))
-  } finally { await proc.kill() }
+  } finally {
+    try { await proc.kill() }
+    finally { if (!proc.isAlive()) release?.() }
+  }
 }
 
 /** codex 订阅可用模型(app-server model/list),过滤 hidden,effort 用 per-model。 */

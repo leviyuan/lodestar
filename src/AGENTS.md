@@ -3,6 +3,7 @@
 `Session` 管理生命周期，`AgentProcess` 定义共享后端事件，具体进程类转换协议，`cardkit.ts` 串行写卡。
 
 - Claude 订阅仅使用 `claude-sub` 来源，统一管理登录验证、模型目录、启动配置和额度；默认选择、MD、hi 和 footer 使用同一来源，不另设本机配置入口或来源别名。
+- Claude 订阅额外账号由用户用 `CLAUDE_CONFIG_DIR=~/.claude-accounts/备注 claude auth login` 手动登录，首次 `hi 备注` 才精确发现并收录，不扫描、不自动登录。默认与已收录账号仅在启动时按缓存选号，不实现耗尽轮换；显式指定只影响本次启动，忙碌时拒绝换号，空闲手动切换恢复同一会话。首次认证后可清理额外账号旧 `projects/tasks/file-history/plans` 并共享默认存储；默认历史、凭据和设置不能删除，重复收录不再清理，持久 enrolling 阶段支持中断后重试，未完成账号不参与调度。默认认证的 unset/原始 CONFIG_DIR 与 Keychain 命名空间必须保留，realpath 只用于路径校验、历史定位和互斥。Token Source 账号枚举/revision 不能硬编码 Codex；模型、额度和 footer 按实际账号隔离，原生身份变化立即作废旧代次缓存。Claude 原生没有可靠跨配置写锁，所有来源的模型进程须按共享历史真实路径 + session ID 取得宿主写入权，退出确认后释放；分叉源保留到初始化完成，纯控制查询不写会话。
 
 ## 会话与后端
 

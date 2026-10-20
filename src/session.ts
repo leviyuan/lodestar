@@ -60,6 +60,8 @@ import { createAgentCards } from './agent-cards-runtime'
 import type { AgentCards } from './agent-cards'
 import { getTokenSource, getTokenSourceForAccount, listEnabledTokenSourcesByAgent, tokenSourceProcessRevision, tokenSourceRuntimeModel, type TokenSource } from './token-source'
 import { codexAccounts, DEFAULT_CODEX_ACCOUNT, processCodexAccount } from './codex-accounts'
+import { claudeAccounts, DEFAULT_CLAUDE_ACCOUNT, processClaudeAccount } from './claude-accounts'
+import { enrollClaudeAccount } from './claude-account-selection'
 import { codexAccountCard } from './cards/codex-account'
 import {
   claudeTranscriptPath,
@@ -571,7 +573,7 @@ export class Session {
 
   /** Minimal cross-chat snapshot for the `hi` peer-list section.
    * `startedAt` stays private so this is the documented read path. */
-  peerSnapshot(): { name: string; status: Status; uptimeMs?: number; codexAccountName?: string } {
+  peerSnapshot(): { name: string; status: Status; uptimeMs?: number; codexAccountName?: string; claudeAccountName?: string } {
     return {
       name: this.sessionName,
       status: this.status,
@@ -581,6 +583,8 @@ export class Session {
         && this.proc.codexAccountSelectionMode?.() !== null
         && !(this.proc.turnRetry?.reason === 'quota' && this.proc.turnRetry.phase === 'waiting')
         ? { codexAccountName: codexAccounts.get(processCodexAccount(this.proc)).name } : {}),
+      ...(this.proc?.isAlive() && this.proc.tokenSourceId === 'claude-sub' && processClaudeAccount(this.proc)
+        ? { claudeAccountName: claudeAccounts.get(processClaudeAccount(this.proc)!).name } : {}),
     }
   }
 
@@ -623,6 +627,7 @@ export class Session {
 
   /** Pending account selection takes effect only after the old process exits. */
   private codexStartAccountOverride: string | undefined
+  private claudeStartAccountOverride: string | undefined
 
   codexAccountId(): string {
     return this.proc?.isAlive() && this.proc.provider === 'codex'
@@ -631,7 +636,24 @@ export class Session {
 
   tokenSource(id: string | null | undefined): TokenSource | undefined {
     const source = getTokenSource(id)
-    return source?.forAccount ? getTokenSourceForAccount(id, this.codexAccountId()) : source
+    if (!source?.forAccount) return source
+    if (source.kind === 'claude-subscription') {
+      const account = this.proc?.isAlive() && this.proc.tokenSourceId === id
+        ? processClaudeAccount(this.proc) : this.claudeStartAccountOverride
+      return account ? getTokenSourceForAccount(id, account) : source
+    }
+    return getTokenSourceForAccount(id, this.codexAccountId())
+  }
+
+  tokenSourceAccountId(id: string | null | undefined): string {
+    if (getTokenSource(id)?.kind !== 'claude-subscription') return this.codexAccountId()
+    return (this.proc?.isAlive() && this.proc.tokenSourceId === id ? processClaudeAccount(this.proc) : null)
+      ?? this.claudeStartAccountOverride ?? DEFAULT_CLAUDE_ACCOUNT
+  }
+
+  /** Histories belong to the shared native store, regardless of the billing account. */
+  claudeHistoryOptions(): { configDir: string } {
+    return { configDir: claudeAccounts.sharedConfigDir() }
   }
 
   currentProvider(): AgentProvider { return this.selectedProvider }
@@ -643,6 +665,8 @@ export class Session {
       tokenSourceId: this.selectedTokenSourceId,
       model: this.selectedModel,
       effort: this.selectedEffort,
+      ...(this.selectedTokenSourceId === 'claude-sub' && processClaudeAccount(this.proc)
+        ? { claudeAccountId: processClaudeAccount(this.proc)! } : {}),
       ...(apiCodex || this.codexAccountId() === DEFAULT_CODEX_ACCOUNT ? {} : { codexAccountId: this.codexAccountId() }),
       ...(!apiCodex && codexAccounts.preferred(this.sessionName) === null ? { codexAccountAutomatic: true } : {}),
     }
@@ -654,6 +678,7 @@ export class Session {
       throw new Error('cannot change conversation routing while the session is running')
     }
     const source = getTokenSource(routing.tokenSourceId)
+    if (routing.claudeAccountId) claudeAccounts.get(routing.claudeAccountId)
     if (routing.codexAccountId && !source?.codexApiProvider) codexAccounts.get(routing.codexAccountId)
     if (source && source.agent !== routing.provider) {
       throw new Error(`token source "${source.id}" belongs to ${source.agent}, not ${routing.provider}`)
@@ -666,6 +691,8 @@ export class Session {
     this.selectedTokenSourceId = routing.tokenSourceId
     this.selectedModel = routing.model
     this.selectedEffort = routing.effort
+    this.claudeStartAccountOverride = routing.provider === 'claude' && routing.tokenSourceId === 'claude-sub'
+      ? routing.claudeAccountId : undefined
     this.lastSessionRef = feishu.getSessionResumeRef(this.sessionName, routing.provider)
     this.lastSessionId = this.lastSessionRef?.sessionId ?? null
     feishu.bindSessionModelChecked(
@@ -746,7 +773,7 @@ export class Session {
     if (ref.provider === 'dsh') {
       throw new Error('DSH resume reference requires its original cwd')
     } else if (ref.provider === 'claude') {
-      const transcript = claudeTranscriptPath(this.workDir, ref.sessionId)
+      const transcript = claudeTranscriptPath(this.workDir, ref.sessionId, this.claudeHistoryOptions())
       if (!existsSync(transcript)) {
         throw new Error(`旧 Claude 会话不属于当前 cwd，或 transcript 不存在: ${diagnosticIdLabel(ref.sessionId)}`)
       }
@@ -960,6 +987,7 @@ export class Session {
     // source 必须 fail closed；无来源的 Claude 同样由共享启动入口拒绝。
     const raw = this.currentTokenSource()
     const codexPool = this.selectedProvider === 'codex' && this.selectedTokenSourceId === 'codex-sub'
+    const claudePool = this.selectedProvider === 'claude' && this.selectedTokenSourceId === 'claude-sub'
     if (this.selectedTokenSourceId && (!raw || (!raw.enabled && !codexPool))) {
       throw new Error(raw?.modelCatalogState?.error
         ?? `token source "${this.selectedTokenSourceId}" 不可用，请重新配置或在 model 面板选择其他账号`)
@@ -977,6 +1005,7 @@ export class Session {
       tokenSourceId: ts?.id ?? null,
       ...(this.selectedProvider === 'codex' ? { codexAccountId: codexAccounts.selected(this.sessionName) } : {}),
       ...(codexPool ? { codexAccountPreference: this.codexStartAccountOverride ?? codexAccounts.preferred(this.sessionName) } : {}),
+      ...(claudePool ? { claudeAccountPreference: this.claudeStartAccountOverride ?? null } : {}),
       model: ts ? (this.selectedModel ?? ts.defaultModel) : this.modelForSpawn(),
       effort: this.selectedProvider === 'dsh'
         ? this.dshEffortForSpawn()
@@ -989,7 +1018,50 @@ export class Session {
     })
     this.procSourceRevisions.set(created.process, created.sourceRevision)
     this.procFileDeliveryModes.set(created.process, fileDeliveryMode)
+    this.claudeStartAccountOverride = undefined
     return created.process
+  }
+
+  /** A named hi authorizes this launch only; automatic choice resumes next time. */
+  async startWithClaudeAccount(name: string, opts: LifecycleProgressOpts = {}): Promise<boolean> {
+    return this.runLifecycle('hi-claude-account', async () => {
+      if (this.proc?.isAlive() && this.proc.tokenSourceId === 'claude-sub') {
+        const running = processClaudeAccount(this.proc)
+        const selected = running && claudeAccounts.get(running)
+        let requested: string | undefined
+        try { requested = claudeAccounts.find(name).id } catch { /* Unknown names are discovered below. */ }
+        if (selected && selected.id === requested) {
+          opts.onStatus?.(`✅ 正在使用 Claude 订阅「${selected.name}」`)
+          return true
+        }
+      }
+      if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0
+        || this.pendingMidTurnMsgs.length > 0 || this.pendingTurnInputs.length > 0
+        || cards.hasActiveBgTask(this.backgroundTasks) || this.modelSettingsChange?.phase === 'pending') {
+        throw new Error('当前任务尚未结束；请结束或停止任务后再指定 Claude 账号')
+      }
+      const root = getTokenSource('claude-sub')
+      if (!root) throw new Error('Claude 订阅来源尚未初始化')
+      if (config.token_sources?.['claude-sub']?.enabled === false) {
+        throw new Error('Claude 订阅已禁用；请先发送 claude-sub on')
+      }
+      opts.onStatus?.(`🔎 检查 Claude 订阅账号「${name}」`)
+      const accountId = await enrollClaudeAccount(name)
+      const source = getTokenSourceForAccount('claude-sub', accountId)
+      if (!source) throw new Error('Claude 账号目录未就绪')
+      if (this.selectedProvider !== 'claude' || this.selectedTokenSourceId !== 'claude-sub') {
+        await this.applyModelSelectionUnlocked('claude', source.defaultModel,
+          tokenSourceRuntimeModel(source, source.defaultModel)?.defaultEffort ?? null, 'claude-sub')
+      }
+      this.claudeStartAccountOverride = accountId
+      try {
+        const resume = this.pendingConversationLaunch?.kind !== 'fresh'
+          && !!(this.proc?.isAlive() || this.lastSessionRef || this.pendingConversationLaunch)
+        return resume ? await this.restartUnlocked(true, opts) : await this.startUnlocked(opts)
+      } finally {
+        this.claudeStartAccountOverride = undefined
+      }
+    })
   }
 
   async applyModelSelection(
@@ -1640,7 +1712,7 @@ export class Session {
     const init = initializeThrown
       ? { state: 'error' as const, error: initializeThrown }
       : this.selectedProvider === 'claude'
-        ? await claudeInitWait!
+        ? initialization ? await this.waitForClaudeInitialization(initialization, claudeInitWait!) : await claudeInitWait!
         : await this.waitForCodexInitialization(
             this.requireCodexInitializationPromise(initialization),
             () => {
@@ -1663,12 +1735,13 @@ export class Session {
       return false
     }
     if (init.state === 'timeout') {
-      log(`session "${this.sessionName}": ${this.selectedProvider} init wait timeout (${CODEX_INIT_TIMEOUT_MS / 1000}s)`)
+      const timeoutMs = this.selectedProvider === 'claude' ? 30_000 : CODEX_INIT_TIMEOUT_MS
+      log(`session "${this.sessionName}": ${this.selectedProvider} init wait timeout (${timeoutMs / 1000}s)`)
       const stopConfirmed = await this.stopOwnedProc(proc, 1000)
       const cleanup = stopConfirmed
         ? ''
         : `；进程终止未确认: ${this.blockedProcReason ?? '未知原因'}`
-      const message = `❌ ${backend} 启动超时: ${CODEX_INIT_TIMEOUT_MS / 1000} 秒内初始化事务未完成${cleanup}`
+      const message = `❌ ${backend} 启动超时: ${timeoutMs / 1000} 秒内初始化事务未完成${cleanup}`
       report?.(message)
       if (announce) await feishu.sendText(this.chatId, message)
       this.status = 'stopped'
@@ -1685,6 +1758,11 @@ export class Session {
       this.opts.onLifecycleChange?.()
       return false
     }
+
+    // The native authentication gate may observe a manual CLI re-login during
+    // startup. Capture that one verified revision now; later changes must
+    // still invalidate this process instead of being silently absorbed.
+    this.captureAuthenticatedClaudeRevision(proc)
 
     if (init.state === 'waiting_quota') {
       if (this.pendingConversationLaunch && this.pendingConversationLaunch.kind !== 'fresh') {
@@ -1720,6 +1798,34 @@ export class Session {
     return Promise.resolve(value)
   }
 
+  private waitForClaudeInitialization(initialization: Promise<void>, early: Promise<{
+    state: string; error?: unknown
+  }>): Promise<{
+    state: 'ready' | 'error' | 'exit' | 'timeout'; error?: unknown
+  }> {
+    return new Promise(resolve => {
+      const timer = setTimeout(() => resolve({ state: 'timeout' }), 30_000)
+      // An immediate error/exit event can precede the readiness Promise.
+      // The old grace period's successful expiry must never bypass auth.
+      void early.then(result => {
+        if (result.state === 'error' || result.state === 'exit') {
+          clearTimeout(timer); resolve({ state: result.state, error: result.error })
+        }
+      })
+      void initialization.then(
+        () => { clearTimeout(timer); resolve({ state: 'ready' }) },
+        error => { clearTimeout(timer); resolve({ state: 'error', error }) },
+      )
+    })
+  }
+
+  private captureAuthenticatedClaudeRevision(proc: AgentProcess): void {
+    if (proc.provider === 'claude' && proc.tokenSourceId === 'claude-sub' && processClaudeAccount(proc)) {
+      const source = getTokenSourceForAccount('claude-sub', processClaudeAccount(proc)!)
+      this.procSourceRevisions.set(proc, tokenSourceProcessRevision(source, this.selectedModel))
+    }
+  }
+
   private async waitForCodexInitialization(
     initialization: Promise<void>,
     onStillWaiting?: () => void,
@@ -1749,11 +1855,11 @@ export class Session {
     })
   }
 
-  private async waitForProcEarlyFailure(
+  private waitForProcEarlyFailure(
     proc: AgentProcess,
     graceMs: number,
   ): Promise<{ state: 'init' | 'error' | 'exit' | 'ready'; error?: unknown }> {
-    return await new Promise(resolve => {
+    return new Promise(resolve => {
       let settled = false
       const finish = (state: 'init' | 'error' | 'exit' | 'ready', error?: unknown) => {
         if (settled) return
@@ -2225,7 +2331,7 @@ export class Session {
       const init = initializeThrown
         ? { state: 'error' as const, error: initializeThrown }
         : this.selectedProvider === 'claude'
-          ? await claudeInitWait!
+          ? initialization ? await this.waitForClaudeInitialization(initialization, claudeInitWait!) : await claudeInitWait!
           : await this.waitForCodexInitialization(
               this.requireCodexInitializationPromise(initialization),
               () => {
@@ -2266,6 +2372,7 @@ export class Session {
         await closeInternalStatusCard(finalStatus)
         return false
       }
+      this.captureAuthenticatedClaudeRevision(proc)
       const msg = this.withModel(this.withWorktreeInstructionNotice(
         init.state === 'waiting_quota' ? '⏳ 账号额度用尽 · 等待后自动恢复原会话'
         : this.selectedProvider === 'claude' && init.state === 'ready'
@@ -6035,6 +6142,8 @@ export class Session {
       tokenSourceId: this.selectedTokenSourceId,
       tokenSource: proc?.provider === 'codex'
         ? getTokenSourceForAccount(proc.tokenSourceId ?? this.selectedTokenSourceId, processCodexAccount(proc))
+        : proc?.provider === 'claude' && proc.tokenSourceId === 'claude-sub' && processClaudeAccount(proc)
+          ? getTokenSourceForAccount('claude-sub', processClaudeAccount(proc)!)
         : this.currentTokenSource(),
       codexUsage: proc?.provider === 'codex' && !getTokenSource(proc.tokenSourceId)?.codexApiProvider
         ? captureCodexUsageCache(processCodexAccount(proc)) : null,

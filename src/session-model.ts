@@ -274,8 +274,8 @@ export async function onModelListEdit(
     if (users.length) return { ok: false, message: `补录模型仍被会话 ${users.map(session => session.sessionName).join('、')} 选用，请先切换再删除` }
   }
   try {
-    if (action === 'delete') await removeCustomTokenSourceModel(sourceId, model, s.codexAccountId())
-    else await editTokenSourceModels(sourceId, model, action, s.codexAccountId())
+    if (action === 'delete') await removeCustomTokenSourceModel(sourceId, model, s.tokenSourceAccountId(sourceId))
+    else await editTokenSourceModels(sourceId, model, action, s.tokenSourceAccountId(sourceId))
     // 其他面板的快照在列表变化后失效；不影响会话、进程和正在运行的 turn。
     for (const session of Session.all) {
       for (const [id, other] of session.modelPanels) {
@@ -409,7 +409,7 @@ export async function consumeModelCustomMessage(
     return true
   }
   try {
-    await registerCustomTokenSourceModel(ts.id, model, s.codexAccountId())
+    await registerCustomTokenSourceModel(ts.id, model, s.tokenSourceAccountId(ts.id))
   } catch (error) {
     log(`model-custom: config/refresh MISS (${messageOf(error)})`)
     await failCard(`配置写入或模型刷新失败：${messageOf(error)}`)

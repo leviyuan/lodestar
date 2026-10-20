@@ -166,6 +166,7 @@ test('manual Codex launch bypasses failed catalogs and model restrictions while 
     mock.module('./src/codex-process', () => ({
       CodexProcess: class extends EventEmitter { constructor(opts) { super(); captured.push(opts) } isAlive() { return false } },
       isCodexReasoningEffort: value => value === 'ultra', resolveCodexBin: () => 'unused',
+      CODEX_REASONING_EFFORTS: ['ultra'],
     }))
     const { registerTokenSource } = await import('./src/token-source')
     registerTokenSource({ id: 'codex-sub', kind: 'codex-subscription', agent: 'codex', enabled: false,

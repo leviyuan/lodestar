@@ -37,6 +37,7 @@ export interface ConsoleOpts {
     uptimeMs?: number
     /** Actual live Codex process account, independent of the next-start selection. */
     codexAccountName?: string
+    claudeAccountName?: string
   }>
   /** Subscription usage snapshot from Codex app-server. Undefined → omit row.
    * 仅 codex 后端渲染;claude/GLM 后端走 glmUsage。 */
@@ -358,7 +359,9 @@ export function consoleMainContent(opts: ConsoleOpts): string {
     const label = PEER_STATUS_LABEL[p.status] ?? p.status
     const up = p.uptimeMs != null && p.uptimeMs > 0 ? ` · ${fmtUptime(p.uptimeMs)}` : ''
     const mark = p.isCurrent ? ' · 当前' : ''
-    const account = p.codexAccountName === undefined ? '' : ` · Codex：${inlineCode(escapeMarkdown(p.codexAccountName))}`
+    const account = p.claudeAccountName !== undefined
+      ? ` · Claude：${inlineCode(escapeMarkdown(p.claudeAccountName))}`
+      : p.codexAccountName === undefined ? '' : ` · Codex：${inlineCode(escapeMarkdown(p.codexAccountName))}`
     return `　· ${dot} \`${p.name}\` · ${label}${up}${mark}${account}`
   }).join('\n')
 }

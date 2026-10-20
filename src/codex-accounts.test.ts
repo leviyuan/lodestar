@@ -9,7 +9,7 @@ import { CodexAccounts, reserveCodexLogin, isCodexLoginPending } from './codex-a
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
 function fixture() {
-  const root = mkdtempSync(join(tmpdir(), 'codex-account-test-')); roots.push(root)
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'codex-account-test-'))); roots.push(root)
   const home = join(root, 'native'); mkdirSync(home)
   writeFileSync(join(home, 'config.toml'), 'model = "test-model"\n')
   writeFileSync(join(home, 'auth.json'), '{"native":"must-not-change"}')

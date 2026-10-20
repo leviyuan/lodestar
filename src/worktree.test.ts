@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, test } from 'bun:test'
@@ -271,7 +271,7 @@ describe('project worktrees', () => {
 })
 
 function initRepo(): { root: string; repo: string } {
-  const root = mkdtempSync(join(tmpdir(), 'lodestar-wt-'))
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'lodestar-wt-')))
   roots.push(root)
   const repo = join(root, 'feishu')
   mkdirSync(repo)

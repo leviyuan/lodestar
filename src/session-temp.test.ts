@@ -75,6 +75,7 @@ function makeHarness(sessionName = 'project'): TempHarness {
     conversationRouting: () => ({ ...state.routing }),
     isRunning: () => state.running,
     listCodexConversations: async () => state.history.slice(),
+    claudeHistoryOptions: () => ({ configDir: process.env.CLAUDE_CONFIG_DIR }),
     rollbackTo: async (launch: ConversationLaunch, branchState?: { anchors: TurnAnchor[]; base: any }) => {
       rollbackCalls.push(launch)
       rollbackStates.push(branchState)

@@ -1,8 +1,8 @@
 import { BackgroundRefresh } from './background-refresh'
 import type { TokenSourceConfig } from './config'
-import { codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
+import { DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
 import { customModelEfforts, modelList } from './token-source-visibility'
-import type { TokenSource, TokenSourceModel, UsageSnapshotUnified } from './token-source'
+import { tokenSourceAccounts, tokenSourceAccountRevision, type TokenSource, type TokenSourceModel, type UsageSnapshotUnified } from './token-source'
 import { invalidateCodexUsage, peekUsage } from './usage'
 import { codexUsageToUnified } from './token-source-codex'
 import { isUsageAuthError } from './usage-cache'
@@ -16,12 +16,97 @@ interface CachedSource {
   baseIdentity: string
   identity: string
   configuration: string
-  model: BackgroundRefresh
-  usage: BackgroundRefresh
+  model?: BackgroundRefresh
+  usage?: BackgroundRefresh
   snapshot(): UsageSnapshotUnified | undefined
   children: Map<string, { revision: string; source: TokenSource }>
   active(): boolean
   dispose(): void
+}
+
+/** Synchronous cache-only quota access for startup selection. */
+export function peekTokenSourceUsage(source: TokenSource): UsageSnapshotUnified | undefined {
+  return metadata.get(source)?.snapshot()
+}
+
+function aggregateAccountCatalog(create: () => TokenSource, cfg: TokenSourceConfig,
+  baseIdentity: string, configuration: string, previous?: TokenSource): TokenSource {
+  const old = previous && metadata.get(previous)
+  if (old?.active() && old.baseIdentity === baseIdentity && old.configuration === configuration) return previous!
+  const raw = create()
+  const source: TokenSource = { ...raw }
+  const children: CachedSource['children'] = new Map()
+  let active = true
+  source.forAccount = id => {
+    const revision = tokenSourceAccountRevision(raw, id)
+    const current = children.get(id)
+    if (current?.revision === revision) return current.source
+    if (current) disposeCachedTokenSource(current.source)
+    const prior = old?.baseIdentity === baseIdentity ? old.children.get(id) : undefined
+    const child = cachedTokenSource(() => create().forAccount!(id), cfg, baseIdentity, configuration,
+      prior?.revision === revision ? prior.source : undefined, id)
+    children.set(id, { revision, source: child })
+    return child
+  }
+  const accounts = () => tokenSourceAccounts(raw).map(account => source.forAccount!(account.id))
+  const available = () => accounts().filter(account => account.enabled && account.modelCatalogState?.status === 'ready')
+  const catalog = (): TokenSourceModel[] => {
+    const result = new Map<string, TokenSourceModel>()
+    for (const account of available()) for (const model of account.models) {
+      const prior = result.get(model.model)
+      result.set(model.model, prior ? { ...prior, efforts: [...new Set([...prior.efforts, ...model.efforts])] } : { ...model })
+    }
+    return [...result.values()]
+  }
+  // These are projections of committed child snapshots, never a second upstream cache.
+  Object.defineProperties(source, {
+    enabled: { enumerable: true, get: () => raw.enabled && (available().length > 0
+      || accounts().some(account => account.modelCatalogState?.status === 'idle' || account.modelCatalogState?.status === 'loading')) },
+    models: { enumerable: true, get: catalog },
+    defaultModel: { enumerable: true, get: () => cfg.model?.trim()
+      || available().map(account => account.defaultModel).find(model => /(?:^|[- :])opus(?:$|[- \[])/i.test(model)) || '' },
+    modelSelection: { enumerable: true, get: () => {
+      const all = new Map<string, TokenSourceModel>()
+      for (const account of available()) for (const model of account.modelSelection?.availableModels ?? account.models) {
+        const prior = all.get(model.model)
+        all.set(model.model, prior ? { ...prior, efforts: [...new Set([...prior.efforts, ...model.efforts])] } : { ...model })
+      }
+      return { ...raw.modelSelection, mode: 'catalog', modelIds: catalog().map(model => model.model), availableModels: [...all.values()] }
+    } },
+    modelCatalogState: { enumerable: true, get: () => {
+      if (!raw.enabled) return raw.modelCatalogState
+      const ready = available()
+      if (ready.length) {
+        const errors = ready.map(account => account.modelCatalogState?.error).filter(Boolean)
+        return { status: 'ready', updatedAt: Math.max(...ready.map(account => account.modelCatalogState?.updatedAt ?? 0)),
+          ...(errors.length ? { error: errors.join('；') } : {}) }
+      }
+      const all = accounts()
+      const state = all.find(account => account.modelCatalogState?.status === 'failed')?.modelCatalogState
+        ?? all.find(account => account.modelCatalogState?.status === 'disabled')?.modelCatalogState
+        ?? all[0]?.modelCatalogState
+      return state ?? { status: 'idle', updatedAt: null }
+    } },
+  })
+  source.refreshModels = async () => {
+    if (!raw.enabled) return
+    const initial = tokenSourceAccounts(raw).map(account => ({ id: account.id, revision: tokenSourceAccountRevision(raw, account.id) }))
+    const results = await Promise.allSettled(initial.map(account => source.forAccount!(account.id).refreshModels()))
+    // First native identity discovery may advance a generation. Warm that new binding once.
+    const changed = initial.filter(account => tokenSourceAccountRevision(raw, account.id) !== account.revision)
+    const repeated = await Promise.allSettled(changed.map(account => source.forAccount!(account.id).refreshModels()))
+    if (!available().length || available().every(account => !!account.modelCatalogState?.error)) {
+      const failure = [...results, ...repeated].find((result): result is PromiseRejectedResult => result.status === 'rejected')
+      if (failure) throw failure.reason
+    }
+  }
+  source.readUsage = async () => ({ state: 'not_applicable', windows: [], reason: 'Claude 订阅额度按实际账号展示' })
+  metadata.set(source, { baseIdentity, identity: baseIdentity, configuration, children,
+    snapshot: () => undefined, active: () => active,
+    dispose() { active = false; for (const child of children.values()) disposeCachedTokenSource(child.source) } })
+  // Register each account's background refresh, including the native default.
+  accounts()
+  return source
 }
 
 /** Reapply local visibility/custom choices to the same account's cached upstream catalog. */
@@ -65,7 +150,7 @@ function restoreCatalog(source: TokenSource, previous: TokenSource, cfg: TokenSo
     selection.modelIds = source.models.map(model => model.model)
   }
   source.defaultModel = source.kind === 'openrouter' ? cfg.model?.trim() || ''
-    : cfg.model?.trim() || (catalog.some(model => model.model === previous.defaultModel)
+    : cfg.model?.trim() || (source.kind === 'claude-subscription' ? previous.defaultModel : catalog.some(model => model.model === previous.defaultModel)
       ? previous.defaultModel : source.models[0]?.model ?? '')
   source.modelCatalogState = { ...previous.modelCatalogState }
 }
@@ -77,8 +162,15 @@ export function cachedTokenSource(
 ): TokenSource {
   const old = previous && metadata.get(previous)
   let committed = create()
-  const identity = committed.kind === 'codex-subscription'
-    ? `${baseIdentity}:${codexAccounts.revision(accountId ?? DEFAULT_CODEX_ACCOUNT)}` : baseIdentity
+  if (committed.aggregateAccountCatalog && accountId === undefined) {
+    return aggregateAccountCatalog(create, cfg, baseIdentity, configuration, previous)
+  }
+  const selectedId = accountId ?? committed.accountId ?? DEFAULT_CODEX_ACCOUNT
+  const revision = () => committed.accountRevision || committed.kind === 'codex-subscription'
+    ? tokenSourceAccountRevision(committed, selectedId) : null
+  const initialRevision = revision()
+  const identity = initialRevision === null ? baseIdentity : JSON.stringify([baseIdentity, selectedId, initialRevision])
+  const currentIdentity = () => initialRevision === revision()
   if (old?.active() && old.configuration === configuration && old.identity === identity) return previous!
   if (old?.identity === identity) restoreCatalog(committed, previous!, cfg)
   const source: TokenSource = { ...committed }
@@ -119,7 +211,7 @@ export function cachedTokenSource(
         if (!result.source.enabled) next.enabled = false
       }
     }
-    if (!active) return
+    if (!active || !currentIdentity()) return
     if (failure !== undefined && !next.modelCatalogState?.error) {
       next.modelCatalogState = { status: 'failed', updatedAt: Date.now(),
         error: failure instanceof Error ? failure.message : String(failure) }
@@ -137,36 +229,41 @@ export function cachedTokenSource(
       throw failure ?? new Error(error)
     }
     publish(next)
-  }, old?.identity === identity ? old.model.nextRefreshAt : 0)
+  }, old?.identity === identity ? old.model?.nextRefreshAt : 0)
   const usage = new BackgroundRefresh(`token-source ${source.id}${accountId ? `/${accountId}` : ''} usage`, USAGE_REFRESH_MS, async () => {
     let snapshot: UsageSnapshotUnified
     try { snapshot = await committed.readUsage() }
     catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
-      if (active && (usageSnapshot?.state !== 'ok' || isUsageAuthError(reason))) {
+      if (active && currentIdentity() && (usageSnapshot?.state !== 'ok' || isUsageAuthError(reason))) {
         usageSnapshot = { state: isUsageAuthError(reason) ? 'no_credentials' : 'network', windows: [], reason }
       }
       throw error
     }
-    if (!active) return
+    if (!active || !currentIdentity()) return
     if (usageSnapshot?.state !== 'ok' || !['network', 'rate_limited'].includes(snapshot.state)
       || isUsageAuthError(snapshot.reason)) usageSnapshot = snapshot
     if (snapshot.state !== 'ok' && snapshot.state !== 'not_applicable' && snapshot.state !== 'no_credentials') {
       throw Object.assign(new Error(snapshot.reason ?? snapshot.state), { retryAfterMs: snapshot.retryAfterMs })
     }
-  }, old?.identity === identity ? old.usage.nextRefreshAt : 0)
+  }, old?.identity === identity ? old.usage?.nextRefreshAt : 0)
   source.refreshModels = () => model.refresh()
-  source.readUsage = async () => !source.enabled
+  const snapshot = (): UsageSnapshotUnified | undefined => !currentIdentity()
+    ? { state: 'no_credentials', windows: [], reason: '账号认证身份已变化，后台刷新中' }
+    : !source.enabled ? { state: 'no_credentials', windows: [], reason: source.modelCatalogState?.error }
+    : source.kind === 'codex-subscription'
+      ? codexUsageToUnified(peekUsage(selectedId) ?? { state: 'network', reason: '额度缓存尚未就绪，后台刷新中' }) : usageSnapshot
+  source.readUsage = async () => snapshot() ?? (!source.enabled
     ? { state: 'no_credentials', windows: [], reason: source.modelCatalogState?.error }
     : source.kind === 'codex-subscription'
     ? codexUsageToUnified(peekUsage(accountId) ?? { state: 'network', reason: '额度缓存尚未就绪，后台刷新中' })
     : usageSnapshot ?? {
     state: source.enabled ? 'network' : 'no_credentials', windows: [], reason: '额度缓存尚未就绪，后台刷新中',
-  }
+  })
   if (committed.forAccount) {
     source.forAccount = id => {
-      if (id === DEFAULT_CODEX_ACCOUNT) return source
-      const revision = codexAccounts.revision(id)
+      if (id === selectedId && currentIdentity()) return source
+      const revision = tokenSourceAccountRevision(committed, id)
       const current = children.get(id)
       if (current?.revision === revision) return current.source
       if (current) disposeCachedTokenSource(current.source)
@@ -177,7 +274,7 @@ export function cachedTokenSource(
       return child
     }
   }
-  metadata.set(source, { baseIdentity, identity, configuration, model, usage, children, snapshot: () => usageSnapshot, active: () => active,
+  metadata.set(source, { baseIdentity, identity, configuration, model, usage, children, snapshot, active: () => active,
     dispose() {
       active = false
       model.dispose(); usage.dispose()
@@ -196,5 +293,8 @@ export function removeCachedTokenSourceAccount(source: TokenSource | undefined, 
 
 /** Used only by initial warmup and explicit invalidation, never by interactive reads. */
 export function refreshTokenSourceUsage(source: TokenSource): Promise<void> {
-  return metadata.get(source)?.usage.refresh() ?? Promise.resolve()
+  if (source.aggregateAccountCatalog && source.forAccount) {
+    return Promise.all(tokenSourceAccounts(source).map(account => refreshTokenSourceUsage(source.forAccount!(account.id)))).then(() => {})
+  }
+  return metadata.get(source)?.usage?.refresh() ?? Promise.resolve()
 }

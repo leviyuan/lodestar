@@ -13,8 +13,8 @@ test('Claude subscription is the only first-party source across panels, launch, 
     ] }
     mock.module('./src/token-source-models', () => ({ ...nativeModels,
       fetchNativeClaudeModels: async options => {
-        options?.validateAccount?.({ subscriptionType: 'max', apiProvider: 'firstParty' })
-        return [{ model: 'sonnet', display: 'Sonnet', efforts: ['high'], defaultEffort: 'high' }]
+        options?.validateAccount?.({ email: 'routing@example.test', organization: 'test-org', subscriptionType: 'max', apiProvider: 'firstParty' })
+        return [{ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' }]
       },
     }))
     mock.module('./src/claude-usage', () => ({ ...nativeUsage,
@@ -53,8 +53,9 @@ test('Claude subscription is the only first-party source across panels, launch, 
     assert.ok(panel.includes('Claude Code 订阅'))
     assert.ok(!panel.includes('claude-native'))
     const claudeRows = (await readAllAccountUsage()).filter(row => row.id.startsWith('claude'))
-    assert.deepEqual(claudeRows.map(row => row.id), ['claude-sub'])
-    assert.equal(await fresh.footerUsageSuffix('claude', null, source.id, source, null, 'sonnet'),
+    assert.deepEqual(claudeRows.map(row => row.id), ['claude:default'])
+    assert.equal((await source.readUsage()).state, 'not_applicable')
+    assert.equal(await fresh.footerUsageSuffix('claude', null, source.id, source.forAccount('default'), null, 'opus'),
       '  |  3.1h·14%·[4.2d·2%]')
     writeFailure = true
     assert.throws(() => fresh.spawnAgent(), /routing write failed/)

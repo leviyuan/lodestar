@@ -47,6 +47,11 @@ export function pendingSourceCommands(): Promise<void>[] { return [...sourceComm
 export async function runCommand(s: Session, raw: string, userOpenId = '', messageId?: string): Promise<boolean> {
   const namedHi = raw.trim().match(/^hi[ \t]+([^\r\n]+)$/i)
   if (namedHi) {
+    if (s.currentProvider() === 'claude') {
+      const { runClaudeNamedHi } = await import('./session-claude-accounts')
+      backgroundSourceCommand(s, runClaudeNamedHi(s, namedHi[1].trim()))
+      return true
+    }
     const { runCodexNamedHi } = await import('./session-codex-accounts')
     await runCodexNamedHi(s, namedHi[1].trim())
     return true

@@ -1,7 +1,7 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { spawn as crossSpawn } from 'cross-spawn'
-import { delimiter, join } from 'node:path'
+import { delimiter, join, resolve } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { randomUUID } from 'node:crypto'
 import {
@@ -49,6 +49,7 @@ import { observeContextWindow } from './context-window-observe'
 import type { ClaudeTranslation } from './claude-translation'
 import { CLAUDE_TRANSLATION_ORIGINS, type ClaudeTranslationContext } from './claude-translation-context'
 import { ClaudePresentationTranslation, claudeToolInputContext, claudeToolInputOrigin, claudeToolResultContext } from './claude-presentation-translation'
+import { acquireClaudeSessionLease, type ClaudeSessionLease } from './claude-session-lease'
 
 type QueueWaiter<T> = (value: IteratorResult<T>) => void
 
@@ -126,7 +127,9 @@ export interface ClaudeSpawnOpts extends Omit<SpawnOpts, 'effort'> {
    *  Claude 订阅传 ['user','project','local']，配合进程级 settings 和原生账号验证隔离认证。 */
   settingSources?: readonly string[]
   settings?: Settings
-  validateAccount?: (account: AccountInfo) => void
+  validateAccount?: (account: AccountInfo) => void | Promise<void>
+  /** Native account/model/usage probes cannot submit user turns or own a writer lease. */
+  controlOnly?: boolean
   /** 该进程 spawn 时绑定的 token source id;stopIdleMismatchedProcess 据此判跨 source 重启。 */
   tokenSourceId?: string | null
   /** Daemon-owned local plugin containing shared Skills. Loaded only when the
@@ -252,22 +255,35 @@ function contextOccupancyFromUsage(usage: CodexUsage | null | undefined): number
   return occ > 0 ? occ : null
 }
 
-/** Claude Code session transcript 路径:~/.claude/projects/<cwd 编码>/<sid>.jsonl。
- * cwd 编码 = 绝对路径的 / 全替换成 -(claude code 约定,如 /home/x → -home-x)。 */
-/** Claude Code transcript 目录:~/.claude/projects/<cwd 编码>/。同 cwd 的所有会话
- *  jsonl 都在此 —— rs 历史列表扫这个目录,得到同工作目录的全部 claude 会话
- *  (worktree 不同 cwd → 不同编码目录,自然不混进来)。cwd 编码 = 绝对路径 / 全替换成 -。 */
-export function claudeTranscriptDir(workDir: string): string {
-  // 编码对齐 Claude Code SDK:cwd 非字母数字字符全 → -(不只 /,[ ] . _ - 等也 → -)。
-  // 否则 workDir 含特殊字符(如 test[deepseek])时,SDK 实际 transcript dir 与本函数算出的
-  // 不一致,readLastCallUsageFromTranscript 读不到 → lastContextTokens 恒 null → footer 无 🧠。
-  const encoded = workDir.replace(/[^a-zA-Z0-9]/g, '-')
-  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
-  return join(configDir, 'projects', encoded)
+/** Native history naming: canonical cwd, ASCII path encoding, and the native long-path hash. */
+export interface ClaudeTranscriptOptions {
+  /** Effective child CONFIG_DIR; explicit empty string uses the native default. */
+  configDir?: string
+  /** Effective child PROJECT_DIR_NAME; explicit empty string disables an inherited override. */
+  projectDirName?: string
 }
 
-export function claudeTranscriptPath(workDir: string, sessionId: string): string {
-  return join(claudeTranscriptDir(workDir), `${sessionId}.jsonl`)
+export function claudeTranscriptDir(workDir: string, options: ClaudeTranscriptOptions = {}): string {
+  const configuredDir = options.configDir ?? process.env.CLAUDE_CONFIG_DIR
+  const configDir = (configuredDir || join(homedir(), '.claude')).normalize('NFC')
+  const override = options.projectDirName ?? process.env.CLAUDE_CODE_PROJECT_DIR_NAME
+  if (configuredDir && override && /^[A-Za-z0-9_-]{1,64}$/.test(override)
+    && !/^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$/i.test(override)) {
+    return join(configDir, 'projects', override)
+  }
+  let canonical = resolve(workDir)
+  // The native catalog falls back to the absolute spelling if realpath is unavailable.
+  try { canonical = realpathSync(canonical) } catch {}
+  if (process.platform === 'darwin') canonical = canonical.normalize('NFC')
+  const encoded = canonical.replace(/[^a-zA-Z0-9]/g, '-')
+  // Claude Code uses a signed 32-bit string hash, then abs/base36, past 200 chars.
+  let hash = 0
+  if (encoded.length > 200) for (let i = 0; i < canonical.length; i++) hash = ((hash << 5) - hash + canonical.charCodeAt(i)) | 0
+  return join(configDir, 'projects', encoded.length > 200 ? `${encoded.slice(0, 200)}-${Math.abs(hash).toString(36)}` : encoded)
+}
+
+export function claudeTranscriptPath(workDir: string, sessionId: string, options: ClaudeTranscriptOptions = {}): string {
+  return join(claudeTranscriptDir(workDir, options), `${sessionId}.jsonl`)
 }
 
 /** 读 transcript jsonl,取最后一条 assistant message 的 usage —— 这是最后一次 API
@@ -639,6 +655,9 @@ export class ClaudeAgentProcess extends EventEmitter {
   private started = false
   private queryStart?: Promise<void>
   private initializationError: Error | null = null
+  private sessionLease: ClaudeSessionLease | null = null
+  private nativeSessionId: string | null = null
+  private transcriptOptions?: ClaudeTranscriptOptions
   private pendingPermissions = new Map<string, PendingControl>()
   private requestCounter = 0
   private cumulativeUsageFromResults: CodexUsage | null = null
@@ -648,6 +667,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   private inputTurnPending = false
   /** Actual native submission/running state, excluding pending host translation. */
   private nativeTurnPending = false
+  private compactionPending = false
   private steeringInputs = new Set<string>()
   /** A native result can beat a streaming-input write. Keep that native
    * continuation in the same visible task, and retain all result metadata. */
@@ -706,6 +726,13 @@ export class ClaudeAgentProcess extends EventEmitter {
     })
   }
 
+  async initializationPromise(): Promise<void> {
+    if (!this.started) this.sendInitialize()
+    await this.queryStart
+    if (this.initializationError) throw this.initializationError
+    if (!this.alive) throw new Error('Claude 进程在初始化完成前已退出')
+  }
+
   private async *validatedInput(): AsyncIterableIterator<SDKUserMessage> {
     await this.queryStart
     if (this.initializationError || !this.alive) return
@@ -736,15 +763,30 @@ export class ClaudeAgentProcess extends EventEmitter {
       // Validate the local executable before any asynchronous context/GLM work.
       // Invalid explicit configuration must keep its synchronous error event.
       const executable = resolveClaudeExecutableConfig()
+      const baseEnv: Record<string, string | undefined> = { ...(process.env as Record<string, string>), PATH: buildClaudeSpawnPath(),
+        ...config.claude.env, ...(this.opts.hostEnv ?? {}) }
+      const env = this.opts.transformEnv ? this.opts.transformEnv(baseEnv) : baseEnv
+      this.transcriptOptions = {
+        configDir: env.CLAUDE_CONFIG_DIR ?? '',
+        projectDirName: env.CLAUDE_CODE_PROJECT_DIR_NAME ?? '',
+      }
+      if (!this.opts.controlOnly) {
+        this.nativeSessionId = this.opts.resumeSessionId && !this.opts.forkSession ? this.opts.resumeSessionId : randomUUID()
+        this.sessionLease = acquireClaudeSessionLease({
+          historyRoot: join((env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')).normalize('NFC'), 'projects'),
+          sessionId: this.nativeSessionId,
+          isActive: () => this.turnActive || this.inputTurnPending || this.nativeTurnPending
+            || this.compactionPending || this.steeringInputs.size > 0,
+          ...(this.opts.forkSession && this.opts.resumeSessionId ? { sourceSessionId: this.opts.resumeSessionId } : {}),
+          ...(this.opts.forkSession && this.opts.resumeSessionAt ? { sourceCheckpointId: this.opts.resumeSessionAt } : {}),
+        })
+      }
       if (this.opts.translation) await this.initializeTranslationContext()
       if (!this.alive || this.abortController.signal.aborted) return
       // resolveClaudeExecutableConfig 在 [claude].bin 配错路径时同步抛出;
       // 必须在 try 内调用,确保错误走 error/exit 事件而非穿透到调用方。
       const { query } = await loadClaudeSdk()
       if (!this.alive || this.abortController.signal.aborted) return
-      const baseEnv: Record<string, string | undefined> = { ...(process.env as Record<string, string>), PATH: buildClaudeSpawnPath(),
-        ...config.claude.env, ...(this.opts.hostEnv ?? {}) }
-      const env = this.opts.transformEnv ? this.opts.transformEnv(baseEnv) : baseEnv
       // Claude Code 2.1.268+ hides task tracking on newer/unknown models unless
       // the host opts in. The session card consumes these Task tool events.
       env.CLAUDE_CODE_ENABLE_TODO_TOOLS = '1'
@@ -760,6 +802,8 @@ export class ClaudeAgentProcess extends EventEmitter {
           // 子进程环境中的 unset 阻止发送 effort，不能只省略选项（CLI 会补 high）。
           effort: (this.opts.effort === 'default' ? 'high' : this.opts.effort) as EffortLevel,
           resume: this.opts.resumeSessionId,
+          ...(!this.opts.controlOnly && (!this.opts.resumeSessionId || this.opts.forkSession)
+            ? { sessionId: this.nativeSessionId! } : {}),
           ...(this.opts.resumeSessionAt ? { resumeSessionAt: this.opts.resumeSessionAt } : {}),
           ...(this.opts.forkSession ? { forkSession: true } : {}),
           ...(executable.pathToClaudeCodeExecutable
@@ -806,7 +850,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     void this.readLoop(this.query)
     if (this.opts.validateAccount) {
       try {
-        this.opts.validateAccount(await this.query.accountInfo())
+        await this.opts.validateAccount(await this.query.accountInfo())
       } catch (error) {
         this.initializationError = error instanceof Error ? error : new Error(String(error))
         this.emit('error', this.initializationError)
@@ -816,6 +860,10 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   sendUserText(text: string, files: string[] = [], metadata?: { contextPrefix?: string }): void {
+    if (this.opts.controlOnly) {
+      this.emit('error', new Error('Claude 控制查询不允许提交会话输入'))
+      return
+    }
     if (!this.alive) {
       log('claude-agent-process: sendUserText ignored on dead process')
       return
@@ -1147,6 +1195,14 @@ export class ClaudeAgentProcess extends EventEmitter {
     return models.map(mapModelInfo)
   }
 
+  async readAccountInfo(): Promise<AccountInfo> {
+    if (!this.started) this.sendInitialize()
+    await this.queryStart
+    if (this.initializationError) throw this.initializationError
+    if (!this.query || !this.alive) throw new Error('Claude 账号查询连接未就绪或已退出')
+    return this.query.accountInfo()
+  }
+
   /** 原生 /usage 控制查询；不发送对话，也不扫描本机历史用量。 */
   async readSubscriptionUsage(): Promise<SDKControlGetUsageResponse> {
     if (!this.started) this.sendInitialize()
@@ -1190,22 +1246,25 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   async compactThread(): Promise<void> {
+    if (this.opts.controlOnly) throw new Error('Claude 控制查询不允许压缩会话')
     // /compact 通过 streaming input 执行，以 compact_boundary 为完成信号。
     // 不设固定时限；仅明确的 "Not enough messages to compact" 表示无需压缩。
     // result 可能先于 boundary 到达，不能据此提前结束等待。
     if (!this.input) throw new Error('claude thread not initialized')
     if (this.opts.translation) this.translationOutputStopped = false
-    this.input.push({
+    this.compactionPending = true
+    try { this.input.push({
       type: 'user',
       session_id: this.sessionId ?? '',
       message: { role: 'user', content: [{ type: 'text', text: '/compact' }] },
       parent_tool_use_id: null,
       priority: 'now',
-    } as SDKUserMessage)
+    } as SDKUserMessage) } catch (error) { this.compactionPending = false; throw error }
     const assistantTextEvent = this.opts.translation ? 'assistant_control_text' : 'assistant_text'
     return new Promise<void>((resolve, reject) => {
       let settled = false
       const cleanup = () => {
+        this.compactionPending = false
         this.off('context_compacted', onCompacted)
         this.off(assistantTextEvent, onAssistantText)
         this.off('exit', onExit)
@@ -1477,10 +1536,13 @@ export class ClaudeAgentProcess extends EventEmitter {
   private finishExit(code: number | null, signal: string | null): void {
     if (!this.alive) return
     this.alive = false
+    this.sessionLease?.release()
+    this.sessionLease = null
     if (this.opts.translation) this.invalidateTranslations()
     this.translatedToolInputs.clear()
     this.turnActive = false
     this.nativeTurnPending = false
+    this.compactionPending = false
     this.inputTurnPending = false
     this.steeringInputs.clear()
     this.steeringResults = []
@@ -1825,6 +1887,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
     switch (raw.subtype) {
       case 'init':
+        if (this.opts.forkSession && raw.session_id === this.nativeSessionId) this.sessionLease?.releaseSource()
         if (typeof raw.model === 'string' && raw.model) this.lastModel = claudeModelKey(raw.model)
         this.lastEffort = this.opts.effort
         this.emit('init', { session_id: this.sessionId, raw })
@@ -2140,7 +2203,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     // context_window.current_usage 同口径。transcript 不可读 → null → footer 显 MISS。
     // transcript 读最后真实 assistant usage(跳 synthetic);文件存在但全 synthetic(DeepSeek 前 turn
     // SDK 只写占位)→ fallback result.usage 单 turn input;文件不存在(test / 新 session 首次)→ null(MISS)。
-    const transcriptPath = claudeTranscriptPath(this.opts.workDir, this.sessionId ?? '')
+    const transcriptPath = claudeTranscriptPath(this.opts.workDir, this.sessionId ?? '', this.transcriptOptions)
     const transcriptUsage = readLastCallUsageFromTranscript(transcriptPath)
     this.lastContextTokens = contextOccupancyFromUsage(transcriptUsage)
       ?? (existsSync(transcriptPath) ? contextOccupancyFromUsage(usage) : null)

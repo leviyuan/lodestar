@@ -1,0 +1,106 @@
+name: 发布版本
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 已推送的版本标签，例如 v0.21.9
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lodestar-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: 验收并发布两个包仓库
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: 检出指定版本
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.2
+      - name: 配置 Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: 校验标签与版本
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          import assert from 'node:assert/strict';
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+          assert.match(process.env.RELEASE_TAG, /^v\d+\.\d+\.\d+$/);
+          assert.equal(process.env.RELEASE_TAG, `v${pkg.version}`);
+          assert.equal(pkg.name, '@leviyuan/lodestar');
+          NODE
+          git show-ref --verify "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+      - name: 检查 npm 发布身份
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN"
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/lodestar-preflight-npmrc"
+          trap 'rm -f "$NPM_CONFIG_USERCONFIG"' EXIT
+          printf '%s\n' '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}' > "$NPM_CONFIG_USERCONFIG"
+          npm whoami --registry=https://registry.npmjs.org
+      - name: 检查 GitHub Packages 访问
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN"
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/lodestar-preflight-github-npmrc"
+          trap 'rm -f "$NPM_CONFIG_USERCONFIG"' EXIT
+          printf '%s\n' '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' > "$NPM_CONFIG_USERCONFIG"
+          npm view @leviyuan/lodestar version --registry=https://npm.pkg.github.com
+      - name: 安装锁定的开发依赖
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: 检查安全依赖声明
+        run: bun scripts/sync-security-deps.ts --check
+      - name: 执行发布前完整检查
+        run: bun run ci
+      - name: 打包并验收实际安装结果
+        run: |
+          mkdir -p "$RUNNER_TEMP/lodestar-release/pack" "$RUNNER_TEMP/lodestar-release/install"
+          npm pack --pack-destination "$RUNNER_TEMP/lodestar-release/pack" --json > "$RUNNER_TEMP/lodestar-release/pack.json"
+          npm install --prefix "$RUNNER_TEMP/lodestar-release/install" --ignore-scripts --no-fund --no-audit "$RUNNER_TEMP"/lodestar-release/pack/*.tgz
+          npm audit --prefix "$RUNNER_TEMP/lodestar-release/install" --omit=dev
+          bun scripts/check-installed-package.ts "$RUNNER_TEMP/lodestar-release/install"
+      - name: 保存已验收的发布包
+        uses: actions/upload-artifact@v4
+        with:
+          name: lodestar-${{ inputs.tag }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/lodestar-release/pack/*.tgz
+          if-no-files-found: error
+      - name: 发布 npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN"
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/lodestar-release/npmrc"
+          trap 'rm -f "$NPM_CONFIG_USERCONFIG"' EXIT
+          printf '%s\n' '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}' > "$NPM_CONFIG_USERCONFIG"
+          npm whoami --registry=https://registry.npmjs.org
+          node scripts/publish-verified-package.mjs "$RUNNER_TEMP/lodestar-release/pack.json" "$RUNNER_TEMP/lodestar-release/pack" https://registry.npmjs.org
+      - name: 发布 GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN"
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/lodestar-release/github-npmrc"
+          trap 'rm -f "$NPM_CONFIG_USERCONFIG"' EXIT
+          printf '%s\n' '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' > "$NPM_CONFIG_USERCONFIG"
+          node scripts/publish-verified-package.mjs "$RUNNER_TEMP/lodestar-release/pack.json" "$RUNNER_TEMP/lodestar-release/pack" https://npm.pkg.github.com
