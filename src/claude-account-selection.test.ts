@@ -1,41 +1,4 @@
-import { describe, expect, test } from 'bun:test'
-import { claudeAccountAvailability } from './claude-account-selection'
-import type { UsageSnapshotUnified } from './token-source'
-
-const quota = (extra: UsageSnapshotUnified['windows'] = []): UsageSnapshotUnified => ({ state: 'ok', fetchedAt: Date.now(), windows: [
-  { kind: 'fiveHour', label: '5h', percent: 20, resetsAt: null },
-  { kind: 'weekly', label: '周', percent: 30, resetsAt: null }, ...extra,
-] })
-
-describe('Claude startup quota eligibility', () => {
-  test('requires total weekly quota even when an Opus-specific window is available', () => {
-    const data = quota([{ kind: 'seven_day_opus', label: 'Opus', percent: 0, resetsAt: null }])
-    data.windows[1]!.percent = 100
-    expect(() => claudeAccountAvailability(data, 'claude-opus-5')).toThrow('周 已耗尽')
-  })
-  test.each(['fiveHour', 'weekly', 'seven_day_opus', 'seven_day_oauth_apps', 'modelWeekly:Opus 5'])(
-    'each applicable %s limit can independently exclude an account', kind => {
-      const data = quota().windows.filter(window => window.kind !== kind)
-      data.push({ kind, label: kind, percent: 100, resetsAt: null })
-      expect(() => claudeAccountAvailability({ state: 'ok', windows: data }, 'opus')).toThrow('已耗尽')
-    })
-  test('unrelated model limits do not exclude Opus; all its matching limits determine remaining quota', () => {
-    expect(claudeAccountAvailability(quota([
-      { kind: 'seven_day_sonnet', label: 'Sonnet', percent: 100, resetsAt: null },
-      { kind: 'modelWeekly:Fable', label: 'Fable', percent: 100, resetsAt: null },
-      { kind: 'modelWeekly:Opus', label: 'Opus', percent: 65, resetsAt: null },
-    ]), 'claude-opus-5')).toBe(35)
-  })
-  test('cold, failed, missing and malformed quota never becomes a full window', () => {
-    expect(() => claudeAccountAvailability(undefined, 'opus')).toThrow('MISS')
-    expect(() => claudeAccountAvailability({ state: 'network', windows: [], reason: 'offline' }, 'opus')).toThrow('offline')
-    expect(() => claudeAccountAvailability({ state: 'ok', windows: [] }, 'opus')).toThrow('MISS')
-    for (const percent of [null, NaN, -1, 101]) {
-      const data = quota(); data.windows[0]!.percent = percent
-      expect(() => claudeAccountAvailability(data, 'opus')).toThrow('MISS')
-    }
-  })
-})
+import { expect, test } from 'bun:test'
 
 function isolated(script: string): void {
   const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
@@ -80,11 +43,12 @@ test('an unobserved default authenticates and warms on explicit selection, then 
       return [{ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' }]
     } }))
     const usage = await import('./src/claude-usage')
+    const quotaNow = Date.now()
     mock.module('./src/claude-usage', () => ({ ...usage, fetchClaudeSubscriptionUsage: async (options, binding) => {
       calls.usage++; assert.equal(binding.accountId, 'default'); options.validateAccount(info)
       return { state: 'ok', fetchedAt: Date.now(), windows: [
-        { kind: 'fiveHour', label: '5h', percent: 10, resetsAt: null },
-        { kind: 'weekly', label: '周', percent: 20, resetsAt: null },
+        { kind: 'fiveHour', label: '5h', percent: 10, resetsAt: new Date(quotaNow + 3 * 3600_000) },
+        { kind: 'weekly', label: '周', percent: 20, resetsAt: new Date(quotaNow + 24 * 3600_000) },
       ] }
     } }))
     const registry = await import('./src/token-source')
@@ -134,7 +98,13 @@ test('named-only authentication keeps one visible source, account-isolated quota
     const named = await manager.enroll('second', async () => info('named@example.test'))
     let defaultInfo = {}
     const percentages = { default: 10, [named.id]: 40 }
-    let models = [{ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' }]
+    const fablePercentages = { default: 0, [named.id]: 0 }
+    const quotaNow = Date.now()
+    const weeklyHours = { default: 24, [named.id]: 24 }
+    let models = [
+      { model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' },
+      { model: 'fable', display: 'Fable', efforts: ['high'], defaultEffort: 'high' },
+    ]
     const calls = { models: 0, quota: 0 }
     const modelApi = await import('./src/token-source-models')
     mock.module('./src/token-source-models', () => ({ ...modelApi, fetchNativeClaudeModels: async options => {
@@ -148,8 +118,9 @@ test('named-only authentication keeps one visible source, account-isolated quota
       calls.quota++
       options.validateAccount(binding.accountId === 'default' ? defaultInfo : info('named@example.test'))
       return { state: 'ok', fetchedAt: Date.now(), windows: [
-        { kind: 'fiveHour', label: '5h', percent: percentages[binding.accountId], resetsAt: null },
-        { kind: 'weekly', label: '周', percent: percentages[binding.accountId], resetsAt: null },
+        { kind: 'fiveHour', label: '5h', percent: percentages[binding.accountId], resetsAt: new Date(quotaNow + 3 * 3600_000) },
+        { kind: 'weekly', label: '周', percent: percentages[binding.accountId], resetsAt: new Date(quotaNow + weeklyHours[binding.accountId] * 3600_000) },
+        { kind: 'modelWeekly:Fable', label: 'Fable 周', percent: fablePercentages[binding.accountId], resetsAt: new Date(quotaNow + weeklyHours[binding.accountId] * 3600_000) },
       ] }
     } }))
     const registry = await import('./src/token-source')
@@ -182,10 +153,40 @@ test('named-only authentication keeps one visible source, account-isolated quota
       defaultInfo = info('default@example.test')
       await root.refreshModels(); await refreshTokenSourceUsage(root)
       assert.equal(selectClaudeAccount({ model: 'opus', effort: 'high' }), 'default')
+      percentages.default = 90; percentages[named.id] = 20; fablePercentages[named.id] = 80
+      await refreshTokenSourceUsage(root)
+      const beforeFableChoice = { ...calls }
+      assert.equal(selectClaudeAccount({ model: 'fable', effort: 'high' }), named.id)
+      assert.deepEqual(calls, beforeFableChoice)
+      percentages.default = 10; percentages[named.id] = 40; fablePercentages[named.id] = 0
+      await refreshTokenSourceUsage(root)
       assert.throws(() => selectClaudeAccount({ model: 'opus', effort: 'max' }), /档位不可用/)
       assert.throws(() => selectClaudeAccount({ model: 'unknown', effort: 'high' }), /模型目录 MISS/)
+      percentages[named.id] = 95; weeklyHours[named.id] = 2
+      await refreshTokenSourceUsage(root)
+      const beforeDeadlineChoice = { ...calls }
+      assert.equal(selectClaudeAccount({ model: 'opus', effort: 'high' }), 'default')
+      assert.deepEqual(calls, beforeDeadlineChoice)
+      percentages[named.id] = 40; weeklyHours[named.id] = 24
       percentages.default = 40; await refreshTokenSourceUsage(root)
       assert.equal(selectClaudeAccount({ model: 'opus', effort: 'high' }), 'default')
+      assert.equal(selectClaudeAccount({ model: 'opus', effort: 'high', activeSessions: new Map([['default', 5]]) }), named.id)
+      assert.equal(selectClaudeAccount({ model: 'opus', effort: 'high', preferred: 'default', activeSessions: new Map([['default', 100]]) }), 'default')
+      percentages.default = 99; percentages[named.id] = 99
+      await refreshTokenSourceUsage(root)
+      const activeSessions = new Map([['default', 0], [named.id, 0]])
+      const beforeSqueezing = { ...calls }
+      for (let i = 0; i < 40; i++) {
+        const selected = selectClaudeAccount({ model: 'opus', effort: 'high', activeSessions })
+        activeSessions.set(selected, activeSessions.get(selected) + 1)
+      }
+      assert.deepEqual([...activeSessions.values()], [20, 20])
+      assert.deepEqual(calls, beforeSqueezing)
+      percentages.default = 100; percentages[named.id] = 100
+      await refreshTokenSourceUsage(root)
+      assert.throws(() => selectClaudeAccount({ model: 'opus', effort: 'high', activeSessions }), /已耗尽/)
+      percentages.default = 40; percentages[named.id] = 40
+      await refreshTokenSourceUsage(root)
       const old = root.forAccount('default')
       old.validateClaudeAccount(info('relogged@example.test'))
       const newIdentity = manager.get('default').identity

@@ -62,6 +62,7 @@ import { getTokenSource, getTokenSourceForAccount, listEnabledTokenSourcesByAgen
 import { codexAccounts, DEFAULT_CODEX_ACCOUNT, processCodexAccount } from './codex-accounts'
 import { claudeAccounts, DEFAULT_CLAUDE_ACCOUNT, processClaudeAccount } from './claude-accounts'
 import { enrollClaudeAccount } from './claude-account-selection'
+import { countActiveClaudeSessions } from './session-activity'
 import { codexAccountCard } from './cards/codex-account'
 import {
   claudeTranscriptPath,
@@ -594,6 +595,14 @@ export class Session {
     return sessionWorktree.worktreeSessionDir(this)
   }
   isRunning(): boolean { return !!this.proc && this.proc.isAlive() }
+  /** Startup and queued/background work reserve once even before a visible main turn opens. */
+  hasActiveConversationWork(): boolean {
+    return this.status === 'starting' || this.status === 'working' || this.status === 'awaiting_permission'
+      || Boolean(this.currentTurn || this.openingTurn || this.steeringSend
+        || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0 || this.pendingTurnInputs.length > 0
+        || cards.hasActiveBgTask(this.backgroundTasks) || this.pendingBgTasks.length > 0 || this.backgroundSync
+        || this.bgResumeCardless || this.bgResumePending)
+  }
   /** Running sessions normally revive after daemon restart. A process kept
    * only because the user's explicit stop could not yet be confirmed must not
    * undo that stop intent on the next boot. */
@@ -1005,7 +1014,8 @@ export class Session {
       tokenSourceId: ts?.id ?? null,
       ...(this.selectedProvider === 'codex' ? { codexAccountId: codexAccounts.selected(this.sessionName) } : {}),
       ...(codexPool ? { codexAccountPreference: this.codexStartAccountOverride ?? codexAccounts.preferred(this.sessionName) } : {}),
-      ...(claudePool ? { claudeAccountPreference: this.claudeStartAccountOverride ?? null } : {}),
+      ...(claudePool ? { claudeAccountPreference: this.claudeStartAccountOverride ?? null,
+        claudeActiveSessions: countActiveClaudeSessions(Session.all, { excludeChatId: this.chatId }) } : {}),
       model: ts ? (this.selectedModel ?? ts.defaultModel) : this.modelForSpawn(),
       effort: this.selectedProvider === 'dsh'
         ? this.dshEffortForSpawn()

@@ -5,19 +5,16 @@ const reset = '2030-01-02T03:04:05.123456+00:00'
 const response = (rate_limits: unknown) => ({ subscription_type: 'max', rate_limits_available: true, rate_limits })
 
 describe('Claude subscription usage response', () => {
-  test('keeps percentage units, zero, ISO resets and model-specific windows', () => {
+  test('keeps the main windows and Fable weekly quota with percentage units, zero and ISO resets', () => {
     const snapshot = claudeUsageSnapshot(response({
       five_hour: { utilization: 12.5, resets_at: reset },
       seven_day: { utilization: 0, resets_at: null },
-      seven_day_opus: { utilization: 25, resets_at: reset },
-      seven_day_sonnet: null,
       model_scoped: [{ display_name: 'Fable', utilization: 4.5, resets_at: reset }],
     }))
     expect(snapshot.state).toBe('ok')
     expect(snapshot.windows).toEqual([
       { kind: 'fiveHour', label: '5h 窗口', percent: 12.5, resetsAt: new Date(reset) },
       { kind: 'weekly', label: '周额度', percent: 0, resetsAt: null },
-      { kind: 'seven_day_opus', label: 'Opus 周额度', percent: 25, resetsAt: new Date(reset) },
       { kind: 'modelWeekly:Fable', label: 'Fable 周额度', percent: 4.5, resetsAt: new Date(reset) },
     ])
   })
@@ -105,21 +102,19 @@ describe('Claude weekly quota selection', () => {
   const snapshot = () => claudeUsageSnapshot(response({
     five_hour: { utilization: 10, resets_at: reset },
     seven_day: { utilization: 20, resets_at: reset },
-    seven_day_opus: { utilization: 30, resets_at: reset },
-    seven_day_sonnet: { utilization: 40, resets_at: reset },
     model_scoped: [{ display_name: 'Fable', utilization: 50, resets_at: reset }],
   }))
 
-  test('matches aliases, full IDs, old IDs and context suffixes to their model quota', () => {
+  test('uses Fable dedicated quota and the total weekly quota for Opus, default and Sonnet', () => {
     const data = snapshot()
     for (const model of ['fable', 'claude:fable', 'FABLE[1m]', 'claude-fable-5-1', 'claude:claude-fable-5-1[1m]']) {
       expect(claudeWeeklyUsageWindow(data, model)?.percent).toBe(50)
     }
     for (const model of ['opus', 'claude:opus[1m]', 'claude-opus-4-7', 'default', 'claude:default']) {
-      expect(claudeWeeklyUsageWindow(data, model)?.percent).toBe(30)
+      expect(claudeWeeklyUsageWindow(data, model)).toBe(data.windows[1])
     }
     for (const model of ['sonnet', 'claude-sonnet-5', 'claude-3-5-sonnet-20241022']) {
-      expect(claudeWeeklyUsageWindow(data, model)?.percent).toBe(40)
+      expect(claudeWeeklyUsageWindow(data, model)).toBe(data.windows[1])
     }
   })
 
@@ -145,5 +140,37 @@ describe('Claude weekly quota selection', () => {
     expect(claudeWeeklyUsageWindow({ ...data, state: 'network' }, 'fable')).toBeNull()
     data.windows.push({ ...fable, kind: 'modelWeekly:Fable 5' })
     expect(claudeWeeklyUsageWindow(data, 'fable')).toBeNull()
+  })
+})
+
+describe('legacy Claude model-specific weekly quota compatibility', () => {
+  test('preserves explicitly returned legacy Opus and Sonnet windows and matches their aliases', () => {
+    const data = claudeUsageSnapshot(response({
+      five_hour: { utilization: 10, resets_at: reset },
+      seven_day: { utilization: 20, resets_at: reset },
+      seven_day_opus: { utilization: 30, resets_at: reset },
+      seven_day_sonnet: { utilization: 40, resets_at: reset },
+    }))
+    expect(data.windows.slice(2)).toEqual([
+      { kind: 'seven_day_opus', label: 'Opus 周额度', percent: 30, resetsAt: new Date(reset) },
+      { kind: 'seven_day_sonnet', label: 'Sonnet 周额度', percent: 40, resetsAt: new Date(reset) },
+    ])
+    for (const model of ['opus', 'claude:opus[1m]', 'claude-opus-4-7', 'default', 'claude:default']) {
+      expect(claudeWeeklyUsageWindow(data, model)?.percent).toBe(30)
+    }
+    for (const model of ['sonnet', 'claude-sonnet-5', 'claude-3-5-sonnet-20241022']) {
+      expect(claudeWeeklyUsageWindow(data, model)?.percent).toBe(40)
+    }
+  })
+
+  test('does not create legacy windows when the native response returns null', () => {
+    const data = claudeUsageSnapshot(response({
+      seven_day: { utilization: 20, resets_at: reset },
+      seven_day_opus: null,
+      seven_day_sonnet: null,
+    }))
+    expect(data.windows.map(window => window.kind)).toEqual(['fiveHour', 'weekly'])
+    expect(claudeWeeklyUsageWindow(data, 'opus')).toBe(data.windows[1])
+    expect(claudeWeeklyUsageWindow(data, 'sonnet')).toBe(data.windows[1])
   })
 })

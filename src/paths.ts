@@ -47,6 +47,8 @@ export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
  *  key = sessionName(主群名或 <project>*MMDD-HHMM 临时群名)。 */
 export const SESSION_TURNS_MAP_FILE = join(DATA_DIR, 'session-turns-map.json')
 export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
+/** Last real inbound user-message time per chat, used by Claude account reservations. */
+export const SESSION_ACTIVITY_FILE = join(DATA_DIR, 'session-activity.json')
 /** Private bilingual exchanges visible at the Claude translation boundary; never native transcripts. */
 export const CLAUDE_TRANSLATION_CONTEXT_DIR = join(DATA_DIR, 'claude-translation-context')
 /** Private complete Flash translation request/response traces, one file per translator. */

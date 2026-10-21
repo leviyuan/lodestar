@@ -4,42 +4,21 @@ import type { AgentReasoningEffort } from './agent-process'
 import type { AccountInfo } from '@anthropic-ai/claude-agent-sdk'
 import { ClaudeAgentProcess } from './claude-agent-process'
 import { claudeAccounts, DEFAULT_CLAUDE_ACCOUNT } from './claude-accounts'
-import { claudeModelFamily } from './claude-usage'
-import { resolveClaudeSdkModel } from './claude-models'
+import { compareClaudeQuota, rankClaudeQuota, type ClaudeQuotaRank } from './claude-quota'
 import { assertClaudeDefaultSettingsEnvironment, claudeSubscriptionSettings, validateClaudeSubscriptionAccount } from './token-source-claude'
-import { getTokenSourceForAccount, scrubAnthropicEnv, tokenSourceRuntimeModel, type UsageSnapshotUnified } from './token-source'
+import { getTokenSourceForAccount, scrubAnthropicEnv, tokenSourceRuntimeModel } from './token-source'
 import { peekTokenSourceUsage, refreshTokenSourceUsage } from './token-source-cache'
 import { log } from './log'
 
-/** All independently applicable plan windows must permit this model. No missing quota is inferred. */
-export function claudeAccountAvailability(snapshot: UsageSnapshotUnified | undefined, model: string): number {
-  if (!snapshot || snapshot.state !== 'ok') throw new Error(snapshot?.reason ?? '额度缓存 MISS')
-  const family = claudeModelFamily(resolveClaudeSdkModel(model))
-  if (!family || family === 'default') throw new Error('模型额度归属 MISS')
-  const windows = snapshot.windows.filter(window => window.kind === 'fiveHour' || window.kind === 'weekly'
-    || window.kind === 'seven_day_oauth_apps'
-    || window.kind === 'seven_day_opus' && family === 'opus'
-    || window.kind === 'seven_day_sonnet' && family === 'sonnet'
-    || window.kind.startsWith('modelWeekly:') && claudeModelFamily(window.kind.slice('modelWeekly:'.length)) === family)
-  if (!windows.some(window => window.kind === 'fiveHour') || !windows.some(window => window.kind === 'weekly')) {
-    throw new Error('订阅主窗口额度 MISS')
-  }
-  for (const window of windows) {
-    if (typeof window.percent !== 'number' || !Number.isFinite(window.percent) || window.percent < 0 || window.percent > 100) {
-      throw new Error(`${window.label} MISS`)
-    }
-    if (window.percent >= 100) throw new Error(`${window.label} 已耗尽`)
-  }
-  return Math.min(...windows.map(window => 100 - window.percent!))
-}
-
 /** Startup selection only; this function neither queries upstream nor changes any running process. */
-export function selectClaudeAccount(options: { model?: string | null; effort?: AgentReasoningEffort | null; preferred?: string | null }): string {
+export function selectClaudeAccount(options: { model?: string | null; effort?: AgentReasoningEffort | null;
+  preferred?: string | null; activeSessions?: ReadonlyMap<string, number> }): string {
   if (config.token_sources?.['claude-sub']?.enabled === false) throw new Error('Claude 订阅已禁用；发送 claude-sub on 启用')
   if (options.preferred) return claudeAccounts.get(options.preferred).id
   const diagnostics: string[] = []
   const identities = new Set<string>()
-  const candidates: Array<{ id: string; score: number }> = []
+  const candidates: Array<ClaudeQuotaRank & { id: string }> = []
+  const now = Date.now()
   for (const account of claudeAccounts.list()) {
     try {
       const source = getTokenSourceForAccount('claude-sub', account.id)
@@ -52,14 +31,15 @@ export function selectClaudeAccount(options: { model?: string | null; effort?: A
       if (!entry || entry.unavailableReason || !entry.efforts.length) throw new Error(entry?.unavailableReason ?? `${model} 模型目录 MISS`)
       const effort = options.effort ?? entry.defaultEffort
       if (!effort || !entry.efforts.includes(effort)) throw new Error(`${model}/${effort ?? 'MISS'} 档位不可用`)
-      const score = claudeAccountAvailability(peekTokenSourceUsage(source), model)
+      const rank = rankClaudeQuota(peekTokenSourceUsage(source), model, now, options.activeSessions?.get(account.id) ?? 0)
+      if (rank.state !== 'ready') throw new Error(rank.reason ?? '额度缓存 MISS')
       if (!account.identity) throw new Error('原生账号身份 MISS')
       if (identities.has(account.identity)) continue
       identities.add(account.identity)
-      candidates.push({ id: account.id, score })
+      candidates.push({ id: account.id, ...rank })
     } catch (error) { diagnostics.push(`${account.name}：${error instanceof Error ? error.message : String(error)}`) }
   }
-  candidates.sort((a, b) => b.score - a.score)
+  candidates.sort(compareClaudeQuota)
   if (!candidates.length) throw new Error(`Claude 自动选号 MISS：${diagnostics.join('；') || '尚无已收录账号'}`)
   return candidates[0]!.id
 }

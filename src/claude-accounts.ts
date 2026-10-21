@@ -182,6 +182,16 @@ export class ClaudeAccounts {
   }
   revision(id: string): string { return this.revisionOf(this.get(id)) }
 
+  /** Native terminal login may precede directory creation and enrollment. Never migrate history here. */
+  nativeCliEnv(name: string, base: Env): Env {
+    if (defaultName(name)) return this.env(DEFAULT_CLAUDE_ACCOUNT, base)
+    const normalized = accountName(name)
+    const old = this.read().accounts.find(row => nameKey(row.name) === nameKey(normalized))
+    const candidate: ClaudeAccount = old ? clone(old)
+      : { id: accountId(normalized), name: normalized, configDir: join(this.root, normalized), state: 'candidate', generation: 0 }
+    return this.candidateEnv(candidate, base)
+  }
+
   candidateEnv(candidate: ClaudeAccount, base: Env): Env {
     const env = { ...base }
     if (candidate.id === DEFAULT_CLAUDE_ACCOUNT) {

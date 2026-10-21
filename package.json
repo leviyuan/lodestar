@@ -1,6 +1,6 @@
 {
   "name": "@leviyuan/lodestar",
-  "version": "0.21.9",
+  "version": "0.21.10",
   "publishConfig": {
     "access": "public"
   },
@@ -41,7 +41,8 @@
     "build:update": "bun build src/update-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-update.js",
     "build:version": "bun build src/version-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-version.js",
     "build:agent": "bun build src/agent-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-agent.js",
-    "build": "bun run build:daemon && bun run build:setup && bun run build:stop && bun run build:update && bun run build:version && bun run build:agent && bun run build:dsh",
+    "build:claude": "bun build src/claude-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-claude.js",
+    "build": "bun run build:daemon && bun run build:setup && bun run build:stop && bun run build:update && bun run build:version && bun run build:agent && bun run build:claude && bun run build:dsh",
     "prepublishOnly": "bun run ci",
     "postinstall": "node scripts/postinstall.cjs",
     "build:dsh": "bun build src/dsh-bridge.ts --target=node --packages=external --outfile=dist/dsh-bridge.js"
@@ -52,7 +53,8 @@
     "lodestar-stop": "./dist/lodestar-stop.js",
     "lodestar-update": "./dist/lodestar-update.js",
     "lodestar-version": "./dist/lodestar-version.js",
-    "lodestar-agent": "./dist/lodestar-agent.js"
+    "lodestar-agent": "./dist/lodestar-agent.js",
+    "lodestar-claude": "./dist/lodestar-claude.js"
   },
   "files": [
     "dist/",
@@ -76,6 +78,7 @@
     "cross-spawn": "^7.0.6",
     "fast-uri": "3.1.8",
     "fflate": "0.8.3",
+    "follow-redirects": "1.16.1",
     "hono": "4.13.12",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.6",
@@ -103,7 +106,8 @@
     "protobufjs": "7.6.5",
     "proxy-addr": "2.0.8",
     "qs": "6.16.0",
-    "ws": "8.21.3"
+    "ws": "8.21.3",
+    "follow-redirects": "1.16.1"
   },
   "devDependencies": {
     "@anthropic-ai/claude-agent-sdk": "latest",

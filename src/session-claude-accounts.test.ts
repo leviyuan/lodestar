@@ -12,6 +12,7 @@ import * as codexCommands from './session-codex-accounts'
 import { pendingSourceCommands } from './session-commands'
 import { getTokenSource, getTokenSourceForAccount, listTokenSources, registerTokenSource, resetTokenSourceRegistry, type TokenSource } from './token-source'
 import { listClaudeSessions } from './session-temp'
+import { sessionActivity } from './session-activity'
 
 const spies: Array<{ mockRestore(): void }> = []
 const sessions: Session[] = []
@@ -42,8 +43,8 @@ class Proc extends EventEmitter {
   sendInitialize() {}
   async kill() { this.killCalls++; this.alive = false; this.emit('exit', { code: 0, signal: null, expected: true }) }
 }
-function session(): any {
-  const s = new Session(`claude-account-test-${sessions.length}`, 'chat-claude-account') as any
+function session(chatId = 'chat-claude-account'): any {
+  const s = new Session(`claude-account-test-${sessions.length}`, chatId) as any
   s.selectedProvider = 'claude'; s.selectedTokenSourceId = 'claude-sub'
   s.selectedModel = 'opus'; s.selectedEffort = 'high'
   sessions.push(s)
@@ -199,11 +200,50 @@ describe('Claude named hi integration', () => {
     spies.push(choose)
     const proc = s.spawnAgent()
     try {
-      expect(choose).toHaveBeenCalledWith({ model: 'opus', effort: 'high', preferred: null })
+      expect(choose).toHaveBeenCalledWith({ model: 'opus', effort: 'high', preferred: null, activeSessions: new Map() })
       expect(processClaudeAccount(proc)).toBe(accountB)
       await expect(store.enroll('B', async () => accountInfo('b@example.test'))).rejects.toThrow('使用')
     } finally { await proc.kill() }
     expect((await store.enroll('B', async () => accountInfo('b@example.test'))).id).toBe(accountB)
+  })
+  test('Session spawn forwards actual active-account counts and the next synchronous launch sees the first binding', async () => {
+    const executing = session('active-A'); running(executing, accountA); executing.status = 'working'
+    const recent = session('recent-A'); running(recent, accountA)
+    const existingB = session('active-B'); running(existingB, accountB); existingB.status = 'working'
+    const thirdParty = session('third-party'); running(thirdParty, accountA)
+    thirdParty.proc.tokenSourceId = 'packy'; thirdParty.status = 'working'
+    const target = session('first-target'), secondTarget = session('second-target')
+    // The current chat must never be counted once as its old binding and again as the new launch.
+    const old = running(target, accountA); target.status = 'working'
+    for (const s of [target, secondTarget]) Object.defineProperty(s, 'workDir', { value: root, configurable: true })
+    const messageTimes = spyOn(sessionActivity, 'lastUserMessageAt').mockImplementation(chatId =>
+      chatId === recent.chatId ? Date.now() - 60_000 : undefined)
+    const snapshots: Array<Array<[string, number]>> = []
+    const choose = spyOn(selection, 'selectClaudeAccount').mockImplementation(options => {
+      const counts = options.activeSessions ?? new Map<string, number>()
+      snapshots.push([...counts].sort(([a], [b]) => a.localeCompare(b)))
+      return (counts.get(accountA) ?? 0) <= (counts.get(accountB) ?? 0) ? accountA : accountB
+    })
+    spies.push(messageTimes, choose)
+    // Constructors are inert until sendInitialize; this exercises the real shared launch and binding only.
+    const first = target.spawnAgent()
+    let second: NonNullable<Session['proc']> | undefined
+    try {
+      expect(new Map(snapshots[0])).toEqual(new Map([[accountA, 2], [accountB, 1]]))
+      expect(processClaudeAccount(first)).toBe(accountB)
+      old.alive = false
+      target.attachProc(first)
+      target.status = 'starting'
+      second = secondTarget.spawnAgent()
+      expect(new Map(snapshots[1])).toEqual(new Map([[accountA, 2], [accountB, 2]]))
+      expect(processClaudeAccount(second)).toBe(accountA)
+      expect(choose).toHaveBeenCalledTimes(2)
+      expect(snapshots[0]).not.toEqual(snapshots[1])
+    } finally {
+      target.detachProc(first)
+      await first.kill()
+      await second?.kill()
+    }
   })
   test('a named launch passes its explicit account once; the next launch asks for automatic selection', async () => {
     const s = session()

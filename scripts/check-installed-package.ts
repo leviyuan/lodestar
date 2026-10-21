@@ -14,9 +14,11 @@ assert.equal(installed.version, expected.version)
 assert.ok(!Object.keys(installed.dependencies).some(name => name.startsWith('@deepseek-ai/') || name.startsWith('@anthropic-ai/') || name === '@openai/codex'),
   'Agent 不应作为固定发布依赖安装')
 
-const help = Bun.spawnSync({ cmd: [join(prefix, 'node_modules/.bin/lodestar-agent'), '--help'], stdout: 'pipe', stderr: 'pipe' })
-assert.equal(help.exitCode, 0, help.stderr.toString())
-assert.ok(help.stdout.toString().includes('lodestar-agent'), 'npm 命令链接没有执行 CLI')
+for (const command of ['lodestar-agent', 'lodestar-claude']) {
+  const help = Bun.spawnSync({ cmd: [join(prefix, 'node_modules/.bin', command), '--help'], stdout: 'pipe', stderr: 'pipe' })
+  assert.equal(help.exitCode, 0, help.stderr.toString())
+  assert.ok(help.stdout.toString().includes(command), `${command} npm 命令链接没有执行 CLI`)
+}
 
 const scratch = mkdtempSync(join(tmpdir(), 'lodestar-installed-check-'))
 const entry = join(scratch, 'probe.ts')

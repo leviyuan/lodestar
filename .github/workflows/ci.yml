@@ -59,6 +59,7 @@ jobs:
           node --check dist/lodestar-stop.js
           node --check dist/lodestar-update.js
           node --check dist/lodestar-version.js
+          node --check dist/lodestar-claude.js
           node --check dist/lodestar-agent.js
           node --check dist/dsh-bridge.js
           node -e "Promise.all([import('@anthropic-ai/claude-agent-sdk'), import('@larksuiteoapi/node-sdk'), import('cross-spawn')])"

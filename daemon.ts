@@ -25,6 +25,7 @@ import { pendingSourceCommands } from './src/session-commands'
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { Session } from './src/session'
+import { sessionActivity } from './src/session-activity'
 import * as feishu from './src/feishu'
 import { formatFeishuError } from './src/feishu-errors'
 import * as cards from './src/cards'
@@ -484,6 +485,13 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   const sessionName = feishu.sanitizeSessionName(groupName)
   feishu.bindSessionToChat(sessionName, chatId)
   const session = sessionFor(chatId, sessionName)
+  try { sessionActivity.recordUserMessage(chatId, createTime, receivedAt) }
+  catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    log(`session activity persistence failed chat=${chatId}: ${reason}`)
+    await feishu.sendText(chatId, `❌ 用户消息活跃时间保存失败，未执行本条消息：${reason}`)
+    return
+  }
 
   let contentObj: any = {}
   try { contentObj = JSON.parse(message.content ?? '{}') } catch {}

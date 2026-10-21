@@ -28,6 +28,7 @@ lodestar-setup
 | `lodestar-stop` | 停止 daemon |
 | `lodestar-update` | 升级 Lodestar 及实际使用的 Codex、Claude Code/SDK、DSH；`--agents-only` 仅立即更新 Agent |
 | `lodestar-version` | 查看 Lodestar、实际 Agent 版本及运行目录 |
+| `lodestar-claude <备注> [原生参数...]` | 用户终端入口，使用 Lodestar 管理的当前 Claude 安装和对应账号目录；例如 `lodestar-claude 工作号 auth login`，不自动收录账号或清理历史 |
 | `lodestar-agent` | 调用已配置模型执行任务；不支持 Claude 订阅，遵守 Claude 用户协议，中转站等第三方 Claude 模型仍可调用 |
 
 启动和停止命令会核对 PID 对应的实际入口，读取进程信息失败时明确报错。无法识别的运行时选项、macOS 无法区分边界的含空格入口、Windows 相对入口也会拒绝操作，请通过对应服务管理器处理。旧式单行 PID 文件缺少入口标识，`lodestar-stop` 会拒绝发送信号；请先核对该 PID 的完整命令行，再通过服务管理器或精确 PID 停止。停止命令以进程退出为准，删除 PID 文件不会被当作停止成功。
