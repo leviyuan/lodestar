@@ -23,6 +23,7 @@ function fixture(env: Record<string, string | undefined> = {}) {
     writeFileSync(join(accounts.sharedConfigDir(), key, 'shared.txt'), 'shared:' + key)
   }
   writeFileSync(join(accounts.sharedConfigDir(), '.credentials.json'), 'SYNTHETIC-DEFAULT-CREDENTIAL')
+  writeFileSync(join(accounts.sharedConfigDir(), 'settings.json'), '{"theme":"global"}')
   const profile = (name = '备用一') => {
     const path = join(options.accountsDir, name); mkdirSync(path)
     for (const key of CLAUDE_SHARED_DIRS) { mkdirSync(join(path, key)); writeFileSync(join(path, key, 'old.txt'), 'old:' + key) }
@@ -110,7 +111,7 @@ describe('Claude native environment and explicit account enrollment', () => {
     }
     oldPresent(untouched); protect()
     expect(readFileSync(join(path, '.credentials.json'), 'utf8')).toBe('SYNTHETIC-EXTRA-CREDENTIAL')
-    expect(readFileSync(join(path, 'settings.json'), 'utf8')).toBe('SYNTHETIC-SETTINGS')
+    expect(readFileSync(join(path, 'settings.json'), 'utf8')).toBe('{"theme":"global"}')
     expect(readFileSync(accounts.stateFile, 'utf8')).not.toContain('one@example.test')
     if (process.platform !== 'win32') expect(lstatSync(accounts.stateFile).mode & 0o777).toBe(0o600)
   })
@@ -120,6 +121,65 @@ describe('Claude native environment and explicit account enrollment', () => {
     expect(() => accounts.find('missing')).toThrow('尚未收录')
     await expect(accounts.enroll('missing', async () => nativeInfo())).rejects.toThrow('目录不存在')
     expect(readdirSync(options.accountsDir)).toEqual(['existing']); oldPresent(sibling)
+  })
+  test('new named accounts discover global Skills while retaining their native authentication directories', async () => {
+    const { accounts, profile, protect } = fixture(); const path = profile()
+    const globalSkill = join(accounts.sharedConfigDir(), 'skills', 'shared-helper')
+    mkdirSync(globalSkill, { recursive: true })
+    writeFileSync(join(globalSkill, 'SKILL.md'), 'global skill')
+    const row = await accounts.enroll('备用一', async () => nativeInfo())
+    const env = accounts.env(row.id, {})
+    expect(env.CLAUDE_CONFIG_DIR).toBe(path)
+    expect(env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe(path)
+    expect(readFileSync(join(env.CLAUDE_CONFIG_DIR!, 'skills', 'shared-helper', 'SKILL.md'), 'utf8')).toBe('global skill')
+    expect(readFileSync(join(path, '.credentials.json'), 'utf8')).toBe('SYNTHETIC-EXTRA-CREDENTIAL')
+    expect(readFileSync(join(path, 'settings.json'), 'utf8')).toBe('{"theme":"global"}')
+    protect()
+  })
+  test.each(['implicit', 'explicit', 'legacy'])('shares %s native preferences and MCP definitions while keeping named login identity', async mode => {
+    const { accounts: original, options, root, profile, protect } = fixture(); const path = profile()
+    const accounts = mode === 'explicit'
+      ? new ClaudeAccounts({ ...options, env: { CLAUDE_CONFIG_DIR: original.sharedConfigDir() } }) : original
+    const source = mode === 'legacy' ? join(accounts.sharedConfigDir(), '.config.json')
+      : join(mode === 'explicit' ? accounts.sharedConfigDir() : root, '.claude.json')
+    writeFileSync(source, JSON.stringify({ oauthAccount: { accountUuid: 'default-account' },
+      mcpServers: { shared: { command: 'shared-server' } }, theme: 'global' }))
+    writeFileSync(join(path, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'named-account' },
+      mcpServers: { old: { command: 'old-server' } }, theme: 'private' }))
+    const before = readFileSync(source, 'utf8')
+    const row = await accounts.enroll('备用一', async () => nativeInfo())
+    accounts.env(row.id, {})
+    expect(JSON.parse(readFileSync(join(path, '.claude.json'), 'utf8'))).toEqual({
+      oauthAccount: { accountUuid: 'named-account' }, mcpServers: { shared: { command: 'shared-server' } }, theme: 'global',
+    })
+    expect(lstatSync(join(path, '.claude.json')).isSymbolicLink()).toBe(false)
+    expect(readFileSync(source, 'utf8')).toBe(before)
+    protect()
+  })
+  test.each(['launch', 'enroll'])('existing ready accounts gain global Skills on %s without migrating history or changing registry format', async method => {
+    const { accounts, options, profile, protect } = fixture(); const path = profile()
+    const row = await accounts.enroll('备用一', async () => nativeInfo())
+    // Simulate a v1 ready account from before non-login config sharing existed.
+    unlinkSync(join(path, 'skills')); mkdirSync(join(path, 'skills'))
+    const state = readFileSync(accounts.stateFile, 'utf8')
+    const globalSkill = join(accounts.sharedConfigDir(), 'skills', 'added-later')
+    mkdirSync(globalSkill, { recursive: true })
+    writeFileSync(join(globalSkill, 'SKILL.md'), 'added after enrollment')
+    const reloaded = new ClaudeAccounts(options)
+    if (method === 'launch') reloaded.env(row.id, {})
+    else await reloaded.enroll('备用一', async () => nativeInfo())
+    expect(readFileSync(join(path, 'skills', 'added-later', 'SKILL.md'), 'utf8')).toBe('added after enrollment')
+    expect(readFileSync(accounts.stateFile, 'utf8')).toBe(state)
+    protect()
+  })
+  test('global config failures are reported before any enrollment history is cleared', async () => {
+    const { accounts, root, profile, oldPresent, protect } = fixture(); const path = profile()
+    const globalSkill = join(accounts.sharedConfigDir(), 'skills', 'helper')
+    mkdirSync(globalSkill, { recursive: true }); writeFileSync(join(globalSkill, 'SKILL.md'), 'global')
+    symlinkSync(join(root, 'missing-source'), join(accounts.sharedConfigDir(), 'commands'), process.platform === 'win32' ? 'junction' : 'dir')
+    await expect(accounts.enroll('备用一', async () => nativeInfo())).rejects.toThrow('全局配置共享失败')
+    expect(existsSync(accounts.stateFile)).toBe(false)
+    oldPresent(path); protect()
   })
   test.each(['.', '..', '../escape', '/absolute', 'a/b', 'a\\b', 'bad\nname', 'bad\0name', ' leading', 'trailing ', 'trailing.', 'CON', 'a:b'])('rejects unsafe explicit remark %j', async name => {
     const { accounts, protect } = fixture()

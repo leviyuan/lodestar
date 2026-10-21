@@ -30,7 +30,7 @@ function scratch(): string {
 function fixture(install = true) {
   const root = scratch(), data = join(root, 'data'), runtime = join(root, 'runtime')
   const env: NodeJS.ProcessEnv = { ...process.env, NODE_ENV: 'production', LODESTAR_DATA_DIR: data,
-    LODESTAR_CONFIG: join(root, 'missing-config.toml') }
+    LODESTAR_CONFIG: join(root, 'missing-config.toml'), HOME: join(root, 'home'), USERPROFILE: join(root, 'home') }
   for (const key of managedKeys) delete env[key]
   delete env.LODESTAR_TEST_AGENT_RUNTIME_ROOT
   delete env.CLAUDE_CONFIG_DIR
@@ -69,7 +69,7 @@ else {
   } }
 }
 
-test('named native environments allow first login without creating or enrolling an account', () => {
+test('first native login prepares global configuration without credentials or account enrollment', () => {
   const root = scratch(), stateFile = join(root, 'accounts.json')
   const manager = new ClaudeAccounts({ home: root, stateFile, env: {} })
   const original = { HOME: homedir(), KEEP: 'unchanged', CLAUDE_CONFIG_DIR: '/other', CLAUDE_SECURESTORAGE_CONFIG_DIR: '/other' }
@@ -77,7 +77,9 @@ test('named native environments allow first login without creating or enrolling 
   expect(env).toEqual({ ...original, CLAUDE_CONFIG_DIR: join(root, '.claude-accounts', '工作号'),
     CLAUDE_SECURESTORAGE_CONFIG_DIR: join(root, '.claude-accounts', '工作号') })
   expect(original.CLAUDE_CONFIG_DIR).toBe('/other')
-  expect(readdirSync(root)).toEqual([])
+  expect(realpathSync(join(root, '.claude-accounts', '工作号', 'skills'))).toBe(realpathSync(join(root, '.claude', 'skills')))
+  expect(existsSync(join(root, '.claude-accounts', '工作号', '.credentials.json'))).toBe(false)
+  expect(existsSync(stateFile)).toBe(false)
   for (const name of ['../escape', 'a/b', 'a\\b', ' trailing ', 'CON']) {
     expect(() => manager.nativeCliEnv(name, original)).toThrow('备注名')
   }
@@ -95,6 +97,24 @@ test('registered case and Unicode aliases use the original path without changing
   expect(manager.nativeCliEnv('CAFE\u0301', {}).CLAUDE_CONFIG_DIR).toBe(profile)
   expect(readFileSync(stateFile, 'utf8')).toBe(before)
   expect(readFileSync(history, 'utf8')).toBe('native history')
+})
+
+test('existing terminal accounts use global configuration and history while leaving the registry untouched', () => {
+  const root = scratch(), stateFile = join(root, 'accounts.json')
+  const manager = new ClaudeAccounts({ home: root, stateFile, env: {} })
+  const profile = join(root, '.claude-accounts', '工作号'), skill = join(root, '.claude', 'skills', 'global-helper')
+  mkdirSync(join(profile, 'projects'), { recursive: true })
+  writeFileSync(join(profile, 'projects', 'keep.txt'), 'private history')
+  mkdirSync(skill, { recursive: true }); writeFileSync(join(skill, 'SKILL.md'), 'global skill')
+  mkdirSync(join(root, '.claude', 'projects'), { recursive: true })
+  writeFileSync(join(root, '.claude', 'projects', 'shared.txt'), 'global history')
+  const env = manager.nativeCliEnv('工作号', {})
+  expect(env.CLAUDE_CONFIG_DIR).toBe(profile)
+  expect(env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe(profile)
+  expect(readFileSync(join(profile, 'skills', 'global-helper', 'SKILL.md'), 'utf8')).toBe('global skill')
+  expect(existsSync(join(profile, 'projects', 'keep.txt'))).toBe(false)
+  expect(readFileSync(join(profile, 'projects', 'shared.txt'), 'utf8')).toBe('global history')
+  expect(existsSync(stateFile)).toBe(false)
 })
 
 test('native default keeps an unset or exact config and keychain namespace while preserving HOME', () => {
@@ -116,9 +136,9 @@ test('compiled terminal CLI passes native arguments and stdio exactly without ne
   const result = f.run(['未登录的工作号', ...args], 'native input\n')
   expect(result.status, result.stderr).toBe(0)
   expect(result.stderr).toBe('native stderr\n')
-  expect(JSON.parse(result.stdout)).toEqual({ args, input: 'native input\n', cwd: realpathSync(f.root), home: process.env.HOME,
-    configDir: join(homedir(), '.claude-accounts', '未登录的工作号'),
-    secureDir: join(homedir(), '.claude-accounts', '未登录的工作号'), sentinel: 'keep native environment' })
+  expect(JSON.parse(result.stdout)).toEqual({ args, input: 'native input\n', cwd: realpathSync(f.root), home: f.env.HOME,
+    configDir: join(f.env.HOME!, '.claude-accounts', '未登录的工作号'),
+    secureDir: join(f.env.HOME!, '.claude-accounts', '未登录的工作号'), sentinel: 'keep native environment' })
   expect(existsSync(join(f.data, 'claude-accounts.json'))).toBe(false)
   expect(existsSync(f.env.LODESTAR_CONFIG!)).toBe(false)
 })
@@ -127,7 +147,7 @@ test('compiled CLI preserves default namespace, native exit status and npm-style
   const f = fixture()
   const implicit = f.run(['default'])
   expect(implicit.status, implicit.stderr).toBe(0)
-  expect(JSON.parse(implicit.stdout)).toMatchObject({ configDir: null, secureDir: '', home: process.env.HOME })
+  expect(JSON.parse(implicit.stdout)).toMatchObject({ configDir: null, secureDir: '', home: f.env.HOME })
   f.env.CLAUDE_CONFIG_DIR = join(f.root, 'native') + '/'
   f.env.CLAUDE_SECURESTORAGE_CONFIG_DIR = '/wrong'
   const explicit = f.run(['default', '--exit', '37'])

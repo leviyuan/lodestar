@@ -13,7 +13,8 @@ const usage = [
   '  lodestar-claude default --help',
   '',
   '使用 Lodestar 当前选中的 Claude 原生运行时，保留当前终端的 HOME、工作目录和其他环境。',
-  '额外账号使用 ~/.claude-accounts/备注名；首次登录无需先收录，命令本身不创建目录或清理历史。',
+  '额外账号使用 ~/.claude-accounts/备注名；首次登录前准备共享配置，但不代办登录或收录账号。',
+  '账号目录只保留登录状态，其余以全局配置为准并链接共享，备注账号的旧内容会被替换。',
   'default 保留当前终端 CLAUDE_CONFIG_DIR 的未设置状态或原始路径，不读取 Lodestar 的 [claude.env]。',
   '仅供用户本机终端使用；受管 Agent 任务请使用 lodestar-agent。',
 ].join('\n')

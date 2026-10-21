@@ -6,6 +6,8 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { CLAUDE_ACCOUNTS_DIR, CLAUDE_ACCOUNTS_FILE } from './paths'
 import { writeJsonStateAtomic } from './state-store'
+import { syncClaudeAccountConfig } from './claude-account-config'
+import { syncClaudeAccountConfigState } from './claude-account-config-state'
 
 export const DEFAULT_CLAUDE_ACCOUNT = 'default'
 export const CLAUDE_SHARED_DIRS = ['projects', 'tasks', 'file-history', 'plans'] as const
@@ -112,6 +114,13 @@ export class ClaudeAccounts {
   configureNativeEnv(env: Env): void { this.nativeConfigDir = nativeConfigDirectory(env.CLAUDE_CONFIG_DIR) }
   private namespace(): string { return JSON.stringify([this.nativeConfigDir ?? null]) }
   sharedConfigDir(): string { return resolve(this.nativeConfigDir || join(this.home, '.claude')) }
+  private shareConfig(account: ClaudeAccount, excludeHistory = true): void {
+    const shared = this.sharedConfigDir()
+    const legacy = join(shared, '.config.json')
+    const nativeState = stat(legacy) ? legacy : join(this.nativeConfigDir || this.home, '.claude.json')
+    syncClaudeAccountConfigState(account.configDir!, shared, nativeState)
+    syncClaudeAccountConfig(account.configDir!, shared, excludeHistory ? CLAUDE_SHARED_DIRS : [])
+  }
 
   private read(): AccountState {
     const file = stat(this.stateFile)
@@ -182,13 +191,16 @@ export class ClaudeAccounts {
   }
   revision(id: string): string { return this.revisionOf(this.get(id)) }
 
-  /** Native terminal login may precede directory creation and enrollment. Never migrate history here. */
+  /** Prepare shared non-login config even for the first native terminal login.
+   * Directory creation does not authenticate or enroll the account. */
   nativeCliEnv(name: string, base: Env): Env {
     if (defaultName(name)) return this.env(DEFAULT_CLAUDE_ACCOUNT, base)
     const normalized = accountName(name)
     const old = this.read().accounts.find(row => nameKey(row.name) === nameKey(normalized))
     const candidate: ClaudeAccount = old ? clone(old)
       : { id: accountId(normalized), name: normalized, configDir: join(this.root, normalized), state: 'candidate', generation: 0 }
+    mkdirSync(candidate.configDir!, { recursive: true, mode: 0o700 })
+    this.shareConfig(candidate, false)
     return this.candidateEnv(candidate, base)
   }
 
@@ -246,13 +258,15 @@ export class ClaudeAccounts {
     }
     return { directory, shared }
   }
-  /** Ready accounts are validation-only. Never clear directories that reappear after enrollment. */
+  /** Validate history and share all global configuration, including pre-fix ready accounts.
+   * Never clear history directories that reappear after enrollment. */
   prepareShared(id: string): void {
     if (id === DEFAULT_CLAUDE_ACCOUNT) return
     const state = this.read(), row = state.accounts.find(row => row.id === id)
     if (!row || row.state !== 'ready') throw new Error('Claude 账号尚未完成收录，请显式发送 hi 备注重试')
     this.inspect(row, state, row)
     if (initializingDirectories.has(row.directoryKey)) throw new Error(`Claude 账号 ${row.name} 正在校验收录，请稍后重试`)
+    this.shareConfig(row)
   }
 
   acquireUse(id: string): () => void {
@@ -356,11 +370,13 @@ export class ClaudeAccounts {
       const { directory, shared } = this.inspect(candidate, state, old)
       if (directory !== key) throw new Error('Claude 认证期间账号目录已被替换，拒绝清理历史')
       if (old?.state === 'ready') {
+        this.shareConfig(old)
         this.observeIdentity(old.id, info, this.revisionOf(candidate))
         return this.get(old.id)
       }
       const duplicate = this.duplicate(state, candidate.id, identity)
       if (duplicate) throw authError(`Claude 账号与已收录账号「${duplicate}」是同一订阅身份，未清理该目录的历史`)
+      this.shareConfig(candidate)
       const row: StoredAccount = old ?? { ...candidate, configDir: candidate.configDir!, state: 'enrolling', directoryKey: directory, linked: [] }
       if (row.identity !== identity) { row.identity = identity; row.generation++ }
       if (!old) state.accounts.push(row)
