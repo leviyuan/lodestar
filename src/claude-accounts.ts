@@ -7,7 +7,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { CLAUDE_ACCOUNTS_DIR, CLAUDE_ACCOUNTS_FILE } from './paths'
 import { writeJsonStateAtomic } from './state-store'
 import { syncClaudeAccountConfig } from './claude-account-config'
-import { syncClaudeAccountConfigState } from './claude-account-config-state'
+import { claudeNativeConfigFile, syncClaudeAccountConfigState } from './claude-account-config-state'
 
 export const DEFAULT_CLAUDE_ACCOUNT = 'default'
 export const CLAUDE_SHARED_DIRS = ['projects', 'tasks', 'file-history', 'plans'] as const
@@ -114,11 +114,12 @@ export class ClaudeAccounts {
   configureNativeEnv(env: Env): void { this.nativeConfigDir = nativeConfigDirectory(env.CLAUDE_CONFIG_DIR) }
   private namespace(): string { return JSON.stringify([this.nativeConfigDir ?? null]) }
   sharedConfigDir(): string { return resolve(this.nativeConfigDir || join(this.home, '.claude')) }
-  private shareConfig(account: ClaudeAccount, excludeHistory = true): void {
+  private shareConfig(account: ClaudeAccount, excludeHistory = true, syncMcp = false): void {
     const shared = this.sharedConfigDir()
-    const legacy = join(shared, '.config.json')
-    const nativeState = stat(legacy) ? legacy : join(this.nativeConfigDir || this.home, '.claude.json')
-    syncClaudeAccountConfigState(account.configDir!, shared, nativeState)
+    if (syncMcp) {
+      const nativeState = claudeNativeConfigFile(shared, join(this.nativeConfigDir || this.home, '.claude.json'))
+      syncClaudeAccountConfigState(account.configDir!, shared, nativeState)
+    }
     syncClaudeAccountConfig(account.configDir!, shared, excludeHistory ? CLAUDE_SHARED_DIRS : [])
   }
 
@@ -200,7 +201,7 @@ export class ClaudeAccounts {
     const candidate: ClaudeAccount = old ? clone(old)
       : { id: accountId(normalized), name: normalized, configDir: join(this.root, normalized), state: 'candidate', generation: 0 }
     mkdirSync(candidate.configDir!, { recursive: true, mode: 0o700 })
-    this.shareConfig(candidate, false)
+    this.shareConfig(candidate, false, true)
     return this.candidateEnv(candidate, base)
   }
 
@@ -224,7 +225,7 @@ export class ClaudeAccounts {
     if (id === DEFAULT_CLAUDE_ACCOUNT) return this.candidateEnv({ id, name: '默认', state: 'ready', generation: 0 }, base)
     const account = this.get(id)
     if (account.state !== 'ready') throw new Error(`Claude 账号 ${account.name} 尚在收录，不能启动任务或查询`)
-    this.prepareShared(id)
+    this.validateShared(id)
     return this.candidateEnv(account, base)
   }
 
@@ -258,19 +259,24 @@ export class ClaudeAccounts {
     }
     return { directory, shared }
   }
-  /** Validate history and share all global configuration, including pre-fix ready accounts.
-   * Never clear history directories that reappear after enrollment. */
-  prepareShared(id: string): void {
-    if (id === DEFAULT_CLAUDE_ACCOUNT) return
+  /** Environment resolution and use leases only validate; they never sync MCP. */
+  private validateShared(id: string): StoredAccount | undefined {
+    if (id === DEFAULT_CLAUDE_ACCOUNT) return undefined
     const state = this.read(), row = state.accounts.find(row => row.id === id)
     if (!row || row.state !== 'ready') throw new Error('Claude 账号尚未完成收录，请显式发送 hi 备注重试')
     this.inspect(row, state, row)
     if (initializingDirectories.has(row.directoryKey)) throw new Error(`Claude 账号 ${row.name} 正在校验收录，请稍后重试`)
-    this.shareConfig(row)
+    return row
+  }
+
+  /** Called once before an actual account launch, never by background probes. */
+  prepareShared(id: string): void {
+    const row = this.validateShared(id)
+    if (row) this.shareConfig(row, true, true)
   }
 
   acquireUse(id: string): () => void {
-    this.prepareShared(id)
+    this.validateShared(id)
     const key = canonical(id === DEFAULT_CLAUDE_ACCOUNT ? this.sharedConfigDir() : this.get(id).configDir!)
     if (initializingDirectories.has(key)) throw new Error('Claude 账号正在收录，不能同时启动任务或额度查询')
     return this.useDirectory(key)

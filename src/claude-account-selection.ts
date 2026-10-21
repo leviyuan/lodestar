@@ -48,10 +48,7 @@ export function selectClaudeAccount(options: { model?: string | null; effort?: A
 export async function enrollClaudeAccount(name: string): Promise<string> {
   if (config.token_sources?.['claude-sub']?.enabled === false) throw new Error('Claude 订阅已禁用；发送 claude-sub on 启用')
   const candidate = claudeAccounts.candidate(name)
-  if (candidate.state === 'ready' && candidate.identity) {
-    claudeAccounts.prepareShared(candidate.id)
-    return candidate.id
-  }
+  if (candidate.state === 'ready' && candidate.identity) return candidate.id
   const account = await claudeAccounts.enroll(name, async candidate => {
     if (candidate.id === DEFAULT_CLAUDE_ACCOUNT && candidate.configDir === undefined) {
       assertClaudeDefaultSettingsEnvironment(claudeAccounts.sharedConfigDir())

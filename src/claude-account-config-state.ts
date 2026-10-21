@@ -1,23 +1,21 @@
 import { randomUUID } from 'node:crypto'
-import { lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, unlinkSync, writeFileSync, type Stats } from 'node:fs'
+import { existsSync, lstatSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync, type Stats } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
 type State = Record<string, unknown>
+type Snapshot = { value: State; text?: string; stat?: Stats }
+const PROJECT_MCP_FIELDS = ['mcpServers', 'enabledMcpServers', 'disabledMcpServers'] as const
 
-// Native performLogout clears these account-scoped bootstrap/entitlement caches.
-// Never import them from the default login, even when the named account has none.
-const ACCOUNT_FIELDS = new Set([
-  'oauthAccount', 'primaryApiKey', 'customApiKeyResponses',
-  'hasCompletedOnboarding', 'hasAvailableSubscription', 'lastOnboardingVersion', 'subscriptionNoticeCount',
-  'userID', 'machineID', 'summonSidKey', 'remoteControlMachineId',
-  'additionalModelOptionsCache', 'additionalModelOptionsAnsweredAt', 'additionalModelCostsCache',
-  'modelAccessCache', 'orgModelDefaultCache', 'cachedArtifactRoster', 'lastSeenOrgDefaultUpdatedAt',
-  'clientDataCache', 'clientDataCacheSlots', 'autoCompactWindowsCache', 'cachedUsageUtilization',
-  'githubWebConnectionStatusCache', 'startupPrefetchedAt',
-  'cachedDynamicConfigs', 'cachedGrowthBookFeatures', 'cachedGrowthBookFeaturesAt',
-  'cachedExperimentFeatures', 'cachedExperimentData',
-])
+/** Match native legacy selection; an empty legacy file must not hide current state. */
+export function claudeNativeConfigFile(configDir: string, current = join(configDir, '.claude.json')): string {
+  const legacy = join(configDir, '.config.json')
+  try {
+    const stat = statSync(legacy)
+    if (stat.isFile() && (stat.size > 0 || (stat.mode & 0o222) !== 0 && !existsSync(current))) return legacy
+  } catch { /* Native also ignores an unavailable optional legacy candidate. */ }
+  return current
+}
 
 function inspect(path: string): Stats | undefined {
   try { return lstatSync(path) }
@@ -38,7 +36,11 @@ function contains(parent: string, child: string): boolean {
   return path === '' || (!isAbsolute(path) && path !== '..' && !path.startsWith(`..${sep}`))
 }
 
-function readState(path: string): { value: State; text?: string; stat?: Stats } {
+function object(value: unknown): value is State {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function readState(path: string): Snapshot {
   const stat = inspect(path)
   if (!stat) return { value: {} }
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`原生配置状态必须为独立文件：${path}`)
@@ -46,42 +48,67 @@ function readState(path: string): { value: State; text?: string; stat?: Stats } 
   let value: unknown
   try { value = JSON.parse(text) }
   catch { throw new Error(`原生配置状态 JSON 无效：${path}`) }
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`原生配置状态必须为 JSON 对象：${path}`)
-  return { value: value as State, text, stat }
+  if (!object(value)) throw new Error(`原生配置状态必须为 JSON 对象：${path}`)
+  return { value, text, stat }
 }
 
-interface HeldLock { path: string; stat: Stats; acquired: number }
+function projects(state: State): State {
+  if (!Object.hasOwn(state, 'projects')) return {}
+  if (!object(state.projects)) throw new Error('原生配置 projects 必须为 JSON 对象')
+  return state.projects
+}
 
-// Claude's native filesystem writer uses proper-lockfile with an explicit
-// `${configFile}.lock` directory, a 10s stale threshold and ~5s heartbeat.
-// This synchronous transaction takes the same lock and finishes before 5s;
-// it never steals even an apparently stale lock or falls back to an unlocked write.
-// Native custom storage backends/unlocked fallback writers cannot be coordinated
-// by a filesystem lock; compare the original bytes again immediately before commit.
-function acquireLock(path: string): HeldLock {
-  const lockPath = `${path}.lock`
-  try { mkdirSync(lockPath, { mode: 0o700 }) }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error(`原生配置正在被写入，未覆盖：${path}`)
-    throw error
+function mcpFields(project: unknown): State {
+  if (!object(project)) return {}
+  return Object.fromEntries(PROJECT_MCP_FIELDS.filter(key => Object.hasOwn(project, key)).map(key => [key, project[key]]))
+}
+
+function mcpConfig(state: State): State {
+  const entries = Object.entries(projects(state)).map(([path, project]): [string, State] => [path, mcpFields(project)])
+  return {
+    ...(Object.hasOwn(state, 'mcpServers') ? { mcpServers: state.mcpServers } : {}),
+    projects: Object.fromEntries(entries.filter(([, fields]) => Object.keys(fields).length)),
   }
-  return { path: lockPath, stat: lstatSync(lockPath), acquired: performance.now() }
 }
 
-function verifyLock(lock: HeldLock): void {
-  const stat = inspect(lock.path)
-  if (!stat?.isDirectory() || stat.isSymbolicLink() || stat.dev !== lock.stat.dev || stat.ino !== lock.stat.ino) {
-    throw new Error(`原生配置写锁已变化，拒绝覆盖：${lock.path}`)
+/** Replace only currently used native MCP fields. Keep every other target field,
+ * including unknown future login state, preferences, trust and legacy MCP approvals.
+ * Legacy approvals migrate to settings.local.json natively; never import them back. */
+function mergeMcp(target: State, source: State): State {
+  const next = { ...target }
+  if (Object.hasOwn(source, 'mcpServers')) next.mcpServers = source.mcpServers
+  else delete next.mcpServers
+  const ownProjects = new Map(Object.entries(projects(target)))
+  for (const path of Object.keys(mcpConfig(source).projects as State)) {
+    if (!ownProjects.has(path)) ownProjects.set(path, {})
   }
-  if (performance.now() - lock.acquired >= 5_000) throw new Error(`原生配置共享持锁超时，拒绝覆盖：${lock.path}`)
+  const sourceProjects = projects(source)
+  for (const [path, old] of ownProjects) {
+    const desired = mcpFields(Object.hasOwn(sourceProjects, path) ? sourceProjects[path] : undefined)
+    if (!object(old)) {
+      if (Object.keys(desired).length) throw new Error(`原生配置项目必须为 JSON 对象：${path}`)
+      continue
+    }
+    const project = { ...old }
+    for (const key of PROJECT_MCP_FIELDS) {
+      if (Object.hasOwn(desired, key)) project[key] = desired[key]
+      else delete project[key]
+    }
+    ownProjects.set(path, project)
+  }
+  if (Object.hasOwn(target, 'projects') || ownProjects.size) next.projects = Object.fromEntries(ownProjects)
+  return next
 }
 
-/** Copy ordinary native state while leaving every account's login metadata independent.
- * The caller supplies the effective global JSON path (including its legacy priority).
- * Settings/Skills/etc. are shared separately; credentials are never read here. */
+function unchanged(before: Snapshot, after: Snapshot): boolean {
+  return before.text === after.text && before.stat?.dev === after.stat?.dev && before.stat?.ino === after.stat?.ino
+}
+
+/** Startup-only synchronous MCP comparison. Equal MCP means zero writes, even
+ * when native lock files exist. This code never creates, waits for or removes locks.
+ * Byte/inode rechecks detect observed external writes; atomic rename prevents
+ * partial JSON, but neither is a cross-process compare-and-swap guarantee. */
 export function syncClaudeAccountConfigState(accountDir: string, sharedDir: string, nativeConfigFile: string): void {
-  const locks: HeldLock[] = []
-  let failure: unknown
   try {
     if (![accountDir, sharedDir, nativeConfigFile].every(isAbsolute)) throw new Error('Claude 配置路径必须为绝对路径')
     const account = inspect(accountDir)
@@ -89,65 +116,31 @@ export function syncClaudeAccountConfigState(accountDir: string, sharedDir: stri
     const accountRoot = canonical(accountDir), sharedRoot = canonical(sharedDir)
     if (contains(accountRoot, sharedRoot) || contains(sharedRoot, accountRoot)) throw new Error('Claude 全局配置目录与账号目录重叠')
     if (contains(accountRoot, canonical(nativeConfigFile))) throw new Error('Claude 全局状态文件不能位于账号目录内')
-
-    // Native prefers .config.json when it exists. Update any existing inactive
-    // .claude.json too, preserving that file's own identity instead of copying it.
-    const legacy = join(accountDir, '.config.json'), current = join(accountDir, '.claude.json')
-    const paths = inspect(legacy) ? [legacy, ...(inspect(current) ? [current] : [])] : [current]
-    const sourcePresent = inspect(nativeConfigFile) !== undefined
-    const source = canonical(nativeConfigFile)
-    if (sourcePresent && contains(accountRoot, source)) throw new Error('Claude 全局状态文件实际位于账号目录内')
-    // Validate every destination before even placing a lock in a source directory.
-    for (const path of paths) {
-      const stat = inspect(path)
-      if (stat && (stat.isSymbolicLink() || !stat.isFile())) throw new Error(`原生配置状态必须为独立文件：${path}`)
-    }
-    if (!sourcePresent && paths.every(path => !inspect(path))) return
-    const lockFiles = new Map<string, string>()
-    for (const path of [...paths, ...(sourcePresent ? [nativeConfigFile, source] : [])]) {
-      lockFiles.set(canonical(`${path}.lock`), path)
-    }
-    for (const path of [...lockFiles.values()].sort()) locks.push(acquireLock(path))
-    const global = sourcePresent ? readState(source) : { value: {} as State, text: undefined, stat: undefined }
-    const ordinary = Object.fromEntries(Object.entries(global.value).filter(([key]) => !ACCOUNT_FIELDS.has(key)))
-    const plans = paths.map(path => {
-      const old = readState(path)
-      if (old.stat && global.stat && old.stat.dev === global.stat.dev && old.stat.ino === global.stat.ino) {
-        throw new Error(`账号原生状态与全局状态指向同一文件：${path}`)
+    // Only the file native Claude will read is relevant. Leave inactive files alone.
+    const target = claudeNativeConfigFile(accountDir)
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const sourcePath = canonical(nativeConfigFile)
+      if (contains(accountRoot, sourcePath)) throw new Error('Claude 全局状态文件实际位于账号目录内')
+      const source = readState(sourcePath), old = readState(target)
+      if (old.stat && source.stat && old.stat.dev === source.stat.dev && old.stat.ino === source.stat.ino) {
+        throw new Error(`账号原生状态与全局状态指向同一文件：${target}`)
       }
-      const own = Object.fromEntries(Object.entries(old.value).filter(([key]) => ACCOUNT_FIELDS.has(key)))
-      return { path, old, next: { ...ordinary, ...own } }
-    })
-    for (const plan of plans) {
-      if (isDeepStrictEqual(plan.old.value, plan.next)) continue
-      const temporary = join(accountDir, `${basename(plan.path)}.${process.pid}.${randomUUID()}.tmp`)
+      if (isDeepStrictEqual(mcpConfig(old.value), mcpConfig(source.value))) return
+      const next = mergeMcp(old.value, source.value)
+      const temporary = join(accountDir, `${basename(target)}.${process.pid}.${randomUUID()}.tmp`)
       let temporaryExists = false
       try {
-        writeFileSync(temporary, `${JSON.stringify(plan.next, null, 2)}\n`, { flag: 'wx', mode: 0o600 })
+        writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, { flag: 'wx', mode: 0o600 })
         temporaryExists = true
-        for (const lock of locks) verifyLock(lock)
-        if (canonical(nativeConfigFile) !== source || readState(source).text !== global.text) {
-          throw new Error('全局原生配置在共享期间发生变化，拒绝覆盖')
-        }
-        const latest = readState(plan.path)
-        if (latest.text !== plan.old.text || latest.stat?.ino !== plan.old.stat?.ino || latest.stat?.dev !== plan.old.stat?.dev) {
-          throw new Error(`原生配置在共享期间发生变化，拒绝覆盖：${plan.path}`)
-        }
-        renameSync(temporary, plan.path)
+        if (canonical(nativeConfigFile) !== sourcePath || !unchanged(source, readState(sourcePath))
+          || !unchanged(old, readState(target))) continue
+        renameSync(temporary, target)
         temporaryExists = false
+        return
       } finally { if (temporaryExists) unlinkSync(temporary) }
     }
-  } catch (error) { failure = error }
-  finally {
-    for (const lock of locks.reverse()) {
-      try {
-        const stat = inspect(lock.path)
-        if (!stat?.isDirectory() || stat.isSymbolicLink() || stat.dev !== lock.stat.dev || stat.ino !== lock.stat.ino) {
-          throw new Error(`原生配置写锁已被替换，未删除他人锁：${lock.path}`)
-        }
-        rmdirSync(lock.path)
-      } catch (error) { failure = failure ? new AggregateError([failure, error], '配置状态共享与释放写锁均失败') : error }
-    }
+    throw new Error('原生配置在 MCP 同步期间持续变化，未覆盖；请重试启动')
+  } catch (error) {
+    throw new Error(`Claude MCP 配置同步失败：${error instanceof Error ? error.message : String(error)}`, { cause: error })
   }
-  if (failure) throw new Error(`Claude 全局配置状态共享失败：${failure instanceof Error ? failure.message : String(failure)}`, { cause: failure })
 }

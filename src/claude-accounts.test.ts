@@ -136,7 +136,7 @@ describe('Claude native environment and explicit account enrollment', () => {
     expect(readFileSync(join(path, 'settings.json'), 'utf8')).toBe('{"theme":"global"}')
     protect()
   })
-  test.each(['implicit', 'explicit', 'legacy'])('shares %s native preferences and MCP definitions while keeping named login identity', async mode => {
+  test.each(['implicit', 'explicit', 'legacy'])('syncs only %s native MCP definitions at launch while keeping all other named state', async mode => {
     const { accounts: original, options, root, profile, protect } = fixture(); const path = profile()
     const accounts = mode === 'explicit'
       ? new ClaudeAccounts({ ...options, env: { CLAUDE_CONFIG_DIR: original.sharedConfigDir() } }) : original
@@ -147,10 +147,16 @@ describe('Claude native environment and explicit account enrollment', () => {
     writeFileSync(join(path, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'named-account' },
       mcpServers: { old: { command: 'old-server' } }, theme: 'private' }))
     const before = readFileSync(source, 'utf8')
+    const accountBefore = readFileSync(join(path, '.claude.json'), 'utf8')
     const row = await accounts.enroll('备用一', async () => nativeInfo())
+    expect(readFileSync(join(path, '.claude.json'), 'utf8')).toBe(accountBefore)
     accounts.env(row.id, {})
+    const release = accounts.acquireUse(row.id)
+    release()
+    expect(readFileSync(join(path, '.claude.json'), 'utf8')).toBe(accountBefore)
+    accounts.prepareShared(row.id)
     expect(JSON.parse(readFileSync(join(path, '.claude.json'), 'utf8'))).toEqual({
-      oauthAccount: { accountUuid: 'named-account' }, mcpServers: { shared: { command: 'shared-server' } }, theme: 'global',
+      oauthAccount: { accountUuid: 'named-account' }, mcpServers: { shared: { command: 'shared-server' } }, theme: 'private',
     })
     expect(lstatSync(join(path, '.claude.json')).isSymbolicLink()).toBe(false)
     expect(readFileSync(source, 'utf8')).toBe(before)
@@ -166,11 +172,22 @@ describe('Claude native environment and explicit account enrollment', () => {
     mkdirSync(globalSkill, { recursive: true })
     writeFileSync(join(globalSkill, 'SKILL.md'), 'added after enrollment')
     const reloaded = new ClaudeAccounts(options)
-    if (method === 'launch') reloaded.env(row.id, {})
+    if (method === 'launch') reloaded.prepareShared(row.id)
     else await reloaded.enroll('备用一', async () => nativeInfo())
     expect(readFileSync(join(path, 'skills', 'added-later', 'SKILL.md'), 'utf8')).toBe('added after enrollment')
     expect(readFileSync(accounts.stateFile, 'utf8')).toBe(state)
     protect()
+  })
+  test('empty global legacy file does not hide current MCP configuration during startup', async () => {
+    const { accounts, root, profile } = fixture(); const path = profile()
+    const mcpServers = { shared: { command: 'current-global-server' } }
+    writeFileSync(join(accounts.sharedConfigDir(), '.config.json'), '')
+    writeFileSync(join(root, '.claude.json'), JSON.stringify({ mcpServers }))
+    writeFileSync(join(path, '.claude.json'), JSON.stringify({ theme: 'own' }))
+    const row = await accounts.enroll('备用一', async () => nativeInfo())
+    accounts.prepareShared(row.id)
+    expect(JSON.parse(readFileSync(join(path, '.claude.json'), 'utf8'))).toEqual({ theme: 'own', mcpServers })
+    expect(readFileSync(join(accounts.sharedConfigDir(), '.config.json'), 'utf8')).toBe('')
   })
   test('global config failures are reported before any enrollment history is cleared', async () => {
     const { accounts, root, profile, oldPresent, protect } = fixture(); const path = profile()

@@ -7,6 +7,81 @@ function isolated(script: string): void {
   expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
 }
 
+test('named Claude accounts synchronize once at model startup and never during catalog, quota or ready-account checks', () => {
+  isolated(`
+    import assert from 'node:assert/strict'
+    import { mock } from 'bun:test'
+    import { EventEmitter } from 'node:events'
+    import { mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync, rmSync } from 'node:fs'
+    import { join } from 'node:path'
+    import { tmpdir } from 'node:os'
+    const dir = mkdtempSync(join(tmpdir(), 'claude-startup-sync-'))
+    process.env.CLAUDE_CONFIG_DIR = join(dir, 'native')
+    const { config } = await import('./src/config'); config.claude.env = {}
+    const accounts = await import('./src/claude-accounts')
+    const manager = new accounts.ClaudeAccounts({ home: dir, accountsDir: join(dir, 'accounts'),
+      stateFile: join(dir, 'accounts.json'), env: process.env })
+    const info = { email: 'named@example.test', organization: 'test', subscriptionType: 'max', apiProvider: 'firstParty' }
+    mkdirSync(join(manager.root, 'named'), { recursive: true })
+    const account = await manager.enroll('named', async () => info)
+    const target = join(account.configDir, '.claude.json')
+    const before = JSON.stringify({ mcpServers: { old: { command: 'old-server' } }, theme: 'account-preference' })
+    const servers = { shared: { command: 'shared-server' } }
+    writeFileSync(join(manager.sharedConfigDir(), '.claude.json'), JSON.stringify({ mcpServers: servers, theme: 'global-preference' }))
+    writeFileSync(target, before)
+    const beforeStat = statSync(target)
+    const preparations = [], prepareShared = manager.prepareShared.bind(manager)
+    manager.prepareShared = id => { preparations.push(id); return prepareShared(id) }
+    mock.module('./src/claude-accounts', () => ({ ...accounts, claudeAccounts: manager }))
+    class FakeProcess extends EventEmitter {
+      constructor(options) {
+        super(); this.options = options; this.alive = true
+        assert.equal(options.prepare, undefined)
+        options.transformEnv?.({})
+      }
+      isAlive() { return this.alive }
+      async kill() { this.alive = false; this.emit('exit', { code: 0, signal: null, expected: true }) }
+      async listModels() {
+        await this.options.validateAccount?.(info)
+        return [{ model: 'opus', displayName: 'Opus',
+          supportedReasoningEfforts: [{ reasoningEffort: 'high' }], defaultReasoningEffort: 'high' }]
+      }
+      async readSubscriptionUsage() {
+        await this.options.validateAccount?.(info)
+        return { subscription_type: 'max', rate_limits_available: true, rate_limits: {
+          five_hour: { utilization: 10, resets_at: null }, seven_day: { utilization: 20, resets_at: null },
+        } }
+      }
+    }
+    mock.module('./src/claude-agent-process', () => ({ ClaudeAgentProcess: FakeProcess, assertClaudeCodeAvailable() {} }))
+    const registry = await import('./src/token-source')
+    await import('./src/token-source-claude')
+    const { createAgentProcess } = await import('./src/agent-launch')
+    const { enrollClaudeAccount } = await import('./src/claude-account-selection')
+    const root = registry.tokenSourceFactories().find(item => item.kind === 'claude-subscription').build({})
+    registry.resetTokenSourceRegistry(); registry.registerTokenSource(root)
+    const source = root.forAccount(account.id)
+    try {
+      await source.refreshModels()
+      assert.equal(source.modelCatalogState.status, 'ready')
+      assert.equal((await source.readUsage()).state, 'ok')
+      assert.equal(await enrollClaudeAccount('named'), account.id)
+      assert.deepEqual(preparations, [])
+      assert.equal(readFileSync(target, 'utf8'), before)
+      assert.equal(statSync(target).mtimeMs, beforeStat.mtimeMs)
+      assert.equal(statSync(target).ino, beforeStat.ino)
+      const created = createAgentProcess({ provider: 'claude', tokenSourceId: 'claude-sub', claudeAccountId: account.id,
+        workDir: dir, model: 'opus', effort: 'high' })
+      try {
+        assert.deepEqual(preparations, [account.id])
+        assert.deepEqual(JSON.parse(readFileSync(target, 'utf8')), { mcpServers: servers, theme: 'account-preference' })
+        source.spawnEnv({})
+        assert.deepEqual(preparations, [account.id])
+      } finally { await created.process.kill() }
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  `)
+})
+
 test('native default settings cannot redirect config or keychain before the SDK query is created', () => {
   isolated(`
     import assert from 'node:assert/strict'
