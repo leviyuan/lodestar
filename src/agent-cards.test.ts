@@ -488,6 +488,230 @@ describe('shared delegation card lifecycle', () => {
     expect(h.disposed.has('message-1')).toBe(true)
   })
 
+  test('settings capacity after an append splits the landed row without duplication', async () => {
+    const h = harness()
+    const a = run('a'), b = run('b')
+    await h.cards.add(a)
+    const patch = h.deps.patchSettingsChecked
+    h.deps.patchSettingsChecked = async (cardId, settings, onFailure) => {
+      if (cardId === 'message-1' && h.elements.get(cardId)!.size > 1) {
+        onFailure?.({ cardId, operation: 'patchSettings', code: 200860, logId: 'append-settings', message: 'card over max size' })
+        return false
+      }
+      return patch(cardId, settings, onFailure)
+    }
+    await h.cards.add(b)
+    expect(h.sent).toHaveLength(2)
+    expect(b.cardMessageId).toBe('message-2')
+    expect(h.elements.get('message-1')!.has(agentRunElementId('b'))).toBe(false)
+    expect(h.elements.get('message-2')!.size).toBe(1)
+    expect(h.settings.get('message-1').config.streaming_mode).toBe(true)
+    terminal(a)
+    await h.cards.update(a, true)
+    expect(h.disposed.has('message-1')).toBe(true)
+    expect(h.settings.get('message-2').config.streaming_mode).toBe(true)
+  })
+
+  test('splitting an append to a completed card reconfirms its cached closed settings', async () => {
+    const h = harness()
+    const first = { ...background('first'), status: 'completed' as const }
+    const second = { ...background('second'), status: 'completed' as const }
+    await h.cards.syncBackground('chat', 'session', [first, second])
+    const originalSettings = structuredClone(h.settings.get('message-1'))
+    const append = h.deps.addElementResult
+    h.deps.addElementResult = async (cardId, element) => {
+      const result = await append(cardId, element)
+      // Card Kit can reopen streaming when a body mutation lands.
+      h.settings.get(cardId).config.streaming_mode = true
+      return result
+    }
+    const patch = h.deps.patchSettingsChecked
+    const oldCardPatches: any[] = []
+    h.deps.patchSettingsChecked = async (cardId, settings, onFailure) => {
+      if (cardId === 'message-1') {
+        oldCardPatches.push(structuredClone(settings))
+        if (h.elements.get(cardId)!.size > 2) {
+          onFailure?.({ cardId, operation: 'patchSettings', code: 200860, message: 'card over max size' })
+          return false
+        }
+      }
+      return patch(cardId, settings, onFailure)
+    }
+    await h.cards.add(run('next'))
+    expect(h.sent).toHaveLength(2)
+    expect(oldCardPatches).toHaveLength(2)
+    expect(oldCardPatches[0].config.streaming_mode).toBe(true)
+    expect(oldCardPatches[1]).toEqual(originalSettings)
+    expect(h.settings.get('message-1').config.streaming_mode).toBe(false)
+    expect(h.disposed.has('message-1')).toBe(true)
+    expect(h.settings.get('message-2').config.streaming_mode).toBe(true)
+  })
+
+  test('settings capacity after a background result splits once and confirms the new snapshot', async () => {
+    const h = harness()
+    const child = background('child', 'subagent'), other = background('other')
+    await h.cards.syncBackground('chat', 'session', [child, other])
+    const patch = h.deps.patchSettingsChecked
+    let capacityFailures = 0
+    h.deps.patchSettingsChecked = async (cardId, settings, onFailure) => {
+      if (cardId === 'message-1' && h.elements.get(cardId)!.size > 1) {
+        capacityFailures++
+        onFailure?.({ cardId, operation: 'patchSettings', code: 200860, logId: 'result-settings', message: 'card over max size' })
+        return false
+      }
+      return patch(cardId, settings, onFailure)
+    }
+    const completed = { ...child, status: 'completed' as const, summary: '完整子任务结果' }
+    await h.cards.syncBackground('chat', 'session', [completed, other])
+    expect(h.sent).toHaveLength(2)
+    expect(capacityFailures).toBe(1)
+    expect(h.elements.get('message-1')!.size).toBe(1)
+    expect(JSON.stringify([...h.elements.get('message-2')!.values()])).toContain('完整子任务结果')
+    expect(h.settings.get('message-1').config.streaming_mode).toBe(true)
+    expect(h.settings.get('message-2').config.streaming_mode).toBe(false)
+    h.deps.replaceElementResult = async () => { throw new Error('unchanged snapshot must not retry') }
+    await h.cards.syncBackground('chat', 'session', [completed, other])
+    expect(h.sent).toHaveLength(2)
+  })
+
+  test('row capacity migration frees space before settling the full old card', async () => {
+    const h = harness()
+    const first = { ...background('first'), status: 'completed' as const }
+    const second = { ...background('second'), status: 'completed' as const }
+    await h.cards.syncBackground('chat', 'session', [first, second])
+    const replace = h.deps.replaceElementResult
+    h.deps.replaceElementResult = async (cardId, key, element) => cardId === 'message-1'
+      ? failure(200860) : replace(cardId, key, element)
+    const patch = h.deps.patchSettingsChecked
+    h.deps.patchSettingsChecked = async (cardId, settings, onFailure) => {
+      if (cardId === 'message-1') expect(h.elements.get(cardId)!.size).toBe(1)
+      return patch(cardId, settings, onFailure)
+    }
+    // A correction to a completed card invalidates its old streaming settings.
+    await h.cards.syncBackground('chat', 'session', [{ ...first, status: 'failed', error: '原生终态纠正' }, second])
+    expect(h.sent).toHaveLength(2)
+    expect(h.disposed.has('message-1')).toBe(true)
+    expect(h.settings.get('message-2').config.streaming_mode).toBe(false)
+  })
+
+  test('single-row settings capacity reports its original error without creating more cards', async () => {
+    const h = harness()
+    const a = run('a'), b = run('b')
+    await h.cards.add(a)
+    await h.cards.add(b)
+    h.deps.patchSettingsChecked = async (cardId, _settings, onFailure) => {
+      onFailure?.({ cardId, operation: 'patchSettings', code: 200860, logId: `capacity-${cardId}`, message: 'card over max size' })
+      return false
+    }
+    terminal(a)
+    const error = await h.cards.update(a, true).catch(error => error)
+    expect(error).toBeInstanceOf(AggregateError)
+    expect(error.errors).toHaveLength(2)
+    expect(error.errors.every((item: unknown) => item instanceof Error)).toBe(true)
+    expect(error.errors[0].message).toContain('code=200860 message=card over max size log_id=capacity-message-1')
+    expect(error.errors[1].message).toContain('code=200860 message=card over max size log_id=capacity-message-2')
+    expect(h.sent).toHaveLength(2)
+    expect(a.cardMessageId).toBe('message-2')
+    await expect(h.cards.update(a, true)).rejects.toThrow('code=200860 message=card over max size log_id=capacity-message-2')
+    expect(h.sent).toHaveLength(2)
+    expect(h.disposed.size).toBe(0)
+  })
+
+  test('failed creation during settings capacity recovery preserves the old row for retry', async () => {
+    const h = harness()
+    const a = run('a'), b = run('b')
+    await h.cards.add(a)
+    await h.cards.add(b)
+    const patch = h.deps.patchSettingsChecked
+    h.deps.patchSettingsChecked = async (cardId, settings, onFailure) => {
+      if (h.elements.get(cardId)!.size > 1) {
+        onFailure?.({ cardId, operation: 'patchSettings', code: 200860, message: 'card over max size' })
+        return false
+      }
+      return patch(cardId, settings, onFailure)
+    }
+    const send = h.deps.sendCard
+    h.deps.sendCard = async (_chatId, _card, onFailure) => {
+      onFailure?.(new Error('new card unavailable'))
+      return null
+    }
+    terminal(a)
+    await expect(h.cards.update(a, true)).rejects.toThrow('new card unavailable')
+    expect(a.cardMessageId).toBe('message-1')
+    expect(h.elements.get('message-1')!.size).toBe(2)
+    h.deps.sendCard = send
+    await h.cards.update(a, true)
+    expect(a.cardMessageId).toBe('message-2')
+    expect(h.elements.get('message-1')!.size).toBe(1)
+    expect(h.settings.get('message-2').config.streaming_mode).toBe(false)
+  })
+
+  test('background sync retries failed old-card settings without rewriting unchanged old rows', async () => {
+    const h = harness()
+    const first = { ...background('first'), status: 'completed' as const }
+    const second = background('second')
+    await h.cards.syncBackground('chat', 'session', [first, second])
+    const patch = h.deps.patchSettingsChecked
+    let oldSettingsAttempts = 0, oldRowWrites = 0, rejectOldSettings = true
+    const replace = h.deps.replaceElementResult
+    h.deps.replaceElementResult = async (cardId, key, element) => {
+      if (cardId === 'message-1') oldRowWrites++
+      return replace(cardId, key, element)
+    }
+    h.deps.patchSettingsChecked = async (cardId, settings, onFailure) => {
+      if (cardId === 'message-1') {
+        oldSettingsAttempts++
+        if (h.elements.get(cardId)!.size > 1 || rejectOldSettings) {
+          const full = h.elements.get(cardId)!.size > 1
+          onFailure?.({ cardId, operation: 'patchSettings', code: full ? 200860 : 300317, message: full ? 'card over max size' : 'old card settings rejected' })
+          return false
+        }
+      }
+      return patch(cardId, settings, onFailure)
+    }
+    const completed = { ...second, status: 'completed' as const }
+    await expect(h.cards.syncBackground('chat', 'session', [first, completed])).rejects.toThrow('old card settings rejected')
+    expect(oldSettingsAttempts).toBe(2)
+    expect(oldRowWrites).toBe(1)
+    expect(h.disposed.has('message-1')).toBe(false)
+    await expect(h.cards.syncBackground('chat', 'session', [first, completed])).rejects.toThrow('old card settings rejected')
+    expect(oldSettingsAttempts).toBe(3)
+    expect(oldRowWrites).toBe(1)
+    rejectOldSettings = false
+    await h.cards.syncBackground('chat', 'session', [first, completed])
+    expect(oldSettingsAttempts).toBe(4)
+    expect(oldRowWrites).toBe(1)
+    expect(h.disposed.has('message-1')).toBe(true)
+    expect(h.settings.get('message-1').config.streaming_mode).toBe(false)
+    await h.cards.syncBackground('chat', 'session', [first, completed])
+    expect(oldSettingsAttempts).toBe(4)
+  })
+
+  test('closeChat drains failed sealed groups after their background owners are released', async () => {
+    const h = harness()
+    const first = { ...background('first'), status: 'completed' as const }
+    const second = background('second')
+    await h.cards.syncBackground('chat', 'first-owner', [first])
+    await h.cards.syncBackground('chat', 'second-owner', [second])
+    const patch = h.deps.patchSettingsChecked
+    h.deps.patchSettingsChecked = async (cardId, settings, onFailure) => {
+      if (cardId === 'message-1') {
+        const full = h.elements.get(cardId)!.size > 1
+        onFailure?.({ cardId, operation: 'patchSettings', code: full ? 200860 : 300317, message: full ? 'card over max size' : 'old card settings rejected' })
+        return false
+      }
+      return patch(cardId, settings, onFailure)
+    }
+    await expect(h.cards.syncBackground('chat', 'second-owner', [{ ...second, status: 'completed' }]))
+      .rejects.toThrow('old card settings rejected')
+    h.cards.releaseBackground('first-owner')
+    h.cards.releaseBackground('second-owner')
+    h.deps.patchSettingsChecked = patch
+    await h.cards.closeChat('chat')
+    expect([...h.disposed].sort()).toEqual(['message-1', 'message-2'])
+    expect(h.settings.get('message-1').config.streaming_mode).toBe(false)
+  })
+
   test('does not create substitute cards after unknown tail or non-capacity write failures', async () => {
     const h = harness()
     await h.cards.add(run('a'))

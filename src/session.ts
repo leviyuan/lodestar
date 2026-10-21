@@ -257,6 +257,13 @@ function cardFailureNoticeKey(code?: number, failure?: cardkit.CardWriteFailure)
   return `${code ?? 'MISS'}:${failure?.httpStatus ?? 'MISS'}:${message}`
 }
 
+function backgroundFailureNotices(error: unknown): string[] {
+  if (error instanceof AggregateError && error.errors.length) {
+    return error.errors.flatMap(backgroundFailureNotices)
+  }
+  return [messageOf(error)]
+}
+
 export class Session {
   /** Process-wide registry of every Session ever constructed in this daemon.
    * Used by the `hi` console panel to enumerate sibling sessions across
@@ -316,7 +323,7 @@ export class Session {
   private backgroundOwner = randomBytes(16).toString('hex')
   private backgroundRefreshTimer: ReturnType<typeof setTimeout> | null = null
   private backgroundSync: Promise<void> | null = null
-  private backgroundWriteError: string | null = null
+  private readonly backgroundWriteErrors = new Set<string>()
   private lastMainTaskToolUseId: string | null = null
   private nativeAgentTools = new Map<string, { confirmed: boolean; input: any; displayInput?: any }>()
   /** turn 收尾后有后台任务结算 → SDK 会自发开一轮恢复轮(task_notification
@@ -3593,7 +3600,7 @@ export class Session {
     const snapshot = [...this.backgroundTasks]
     const operation = this.agentCards.syncBackground(this.chatId, owner, snapshot)
     let guarded!: Promise<void>
-    guarded = operation.then(() => { this.backgroundWriteError = null }).finally(() => {
+    guarded = operation.then(() => { this.backgroundWriteErrors.clear() }).finally(() => {
       if (this.backgroundSync === guarded) this.backgroundSync = null
     })
     this.backgroundSync = guarded
@@ -3601,11 +3608,18 @@ export class Session {
   }
 
   private async reportBackgroundWriteFailure(error: unknown): Promise<void> {
-    const detail = messageOf(error)
-    log(`session "${this.sessionName}": task panel update failed: ${detail}`)
-    if (this.backgroundWriteError === detail) return
-    this.backgroundWriteError = detail
-    await feishu.sendTextRaw(this.chatId, `⚠️ 运行任务面板更新失败：${detail}`)
+    const messages = backgroundFailureNotices(error)
+    log(`session "${this.sessionName}": task panel update failed: ${messages.join('; ')}`)
+    const notices = messages.filter(message => {
+      // A new request id does not mean a new fault. Keep each original error
+      // in the log, and show each cause once until the panel sync recovers.
+      const key = message.replace(/\s+log_id=\S+/gi, '').replace(/\s+/g, ' ').trim()
+      if (this.backgroundWriteErrors.has(key)) return false
+      this.backgroundWriteErrors.add(key)
+      return true
+    })
+    if (!notices.length) return
+    await feishu.sendTextRaw(this.chatId, `⚠️ 运行任务面板更新失败：${notices.join('; ')}`)
   }
 
   /** Drain admitted writes and settle only this process's rows. The shared card

@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { channelInstructions } from './instructions'
 import { FileDeliveryBatch } from './file-delivery'
+import type { CardWriteFailure } from './cardkit'
 import { GroupFileDelivery } from './group-file-delivery'
 import type { FileDeliverySnapshot } from './file-delivery-types'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
@@ -5535,6 +5536,65 @@ describe('Session background tasks in shared delegation cards', () => {
     expect(session.backgroundTasks).toEqual([])
     expect(sentCards).toHaveLength(1)
     await session.agentCards.closeChat('chat_id')
+  })
+
+  test('repeated settings failures with new request ids notify once until the panel recovers', async () => {
+    const session = new Session('background-settings-notices', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('running')]
+    await session.refreshBackgroundCardFull()
+    const patchSettings = session.agentCards.deps.patchSettingsChecked
+    let rejecting = true
+    let attempts = 0
+    const patch = spyOn(session.agentCards.deps, 'patchSettingsChecked').mockImplementation(
+      async (cardId: string, settings: object, onFailure?: (failure: CardWriteFailure) => void) => {
+        if (!rejecting) return patchSettings(cardId, settings, onFailure)
+        onFailure?.({ cardId, operation: 'patchSettings', code: 200860,
+          message: 'ErrMsg: card over max size;', logId: `settings-request-${++attempts}` })
+        return false
+      },
+    )
+    const refresh = () => session.refreshBackgroundCardFull().catch((error: unknown) => session.reportBackgroundWriteFailure(error))
+    try {
+      session.backgroundTasks = [{ ...session.backgroundTasks[0], status: 'completed', summary: '任务结果' }]
+      await refresh()
+      await refresh()
+      await refresh()
+      expect(attempts).toBe(3)
+      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts[0]).toContain('code=200860 message=ErrMsg: card over max size; log_id=settings-request-1')
+      expect(sentCards).toHaveLength(1)
+
+      rejecting = false
+      await refresh()
+      rejecting = true
+      session.backgroundTasks = [{ ...session.backgroundTasks[0], summary: '补充任务结果' }]
+      await refresh()
+      expect(sentRawTexts).toHaveLength(2)
+      expect(sentRawTexts[1]).toContain('log_id=settings-request-4')
+    } finally {
+      patch.mockRestore()
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+    }
+  })
+
+  test('background error batches preserve new causes without repeating known ones', async () => {
+    const session = new Session('background-notice-causes', 'chat_id') as any
+    const failure = (id: number) => new Error(`agent card settings update MISS: code=200860 message=card over max size log_id=request-${id}`)
+    await session.reportBackgroundWriteFailure(new AggregateError([failure(1), failure(2)]))
+    expect(sentRawTexts).toHaveLength(1)
+    expect(sentRawTexts[0]).toContain('log_id=request-1')
+    expect(sentRawTexts[0]).not.toContain('request-2')
+
+    const cleanupFailure = new Error('agent moved task row deletion MISS: code=300317 message=cleanup rejected log_id=cleanup-request')
+    await session.reportBackgroundWriteFailure(new AggregateError([
+      failure(3), new AggregateError([cleanupFailure, failure(4)]),
+    ]))
+    expect(sentRawTexts).toHaveLength(2)
+    expect(sentRawTexts[1]).toContain('cleanup rejected log_id=cleanup-request')
+    expect(sentRawTexts[1]).not.toContain('card over max size')
+    await session.reportBackgroundWriteFailure(failure(5))
+    expect(sentRawTexts).toHaveLength(2)
   })
 
   test('a failed launch is visible in the delegation panel without a main tool panel', async () => {

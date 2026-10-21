@@ -56,6 +56,7 @@ export class AgentCards {
   private readonly tails = new Map<string, CardGroup>()
   private readonly byTask = new Map<string, CardGroup>()
   private readonly background = new Map<string, Map<string, { task: BgTaskEntry; version: number; pendingSettings?: boolean }>>()
+  private readonly failedSettings = new Map<CardGroup, { error: unknown }>()
 
   constructor(private readonly deps: AgentCardsDeps) {}
 
@@ -71,6 +72,7 @@ export class AgentCards {
    * Native follow-ups get a fresh row; late terminal corrections update the old row. */
   syncBackground(chatId: string, owner: string, tasks: BgTaskEntry[]): Promise<void> {
     return withChatMessageOrder(chatId, async () => {
+      const pendingSettings = new Map(this.failedSettings)
       let entries = this.background.get(owner)
       if (!entries) this.background.set(owner, entries = new Map())
       const errors: unknown[] = []
@@ -104,6 +106,7 @@ export class AgentCards {
           errors.push(error)
         }
       }
+      await this.retrySettings(chatId, pendingSettings, errors)
       if (errors.length) throw new AggregateError(errors, errors.map(String).join('; '))
     })
   }
@@ -128,7 +131,7 @@ export class AgentCards {
           if (result.landed) {
             this.attach(group, row)
             // Appending to a completed card reopens the group for this run.
-            await this.settings(group)
+            await this.settingsForRow(group, row)
             return
           }
           if (!isCapacity(result)) throw writeError('agent card append', result)
@@ -146,13 +149,13 @@ export class AgentCards {
       if (group.settled.has(row.key) && !allowTerminalCorrection) {
         // A progress callback admitted before finalization must not reopen a
         // completed card; failed terminal settings may still be retried.
-        if (terminal) await this.settings(group)
+        if (terminal) await this.settingsForRow(group, group.rows.get(row.key)!)
         return true
       }
       // 完成后的正文更新可能由 Card Kit 自动重开 streaming。旧的设置缓存
       // 此时不能证明远端仍已关闭，即便补充结果没有改变标题和摘要。
       if (group.settled.size === group.rows.size) group.settingsJson = undefined
-      const errors: string[] = []
+      const errors: unknown[] = []
       const result = await this.deps.replaceElementResult(group.cardId, row.elementId, row.element)
       if (!result.landed) {
         const previous = group.rows.get(row.key)
@@ -165,39 +168,29 @@ export class AgentCards {
         if (!isCapacity(result) || group.rows.size === 1) throw writeError('agent task row update', result)
         // A later result can exhaust the shared card's byte capacity. Move only
         // this row, keeping every other running task attached to its own card.
-        const old = group
-        await this.seal(old, true)
-        const tail = this.tails.get(row.chatId)
-        if (tail) await this.seal(tail)
-        group = await this.create(row)
-        // Ownership transfers as soon as the new row exists. Even a failed
-        // deletion must not leave a ghost task holding the old card open.
-        old.rows.delete(row.key)
-        old.settled.delete(row.key)
-        try {
-          let failure: CardWriteFailure | undefined
-          if (!await this.deps.deleteElementChecked(old.cardId, row.elementId, detail => { failure = detail })) {
-            const error = writeError('agent moved task row deletion', { landed: false, failure })
-            throw new Error(`${error.message}; the previous card may still show its earlier state`)
-          }
-        } catch (error) { errors.push(String(error)) }
-        try { await this.settings(old) }
-        catch (error) { errors.push(String(error)) }
+        group = await this.moveRow(group, row, errors)
       }
       group.rows.set(row.key, row)
       if (terminal) group.settled.add(row.key)
       else group.settled.delete(row.key)
-      try { await this.settings(group) }
-      catch (error) { errors.push(String(error)) }
-      if (errors.length) throw new Error(errors.join('; '))
+      try { await this.settingsForRow(group, row) }
+      catch (error) { errors.push(error) }
+      if (errors.length) throw combinedError(errors)
       return true
     })
   }
 
   closeChat(chatId: string): Promise<void> {
     return withChatMessageOrder(chatId, async () => {
+      const pendingSettings = new Map(this.failedSettings)
+      const errors: unknown[] = []
       const group = this.tails.get(chatId)
-      if (group) await this.seal(group)
+      if (group) {
+        try { await this.seal(group) }
+        catch (error) { errors.push(error) }
+      }
+      await this.retrySettings(chatId, pendingSettings, errors)
+      if (errors.length) throw combinedError(errors)
     })
   }
 
@@ -226,13 +219,81 @@ export class AgentCards {
     return group
   }
 
-  private async seal(group: CardGroup, movingRow = false): Promise<void> {
+  private markSealed(group: CardGroup): void {
     group.sealed = true
     if (this.tails.get(group.chatId) === group) this.tails.delete(group.chatId)
-    await this.settings(group, !movingRow)
   }
 
-  private async settings(group: CardGroup, allowDisposal = true): Promise<void> {
+  private async seal(group: CardGroup): Promise<void> {
+    this.markSealed(group)
+    await this.settings(group)
+  }
+
+  private async moveRow(old: CardGroup, row: TaskRow, errors: unknown[]): Promise<CardGroup> {
+    // The full card's settings can hit the same capacity ceiling as its body.
+    // Free its row before trying to settle it; sealing must not block recovery.
+    this.markSealed(old)
+    const tail = this.tails.get(row.chatId)
+    if (tail) {
+      try { await this.seal(tail) }
+      catch (error) { errors.push(error) }
+    }
+    let group: CardGroup
+    try { group = await this.create(row) }
+    catch (error) { throw combinedError([...errors, error]) }
+    // Ownership transfers as soon as the new row exists. Even a failed
+    // deletion must not leave a ghost task holding the old card open.
+    old.rows.delete(row.key)
+    old.settled.delete(row.key)
+    try {
+      let failure: CardWriteFailure | undefined
+      if (!await this.deps.deleteElementChecked(old.cardId, row.elementId, detail => { failure = detail })) {
+        const error = writeError('agent moved task row deletion', { landed: false, failure })
+        throw new Error(`${error.message}; the previous card may still show its earlier state`)
+      }
+    } catch (error) { errors.push(error) }
+    try { await this.settings(old) }
+    catch (error) { errors.push(error) }
+    return group
+  }
+
+  private async settingsForRow(group: CardGroup, row: TaskRow): Promise<void> {
+    try { await this.settings(group) }
+    catch (error) {
+      if (!(error instanceof AgentCardWriteError) || !isCapacity(error.result) || group.rows.size === 1) throw error
+      // PATCH can be the first operation to discover an oversized card, even
+      // after the row's POST/PUT succeeded. Use the same single-row split.
+      const errors: unknown[] = []
+      const next = await this.moveRow(group, row, errors)
+      try { await this.settings(next) }
+      catch (error) { errors.push(error) }
+      if (errors.length) throw combinedError(errors)
+    }
+  }
+
+  private async settings(group: CardGroup): Promise<void> {
+    try {
+      await this.applySettings(group)
+      this.failedSettings.delete(group)
+    } catch (error) {
+      // Keep sealed groups reachable even after their last row moves away or
+      // its background owner is released. A new marker records each attempt.
+      this.failedSettings.set(group, { error })
+      throw error
+    }
+  }
+
+  private async retrySettings(chatId: string, pending: ReadonlyMap<CardGroup, { error: unknown }>, errors: unknown[]): Promise<void> {
+    for (const [group, failure] of pending) {
+      // A task update may already have settled or retried this group. Never
+      // issue a second retry for that same group in the current batch.
+      if (group.chatId !== chatId || this.failedSettings.get(group) !== failure) continue
+      try { await this.settings(group) }
+      catch (error) { errors.push(error) }
+    }
+  }
+
+  private async applySettings(group: CardGroup): Promise<void> {
     this.deps.cancelSummary(group.cardId)
     const complete = group.settled.size === group.rows.size
     const settings = {
@@ -242,7 +303,7 @@ export class AgentCards {
       },
     }
     const settingsJson = JSON.stringify(settings)
-    if (settingsJson !== group.settingsJson) {
+    if (settingsJson !== group.settingsJson || group.pendingSettings) {
       let failure: CardWriteFailure | undefined
       group.pendingSettings = true
       if (!await this.deps.patchSettingsChecked(group.cardId, settings, detail => { failure = detail })) {
@@ -251,7 +312,7 @@ export class AgentCards {
       group.settingsJson = settingsJson
       group.pendingSettings = false
     }
-    if (complete && group.sealed && allowDisposal) {
+    if (complete && group.sealed) {
       await this.deps.dispose(group.cardId)
       for (const key of group.rows.keys()) {
         if (this.byTask.get(key) === group) this.byTask.delete(key)
@@ -287,6 +348,16 @@ function isBackgroundProgress(previous: BgTaskEntry, task: BgTaskEntry): boolean
       || previous[key as keyof BgTaskEntry] === task[key as keyof BgTaskEntry])
 }
 
+class AgentCardWriteError extends Error {
+  constructor(action: string, readonly result: CardWriteResult) {
+    super(`${action} MISS: ${formatFeishuError(result.failure)}`)
+  }
+}
+
 function writeError(action: string, result: CardWriteResult): Error {
-  return new Error(`${action} MISS: ${formatFeishuError(result.failure)}`)
+  return new AgentCardWriteError(action, result)
+}
+
+function combinedError(errors: unknown[]): unknown {
+  return errors.length === 1 ? errors[0] : new AggregateError(errors, errors.map(String).join('; '))
 }
