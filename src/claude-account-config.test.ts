@@ -192,6 +192,85 @@ describe('Claude named accounts share all non-login configuration', () => {
     expect(readFileSync(join(account, 'settings.json'), 'utf8')).toBe('global settings')
   })
 
+  test.each(['shared-directory', 'account-link', 'both'] as const)('repairs native cleanup of %s without changing surviving shared or private content', removed => {
+    const { account, shared } = fixture()
+    const directories = ['projects', 'tasks', 'file-history', 'plans', 'todos', 'sessions', 'teams', 'cache', 'debug', 'logs']
+    const preservedFiles = [
+      [shared, 'settings.json', 'global settings'],
+      [shared, 'rules/style.md', 'global rule'],
+      [shared, 'skills/helper/SKILL.md', 'global skill'],
+      [shared, '.credentials.json', 'synthetic default identity'],
+      [account, '.credentials.json', 'synthetic named identity'],
+      [account, '.config.json', '{"syntheticNamedIdentity":true}'],
+      [account, 'backups/.claude.json.backup', 'synthetic named backup'],
+    ] as const
+    for (const [root, name, contents] of preservedFiles) put(join(root, name), contents)
+    for (const name of directories) put(join(shared, name, 'before-cleanup.txt'), `existing:${name}`)
+    syncClaudeAccountConfig(account, shared)
+    const preserved = preservedFiles.map(([root, name, contents]) => {
+      const path = join(root, name), stat = lstatSync(path)
+      return { path, contents, ino: stat.ino, mtimeMs: stat.mtimeMs }
+    })
+    const unaffectedLinks = ['settings.json', 'rules', 'skills'].map(name => [name, lstatSync(join(account, name)).ino] as const)
+    const originalLinks = new Map(directories.map(name => [name, lstatSync(join(account, name)).ino]))
+    for (const name of directories) {
+      if (removed !== 'account-link') rmSync(join(shared, name), { recursive: true })
+      if (removed !== 'shared-directory') rmSync(join(account, name))
+    }
+
+    syncClaudeAccountConfig(account, shared)
+    for (const name of directories) {
+      expectShared(account, shared, name)
+      expect(lstatSync(join(shared, name)).isDirectory()).toBe(true)
+      if (removed === 'shared-directory') expect(lstatSync(join(account, name)).ino).toBe(originalLinks.get(name)!)
+      if (removed === 'account-link') {
+        expect(readFileSync(join(account, name, 'before-cleanup.txt'), 'utf8')).toBe(`existing:${name}`)
+      } else {
+        expect(readdirSync(join(shared, name))).toEqual([])
+      }
+      put(join(account, name, 'after-cleanup.txt'), `recovered:${name}`)
+      expect(readFileSync(join(shared, name, 'after-cleanup.txt'), 'utf8')).toBe(`recovered:${name}`)
+    }
+    const repairedIdentities = directories.map(name => [name, lstatSync(join(account, name)).ino, lstatSync(join(shared, name)).ino])
+    syncClaudeAccountConfig(account, shared)
+    syncClaudeAccountConfig(account, shared)
+    expect(directories.map(name => [name, lstatSync(join(account, name)).ino, lstatSync(join(shared, name)).ino])).toEqual(repairedIdentities)
+    expect(unaffectedLinks.map(([name]) => [name, lstatSync(join(account, name)).ino] as const)).toEqual(unaffectedLinks)
+    for (const { path, contents, ino, mtimeMs } of preserved) {
+      expect(readFileSync(path, 'utf8')).toBe(contents)
+      expect(lstatSync(path).ino).toBe(ino)
+      expect(lstatSync(path).mtimeMs).toBe(mtimeMs)
+    }
+    for (const name of ['.credentials.json', '.config.json', 'backups']) {
+      expect(lstatSync(join(account, name)).isSymbolicLink()).toBe(false)
+    }
+  })
+
+  test('deleted global files stay absent files through repeated directory repair', () => {
+    const { account, shared } = fixture()
+    syncClaudeAccountConfig(account, shared)
+    // Discover initially absent file targets instead of mirroring the full
+    // implementation catalog; directory targets must already exist.
+    const files = readdirSync(account).filter(name => !existsSync(join(shared, name)))
+    expect(files).toEqual(expect.arrayContaining(['CLAUDE.md', 'settings.json', 'history.jsonl', '.last-cleanup']))
+    const fileLinks = files.map(name => [name, lstatSync(join(account, name)).ino])
+    for (const name of files) {
+      put(join(shared, name), `before cleanup:${name}`)
+      rmSync(join(shared, name))
+    }
+    rmSync(join(shared, 'file-history'), { recursive: true })
+    syncClaudeAccountConfig(account, shared)
+    syncClaudeAccountConfig(account, shared)
+    expectShared(account, shared, 'file-history')
+    expect(files.map(name => [name, lstatSync(join(account, name)).ino])).toEqual(fileLinks)
+    for (const name of files) {
+      expect(lstatSync(join(account, name)).isSymbolicLink()).toBe(true)
+      expect(existsSync(join(shared, name))).toBe(false)
+      put(join(shared, name), `after cleanup:${name}`)
+      expect(readFileSync(join(account, name), 'utf8')).toBe(`after cleanup:${name}`)
+    }
+  })
+
   test('accepts a symlinked global root and globally linked resource directories', () => {
     const { root, account, shared } = fixture()
     const alias = join(root, 'global-alias'), externalRules = join(root, 'authored-rules')

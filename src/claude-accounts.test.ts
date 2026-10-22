@@ -5,7 +5,7 @@ import * as fs from 'node:fs'
 import * as stateStore from './state-store'
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync, lstatSync, existsSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { ClaudeAccounts, CLAUDE_SHARED_DIRS, DEFAULT_CLAUDE_ACCOUNT, bindProcessClaudeAccount, processClaudeAccount } from './claude-accounts'
 
 const roots: string[] = []
@@ -243,9 +243,180 @@ describe('Claude native environment and explicit account enrollment', () => {
     rmSync(join(path, 'plans'), { recursive: true })
     symlinkSync(join(accounts.sharedConfigDir(), kind === 'wrong' ? 'tasks' : 'missing'), join(path, 'plans'), 'dir')
     let authenticated = false
-    await expect(accounts.enroll('备用一', async () => { authenticated = true; return nativeInfo() })).rejects.toThrow(kind === 'wrong' ? '其他位置' : '损坏')
+    await expect(accounts.enroll('备用一', async () => { authenticated = true; return nativeInfo() })).rejects.toThrow('其他位置')
     expect(authenticated).toBe(false)
     expect(readFileSync(join(path, 'projects', 'old.txt'), 'utf8')).toBe('old:projects'); protect()
+  })
+  test.each(CLAUDE_SHARED_DIRS.flatMap(key => ['target', 'link', 'both'].map(removed => ({ key, removed }))))(
+    'repairs native cleanup of $key ($removed) without changing account state or existing history', async ({ key, removed }) => {
+      const { accounts, options, profile } = fixture(); const path = profile()
+      const row = await accounts.enroll('备用一', async () => nativeInfo())
+      const source = join(path, key), target = join(accounts.sharedConfigDir(), key)
+      const state = readFileSync(accounts.stateFile, 'utf8'), linkInode = lstatSync(source).ino
+      if (removed !== 'link') rmSync(target, { recursive: true })
+      if (removed !== 'target') unlinkSync(source)
+      const reloaded = new ClaudeAccounts(options)
+      reloaded.prepareShared(row.id)
+      expect(lstatSync(target).isDirectory()).toBe(true)
+      expect(lstatSync(source).isSymbolicLink()).toBe(true)
+      expect(realpathSync(source)).toBe(realpathSync(target))
+      if (removed === 'target') expect(lstatSync(source).ino).toBe(linkInode)
+      for (const other of CLAUDE_SHARED_DIRS) {
+        if (other !== key || removed === 'link') {
+          expect(readFileSync(join(path, other, 'shared.txt'), 'utf8')).toBe('shared:' + other)
+        }
+      }
+      writeFileSync(join(source, 'after-cleanup.txt'), 'shared again')
+      expect(readFileSync(join(target, 'after-cleanup.txt'), 'utf8')).toBe('shared again')
+      const repairedLinkInode = lstatSync(source).ino, targetInode = lstatSync(target).ino
+      reloaded.prepareShared(row.id)
+      expect(lstatSync(source).ino).toBe(repairedLinkInode)
+      expect(lstatSync(target).ino).toBe(targetInode)
+      expect(readFileSync(accounts.stateFile, 'utf8')).toBe(state)
+      expect(reloaded.get(row.id)).toEqual(row)
+      expect(readFileSync(join(path, '.credentials.json'), 'utf8')).toBe('SYNTHETIC-EXTRA-CREDENTIAL')
+      expect(readFileSync(join(accounts.sharedConfigDir(), '.credentials.json'), 'utf8')).toBe('SYNTHETIC-DEFAULT-CREDENTIAL')
+    },
+  )
+  test.each(['env', 'lease', 'candidate', 'reenroll', 'terminal'] as const)(
+    '%s also recovers cleaned shared directories before launch preparation', async entry => {
+      const { accounts, profile } = fixture(); const path = profile()
+      const row = await accounts.enroll('备用一', async () => nativeInfo())
+      for (const key of CLAUDE_SHARED_DIRS) rmSync(join(accounts.sharedConfigDir(), key), { recursive: true })
+      if (entry === 'env') expect(accounts.env(row.id, {}).CLAUDE_CONFIG_DIR).toBe(path)
+      else if (entry === 'lease') accounts.acquireUse(row.id)()
+      else if (entry === 'candidate') expect(accounts.candidate(row.name)).toEqual(row)
+      else if (entry === 'reenroll') expect(await accounts.enroll(row.name, async () => nativeInfo())).toEqual(row)
+      else expect(accounts.nativeCliEnv(row.name, {}).CLAUDE_CONFIG_DIR).toBe(path)
+      for (const key of CLAUDE_SHARED_DIRS) {
+        expect(lstatSync(join(accounts.sharedConfigDir(), key)).isDirectory()).toBe(true)
+        expect(realpathSync(join(path, key))).toBe(realpathSync(join(accounts.sharedConfigDir(), key)))
+      }
+    },
+  )
+  test('repairs a correct dangling link through a shared-root alias', async () => {
+    const { accounts, root, profile } = fixture(); const path = profile()
+    const row = await accounts.enroll('备用一', async () => nativeInfo())
+    const alias = join(root, 'shared-alias'), source = join(path, 'file-history')
+    const directoryLink = process.platform === 'win32' ? 'junction' : 'dir'
+    symlinkSync(accounts.sharedConfigDir(), alias, directoryLink)
+    unlinkSync(source)
+    const target = join(alias, 'file-history')
+    symlinkSync(process.platform === 'win32' ? target : relative(path, target), source, directoryLink)
+    const inode = lstatSync(source).ino
+    rmSync(join(accounts.sharedConfigDir(), 'file-history'), { recursive: true })
+    accounts.prepareShared(row.id)
+    expect(realpathSync(source)).toBe(realpathSync(target))
+    expect(lstatSync(source).ino).toBe(inode)
+  })
+  test.each(['wrong-link', 'target-file', 'target-symlink'] as const)(
+    'rejects %s before repairing another missing directory and preserves conflicting entries', async conflict => {
+      const { accounts, root, profile } = fixture(); const path = profile()
+      const row = await accounts.enroll('备用一', async () => nativeInfo())
+      const missing = join(accounts.sharedConfigDir(), 'file-history'), target = join(accounts.sharedConfigDir(), 'plans')
+      rmSync(missing, { recursive: true }); rmSync(target, { recursive: true })
+      const outside = join(root, 'outside')
+      if (conflict === 'wrong-link') {
+        unlinkSync(join(path, 'plans'))
+        symlinkSync(outside, join(path, 'plans'), process.platform === 'win32' ? 'junction' : 'dir')
+      } else if (conflict === 'target-file') writeFileSync(target, 'keep conflicting file')
+      else symlinkSync(outside, target, process.platform === 'win32' ? 'junction' : 'dir')
+      expect(() => accounts.prepareShared(row.id)).toThrow(conflict === 'wrong-link' ? '其他位置' : '不是独立目录')
+      expect(existsSync(missing)).toBe(false)
+      expect(existsSync(outside)).toBe(false)
+      if (conflict === 'target-file') expect(readFileSync(target, 'utf8')).toBe('keep conflicting file')
+      else expect(lstatSync(conflict === 'wrong-link' ? join(path, 'plans') : target).isSymbolicLink()).toBe(true)
+    },
+  )
+  test('reports a directory repair permission failure and can recover on the next attempt', async () => {
+    const { accounts, profile } = fixture(); const path = profile()
+    const row = await accounts.enroll('备用一', async () => nativeInfo())
+    const target = join(realpathSync(accounts.sharedConfigDir()), 'file-history'), source = join(path, 'file-history')
+    rmSync(target, { recursive: true })
+    const inode = lstatSync(source).ino, mkdir = fs.mkdirSync
+    const denied = spyOn(fs, 'mkdirSync').mockImplementation((directory, options) => {
+      if (directory === target) throw Object.assign(new Error('EACCES: synthetic repair denied'), { code: 'EACCES' })
+      return mkdir(directory, options)
+    })
+    try { expect(() => accounts.prepareShared(row.id)).toThrow('EACCES: synthetic repair denied') }
+    finally { denied.mockRestore() }
+    expect(lstatSync(source).ino).toBe(inode)
+    accounts.prepareShared(row.id)
+    expect(realpathSync(source)).toBe(realpathSync(target))
+  })
+  test('recovers when native cleanup removes the target between stat and link resolution', async () => {
+    const { accounts, profile } = fixture(); const path = profile()
+    const row = await accounts.enroll('备用一', async () => nativeInfo())
+    const source = join(path, 'file-history'), target = join(accounts.sharedConfigDir(), 'file-history')
+    const realpath = fs.realpathSync
+    let cleaned = false
+    const cleanup = spyOn(fs, 'realpathSync').mockImplementation(new Proxy(realpath, {
+      apply(fn, receiver, args) {
+        if (args[0] === source && !cleaned) { cleaned = true; rmSync(target, { recursive: true }) }
+        return Reflect.apply(fn, receiver, args)
+      },
+    }))
+    try { accounts.prepareShared(row.id) }
+    finally { cleanup.mockRestore() }
+    expect(cleaned).toBe(true)
+    expect(realpathSync(source)).toBe(realpathSync(target))
+  })
+  test.each(['correct', 'wrong'] as const)('rechecks a concurrently recreated %s link after EEXIST', async kind => {
+    const { accounts, root, profile } = fixture(); const path = profile()
+    const row = await accounts.enroll('备用一', async () => nativeInfo())
+    const source = join(path, 'plans'), target = join(accounts.sharedConfigDir(), 'plans')
+    unlinkSync(source)
+    const symlink = fs.symlinkSync, other = join(root, 'other')
+    mkdirSync(other); writeFileSync(join(other, 'keep.txt'), 'keep concurrent target')
+    const concurrent = spyOn(fs, 'symlinkSync').mockImplementation((destination, link, type) => {
+      if (link === source) {
+        symlink(kind === 'correct' ? destination : other, link, type)
+        throw Object.assign(new Error('EEXIST: concurrent link'), { code: 'EEXIST' })
+      }
+      symlink(destination, link, type)
+    })
+    try {
+      if (kind === 'correct') accounts.prepareShared(row.id)
+      else expect(() => accounts.prepareShared(row.id)).toThrow('其他位置')
+    } finally { concurrent.mockRestore() }
+    expect(realpathSync(source)).toBe(realpathSync(kind === 'correct' ? target : other))
+    expect(readFileSync(join(other, 'keep.txt'), 'utf8')).toBe('keep concurrent target')
+  })
+  test.each(['once', 'continuous'] as const)('bounds repair attempts during %s concurrent cleanup', async cleanupMode => {
+    const { accounts, profile } = fixture(); const path = profile()
+    const row = await accounts.enroll('备用一', async () => nativeInfo())
+    const target = join(realpathSync(accounts.sharedConfigDir()), 'tasks')
+    rmSync(target, { recursive: true })
+    const mkdir = fs.mkdirSync
+    let attempts = 0
+    const cleanup = spyOn(fs, 'mkdirSync').mockImplementation((directory, options) => {
+      const result = mkdir(directory, options)
+      if (directory === target) {
+        attempts++
+        if (cleanupMode === 'continuous' || attempts === 1) rmSync(target, { recursive: true })
+      }
+      return result
+    })
+    try {
+      if (cleanupMode === 'continuous') expect(() => accounts.prepareShared(row.id)).toThrow('修复后再次缺失：tasks')
+      else accounts.prepareShared(row.id)
+    } finally { cleanup.mockRestore() }
+    expect(attempts).toBe(cleanupMode === 'continuous' ? 3 : 2)
+    expect(lstatSync(join(path, 'tasks')).isSymbolicLink()).toBe(true)
+    if (cleanupMode === 'once') expect(realpathSync(join(path, 'tasks'))).toBe(realpathSync(target))
+  })
+  test('resumes enrollment after cleanup removes already recorded links and targets', async () => {
+    const { accounts, options, profile } = fixture(); const path = profile()
+    const row = await accounts.enroll('备用一', async () => nativeInfo())
+    const state = JSON.parse(readFileSync(accounts.stateFile, 'utf8'))
+    state.accounts[0].state = 'enrolling'
+    writeFileSync(accounts.stateFile, JSON.stringify(state))
+    unlinkSync(join(path, 'tasks'))
+    rmSync(join(accounts.sharedConfigDir(), 'tasks'), { recursive: true })
+    rmSync(join(accounts.sharedConfigDir(), 'file-history'), { recursive: true })
+    const recovered = await new ClaudeAccounts(options).enroll(row.name, async () => nativeInfo())
+    expect(recovered).toEqual(row)
+    for (const key of CLAUDE_SHARED_DIRS) expect(realpathSync(join(path, key))).toBe(realpathSync(join(accounts.sharedConfigDir(), key)))
   })
   test('ready validation and repeated enrollment never clear a newly replaced local directory', async () => {
     const { accounts, profile, protect } = fixture(); const path = profile()

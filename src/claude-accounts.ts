@@ -1,7 +1,7 @@
 import type { AccountInfo } from '@anthropic-ai/claude-agent-sdk'
 import type { AgentProcess } from './agent-process'
 import { createHash } from 'node:crypto'
-import { lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
+import { lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { CLAUDE_ACCOUNTS_DIR, CLAUDE_ACCOUNTS_FILE } from './paths'
@@ -241,25 +241,50 @@ export class ClaudeAccounts {
     if (state.sharedConfigDir && state.sharedConfigDir !== shared) throw new Error('Claude 默认共享目录已变化，不能把已收录历史自动改指向其他目录')
     const credentials = stat(join(path, '.credentials.json'))
     if (credentials && (credentials.isSymbolicLink() || !credentials.isFile())) throw new Error('Claude 额外账号凭据必须为独立文件，不能复用其他目录的凭据链接')
-    for (const key of CLAUDE_SHARED_DIRS) {
-      const target = join(shared, key), targetStat = stat(target)
+    const inspectSharedDir = (key: SharedDir) => {
+      const target = join(shared, key)
+      let targetStat = stat(target)
       if (targetStat && (targetStat.isSymbolicLink() || !targetStat.isDirectory())) throw new Error(`Claude 默认共享目录不是独立目录：${key}`)
       const source = join(path, key), sourceStat = stat(source)
       if (!sourceStat) {
-        if (stored?.state === 'ready' || stored?.linked.includes(key)) throw new Error(`Claude 已共享目录缺失：${key}`)
-        continue
+        const linked = stored?.state === 'ready' || !!stored?.linked.includes(key)
+        return { key, source, target, missingLink: linked, missingTarget: linked && !targetStat }
       }
       if (sourceStat.isSymbolicLink()) {
         let linked: string
-        try { linked = realpathSync(source) } catch { throw new Error(`Claude 共享链接已损坏：${key}`) }
+        try { linked = realpathSync(source) } catch (error: any) {
+          // Native cleanup can remove the shared target while retaining the
+          // account link. Resolve its spelling through existing ancestors so
+          // only the expected directory can be recreated, never another path.
+          if (error.code !== 'ENOENT') throw new Error(`Claude 共享链接已损坏：${key}（${error.message}）`)
+          targetStat = stat(target)
+          if (targetStat && (targetStat.isSymbolicLink() || !targetStat.isDirectory())) throw new Error(`Claude 默认共享目录不是独立目录：${key}`)
+          linked = canonical(resolve(dirname(source), readlinkSync(source)))
+        }
         if (linked !== target) throw new Error(`Claude 共享链接指向其他位置：${key}`)
       } else if (!sourceStat.isDirectory() || stored?.state === 'ready' || stored?.linked.includes(key)) {
         throw new Error(`Claude 共享目录已被替换，拒绝清理：${key}`)
       }
+      return { key, source, target, missingLink: false, missingTarget: sourceStat.isSymbolicLink() && !targetStat }
+    }
+    // Check every entry before repairing anything. Repairs only add missing
+    // directories/links; existing history and account identity stay untouched.
+    for (let attempt = 0; ; attempt++) {
+      const repairs = CLAUDE_SHARED_DIRS.map(inspectSharedDir).filter(item => item.missingLink || item.missingTarget)
+      if (!repairs.length) break
+      if (attempt === 3) throw new Error(`Claude 共享目录修复后再次缺失：${repairs.map(item => item.key).join('、')}`)
+      for (const { key } of repairs) {
+        const { source, target, missingLink, missingTarget } = inspectSharedDir(key)
+        if (missingTarget) mkdirSync(target, { recursive: true, mode: 0o700 })
+        if (missingLink) {
+          try { symlinkSync(target, source, process.platform === 'win32' ? 'junction' : 'dir') }
+          catch (error: any) { if (error.code !== 'EEXIST') throw error }
+        }
+      }
     }
     return { directory, shared }
   }
-  /** Environment resolution and use leases only validate; they never sync MCP. */
+  /** Environment resolution and use leases repair cleaned directories, but never sync MCP. */
   private validateShared(id: string): StoredAccount | undefined {
     if (id === DEFAULT_CLAUDE_ACCOUNT) return undefined
     const state = this.read(), row = state.accounts.find(row => row.id === id)

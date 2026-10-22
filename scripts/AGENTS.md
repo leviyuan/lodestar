@@ -16,6 +16,7 @@
 | `test-openrouter.ts` | 使用明确提供的私有 Key 和 `--agent-runtimes` 目录做付费 API/SDK Read 实测；不连接飞书或 daemon，支持请求参数核验与原生 resume 序列 |
 | `test-agent-input-boundary.ts` | 指定已安装运行时与新建私有输出目录，通过隔离项目 API → AgentService → 原生 Claude SDK 捕获实际 tools/system/messages，强制注入提问调用并检查原生拒绝、会话记录和五种新建/续跑/归属切换；仅用本地模拟模型，不调用真实模型、不读取生产凭据、不连接飞书或 live daemon |
 | `test-agent-steering.ts` | 指定已安装运行时与新建私有输出目录，用本地模拟模型验证原生 Claude 在工具间追加、回合边界续接和 stop 取消追加队列；检查模型实际收到的消息、工具结果与输入回执，不调用真实模型、不连接飞书或 live daemon |
+| `test-claude-shared-cleanup.ts` | 指定已安装运行时与新建私有目录，仅删除假默认/备注账号内的共享目标或链接，验证环境解析、租约及启动准备自动补建；用 localhost 模拟模型实际启动原生 Claude 并通过工具读写四个共享历史目录，核对账号代次与假凭据不变，不读取真实凭据、不调用真实模型、不连接飞书或 daemon |
 | `test-codex-steering.ts` | 指定已安装运行时与新建私有目录，用本地 Responses 模型验证原生 Codex 的“提交回执 → 旧输出 → 消息消费事件 → 新输出”顺序和消息 ID 对应；`--input-count 9` 验证九条独立消费事件在下一次 Agent 输出前构成同一批次，不连接飞书或 live daemon |
 | `test-codex-input-boundary.ts` | 用同样的隔离入口捕获 Codex 实际工具声明、当前指令和原生 thread/read 返回路径上的会话记录，注入同步/异步提问并实际执行文件读取；`--model`/`--effort`/`--code-mode` 检查代码模式，`--fresh-only` 只测外部新建与主 Agent 委派对照，省略时增加续跑和旧 Plan 恢复。只用本地 Responses 模拟端点，不使用真实凭据；验收失败退出非零并在报告明确标记 |
 | `test-dsh-glm.ts` | 使用已配置 GLM Coding Plan 做 DSH Read 与原生 resume 实测，只操作私有临时目录；不连接飞书或控制 daemon |
