@@ -19,14 +19,33 @@ describe('Claude subscription usage response', () => {
     ])
   })
 
-  test('missing primary windows remain unknown even when model quota is available', () => {
+  test.each([0, null])('an unstarted five-hour window with utilization %s has a full allowance from the fetch time', utilization => {
     const snapshot = claudeUsageSnapshot(response({
-      five_hour: { utilization: null, resets_at: null },
+      five_hour: { utilization, resets_at: null },
+      seven_day: { utilization: 20, resets_at: reset },
+    }))
+    expect(snapshot.windows[0]).toEqual({ kind: 'fiveHour', label: '5h 窗口', percent: 0,
+      resetsAt: new Date(snapshot.fetchedAt! + 5 * 3_600_000) })
+    expect(snapshot.windows[1]?.percent).toBe(20)
+    expect(snapshot.windows[1]?.resetsAt).toEqual(new Date(reset))
+  })
+
+  test.each([undefined, null])('missing primary windows (%s) remain unknown even when model quota is available', five_hour => {
+    const snapshot = claudeUsageSnapshot(response({
+      five_hour,
       model_scoped: [{ display_name: 'Fable', utilization: 80, resets_at: reset }],
     }))
     expect(snapshot.windows.map(window => window.percent)).toEqual([null, null, 80])
     expect(snapshot.windows[1]?.kind).toBe('weekly')
     expect(snapshot.windows[1]?.resetsAt).toBeNull()
+  })
+
+  test('does not reset used, exhausted, expired or partially missing short windows to a full allowance', () => {
+    for (const [utilization, resets_at] of [[10, null], [100, null], [null, reset], [0, '2020-01-01T00:00:00Z']] as const) {
+      const snapshot = claudeUsageSnapshot(response({ five_hour: { utilization, resets_at } }))
+      expect(snapshot.windows[0]).toEqual({ kind: 'fiveHour', label: '5h 窗口', percent: utilization,
+        resetsAt: resets_at === null ? null : new Date(resets_at) })
+    }
   })
 
   test('does not turn unavailable, failed or empty responses into applicable zero quotas', () => {

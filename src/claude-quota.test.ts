@@ -23,6 +23,20 @@ const fable = (totalUsed: number, totalHours: number, fableUsed: number, fableHo
     extra: [window('modelWeekly:Fable', fableUsed, fableHours)] }), activeSessions, 'fable')
 
 describe('Claude one-hour reservations across actual resets', () => {
+  test.each([0, null])('an unstarted native short window with utilization %s can participate in account selection', utilization => {
+    const snapshot = claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
+      five_hour: { utilization, resets_at: null },
+      seven_day: { utilization: 20, resets_at: new Date(Date.now() + 24 * 3_600_000).toISOString() },
+    } })
+    const now = snapshot.fetchedAt!
+    const original = structuredClone(snapshot)
+    const result = rankClaudeQuota(snapshot, 'opus', now)
+    expect(result).toMatchObject({ state: 'ready', fits: true, fiveHourRemaining: 1, pressure: 0.1 })
+    expect(result.score).toBeCloseTo(0.9 / 5)
+    expect(rankClaudeQuota(snapshot, 'opus', now + 5 * 3_600_000).state).toBe('miss')
+    expect(snapshot).toEqual(original)
+  })
+
   test('a full week is ten complete short windows and its average below 0.1 does not reject a new session', () => {
     const result = rank(quota({ shortUsed: 0, shortHours: 5, weekUsed: 0, weekHours: 168 }))
     expect(result).toMatchObject({ state: 'ready', fits: true, remaining: 1, hours: 168, activeSessions: 0,

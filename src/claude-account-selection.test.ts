@@ -7,7 +7,7 @@ function isolated(script: string): void {
   expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
 }
 
-test('an unobserved default authenticates and warms on explicit selection, then reuses a verified busy account without I/O', () => {
+test('an unobserved default warms an unstarted short window and remains selectable without I/O', () => {
   isolated(`
     import assert from 'node:assert/strict'
     import { mock } from 'bun:test'
@@ -46,10 +46,10 @@ test('an unobserved default authenticates and warms on explicit selection, then 
     const quotaNow = Date.now()
     mock.module('./src/claude-usage', () => ({ ...usage, fetchClaudeSubscriptionUsage: async (options, binding) => {
       calls.usage++; assert.equal(binding.accountId, 'default'); options.validateAccount(info)
-      return { state: 'ok', fetchedAt: Date.now(), windows: [
-        { kind: 'fiveHour', label: '5h', percent: 10, resetsAt: new Date(quotaNow + 3 * 3600_000) },
-        { kind: 'weekly', label: '周', percent: 20, resetsAt: new Date(quotaNow + 24 * 3600_000) },
-      ] }
+      return usage.claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
+        five_hour: { utilization: 0, resets_at: null },
+        seven_day: { utilization: 20, resets_at: new Date(quotaNow + 24 * 3600_000).toISOString() },
+      } })
     } }))
     const registry = await import('./src/token-source')
     const { enrollClaudeAccount, selectClaudeAccount } = await import('./src/claude-account-selection')
@@ -70,11 +70,15 @@ test('an unobserved default authenticates and warms on explicit selection, then 
       assert.ok(manager.get('default').identity)
       assert.equal(root.forAccount('default').defaultModel, 'opus')
       assert.equal(root.forAccount('default').models[0].defaultEffort, 'high')
-      assert.equal((await root.forAccount('default').readUsage()).state, 'ok')
+      const snapshot = await root.forAccount('default').readUsage()
+      assert.equal(snapshot.state, 'ok')
+      assert.equal(snapshot.windows[0].percent, 0)
+      assert.equal(snapshot.windows[0].resetsAt.getTime(), snapshot.fetchedAt + 5 * 3600_000)
       assert.equal(selectClaudeAccount({ model: 'opus', effort: 'high' }), 'default')
       const release = manager.acquireUse('default'), before = { ...calls }
       try { assert.equal(await enrollClaudeAccount('default'), 'default') } finally { release() }
       assert.deepEqual(calls, before)
+      assert.equal(await root.forAccount('default').readUsage(), snapshot)
       assert.equal(readFileSync(sentinel, 'utf8'), 'default history stays')
     } finally { disposeCachedTokenSource(root); rmSync(dir, { recursive: true, force: true }) }
   `)

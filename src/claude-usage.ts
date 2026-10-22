@@ -72,9 +72,17 @@ export function claudeUsageSnapshot(data: unknown): UsageSnapshotUnified {
   if (data.rate_limits_available !== true) throw new Error('Claude 原生接口未开放当前订阅额度查询')
   if (!object(data.rate_limits)) throw new Error('Claude 原生额度接口未返回 rate_limits 数据')
   const limits = data.rate_limits
+  const fetchedAt = Date.now()
+  const fiveHour = usageWindow(limits.five_hour, 'fiveHour', '5h 窗口')
+  // 未启动的短窗没有重置时间：按本次读取起的完整 5h 估算，供展示与选号共用。
+  // 不把缺失窗口、已用额度或无效/过期时间当作未启动，缓存命中也不延后此时间。
+  if (limits.five_hour != null && fiveHour.resetsAt === null && (fiveHour.percent === 0 || fiveHour.percent === null)) {
+    fiveHour.percent = 0
+    fiveHour.resetsAt = new Date(fetchedAt + 5 * 3_600_000)
+  }
   // 主窗口缺失仍保留 MISS，不能用模型专属窗口冒充总周额度。
   const windows = [
-    usageWindow(limits.five_hour, 'fiveHour', '5h 窗口'),
+    fiveHour,
     usageWindow(limits.seven_day, 'weekly', '周额度'),
   ]
   let reported = limits.five_hour != null || limits.seven_day != null
@@ -99,7 +107,7 @@ export function claudeUsageSnapshot(data: unknown): UsageSnapshotUnified {
     }
   }
   if (!reported) throw new Error('Claude 原生额度接口未返回任何订阅额度窗口')
-  return { state: 'ok', windows, fetchedAt: Date.now() }
+  return { state: 'ok', windows, fetchedAt }
 }
 
 /** 沿用订阅来源的认证隔离；独立控制查询用完即关，瞬态失败沿用最近成功快照。 */
