@@ -1,6 +1,6 @@
 {
   "name": "@leviyuan/lodestar",
-  "version": "0.21.15",
+  "version": "0.21.16",
   "publishConfig": {
     "access": "public"
   },
@@ -82,7 +82,7 @@
     "hono": "4.13.12",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.6",
-    "ip-address": "10.7.2",
+    "ip-address": "10.7.4",
     "mathjax-full": "^3.2.2",
     "node-fetch": "^3.3.2",
     "protobufjs": "7.6.5",
@@ -102,7 +102,7 @@
     "fast-uri": "3.1.8",
     "fflate": "0.8.3",
     "hono": "4.13.12",
-    "ip-address": "10.7.2",
+    "ip-address": "10.7.4",
     "protobufjs": "7.6.5",
     "proxy-addr": "2.0.8",
     "qs": "6.16.0",
