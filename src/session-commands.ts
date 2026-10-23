@@ -31,7 +31,7 @@ function backgroundSourceCommand(s: Session, work: Promise<void>): void {
 
 export function pendingSourceCommands(): Promise<void>[] { return [...sourceCommandWork] }
 
-/** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`, `files`)
+/** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
  * plus their two-letter aliases where applicable.
  * Returns true if the command was consumed (don't forward to Codex).
  * Exact match, case-insensitive, ignores trailing whitespace.
@@ -98,11 +98,6 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
   }
   if (raw.trim().toLowerCase() === 'task') {
     await s.showTasklistPanel()
-    return true
-  }
-  const files = raw.trim().match(/^files(?:[ \t]+([^\r\n]+))?$/i)
-  if (files) {
-    await s.runFileDeliveryCommand((files[1] ?? '').trim(), userOpenId)
     return true
   }
   if (raw.trim().match(/^(?:agents|agent)$/i)) {

@@ -3,7 +3,7 @@
 import type { AgentProvider, AgentReasoningEffort } from './agent-process'
 import type { ConversationBranchBase, ConversationLaunch, ConversationRouting } from './conversation'
 import type { TurnAnchor } from './feishu'
-import type { FileDeliveryHandle, FileDeliveryMode } from './file-delivery-types'
+import type { FileDeliveryHandle } from './file-delivery-types'
 
 export interface TurnState {
   cardId: string
@@ -185,8 +185,6 @@ export interface TurnState {
   outboundSentPaths: Set<string>
   /** Cloud uploads survive conversation-card rotations and settle before the turn closes. */
   fileDelivery?: FileDeliveryHandle
-  /** Freeze the transport when its input reaches the Agent, before it prepares files. */
-  fileDeliveryMode?: FileDeliveryMode
 }
 
 export type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'

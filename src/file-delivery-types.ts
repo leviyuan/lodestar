@@ -4,15 +4,8 @@ export interface DeliveryFolder {
   url: string
 }
 
-export type FileDeliveryMode = 'chat' | 'drive'
-
 export interface GroupDeliveryFolder extends DeliveryFolder {
   name: string
-}
-
-export interface GroupFileDeliverySettings {
-  enabled: boolean
-  folder?: GroupDeliveryFolder
 }
 
 export interface DeliveredFile {

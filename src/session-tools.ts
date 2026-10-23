@@ -7,6 +7,7 @@
 
 import type { Session } from './session'
 import type { TurnState } from './session-types'
+import { statSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { normalizeOutboundPath } from './outbound-markers'
 import * as cardkit from './cardkit'
@@ -277,6 +278,16 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
 /** Keep generated artwork and its prompt on the card that owns this tool. */
 function deliverGeneratedImage(s: Session, turn: TurnState, meta: TurnState['toolByUseId'] extends Map<string, infer M> ? M : never, path: string): void {
   if (turn.outboundSeenPaths.has(path)) return
+  let bytes: number | undefined
+  try { bytes = statSync(path).size }
+  catch { /* The image upload below reports local validation errors. */ }
+  if (bytes !== undefined && bytes > feishu.MAX_UPLOAD_BYTES) {
+    s.sendOutboundPath(path, 'generated image')
+    meta.resolvedNote = '图片超过 30 MB，上传结果见云空间交付卡。'
+    void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i),
+      cards.toolCallElement(meta.i, meta.name, meta.displayInput ?? meta.input, meta.displayOutput ?? meta.output ?? null, '✅', meta.resolvedNote))
+    return
+  }
   turn.outboundSeenPaths.add(path)
   const cardId = turn.cardId
   const elementId = cards.ELEMENTS.tool(meta.i)

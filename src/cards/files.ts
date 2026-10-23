@@ -1,4 +1,4 @@
-import type { FileDeliverySnapshot, FileDeliveryEntry, GroupFileDeliverySettings } from '../file-delivery-types'
+import type { FileDeliverySnapshot, FileDeliveryEntry } from '../file-delivery-types'
 import { ELEMENTS } from './elements'
 
 export const FILE_DELIVERY_CARD_ROWS = 12
@@ -63,7 +63,7 @@ export function fileDeliveryCard(snapshot: FileDeliverySnapshot): object {
       template: ready || !failed ? 'blue' : 'red',
     },
     body: { padding: '16px', vertical_spacing: '16px', elements: [
-      { tag: 'markdown', content: `**本次交付 · ${summary}**` },
+      { tag: 'markdown', content: `**本次云空间交付 · ${summary}**` },
       {
         tag: 'column_set', element_id: ELEMENTS.fileDeliveryList, flex_mode: 'none', background_style: 'grey-50',
         columns: [{ tag: 'column', width: 'weighted', weight: 1, padding: '12px', vertical_spacing: '12px', elements: [
@@ -74,39 +74,8 @@ export function fileDeliveryCard(snapshot: FileDeliverySnapshot): object {
       ...(snapshot.error ? [{ tag: 'markdown', content: `<font color='red'>${escapeText(snapshot.error)}</font>` }] : []),
       ...(folderUrl ? [
         { tag: 'button', text: { tag: 'plain_text', content: '管理群文件' }, type: 'primary_filled', width: 'fill', behaviors: [{ type: 'open_url', default_url: folderUrl }] },
-        { tag: 'markdown', content: '<font color=\'grey\'>卡片仅列本轮文件；管理入口查看本群全部云空间交付文件，可重命名、移动或删除。</font>', text_size: 'notation' },
+        { tag: 'markdown', content: '<font color=\'grey\'>卡片仅列本轮云空间文件；管理入口查看本群全部云空间交付文件，可重命名、移动或删除。</font>', text_size: 'notation' },
       ] : []),
-    ] },
-  }
-}
-
-export function fileDeliverySettingsCard(opts: {
-  groupName: string
-  workDir: string
-  settings?: GroupFileDeliverySettings
-  notice?: string
-  error?: string
-}): object {
-  const mode = !opts.settings ? 'MISS' : opts.settings.enabled ? '云空间交付' : '聊天附件（默认）'
-  return {
-    schema: '2.0', config: { update_multi: true },
-    header: { title: { tag: 'plain_text', content: 'files · 工作目录交付设置' }, template: opts.error ? 'red' : 'blue' },
-    body: { elements: [
-      { tag: 'markdown', content: `**当前模式：${mode}**\n工作目录：${escapeText(opts.workDir)}\n群：${escapeText(opts.groupName)}` },
-      { tag: 'markdown', content: '同一工作目录的群共享交付方式，BTW / FK 沿用此设置；WT 使用独立目录设置。云空间文件夹及权限仍各群独立。' },
-      ...(opts.notice ? [{ tag: 'markdown', content: escapeText(opts.notice) }] : []),
-      ...(opts.error ? [{ tag: 'markdown', content: `<font color='red'>${escapeText(opts.error)}</font>` }] : []),
-      {
-        tag: 'column_set', background_style: 'grey-50',
-        columns: [{ tag: 'column', width: 'weighted', weight: 1, padding: '12px', elements: [{
-          tag: 'markdown', content: '`files on` 开启此工作目录的云空间交付\n`files off` 恢复直接发送聊天附件\n`files` 查看工作目录设置',
-        }] }],
-      },
-      ...(opts.settings?.enabled && !opts.settings.folder ? [{ tag: 'markdown', content: '本群首次交付时创建独立云空间文件夹。' }] : []),
-      ...(opts.settings?.folder ? [{
-        tag: 'button', text: { tag: 'plain_text', content: '管理群文件' }, type: 'primary_filled', width: 'fill',
-        behaviors: [{ type: 'open_url', default_url: linkUrl(opts.settings.folder.url) }],
-      }] : []),
     ] },
   }
 }

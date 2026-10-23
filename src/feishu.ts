@@ -1490,7 +1490,7 @@ export async function downloadAttachment(
 }
 
 // ── Outbound: upload + send file/image ────────────────────────────────
-// 用户约定的飞书出站文件上限，普通文件、图片和卡内图片共同遵守。
+// 聊天附件、图片和卡内图片的上限；更大的交付文件由 Session 路由到云空间。
 export const MAX_UPLOAD_BYTES = 30 * 1024 * 1024
 const FILE_UPLOAD_TIMEOUT_MS = 5 * 60_000
 const FILE_UPLOAD_RECOVERY_MS = 32 * 60_000

@@ -16,7 +16,7 @@ import { isDshReasoningEffort } from './agent-process'
  * only the session-*.ts helpers should touch it."
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, statSync } from 'node:fs'
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import {
@@ -109,9 +109,8 @@ import * as sessionCompact from './session-compact'
 import * as sessionModel from './session-model'
 import * as sessionAgentIdentities from './session-agent-identities'
 import * as sessionTasklist from './session-tasklist'
-import { createFileDelivery, groupFileDelivery } from './file-delivery-runtime'
-import type { FileDeliveryHandle, FileDeliveryMode } from './file-delivery-types'
-import { runFileDeliveryCommand } from './file-delivery-command'
+import { createFileDelivery } from './file-delivery-runtime'
+import type { FileDeliveryHandle } from './file-delivery-types'
 import * as sessionWorktree from './session-worktree'
 import * as sessionTemp from './session-temp'
 import {
@@ -297,9 +296,6 @@ export class Session {
    * Same source id with rotated credentials/base URL must still replace the
    * idle child after the registry is rebuilt. Weak keys avoid lifecycle leaks. */
   private readonly procSourceRevisions = new WeakMap<AgentProcess, string | null>()
-  /** Delivery mode for each process's last submitted input and background work. */
-  private readonly procFileDeliveryModes = new WeakMap<AgentProcess, FileDeliveryMode>()
-  private readonly procPendingFileDeliveryModes = new WeakMap<AgentProcess, FileDeliveryMode>()
   currentTurn: TurnState | null = null
   /** Item-scoped compaction ownership survives a turn-card close so a late
    * completion cannot attach itself to the next turn. Completed receipts keep
@@ -1000,7 +996,6 @@ export class Session {
         ?? `token source "${this.selectedTokenSourceId}" 不可用，请重新配置或在 model 面板选择其他账号`)
     }
     const ts = raw?.enabled || codexPool ? raw : undefined
-    const fileDeliveryMode = this.currentTurn?.fileDeliveryMode ?? this.getFileDeliveryMode()
     // 固定首次启动选定的账号，避免仅落盘 resume 后按新的默认来源重选账号。
     // 使用 checked 写入且先于进程创建；失败不启动、也不把会话悄悄切到别的来源。
     if (this.selectedProvider === 'claude' && ts && !feishu.getSessionModelSelection(this.sessionName)?.tokenSourceId) {
@@ -1025,7 +1020,6 @@ export class Session {
       hostEnv,
     })
     this.procSourceRevisions.set(created.process, created.sourceRevision)
-    this.procFileDeliveryModes.set(created.process, fileDeliveryMode)
     this.claudeStartAccountOverride = undefined
     return created.process
   }
@@ -2851,21 +2845,6 @@ export class Session {
     return sessionCommands.runCommand(this, raw, userOpenId, messageId)
   }
 
-  getFileDeliveryMode(): FileDeliveryMode { return groupFileDelivery.mode(this.chatId, this.workDir) }
-
-  runFileDeliveryCommand(argument: string, userOpenId: string): Promise<void> {
-    return runFileDeliveryCommand(this.chatId, this.sessionName, userOpenId, argument, {
-      get: chatId => groupFileDelivery.get(chatId, this.workDir),
-      enable: (chatId, managerOpenId) => groupFileDelivery.enable(chatId, this.workDir, managerOpenId),
-      disable: chatId => groupFileDelivery.disable(chatId, this.workDir),
-      sendCard: (card, onFailure) => feishu.sendCard(this.chatId, card, onFailure),
-      reportError: async message => {
-        logError('session: file delivery settings failed', message)
-        if (!await feishu.sendText(this.chatId, message)) throw new Error(message)
-      },
-    }, this.workDir)
-  }
-
   /** Build the hi-panel data snapshot for this session.
    *
    * Passing `usage=undefined` paints the `_加载中…_` placeholder — the
@@ -3015,10 +2994,6 @@ export class Session {
     this.steeringBoundary?.start()
     this.steeringBoundary = null
     if (!this.proc) return
-    // Keep the last submitted delivery mode for background work.
-    if (processUsesClaudeTranslation(this.proc)) {
-      this.procPendingFileDeliveryModes.delete(this.proc)
-    }
     // Local translation has no native result to acknowledge this stop. Do not
     // consume the next actual task's result as a stale interrupt receipt.
     if (processUsesClaudeTranslation(this.proc) && this.proc.hasPendingNativeTurn?.() === false) this.userInterrupted = false
@@ -3048,20 +3023,11 @@ export class Session {
       this.status = 'idle'
       return false
     }
-    const turn = this.currentTurn
-    const mode = turn ? (turn.fileDeliveryMode ??= this.getFileDeliveryMode()) : this.getFileDeliveryMode()
-    const previousMode = this.procFileDeliveryModes.get(proc)
-    // Capture before the write: synchronous backend events can open a card or deliver a file.
-    if (processUsesClaudeTranslation(proc)) this.procPendingFileDeliveryModes.set(proc, mode)
-    else this.procFileDeliveryModes.set(proc, mode)
     this.pendingUserMessageCount++
     try {
       proc.sendUserText(text, [])
     } catch (error) {
       this.pendingUserMessageCount = Math.max(0, this.pendingUserMessageCount - 1)
-      this.procPendingFileDeliveryModes.delete(proc)
-      if (previousMode === undefined) this.procFileDeliveryModes.delete(proc)
-      else this.procFileDeliveryModes.set(proc, previousMode)
       throw error
     }
     return true
@@ -3752,12 +3718,6 @@ export class Session {
     on('error', err => {
       logError('session: process error', err)
     })
-    on('user_input_submitted', () => {
-      const mode = this.procPendingFileDeliveryModes.get(p)
-      if (mode === undefined) return
-      this.procFileDeliveryModes.set(p, mode)
-      this.procPendingFileDeliveryModes.delete(p)
-    })
     on('init', () => {
       if (p.provider === 'codex' && p.quotaWaitPromise) {
         this.daemonRestoreRequired = false
@@ -4094,9 +4054,8 @@ export class Session {
     on('result', (result: any, snapshot) => {
       if (processUsesClaudeTranslation(p) && result?.subtype === 'claude_turn_start_failed') {
         // Async validation can reject before native init/turn_started consumes
-        // the claim. Keep the delivery mode from the last submitted input.
+        // the claim. Return it so the next native turn is not misattributed.
         this.pendingUserMessageCount = Math.max(0, this.pendingUserMessageCount - 1)
-        this.procPendingFileDeliveryModes.delete(p)
       }
       this.releaseUnconsumedSteering(p)
       const resumePersistenceError = this.persistResumableSessionId()
@@ -4755,11 +4714,6 @@ export class Session {
       cardRotationFailed: false,
       outboundSeenPaths: new Set(),
       outboundSentPaths: new Set(),
-      // Eager user cards capture their delivery mode when input is submitted.
-      // Backend-driven turns keep the mode of the last submitted input.
-      fileDeliveryMode: trigger === 'user_message' && this.pendingUserMessageCount === 0
-        ? undefined
-        : this.proc ? this.procFileDeliveryModes.get(this.proc) : undefined,
     }
     cardkit.recordCardCreated(cardId, initialElementCount, (code, failure) => {
       this.onCardWriteFailure(turnState, cardId, code, failure)
@@ -5845,13 +5799,10 @@ export class Session {
       return
     }
     try {
-      // Input can reach the backend before its card opens. Reuse its captured
-      // mode even if the group switch changed during that opening window.
-      const mode = turn?.fileDeliveryMode
-        ?? (this.proc ? this.procFileDeliveryModes.get(this.proc) : undefined)
-        ?? this.getFileDeliveryMode()
-      if (turn) turn.fileDeliveryMode = mode
-      if (mode === 'chat') {
+      const stats = statSync(p)
+      if (!stats.isFile()) throw new Error(`路径不是普通文件：${p}`)
+      // The boundary is inclusive: exactly 30 MiB still uses chat attachments.
+      if (stats.size <= feishu.MAX_UPLOAD_BYTES) {
         turn?.outboundSentPaths.add(p)
         void feishu.uploadAndSend(this.chatId, p)
         return

@@ -90,6 +90,7 @@ mock.module('./feishu', () => ({
     return imageUploadHandler ? imageUploadHandler(path) : 'img_generated'
   },
   sendImage: async (chatId: string, key: string) => { sentImages.push([chatId, key]); return `om_image_${sentImages.length}` },
+  MAX_UPLOAD_BYTES: 30 * 1024 * 1024,
   uploadAndSend: async (chatId: string, path: string) => { sentLocalFiles.push([chatId, path]); return true },
   preferredChatForSession: new Map(),
   chatNameCache: new Map(),

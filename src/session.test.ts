@@ -1,8 +1,10 @@
 import { EventEmitter } from 'node:events'
+import { closeSync, ftruncateSync, mkdtempSync, openSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { channelInstructions } from './instructions'
 import { FileDeliveryBatch } from './file-delivery'
 import type { CardWriteFailure } from './cardkit'
-import { GroupFileDelivery } from './group-file-delivery'
 import type { FileDeliverySnapshot } from './file-delivery-types'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import {
@@ -22,7 +24,6 @@ const { FeishuRecoveryWindow } = await import('./feishu-retry')
 const feishu = await import('./feishu')
 const mathRender = await import('./math-render')
 const { config } = await import('./config')
-const { groupFileDelivery } = await import('./file-delivery-runtime')
 const { getTokenSource, listTokenSources, registerTokenSource, refreshAllTokenSourceModels, resetTokenSourceRegistry, tokenSourceProcessRevision } = await import('./token-source')
 const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
 const { peekUsage, refreshUsageFromConnection, invalidateCodexUsage } = await import('./usage')
@@ -722,170 +723,120 @@ describe('Session in-flight user guidance', () => {
   })
 })
 
-describe('Session cloud file receipts', () => {
-  for (const provider of ['codex', 'claude', 'dsh'] as const) {
-    test(`${provider} BTW uses its workspace mode and updates on the next input while WT stays separate`, async () => {
-      const registry = new GroupFileDelivery({
-        read: () => undefined, write: () => {}, workDirForChat: () => undefined,
-        getChatName: async id => id,
-        createFolder: async name => ({ token: name, url: `https://example.com/${name}` }),
-        getFolder: async folder => ({ ...folder, name: folder.token }),
-        renameFolder: async (folder, name) => ({ ...folder, name }),
-        grantFolderAccess: async () => {},
-      })
-      const mode = spyOn(groupFileDelivery, 'mode').mockImplementation((chatId, workDir) => registry.mode(chatId, workDir))
-      const main = new Session('workspace-modes', 'main')
-      const btw = new Session('workspace-modes*0917-1234', 'btw') as any
-      const wt = new Session('workspace-modes[feature]', 'wt')
-      try {
-        await registry.enable(main.chatId, main.workDir, 'user')
-        expect(btw.getFileDeliveryMode()).toBe('drive')
-        expect(wt.getFileDeliveryMode()).toBe('chat')
-        const proc = new FakeAgentProc(provider)
-        btw.procFileDeliveryModes.set(proc, 'drive')
-        btw.sendClaimedUserText(proc, 'first')
-        await registry.disable(main.chatId, main.workDir)
-        btw.sendClaimedUserText(proc, 'second')
-        btw.sendClaimedUserText(proc, 'third')
-        expect(proc.sentTexts).toEqual(['first', "second", 'third'])
-      } finally { mode.mockRestore(); main.dispose(); btw.dispose(); wt.dispose() }
-    })
+describe('Session automatic file delivery', () => {
+  let fileDir: string
+  beforeEach(() => { fileDir = mkdtempSync(join(tmpdir(), 'lodestar-delivery-test-')) })
+  afterEach(() => { rmSync(fileDir, { recursive: true, force: true }) })
+  const localFile = (name: string, bytes = feishu.MAX_UPLOAD_BYTES + 1): string => {
+    const path = join(fileDir, name)
+    const fd = openSync(path, 'w')
+    try { ftruncateSync(fd, bytes) } finally { closeSync(fd) }
+    return path
   }
 
-  test('keeps ordinary file and image messages as the default with no cloud card or upload', () => {
-    const session = new Session('native-files', 'unconfigured-chat') as any
+  test.each(['codex', 'claude', 'dsh'] as const)('%s routes files in main, BTW and WT sessions without changing user input', async provider => {
+    const small = localFile('report.pdf', 1024)
+    const large = localFile('video.mp4')
+    for (const name of ['project', 'project*0917-1234', 'project[feature]']) {
+      const session = new Session(name, name) as any
+      const proc = new FakeAgentProc(provider)
+      const cloudPaths: string[] = []
+      session.proc = proc
+      session.currentTurn = turnState()
+      session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
+      await session.sendClaimedUserText(proc, '生成报告和视频')
+      session.sendOutboundPath(small, 'send marker')
+      session.sendOutboundPath(large, 'send marker')
+      expect(sentLocalFiles).toContainEqual([name, small])
+      expect(cloudPaths).toEqual([large])
+      expect(proc.sentTexts).toEqual(['生成报告和视频'])
+      session.dispose()
+    }
+  })
+
+  test('sends files up to exactly 30 MiB to chat and larger files to Drive within the same turn', () => {
+    const session = new Session('mixed-files', 'chat') as any
     const turn = turnState()
     session.currentTurn = turn
-    session.createFileDeliveryForTurn = () => { throw new Error('cloud delivery must not be used by default') }
-    expect(session.getFileDeliveryMode()).toBe('chat')
-    session.sendOutboundPath('/tmp/report.pdf', 'send marker')
-    session.sendOutboundPath('/tmp/image.png', 'send marker')
-    expect(sentLocalFiles).toEqual([['unconfigured-chat', '/tmp/report.pdf'], ['unconfigured-chat', '/tmp/image.png']])
-    expect(turn.fileDelivery).toBeUndefined()
-    expect(turn.fileDeliveryMode).toBe('chat')
+    const cloudPaths: string[] = []
+    session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
+    const tiny = localFile('report.pdf', 1)
+    const boundary = localFile('boundary.zip', 30 * 1024 * 1024)
+    const oversized = localFile('oversized.zip', 30 * 1024 * 1024 + 1)
+    const image = localFile('image.png', 1024)
+    for (const path of [tiny, boundary, oversized, image, boundary, oversized]) session.sendOutboundPath(path, 'send marker')
+    expect(sentLocalFiles).toEqual([['chat', tiny], ['chat', boundary], ['chat', image]])
+    expect(cloudPaths).toEqual([oversized])
+    expect(turn.outboundSentPaths).toEqual(new Set([tiny, boundary, image]))
     expect(sentCards).toHaveLength(0)
   })
 
-  test('switches only newly admitted batches, so one turn never mixes attachment and cloud delivery', () => {
-    const session = new Session('file-mode-switch', 'chat') as any
-    let mode = 'chat'
-    const cloudPaths: string[] = []
-    session.getFileDeliveryMode = () => mode
-    session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
-    session.currentTurn = turnState()
-    session.sendOutboundPath('/tmp/first.pdf', 'send marker')
-    mode = 'drive'
-    session.sendOutboundPath('/tmp/second.pdf', 'send marker')
-    expect(sentLocalFiles.map(([, path]) => path)).toEqual(['/tmp/first.pdf', '/tmp/second.pdf'])
-    expect(cloudPaths).toEqual([])
-    session.currentTurn = turnState()
-    session.sendOutboundPath('/tmp/third.pdf', 'send marker')
-    expect(cloudPaths).toEqual(['/tmp/third.pdf'])
+  test('small files never initialize Drive or require a delivery requester', () => {
+    const session = new Session('native-files', 'chat') as any
+    const turn = turnState()
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    session.createFileDeliveryForTurn = () => { throw new Error('Drive must not be used for small files') }
+    const report = localFile('report.pdf', 1024)
+    session.sendOutboundPath(report, 'send marker')
+    expect(sentLocalFiles).toEqual([['chat', report]])
+    expect(turn.fileDelivery).toBeUndefined()
+    expect(sentTexts).toHaveLength(0)
   })
 
-  test('changes delivery mode without adding instructions to user input', () => {
-    const session = new Session('file-mode-context', 'chat') as any
-    const proc = new FakeAgentProc('codex')
-    let mode = 'drive'
-    session.getFileDeliveryMode = () => mode
-    session.procFileDeliveryModes.set(proc, mode)
-    session.sendClaimedUserText(proc, '生成大文件')
-    mode = 'chat'
-    session.sendClaimedUserText(proc, '继续交付')
-    session.sendClaimedUserText(proc, '生成报告')
-    mode = 'drive'
-    session.sendClaimedUserText(proc, '生成视频')
-    expect(proc.sentTexts).toEqual([
-      '生成大文件',
-      "继续交付",
-      '生成报告',
-      "生成视频",
-    ])
-    expect(proc.sentTexts[3]).not.toMatch(/30|大小|压缩|分卷/)
-  })
-
-  test('freezes delivery before file generation so changing the group switch cannot invalidate the prepared file', () => {
-    const session = new Session('file-mode-preparation', 'chat') as any
-    const proc = new FakeAgentProc('codex')
-    session.proc = proc
-    let mode = 'drive'
-    session.getFileDeliveryMode = () => mode
-    session.procFileDeliveryModes.set(proc, mode)
-    const cloudPaths: string[] = []
-    session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
+  test('reports missing files and directories without sending or creating a cloud batch', () => {
+    const session = new Session('invalid-files', 'chat') as any
     session.currentTurn = turnState()
-    session.sendClaimedUserText(proc, '生成视频')
-    mode = 'chat'
-    session.sendOutboundPath('/tmp/video.mp4', 'send marker')
-    expect(cloudPaths).toEqual(['/tmp/video.mp4'])
+    session.createFileDeliveryForTurn = () => { throw new Error('must validate the file first') }
+    session.sendOutboundPath(join(fileDir, 'missing.zip'), 'send marker')
+    session.sendOutboundPath(fileDir, 'send marker')
     expect(sentLocalFiles).toEqual([])
-    session.currentTurn = turnState()
-    session.sendClaimedUserText(proc, '生成报告')
-    session.sendOutboundPath('/tmp/report.pdf', 'send marker')
-    expect(sentLocalFiles).toEqual([['chat', '/tmp/report.pdf']])
-    expect(proc.sentTexts).toEqual(['生成视频', "生成报告"])
+    expect(session.currentTurn.fileDelivery).toBeUndefined()
+    expect(sentTexts).toHaveLength(2)
+    expect(sentTexts.every(text => text.includes('文件交付失败'))).toBe(true)
   })
 
-  test('keeps the captured delivery mode if the backend opens its card after the group switch changed', () => {
-    const session = new Session('file-mode-late-card', 'chat') as any
-    const proc = new FakeAgentProc('codex')
-    session.proc = proc
-    let mode = 'drive'
-    session.getFileDeliveryMode = () => mode
-    session.procFileDeliveryModes.set(proc, mode)
-    const cloudPaths: string[] = []
-    session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
-    session.sendClaimedUserText(proc, '生成视频')
-    mode = 'chat'
+  test('reports a cloud setup failure without falling back to a chat attachment', () => {
+    const session = new Session('cloud-failure', 'chat') as any
     session.currentTurn = turnState()
-    session.sendOutboundPath('/tmp/late-video.mp4', 'send marker')
-    expect(cloudPaths).toEqual(['/tmp/late-video.mp4'])
+    session.createFileDeliveryForTurn = () => { throw new Error('云空间权限不足') }
+    session.sendOutboundPath(localFile('large.zip'), 'send marker')
     expect(sentLocalFiles).toEqual([])
+    expect(sentTexts.some(text => text.includes('云空间权限不足'))).toBe(true)
+    expect(session.currentTurn.outboundSentPaths.size).toBe(0)
   })
 
-  test('restores the previous delivery mode after the backend rejects its input write', () => {
-    const session = new Session('file-mode-write-error', 'chat') as any
+  test('releases the pending input claim after the backend rejects its input write', async () => {
+    const session = new Session('file-input-error', 'chat') as any
     const proc = new FakeAgentProc('codex')
-    session.procFileDeliveryModes.set(proc, 'drive')
-    session.getFileDeliveryMode = () => 'chat'
     const send = proc.sendUserText.bind(proc)
     proc.sendUserText = () => { throw new Error('input closed') }
-    expect(() => session.sendClaimedUserText(proc, '生成报告')).toThrow('input closed')
+    await expect(session.sendClaimedUserText(proc, '生成报告')).rejects.toThrow('input closed')
     expect(session.pendingUserMessageCount).toBe(0)
-    expect(session.procFileDeliveryModes.get(proc)).toBe('drive')
     proc.sendUserText = send
-    session.sendClaimedUserText(proc, '生成报告')
-    expect(proc.sentTexts).toEqual(["生成报告"])
+    await session.sendClaimedUserText(proc, '生成报告')
+    expect(proc.sentTexts).toEqual(['生成报告'])
   })
 
-  test('an async translation rejection preserves the previous delivery mode without adding context', async () => {
+  test('an async translation rejection releases the pending claim without adding context', async () => {
     const session = new Session('translation-delivery-failure', 'chat') as any
     const proc = new FakeAgentProc('claude', 'translation-session', 'claude-sub') as any
     proc.translationEnabled = true
     session.proc = proc
     session.wireProc(proc)
     session.closeTurnCard = async () => {}
-    session.getFileDeliveryMode = () => 'chat'
-    session.procFileDeliveryModes.set(proc, 'drive')
     await session.sendClaimedUserText(proc, 'first')
     expect(session.pendingUserMessageCount).toBe(1)
     proc.lastResult = { ...proc.lastResult, subtype: 'claude_turn_start_failed', is_error: true }
     proc.emit('result', { subtype: 'claude_turn_start_failed', is_error: true, error: 'validation rejected' })
     expect(session.pendingUserMessageCount).toBe(0)
-    expect(session.procFileDeliveryModes.get(proc)).toBe('drive')
     await session.sendClaimedUserText(proc, 'second')
-    expect(proc.sentTexts).toEqual([
-      "first",
-      "second",
-    ])
+    expect(proc.sentTexts).toEqual(['first', 'second'])
     proc.emit('user_input_submitted', {})
-    expect(session.procFileDeliveryModes.get(proc)).toBe('chat')
     proc.hasPendingNativeTurn = () => false
     session.userInterrupted = true
     session.interrupt()
     expect(session.userInterrupted).toBe(false)
-    expect(session.procFileDeliveryModes.get(proc)).toBe('chat')
-    expect(session.procPendingFileDeliveryModes.has(proc)).toBe(false)
     session.dispose()
   })
 
@@ -904,23 +855,22 @@ describe('Session cloud file receipts', () => {
       session.userInterrupted = true
       session.interrupt()
       expect(session.userInterrupted).toBe(true)
-      expect(session.procPendingFileDeliveryModes.has(proc)).toBe(false)
       session.dispose()
     }
   })
 
-  test('routes files commands to the current group settings without forwarding them to an Agent', async () => {
+  test('files is no longer intercepted as a control command', async () => {
     const session = new Session('file-commands', 'chat') as any
-    const calls: unknown[][] = []
-    session.runFileDeliveryCommand = async (...args: unknown[]) => { calls.push(args) }
-    for (const command of ['files', 'files on', 'FILES OFF']) expect(await session.runCommand(command, 'ou_user')).toBe(true)
-    expect(calls).toEqual([['', 'ou_user'], ['on', 'ou_user'], ['OFF', 'ou_user']])
+    for (const command of ['files', 'files on', 'FILES OFF', 'files status']) {
+      expect(await session.runCommand(command, 'ou_user')).toBe(false)
+    }
+    expect(sentCards).toHaveLength(0)
+    expect(sentTexts).toHaveLength(0)
   })
 
   test('keeps one delivery across rotations, deduplicates markers, and waits for final publication', async () => {
     const session = new Session('files', 'chat_id') as any
     const turn = turnState('card_file_receipt')
-    turn.fileDeliveryMode = 'drive'
     cardkit.recordCardCreated(turn.cardId, 1)
     session.currentTurn = turn
     const admitted: string[] = []
@@ -933,20 +883,22 @@ describe('Session cloud file receipts', () => {
       factories++
       return { add: (path: string) => { admitted.push(path) }, finish: () => { finishStarted = true; return publication } }
     }
-    session.sendOutboundPath('/tmp/large.mp4', 'send marker')
-    session.sendOutboundPath('/tmp/large.mp4', 'duplicate marker')
-    session.sendOutboundPath('/tmp/report.pdf', 'send marker after rotation')
+    const large = localFile('large.mp4')
+    session.sendOutboundPath(large, 'send marker')
+    session.sendOutboundPath(large, 'duplicate marker')
+    const report = localFile('report.pdf')
+    session.sendOutboundPath(report, 'send marker after rotation')
     expect(factories).toBe(1)
-    expect(admitted).toEqual(['/tmp/large.mp4', '/tmp/report.pdf'])
+    expect(admitted).toEqual([large, report])
     expect(turn.outboundSentPaths.size).toBe(0)
     expect(sentLocalFiles).toHaveLength(0)
     const closed = session.closeTurnCard()
     await waitUntil(() => finishStarted)
     expect(cardkit.isDisposed(turn.cardId)).toBe(false)
-    release(['/tmp/large.mp4'])
+    release([large])
     await closed
-    expect(turn.outboundSentPaths.has('/tmp/large.mp4')).toBe(true)
-    expect(turn.outboundSentPaths.has('/tmp/report.pdf')).toBe(false)
+    expect(turn.outboundSentPaths.has(large)).toBe(true)
+    expect(turn.outboundSentPaths.has(report)).toBe(false)
     expect(cardkit.isDisposed(turn.cardId)).toBe(true)
   })
 
@@ -960,12 +912,9 @@ describe('Session cloud file receipts', () => {
     session.proc = proc
     session.selectedProvider = provider
     session.selectedEffort = 'high'
-    session.getFileDeliveryMode = () => 'drive'
-    session.procFileDeliveryModes.set(proc, 'drive')
     session.wireProc(proc)
     const turn = turnState(`card_file_handoff_${provider}_${isError}`)
     turn.provider = provider
-    turn.fileDeliveryMode = 'drive'
     session.currentTurn = turn
     cardkit.recordCardCreated(turn.cardId, 1)
     const receipts: FileDeliverySnapshot[] = []
@@ -991,7 +940,8 @@ describe('Session cloud file receipts', () => {
       reportError: async message => { errors.push(message) },
     })
     session.createFileDeliveryForTurn = () => delivery
-    session.sendOutboundPath('/tmp/preview.mp4', 'send marker')
+    const preview = localFile('preview.mp4')
+    session.sendOutboundPath(preview, 'send marker')
     await waitUntil(() => uploadSignal !== undefined)
     try {
       session.pendingMidTurnMsgs = [{
@@ -1015,7 +965,7 @@ describe('Session cloud file receipts', () => {
       expect(receipts[0].files.map(file => file.status)).toEqual(['ready'])
       expect(receipts[0].error).toBeUndefined()
       expect(errors).toEqual([])
-      expect(turn.outboundSentPaths.has('/tmp/preview.mp4')).toBe(true)
+      expect(turn.outboundSentPaths.has(preview)).toBe(true)
       expect(cardkit.isDisposed(turn.cardId)).toBe(true)
       expect(session.fileDeliveries.size).toBe(0)
       expect(session.currentTurn).toBe(nextTurn)
@@ -1032,7 +982,6 @@ describe('Session cloud file receipts', () => {
   test.each(['hard', 'soft'])('%s stop cancels file delivery after the agent finished and its turn was captured', async mode => {
     const session = new Session('closing-files', 'chat_id') as any
     const turn = turnState('card_closing_files')
-    turn.fileDeliveryMode = 'drive'
     session.currentTurn = turn
     cardkit.recordCardCreated(turn.cardId, 1)
     let finishStarted = false
@@ -1044,7 +993,8 @@ describe('Session cloud file receipts', () => {
       finish: () => { finishStarted = true; return published },
       cancel: (reason: string) => { cancelled = reason; release([]); return true },
     })
-    session.sendOutboundPath('/tmp/large.mp4', 'send marker')
+    const large = localFile('large.mp4')
+    session.sendOutboundPath(large, 'send marker')
     const close = session.closeTurnCard()
     await waitUntil(() => finishStarted)
     expect(session.currentTurn).toBeNull()
@@ -1058,6 +1008,37 @@ describe('Session cloud file receipts', () => {
 })
 
 describe('generated image delivery', () => {
+  test('a generated image over 30 MiB uses Drive and deduplicates its later send marker', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-large-image-test-'))
+    const image = join(dir, 'large-image.png')
+    const fd = openSync(image, 'w')
+    try { ftruncateSync(fd, feishu.MAX_UPLOAD_BYTES + 1) } finally { closeSync(fd) }
+    const session = new Session('large-image', 'chat_id') as any
+    const turn = turnState('card_large_image')
+    session.currentTurn = turn
+    const admitted: string[] = []
+    session.createFileDeliveryForTurn = () => ({ add: (path: string) => admitted.push(path), finish: async () => admitted, cancel: () => false })
+    cardkit.recordCardCreated(turn.cardId, 1)
+    try {
+      sessionTools.addTool(session, 'large-image-call', 'ImageGeneration', { revisedPrompt: 'Large picture' })
+      sessionTools.completeTool(session, 'large-image-call', image, false)
+      await sessionTools.waitForImageDeliveries(turn)
+      session.sendOutboundPath(image, 'duplicate marker')
+      expect(admitted).toEqual([image])
+      expect(uploadedImages).toEqual([])
+      expect(sentImages).toEqual([])
+      expect(sentLocalFiles).toEqual([])
+      expect(turn.outboundSentPaths.has(image)).toBe(false)
+      await session.closeTurnCard()
+      expect(turn.outboundSentPaths.has(image)).toBe(true)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+      session.dispose()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test('card rotation waits for the generated image on the old tool card', async () => {
     const session = new Session('image-rotation', 'chat_id') as any
     const oldCardId = 'card_image_rotation_old'
