@@ -6,7 +6,7 @@ import { claudeTranslationModeEnabled } from './claude-translation-mode'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
-import { log } from './log'
+import { logError } from './log'
 import * as worktree from './worktree'
 import { messageOf, type WorktreeActionResult } from './session-util'
 
@@ -189,7 +189,7 @@ async function worktreeActionResult(
     return { ok, message, card: await buildWorktreeListCard(s, { type, content: message }) }
   } catch (e) {
     const listError = `列表刷新失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": wt action panel refresh failed: ${messageOf(e)}`)
+    logError('session-worktree: wt action panel refresh failed', e)
     return {
       ok: false,
       message: `${message}\n${listError}`,

@@ -1,8 +1,8 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, test } from 'bun:test'
-import { fileLoggingEnabled, localDayKey, log, logFileForDate, parseLogFileDate, pruneOldLogs } from './log'
+import { fileLoggingEnabled, formatLogDiagnostic, formatLogError, localDayKey, log, logFileForDate, parseLogFileDate, pruneOldLogs } from './log'
 
 describe('log day key', () => {
   test('localDayKey formats local date as YYYY-MM-DD', () => {
@@ -107,5 +107,63 @@ describe('test-env file logging guard', () => {
     const todayFile = logFileForDate(new Date())
     const content = existsSync(todayFile) ? readFileSync(todayFile, 'utf8') : ''
     expect(content).not.toContain(marker)
+  })
+})
+
+describe('operational log privacy', () => {
+  test('keeps useful machine diagnostics without serializing upstream errors', () => {
+    const error = Object.assign(new Error('private-user@example.test /private/customer/report.txt'), {
+      code: 'ECONNRESET',
+      request: { headers: { authorization: 'Bearer private-key' }, data: { user: 'private-person' } },
+      response: { status: 503, data: { code: 99991400, message: 'oc_private-chat' } },
+    })
+    expect(formatLogError('transport failed', error)).toBe('transport failed reason=ECONNRESET status=503 code=99991400')
+    expect(formatLogError('request failed', new Error('unauthorized for ou_private-person')))
+      .toBe('request failed reason=authentication')
+    expect(formatLogError('request failed', { get message() { throw new Error('private-person') } }))
+      .toBe('request failed reason=unknown')
+    expect(formatLogError('request failed', new AggregateError([
+      { code: '300308', httpStatus: 500, msg: 'Server Internal Error private-owner' },
+    ], 'private-owner'))).toBe('request failed code=300308 status=500 reason=server_error')
+  })
+
+  test('does not accept identity fields or arbitrary strings disguised as enums', () => {
+    expect(formatLogDiagnostic('request failed', {
+      chatId: 'oc_private-chat', sessionId: 'private-session', user: 'private-person',
+      count: 17, groups: 3, path: '/private/customer', payload: '{"owner":"private-person"}',
+      reason: 'private-person', method: 'GET/oc_private-chat', provider: 'private-provider',
+      status: 503, attempt: 2,
+    })).toBe('request failed status=503 attempt=2')
+  })
+
+  test('both output sinks omit identities and repeated failures do not enumerate users', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lodestar-log-privacy-'))
+    const script = `
+      import { logError, logDiagnostic } from ${JSON.stringify(new URL('./log.ts', import.meta.url).href)};
+      for (const owner of ['private-user-one', 'private-user-two']) {
+        const error = Object.assign(new Error('unauthorized ' + owner + ' /private/' + owner), {
+          response: { status: 401, data: { user: owner, chat_id: 'oc_' + owner } },
+          stack: 'private stack ' + owner,
+        });
+        logError('transport failed', error);
+      }
+      logDiagnostic('protocol invalid', { sessionId: 'private-session', count: 2, payload: 'private-body' });
+    `
+    try {
+      const child = Bun.spawnSync([process.execPath, '--eval', script], {
+        env: { ...process.env, NODE_ENV: 'production', LODESTAR_DATA_DIR: directory },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      const stderr = child.stderr.toString()
+      expect(child.exitCode).toBe(0)
+      expect(child.stdout.toString()).toBe('')
+      expect(stderr).not.toMatch(/private-|oc_|\/private\/|count=|suppressed|stack/)
+      expect(stderr.trim().split('\n')).toHaveLength(2)
+      expect(stderr).toContain('transport failed status=401 reason=authentication')
+      const file = readdirSync(directory).find(name => /^daemon-.*\.log$/.test(name))!
+      expect(readFileSync(join(directory, file), 'utf8')).toBe(stderr)
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
   })
 })

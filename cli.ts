@@ -22,6 +22,7 @@
 import { existsSync, unlinkSync } from 'node:fs'
 import { CONFIG_FILE, PID_FILE } from './src/paths'
 import { checkPidGuard } from './src/pid-guard'
+import { logError } from './src/log'
 
 const C = {
   reset: '\x1b[0m',
@@ -41,7 +42,7 @@ async function main(): Promise<void> {
       // 向导写完 config + 拉起 detached daemon 就 rl.close, 进程从这里干净退出。
       return
     }
-    console.error(`${C.red}Lodestar: 未找到配置 ${CONFIG_FILE}${C.reset}`)
+    console.error('Lodestar: 未找到配置')
     console.error(`请在交互式 cmd / PowerShell 里运行 ${C.green}lodestar-setup${C.reset} 完成首次配置 (或直接运行 ${C.green}lodestar-daemon${C.reset} 也会触发同一个向导)。`)
     process.exit(1)
   }
@@ -55,13 +56,12 @@ async function main(): Promise<void> {
   // 查询失败显式报错，不能把无法确认身份当成允许启动。
   const guard = checkPidGuard(PID_FILE)
   if (guard.state === 'exit') {
-    console.error(`${C.yellow}Lodestar: 已经有一个 daemon 在运行 (pid ${guard.pid})${C.reset}`)
+    console.error('Lodestar: 已经有一个 daemon 在运行')
     console.error('  • 想看日志:'
       + (process.platform === 'win32'
           ? ' %LOCALAPPDATA%\\Lodestar\\daemon-YYYY-MM-DD.log'
           : ' ~/.local/share/lodestar/daemon-YYYY-MM-DD.log'))
-    console.error('  • 想停: 任务管理器结束 pid 上面那个号 (Windows) / `kill ' + guard.pid + '` (Linux/macOS)')
-    console.error(`  • 误判 / 已经死了: 手删 ${PID_FILE} 后再跑`)
+    console.error('  • 想停: 运行 lodestar-stop')
     process.exit(1)
   }
   // 如果 PID 文件存在但 isOurDaemon 判否 (stale + 回收), 顺手清掉, 后面
@@ -74,6 +74,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((e: any) => {
-  console.error('lodestar fatal:', e?.message ?? e)
+  logError('lodestar: startup failed', e)
   process.exit(1)
 })

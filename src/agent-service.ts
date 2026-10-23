@@ -22,7 +22,7 @@ import type {
 } from './agent-run-types'
 import { AGENT_RUNS_DIR, MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { writeJsonStateAtomic, writeStateFileAtomic } from './state-store'
-import { log } from './log'
+import { logError } from './log'
 import type { Session } from './session'
 import { agentPrincipalContext, type AgentExecutionContext, type AgentPrincipal } from './agent-context'
 import type { AgentReasoningEffort } from './agent-process'
@@ -460,7 +460,7 @@ export class AgentService {
     for (const identity of identities) {
       const resumeSessionId = options.resumeSessionId
       void this.executeWorker(run, identity, request.prompt, admittedWorkDir, resumeSessionId).catch(error => {
-        log(`agent: run=${runId} worker=${identity.id} crashed: ${messageOf(error)}`)
+        logError('agent-service: worker crashed', error)
       })
     }
     return this.readSnapshot(run)
@@ -642,9 +642,9 @@ export class AgentService {
       run.finalized = false
       run.snapshot.status = 'failed'
       run.snapshot.error = `Agent terminal persistence failed: ${messageOf(error)}`
-      log(`agent: terminal finalization failed run=${run.snapshot.runId}: ${messageOf(error)}`)
+      logError('agent-service: terminal finalization failed', error)
       void this.deps.sendTextRaw(run.snapshot.chatId, `❌ agent ${run.snapshot.runId} 收尾失败: ${messageOf(error)}`)
-        .catch(deliveryError => log(`agent: terminal failure delivery failed: ${messageOf(deliveryError)}`))
+        .catch(deliveryError => logError('agent-service: terminal failure delivery failed', deliveryError))
     })
   }
 
@@ -682,7 +682,7 @@ export class AgentService {
       run.snapshot.error = error.message
       this.persist(run)
       await this.deps.sendTextRaw(run.snapshot.chatId, `❌ Agent 取消未完成: ${error.message}`)
-        .catch(deliveryError => log(`agent: cancellation failure notice failed: ${messageOf(deliveryError)}`))
+        .catch(deliveryError => logError('agent-service: cancellation failure notice failed', deliveryError))
       throw error
     }
     const cancelledWorkers: AgentWorkerResult[] = []
@@ -722,7 +722,7 @@ export class AgentService {
       await this.deps.sendTextRaw(
         run.snapshot.chatId,
         `⚠️ 委派卡片出现更新错误 · ${run.snapshot.description ?? run.snapshot.runId}\n结果已保存，卡片更新期间出现 ${run.snapshot.presentationErrors.length} 个错误：\n${preview}\n任务：${run.snapshot.runId}`,
-      ).catch(error => log(`agent: warning delivery failed run=${run.snapshot.runId}: ${messageOf(error)}`))
+      ).catch(error => logError('agent-service: warning delivery failed', error))
     }
   }
 
@@ -746,7 +746,7 @@ export class AgentService {
     const errors = run.snapshot.presentationErrors ?? []
     if (!errors.includes(detail)) errors.push(detail)
     run.snapshot.presentationErrors = errors
-    log(`agent: ${detail} run=${run.snapshot.runId}`)
+    logError('agent-service: worker presentation failed', detail)
   }
 
   private persist(run: AgentRunRecord): void {

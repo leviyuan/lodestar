@@ -4,7 +4,6 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { config } from './config'
 import { isClaudeReasoningEffort } from './agent-process'
-import { log } from './log'
 import { ANTHROPIC_ENV_KEYS, registerTokenSourceFactory, scrubAnthropicEnv, type TokenSource, type UsageSnapshotUnified } from './token-source'
 import { fetchNativeClaudeModels } from './token-source-models'
 import { fetchClaudeSubscriptionUsage } from './claude-usage'
@@ -144,7 +143,6 @@ registerTokenSourceFactory({
             ...(!defaultModel ? { error: 'Claude Opus 默认模型 MISS；请通过 md 明确选择账号目录中的模型' } : {}) }
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error)
-          log(`claude-sub ${accountId} refreshModels MISS: ${reason}`)
           if (claudeAccounts.revision(accountId) === revision && isUsageAuthError(error)) invalidateClaudeSubscriptionUsage(accountId)
           if ((error as { code?: string })?.code === 'CLAUDE_SUBSCRIPTION_AUTH_MISSING') source.enabled = false
           source.modelCatalogState = { status: source.enabled ? 'failed' : 'disabled', updatedAt: Date.now(), error: reason }

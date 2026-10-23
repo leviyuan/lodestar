@@ -1,10 +1,9 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, test } from 'bun:test'
 import { CLAUDE_TRANSLATION_API, CLAUDE_TRANSLATION_MODEL, CLAUDE_TRANSLATION_PROMPT, ClaudeInputRejectedError, createClaudeTranslation } from './claude-translation'
 import { CLAUDE_TRANSLATION_ORIGINS, claudeTranslationOriginForRole, ClaudeTranslationContext } from './claude-translation-context'
-import { ClaudeTranslationTrace } from './claude-translation-trace'
 
 type Options = NonNullable<Parameters<typeof createClaudeTranslation>[0]>
 type RequestRecord = { url: string; init: RequestInit; body: Record<string, any> }
@@ -533,83 +532,6 @@ describe('Claude translation snapshots and cancellation', () => {
     await expect(translator.toEnglish('测试。', signal())).rejects.toThrow('timed out')
     expect(requests).toHaveLength(1)
     expect(requests[0]!.init.signal!.aborted).toBe(true)
-  })
-})
-
-describe('translator request and response trace integration', () => {
-  function trace() {
-    const directory = mkdtempSync(join(tmpdir(), 'translator-trace-integration-'))
-    directories.push(directory)
-    return new ClaudeTranslationTrace({ workDir: directory, directory: join(directory, 'traces'), sourceId: 'glm' })
-  }
-  const rows = (trace: ClaudeTranslationTrace): any[] => readFileSync(trace.filePath, 'utf8').trimEnd().split('\n').map(line => JSON.parse(line))
-
-  test('records exact request/response and final translation, binding pre-init calls to the native session', async () => {
-    const audit = trace()
-    const ledger = await context()
-    const raw = { model: CLAUDE_TRANSLATION_MODEL, choices: [choice(`Keep ${KEY}.`)], extra: 'Complete upstream response' }
-    const { translator, requests } = harness([Response.json(raw)], { trace: audit, context: () => ledger.snapshot() })
-    expect(await translator.toEnglish(`保留 ${KEY}。`, signal())).toBe(`Keep ${KEY}.`)
-    translator.bindSession!('native-trace-session')
-    translator.bindSession!('native-trace-session')
-    const recorded = rows(audit)
-    expect(recorded.map(row => row.event)).toEqual(['request', 'response', 'result', 'session_bound'])
-    expect(recorded[0].body).toEqual(JSON.parse(JSON.stringify(requests[0]!.body).replaceAll(KEY, '[REDACTED]')))
-    expect(recorded[0]).toMatchObject({ endpoint: `${CLAUDE_TRANSLATION_API}/chat/completions`, direction: 'en', sessionId: null })
-    expect(JSON.parse(recorded[1].bodyText)).toEqual(JSON.parse(JSON.stringify(raw).replaceAll(KEY, '[REDACTED]')))
-    expect(recorded[2].text).toBe('Keep [REDACTED].')
-    expect(recorded[3].sessionId).toBe('native-trace-session')
-    expect(new Set(recorded.slice(0, 3).map(row => row.requestId)).size).toBe(1)
-    expect(readFileSync(audit.filePath, 'utf8')).not.toContain(KEY)
-    expect(recorded[0].body.messages[0].content).toBe(CLAUDE_TRANSLATION_PROMPT)
-    expect(recorded[0].body.messages.slice(1, -1)).toEqual(pairs(ledger))
-  })
-
-  test('records every field call separately with plain fragment results', async () => {
-    const audit = trace()
-    const { translator, requests } = harness([message('电荷'), message('电流')], { trace: audit })
-    expect(await translator.toChineseFields(['Charge', 'Current'], signal())).toEqual(['电荷', '电流'])
-    expect(requests).toHaveLength(2)
-    expect(rows(audit).map(row => row.event)).toEqual(['request', 'response', 'result', 'request', 'response', 'result'])
-    expect(rows(audit).filter(row => row.event === 'result').map(row => row.text)).toEqual(['电荷', '电流'])
-    expect(new Set(rows(audit).map(row => row.requestId)).size).toBe(2)
-  })
-
-  test.each(['upstream', 'literal-change', 'policy-reject'] as const)('keeps the full response and terminal error for %s', async kind => {
-    const audit = trace()
-    const response = kind === 'upstream'
-      ? Response.json({ error: { code: 'denied', message: `denied ${KEY}` }, details: 'Untruncated diagnostics' }, { status: 403 })
-      : kind === 'literal-change' ? message('Use `/tmp/changed.txt`.') : message('[[TRANSLATION_REJECT]] 规则拒绝')
-    const { translator } = harness([response], { trace: audit, validationRules: 'Reject blocked inputs.' })
-    await expect(translator.toEnglish('使用 `/tmp/original.txt`。', signal())).rejects.toThrow()
-    const recorded = rows(audit)
-    expect(recorded.map(row => row.event)).toEqual(['request', 'response', 'error'])
-    expect(recorded[1].bodyText.length).toBeGreaterThan(0)
-    expect(recorded[2].message.length).toBeGreaterThan(0)
-    expect(readFileSync(audit.filePath, 'utf8')).not.toContain(KEY)
-  })
-
-  test('logs an aborted request without inventing a response or result', async () => {
-    const audit = trace()
-    const controller = new AbortController()
-    let started!: () => void
-    const ready = new Promise<void>(resolve => { started = resolve })
-    const { translator } = harness([request => { started(); return waitForAbort(request) }], { trace: audit })
-    const pending = translator.toEnglish('测试。', controller.signal).catch(error => error)
-    await ready
-    const reason = new Error('cancel translation test')
-    controller.abort(reason)
-    expect(await pending).toBe(reason)
-    expect(rows(audit).map(row => row.event)).toEqual(['request', 'error'])
-    expect(rows(audit)[1]).toMatchObject({ cancelled: true, message: 'cancel translation test' })
-  })
-
-  test('does not send a request if the required trace cannot be written', async () => {
-    const audit = trace()
-    audit.append = () => { throw new Error('trace fixture write failed') }
-    const { translator, requests } = harness([message('Test.')], { trace: audit })
-    await expect(translator.toEnglish('测试。', signal())).rejects.toThrow('trace fixture write failed')
-    expect(requests).toHaveLength(0)
   })
 })
 

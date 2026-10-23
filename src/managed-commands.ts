@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, readFileSync, realpathSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
-import { log } from './log'
+import { log, logError } from './log'
 import { writeExecutableFileAtomic } from './state-store'
 
 export interface AgentCliLaunch {
@@ -67,7 +67,7 @@ export function ensureLodestarAgentCommand(opts: SyncCommandOptions = {}): strin
   const current = existsSync(target) ? readFileSync(target, 'utf8') : null
   if (current !== body) {
     writeExecutableFileAtomic(target, body)
-    log(`command: ${current === null ? 'installed' : 'updated'} ${target}`)
+    log('command: managed command updated')
   } else {
     chmodSync(target, 0o700)
   }
@@ -82,13 +82,13 @@ function removeLegacyConsultCommand(targetDir: string, platform: NodeJS.Platform
   try {
     const body = readFileSync(legacy, 'utf8')
     if (!body.includes('lodestar-consult') && !body.includes('consult-cli')) {
-      log(`command: obsolete path preserved because ownership is unclear ${legacy}`)
+      log('command: obsolete command preserved because ownership is unclear')
       return
     }
     unlinkSync(legacy)
-    log(`command: removed obsolete ${legacy}`)
+    log('command: removed obsolete managed command')
   } catch (error) {
-    log(`command: obsolete removal failed (${legacy}): ${error}`)
+    logError('command: obsolete command removal failed', error)
   }
 }
 

@@ -20,14 +20,13 @@ import { StringDecoder } from 'node:string_decoder'
 import type { Readable, Writable } from 'node:stream'
 import { spawn as crossSpawn } from 'cross-spawn'
 import { config } from './config'
-import { log } from './log'
+import { logError, logDiagnostic } from './log'
 import { agentBin } from './agent-updates'
 import { prepareCodexInputPolicyCatalog, type CodexInputPolicyCatalog } from './codex-input-policy'
 import {
   contextCompactionNoticeFromMessage,
   contextCompactionNoticeFromNotification,
-  logContextCompactionPayload,
-  logUnhandledAppServerPayload,
+  logUnhandledAppServerEvent,
 } from './codex-compaction'
 import { usageFromTokenUsagePayload } from './codex-usage'
 import { shellCommandDescription } from './cards/shell-command'
@@ -385,7 +384,6 @@ export class CodexProcess extends EventEmitter {
   private inputPolicyAbort = new AbortController()
   private inputPolicyCatalog: CodexInputPolicyCatalog | null = null
   private stdoutBuf = ''
-  private stderrBuf = ''
   private requestCounter = 0
   private pending = new Map<string | number, PendingRequest>()
   private serverRequests = new Map<string | number, ServerRequestState>()
@@ -512,7 +510,6 @@ export class CodexProcess extends EventEmitter {
   }
 
   private spawnNative(binary: string, args: string[], env: Record<string, string | undefined>): void {
-    log(`codex-process: spawn ${binary} app-server (cwd=${this.opts.workDir})`)
     // cross-spawn resolves Windows .cmd shims without `shell:true`; keeping an
     // argv vector preserves quoted TOML values passed through --config.
     this.proc = crossSpawn(
@@ -522,7 +519,8 @@ export class CodexProcess extends EventEmitter {
     ) as ChildProcessByStdio<Writable, Readable, Readable>
 
     this.proc.stdout.on('data', (chunk: Buffer) => this.onStdout(chunk))
-    this.proc.stderr.on('data', (chunk: Buffer) => this.onStderr(chunk))
+    // Drain native stderr without copying private upstream diagnostics into host logs.
+    this.proc.stderr.on('data', () => {})
     this.proc.stdin.on('error', err => this.handleStdinError(err))
     this.proc.on('exit', (code, signal) => this.handleChildExit(code, signal))
     this.proc.on('close', (code, signal) => this.handleChildClose(code, signal))
@@ -531,7 +529,7 @@ export class CodexProcess extends EventEmitter {
 
   private handleStdinError(reason: unknown): void {
     const error = reason instanceof Error ? reason : new Error(String(reason))
-    log(`codex-process: stdin failed: ${error.message}`)
+    logError('codex-process: stdin failed', error)
     // Per-write callbacks reject the request whose bytes failed. Do not
     // blanket-reject every already-sent RPC here: an EPIPE during shutdown
     // can race valid responses still buffered in stdout, which close drains
@@ -541,7 +539,6 @@ export class CodexProcess extends EventEmitter {
 
   private handleChildExit(code: number | null, signal: NodeJS.Signals | null): void {
     if (!this.alive) {
-      log(`codex-process: duplicate exit ignored code=${code} signal=${signal}`)
       return
     }
     this.alive = false
@@ -551,14 +548,12 @@ export class CodexProcess extends EventEmitter {
     // Do not reject pending RPCs here: Node's `exit` precedes stdio `close`,
     // and a final response may still be buffered in stdout. close drains that
     // tail first, then rejects only requests that truly received no response.
-    log(`codex-process: OS exit code=${code} signal=${signal}; awaiting stdio close`)
   }
 
   private handleChildClose(code: number | null, signal: NodeJS.Signals | null): void {
     this.alive = false
     this.cancelTurnRetry()
     this.flushStdoutTail()
-    this.flushStderrTail()
     this.rejectPendingRequests((id, pending) => (
       new Error(`codex app-server closed before ${pending.method} response (id=${id})`)
     ))
@@ -581,7 +576,7 @@ export class CodexProcess extends EventEmitter {
   }
 
   private handleChildProcessError(err: Error): void {
-    log(`codex-process: child process error: ${err}`)
+    logError('codex-process: child process error', err)
     this.rejectPendingRequests((id, pending) => new Error(
       `codex app-server process failed before ${pending.method} response (id=${id}): ${err.message}`,
       { cause: err },
@@ -600,7 +595,7 @@ export class CodexProcess extends EventEmitter {
     }
     this.emit('error', err)
     if (terminalized) {
-      log(`codex-process: spawn failed before pid assignment expected=${this.expectedExit}`)
+      logDiagnostic('codex-process: spawn failed before pid assignment')
       this.emitProcessExit(null, null)
     }
   }
@@ -609,7 +604,7 @@ export class CodexProcess extends EventEmitter {
     if (this.exitEventEmitted) return
     this.exitEventEmitted = true
     this.resolveExit()
-    log(`codex-process: exited code=${code} signal=${signal} expected=${this.expectedExit}`)
+    if (!this.expectedExit) logDiagnostic('codex-process: unexpected process exit')
     this.emit('exit', { code, signal, expected: this.expectedExit })
   }
 
@@ -624,7 +619,7 @@ export class CodexProcess extends EventEmitter {
       try {
         msg = JSON.parse(line)
       } catch (e) {
-        log(`codex-process: bad json: ${line.slice(0, 200)} (${e})`)
+        logError('codex-process: invalid protocol JSON', e)
         continue
       }
       try {
@@ -635,7 +630,7 @@ export class CodexProcess extends EventEmitter {
         // subagent item 抛 TypeError,被这里误标成 bad json,整条消息分发中断,
         // 后台卡僵死、主卡混乱。解析与分发分离后,一条 item 的 handler 异常只
         // 丢自己,不连坐后续消息;异常照实记日志等修复。
-        log(`codex-process: dispatch error: ${JSON.stringify(msg).slice(0, 200)} (${e})`)
+        logError('codex-process: dispatch error', e)
       }
     }
   }
@@ -648,27 +643,11 @@ export class CodexProcess extends EventEmitter {
     this.onStdout(Buffer.from('\n'))
   }
 
-  private onStderr(chunk: Buffer): void {
-    this.stderrBuf += chunk.toString()
-    let nl: number
-    while ((nl = this.stderrBuf.indexOf('\n')) >= 0) {
-      const line = this.stderrBuf.slice(0, nl)
-      this.stderrBuf = this.stderrBuf.slice(nl + 1)
-      if (line.trim()) log(`codex-process[stderr]: ${line}`)
-    }
-  }
-
-  private flushStderrTail(): void {
-    const line = this.stderrBuf
-    this.stderrBuf = ''
-    if (line.trim()) log(`codex-process[stderr]: ${line}`)
-  }
-
   private handleMessage(msg: any): void {
     if (Object.prototype.hasOwnProperty.call(msg, 'id') && !msg.method) {
       const pending = this.pending.get(msg.id)
       if (!pending) {
-        log(`codex-process: response for unknown id=${msg.id}`)
+        logDiagnostic('codex-process: response without pending request')
         return
       }
       this.pending.delete(msg.id)
@@ -706,12 +685,11 @@ export class CodexProcess extends EventEmitter {
     const compaction = contextCompactionNoticeFromMessage(msg)
     if (compaction) {
       const notice = this.withSessionId(compaction)
-      logContextCompactionPayload(compaction.sourceMethod ?? 'raw_message', msg, notice)
       this.emit('context_compacted', notice)
       return
     }
 
-    logUnhandledAppServerPayload('RAW_MESSAGE', msg)
+    logUnhandledAppServerEvent('RAW_MESSAGE')
     this.emit('raw', msg)
   }
 
@@ -733,7 +711,6 @@ export class CodexProcess extends EventEmitter {
     const compaction = contextCompactionNoticeFromNotification(method, params)
     if (compaction) {
       const notice = this.withSessionId(compaction)
-      logContextCompactionPayload(method, params, notice)
       this.emit('context_compacted', notice)
       return
     }
@@ -760,7 +737,7 @@ export class CodexProcess extends EventEmitter {
           this.lastUsage = last
           this.lastResult.usage = this.lastUsage
         } else {
-          log('codex-process: tokenUsage notification missing last breakdown')
+          logDiagnostic('codex-process: token usage missing request breakdown')
         }
         this.lastTotalUsage = usageFromTokenUsagePayload(params.tokenUsage?.total)
         const ctx = params.tokenUsage?.modelContextWindow
@@ -776,7 +753,7 @@ export class CodexProcess extends EventEmitter {
       }
       case 'turn/started': {
         if (typeof params.threadId !== 'string' || params.threadId !== this.sessionId) {
-          logUnhandledAppServerPayload('TURN_STARTED_THREAD_MISMATCH', { method, params })
+          logUnhandledAppServerEvent('TURN_STARTED_THREAD_MISMATCH')
           return
         }
         this.recordTurnStarted(params.turn, params.threadId, 'turn/started notification')
@@ -785,14 +762,13 @@ export class CodexProcess extends EventEmitter {
       }
       case 'turn/completed': {
         if (typeof params.threadId !== 'string' || params.threadId !== this.sessionId) {
-          logUnhandledAppServerPayload('TURN_COMPLETED_THREAD_MISMATCH', { method, params })
+          logUnhandledAppServerEvent('TURN_COMPLETED_THREAD_MISMATCH')
           return
         }
         const turn = params.turn ?? {}
         const completedTurnId = typeof turn.id === 'string' && turn.id ? turn.id : null
         if (completedTurnId) {
           if (this.finishedTurnIds?.has(completedTurnId)) {
-            log(`codex-process: duplicate turn/completed ignored turn=${completedTurnId}`)
             return
           }
           if (this.currentTurnId && this.currentTurnId !== completedTurnId) {
@@ -801,7 +777,6 @@ export class CodexProcess extends EventEmitter {
             // attempt and remember the id so further duplicates stay inert.
             this.markTurnStartTerminal(completedTurnId)
             this.rememberFinishedTurn(completedTurnId)
-            log(`codex-process: stale turn/completed ignored turn=${completedTurnId} current=${this.currentTurnId}`)
             return
           }
           this.flushRolloutImageGenerations()
@@ -809,7 +784,7 @@ export class CodexProcess extends EventEmitter {
           this.markTurnStartTerminal(completedTurnId)
           this.rememberFinishedTurn(completedTurnId)
         } else {
-          logUnhandledAppServerPayload('TURN_COMPLETED_MISSING_ID', { method, params })
+          logUnhandledAppServerEvent('TURN_COMPLETED_MISSING_ID')
         }
         const status = turn.status
         const notifiedError = status === 'failed' && this.turnError && this.turnError.turnId === completedTurnId
@@ -883,7 +858,7 @@ export class CodexProcess extends EventEmitter {
         if (params.goal) {
           this.emit('thread_goal_updated', params.goal as ThreadGoal)
         } else {
-          log('codex-process: thread/goal/updated missing goal')
+          logDiagnostic('codex-process: goal notification missing goal')
         }
         return
       }
@@ -899,7 +874,7 @@ export class CodexProcess extends EventEmitter {
         if (typeof params.delta === 'string' && params.delta.length > 0) {
           this.emit('assistant_text', { uuid: params.itemId, text: params.delta, parentToolUseId: null })
         } else {
-          logUnhandledAppServerPayload('AGENT_MESSAGE_DELTA_EMPTY', { method, params })
+          logUnhandledAppServerEvent('AGENT_MESSAGE_DELTA_EMPTY')
         }
         return
       }
@@ -912,7 +887,7 @@ export class CodexProcess extends EventEmitter {
         return
       }
       case 'mcpServer/startupStatus/updated': {
-        log(`codex-process: mcp ${params.name} ${params.status}${params.error ? `: ${params.error}` : ''}`)
+        if (params.error) logError('codex-process: MCP startup failed', params.error)
         return
       }
       case 'account/rateLimits/updated': {
@@ -923,11 +898,11 @@ export class CodexProcess extends EventEmitter {
       case 'warning':
       case 'guardianWarning':
       case 'deprecationNotice': {
-        log(`codex-process: ${method}: ${params.summary ?? params.message ?? JSON.stringify(params).slice(0, 200)}`)
+        logDiagnostic('codex-process: native configuration warning')
         return
       }
       case 'error': {
-        log(`codex-process: server error: ${JSON.stringify(params).slice(0, 500)}`)
+        logError('codex-process: server error', params.error ?? params)
         const error = params.error ?? params
         if (typeof params.turnId === 'string' && params.threadId === this.sessionId
           && !this.finishedTurnIds?.has(params.turnId)
@@ -946,14 +921,18 @@ export class CodexProcess extends EventEmitter {
         return
       }
     }
-    logUnhandledAppServerPayload('NOTIFICATION', { method, params })
+    if (!['turn/moderationMetadata', 'turn/diff/updated', 'item/commandExecution/outputDelta',
+      'item/commandExecution/terminalInteraction', 'thread/readState/changed',
+      'remoteControl/status/changed', 'account/updated'].includes(method)) {
+      logUnhandledAppServerEvent('NOTIFICATION')
+    }
     this.emit('raw', { method, params })
   }
 
   private handleItemStarted(params: any): void {
     const item = params?.item
     if (!item?.id) {
-      logUnhandledAppServerPayload('ITEM_STARTED_MISSING_ID', { method: 'item/started', params })
+      logUnhandledAppServerEvent('ITEM_STARTED_MISSING_ID')
       return
     }
     if (item.type === 'userMessage') {
@@ -974,7 +953,7 @@ export class CodexProcess extends EventEmitter {
     if (this.feedCollabItem(item, 'started')) return
     const mapped = mapStartedItem(item, this.opts.workDir)
     if (!mapped) {
-      logUnhandledAppServerPayload('ITEM_STARTED_UNMAPPED', { method: 'item/started', params })
+      if (!['reasoning', 'agentMessage', 'sleep'].includes(item.type)) logUnhandledAppServerEvent('ITEM_STARTED_UNMAPPED')
       return
     }
     this.emit('tool_use', { id: item.id, name: mapped.name, input: mapped.input })
@@ -1010,7 +989,7 @@ export class CodexProcess extends EventEmitter {
   private handleItemCompleted(params: any): void {
     const item = params?.item
     if (!item?.id) {
-      logUnhandledAppServerPayload('ITEM_COMPLETED_MISSING_ID', { method: 'item/completed', params })
+      logUnhandledAppServerEvent('ITEM_COMPLETED_MISSING_ID')
       return
     }
     if (item.type === 'userMessage') return
@@ -1022,7 +1001,7 @@ export class CodexProcess extends EventEmitter {
     if (this.feedCollabItem(item, 'completed')) return
     const mapped = mapCompletedItem(item, this.opts.workDir, this.sessionId ?? undefined)
     if (!mapped) {
-      logUnhandledAppServerPayload('ITEM_COMPLETED_UNMAPPED', { method: 'item/completed', params })
+      if (!['reasoning', 'sleep'].includes(item.type)) logUnhandledAppServerEvent('ITEM_COMPLETED_UNMAPPED')
       return
     }
     this.emit('tool_result', {
@@ -1312,9 +1291,8 @@ export class CodexProcess extends EventEmitter {
     this.rolloutFilePath = filePath
     try {
       this.rolloutReadOffset = statSync(filePath).size
-      log(`codex-process: image generation rollout scan primed ${filePath} offset=${this.rolloutReadOffset}`)
     } catch (e) {
-      log(`codex-process: image generation rollout stat failed ${filePath}: ${e instanceof Error ? e.message : e}`)
+      logError('codex-process: image generation rollout stat failed', e)
       this.rolloutFilePath = null
       this.rolloutReadOffset = 0
     }
@@ -1324,7 +1302,6 @@ export class CodexProcess extends EventEmitter {
     if (!this.sessionId) return
     const filePath = this.rolloutFilePath ?? findCodexRolloutFile(this.sessionId)
     if (!filePath) {
-      log(`codex-process: image generation rollout file not found for thread=${this.sessionId}`)
       return
     }
     this.rolloutFilePath = filePath
@@ -1348,7 +1325,7 @@ export class CodexProcess extends EventEmitter {
       buf = buf.subarray(0, read)
       this.rolloutReadOffset += read
     } catch (e) {
-      log(`codex-process: image generation rollout read failed ${filePath}: ${e instanceof Error ? e.message : e}`)
+      logError('codex-process: image generation rollout read failed', e)
       return
     }
 
@@ -1361,7 +1338,7 @@ export class CodexProcess extends EventEmitter {
       try {
         record = JSON.parse(line)
       } catch (e) {
-        log(`codex-process: image generation rollout JSON parse failed ${filePath}: ${e instanceof Error ? e.message : e}`)
+        logError('codex-process: image generation rollout JSON parse failed', e)
         continue
       }
       const payload = record?.payload
@@ -1470,7 +1447,7 @@ export class CodexProcess extends EventEmitter {
       case 'applyPatchApproval':
       case 'execCommandApproval':
       default: {
-        logUnhandledAppServerPayload('SERVER_REQUEST_UNSUPPORTED', req)
+        logUnhandledAppServerEvent('SERVER_REQUEST_UNSUPPORTED')
         this.respondError(requestId, `unsupported server request: ${req.method}`)
       }
     }
@@ -1479,7 +1456,7 @@ export class CodexProcess extends EventEmitter {
   private write(obj: object, onError?: (error: Error) => void): boolean {
     const fail = (reason: unknown): false => {
       const error = reason instanceof Error ? reason : new Error(String(reason))
-      log(`codex-process: stdin write failed: ${error.message}`)
+      logError('codex-process: stdin write failed', error)
       onError?.(error)
       return false
     }
@@ -1548,7 +1525,7 @@ export class CodexProcess extends EventEmitter {
     if (!this.readyPromise) {
       this.readyPromise = this.initializeAndStartThread()
       void this.readyPromise.catch(e => {
-        log(`codex-process: initialize failed: ${e}`)
+        logError('codex-process: initialize failed', e)
         this.emit('error', e)
       })
     }
@@ -1684,7 +1661,6 @@ export class CodexProcess extends EventEmitter {
       && typeof res.collaborationMode.settings?.developer_instructions === 'string'
     if (isCodexReasoningEffort(res?.reasoningEffort)) this.lastEffort = res.reasoningEffort
     else this.lastEffort = this.opts.effort ?? null
-    log(`codex-process: thread=${this.sessionId}`)
     this.primeRolloutImageGenerationScan()
     this.emit('init', { session_id: this.sessionId, thread })
   }
@@ -1705,12 +1681,11 @@ export class CodexProcess extends EventEmitter {
       if (this.sessionId !== sessionId || this.conversationResumable) return
       this.lastConversationMaterializationFailure = null
       this.conversationResumable = true
-      log(`codex-process: conversation materialized thread=${sessionId} source=${source}`)
       this.emit('conversation_materialized', { session_id: sessionId, source })
     }, cause => {
       const error = cause instanceof Error ? cause : new Error(String(cause))
       this.lastConversationMaterializationFailure = error
-      log(`codex-process: conversation materialization check failed thread=${sessionId} source=${source}: ${error.message}`)
+      logError('codex-process: conversation materialization check failed', error)
       this.emit('conversation_materialization_failed', {
         session_id: sessionId,
         path: this.conversationRolloutPath,
@@ -1968,7 +1943,6 @@ export class CodexProcess extends EventEmitter {
 
   async setModelSettings(_model: string, _effort: AgentReasoningEffort): Promise<void> {
     // Session 保存目标设置，重启时由启动参数应用；不修改运行中的 thread。
-    log('codex-process: model settings require a process restart')
   }
 
   async compactThread(): Promise<void> {
@@ -1988,13 +1962,12 @@ export class CodexProcess extends EventEmitter {
 
   private failTurnStart(e: unknown, attempt: TurnStartAttempt): void {
     if (!this.ownsTurnStartFailure(attempt)) {
-      log(`codex-process: ignored stale turn/start failure generation=${attempt.generation}`)
       return
     }
     this.turnStartOwner = null
     attempt.terminal = true
     const message = e instanceof Error ? e.message : String(e)
-    log(`codex-process: turn/start failed: ${message}`)
+    logError('codex-process: turn/start failed', message)
     if (e instanceof CodexRpcResponseError && e.method === 'turn/start' && attempt.inputText !== undefined) {
       const retryReason = codexTurnRetryReason({
         ...(e.serverData && typeof e.serverData === 'object' ? e.serverData : {}), message: e.serverMessage,
@@ -2168,7 +2141,6 @@ export class CodexProcess extends EventEmitter {
       this.recordTurnStarted(res?.turn, this.sessionId, 'turn/start response', attempt)
     } catch (e) {
       if (!this.ownsTurnStartFailure(attempt)) {
-        log(`codex-process: ignored stale turn/start rejection generation=${attempt.generation}`)
         return
       }
       throw e
@@ -2201,7 +2173,7 @@ export class CodexProcess extends EventEmitter {
   private interruptTurn(turnId: string): void {
     if (!this.sessionId) return
     void this.request('turn/interrupt', { threadId: this.sessionId, turnId })
-      .catch(e => log(`codex-process: interrupt failed: ${e}`))
+      .catch(e => logError('codex-process: interrupt failed', e))
   }
 
   private cancelTurnRetry(): void {
@@ -2215,7 +2187,7 @@ export class CodexProcess extends EventEmitter {
     if (this.turnRetryTimer) return true
     if (reason !== 'capacity') {
       if ((this.transientRetryCount ?? 0) >= CODEX_TRANSIENT_RETRY_LIMIT) {
-        log(`codex-process: transient retry limit reached (${CODEX_TRANSIENT_RETRY_LIMIT}): ${message}`)
+        logError('codex-process: transient retry limit reached', message)
         return false
       }
       this.transientRetryCount = (this.transientRetryCount ?? 0) + 1
@@ -2227,7 +2199,6 @@ export class CodexProcess extends EventEmitter {
     const generation = this.turnStartGeneration ?? 0
     const notice: AgentTurnRetry = { phase: 'waiting', attempt, delayMs, message, reason }
     this.turnRetry = notice
-    log(`codex-process: ${reason} retry #${attempt} in ${delayMs}ms: ${message}`)
     // Capacity retries continue until cancelled; transient failures share a budget.
     // Every failure stays visible in the log and UI.
     const timer = setTimeout(() => {
@@ -2255,7 +2226,7 @@ export class CodexProcess extends EventEmitter {
   ): void {
     const req = this.serverRequests.get(String(requestId))
     if (!req) {
-      log(`codex-process: permission response for unknown request ${requestId}`)
+      logDiagnostic('codex-process: permission response for unknown request')
       return
     }
     const allow = decision === 'allow'
@@ -2291,13 +2262,7 @@ export class CodexProcess extends EventEmitter {
         return
       }
       default:
-        logUnhandledAppServerPayload('APPROVAL_RESPONSE_UNSUPPORTED', {
-          requestId,
-          method: req.method,
-          params: req.params,
-          decision,
-          payload,
-        })
+        logUnhandledAppServerEvent('APPROVAL_RESPONSE_UNSUPPORTED')
         this.respondError(requestId, payload?.denyMessage ?? 'unsupported approval request')
     }
   }
@@ -2331,18 +2296,16 @@ export class CodexProcess extends EventEmitter {
       throw new Error(`codex app-server exited but stdio did not close within ${timeoutMs}ms`)
     }
     this.expectedExit = true
-    log(`codex-process: SIGTERM (timeout=${timeoutMs}ms)`)
     const signalErrors: string[] = []
     this.sendSignal('SIGTERM', signalErrors)
     if (await this.waitForExit(timeoutMs)) { await this.disposeInputPolicy(); return }
 
-    log(`codex-process: SIGKILL (lifecycle not closed after ${timeoutMs}ms)`)
     if (this.alive) this.sendSignal('SIGKILL', signalErrors)
     if (await this.waitForExit(timeoutMs)) { await this.disposeInputPolicy(); return }
 
     const details = signalErrors.length ? `; ${signalErrors.join('; ')}` : ''
     const error = new Error(`codex app-server did not exit after SIGTERM and SIGKILL (${timeoutMs}ms each)${details}`)
-    log(`codex-process: kill failed: ${error.message}`)
+    logError('codex-process: kill failed', error)
     throw error
   }
 
@@ -2414,7 +2377,7 @@ function findCodexRolloutFile(sessionId: string): string | null {
     try {
       entries = readdirSync(dir, { withFileTypes: true })
     } catch (e) {
-      log(`codex-process: cannot scan Codex session dir ${dir}: ${e instanceof Error ? e.message : e}`)
+      logError('codex-process: cannot scan Codex session dir', e)
       continue
     }
     for (const entry of entries) {
@@ -2429,7 +2392,7 @@ function findCodexRolloutFile(sessionId: string): string | null {
         const mtimeMs = statSync(path).mtimeMs
         if (!best || mtimeMs > best.mtimeMs) best = { path, mtimeMs }
       } catch (e) {
-        log(`codex-process: cannot stat Codex rollout ${path}: ${e instanceof Error ? e.message : e}`)
+        logError('codex-process: cannot stat Codex rollout', e)
       }
     }
   }
@@ -2449,8 +2412,7 @@ export function imageGenerationOutput(
     const materialized = materializeImageGenerationResult(item, threadId, outputRoot)
     if (materialized) return materialized
     if (result.length > 2048) {
-      const id = imageGenerationCallId(item)
-      log(`codex-process: image generation inline result could not be decoded id=${id} length=${result.length}`)
+      logDiagnostic('codex-process: image generation inline result could not be decoded')
       return `Image generation returned ${result.length} chars of inline data, but Lodestar could not materialize it as an image file.`
     }
     return result
@@ -2478,7 +2440,7 @@ function materializeImageGenerationResult(item: any, threadId: string | undefine
     writeFileSync(path, decoded.buffer)
     return path
   } catch (e) {
-    log(`codex-process: failed to write image generation result ${path}: ${e instanceof Error ? e.message : e}`)
+    logError('codex-process: failed to write image generation result', e)
     return null
   }
 }

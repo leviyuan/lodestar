@@ -29,6 +29,7 @@ function harness(initialNames: string[]) {
     actor,
     isShuttingDown: () => shuttingDown,
     log: (message: string) => { logs.push(message) },
+    logError: (event: string, _error: unknown) => { logs.push(event) },
     restartContinuation: undefined as ConstructorParameters<typeof DaemonSessionRecovery>[0]['restartContinuation'],
   }
   const recovery = new DaemonSessionRecovery(deps)
@@ -88,7 +89,7 @@ describe('daemon session recovery', () => {
     await h.recovery.enqueue()
     expect(events.filter(event => event === 'continue-a')).toHaveLength(1)
     expect(h.marker().sort()).toEqual(['a', 'a-extra'])
-    expect(h.logs.join('\n')).toContain('restart continuation for "a" submitted')
+    expect(h.logs.join('\n')).toContain('session.recovery.continuation_submitted')
   })
 
   test.each(['false', 'throw'] as const)('does not continue when restoration returns %s', async outcome => {
@@ -106,7 +107,7 @@ describe('daemon session recovery', () => {
     await h.recovery.enqueue()
     expect(sends).toBe(0)
     expect(h.marker()).toEqual(['a'])
-    expect(h.logs.join('\n')).not.toContain('restart continuation')
+    expect(h.logs.join('\n')).not.toContain('session.recovery.continuation')
   })
 
   test('does not continue when shutdown begins during restoration', async () => {
@@ -145,10 +146,10 @@ describe('daemon session recovery', () => {
     await h.recovery.enqueue()
     expect(sends).toBe(1)
     expect(h.marker()).toEqual(['a'])
-    expect(h.logs.join('\n')).toContain('revive: "a" restored')
-    expect(h.logs.join('\n')).toContain('restart continuation for "a" failed: Error: submission unknown')
-    expect(h.logs.join('\n')).not.toContain('restore "a" failed')
-    expect(h.logs.join('\n')).not.toContain('continuation for "alias"')
+    expect(h.logs.join('\n')).toContain('session.recovery.finished')
+    expect(h.logs.join('\n')).toContain('session.recovery.continuation_failed')
+    expect(h.logs.join('\n')).not.toContain('session.recovery.failed')
+    expect(h.logs.join('\n')).not.toContain('alias')
   })
 
   test('an interrupted early boot and a second restart preserve every unreadied session', async () => {
@@ -280,7 +281,7 @@ describe('daemon session recovery', () => {
     h.recovery.load()
     await h.recovery.enqueue()
     expect(h.marker()).toEqual(['a'])
-    expect(h.logs.join('\n')).toContain('resume unavailable')
+    expect(h.logs.join('\n')).toContain('session.recovery.failed')
     required = false
     h.recovery.persist()
     expect(h.marker()).toEqual([])
@@ -293,8 +294,8 @@ describe('daemon session recovery', () => {
     h.recovery.load()
     await h.recovery.enqueue()
     expect(h.marker()).toEqual(['missing-chat', 'broken-session'])
-    expect(h.logs.join('\n')).toContain('no chatId binding')
-    expect(h.logs.join('\n')).toContain('invalid saved model')
+    expect(h.logs.join('\n')).toContain('session.recovery.binding_missing')
+    expect(h.logs.join('\n')).toContain('session.recovery.failed')
   })
 
   test('marker read/write errors surface and an unread marker is never replaced by cleanup', () => {

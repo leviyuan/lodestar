@@ -1,6 +1,6 @@
 import { codexAccounts, type CodexAccount } from './codex-accounts'
 import { AppServerOnce, readUsageForDisplay, requestCodexControlWithRetry, type UsageSnapshot, type UsageWindow } from './usage'
-import { log } from './log'
+import { logError } from './log'
 import { peekCodexAccountEmail } from './codex-account-info'
 import { codexQuotaAccess } from './codex-quota'
 
@@ -77,7 +77,7 @@ export async function refreshCodexAccountEmails(
         catch (error) { emailError = [emailError, `账号查询进程关闭失败：${error instanceof Error ? error.message : String(error)}`].filter(Boolean).join('；') }
       }
     }
-    if (emailError) log(`codex-accounts: ${entry.account.id} email read: ${emailError}`)
+    if (emailError) logError('codex account email read failed', emailError)
     return { ...entry, email, emailError }
   }))
   return { ...total, entries }

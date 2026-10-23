@@ -2,7 +2,7 @@ import { codexAccounts, isCodexLoginPending } from './codex-accounts'
 import { codexAccountScheduler } from './codex-account-scheduler'
 import { activateCodexAccount, activationEffort, closeCodexActivationClients, CODEX_ACTIVATION_MODEL, isUnusedMainWeek,
   type ActivationRequestOptions, type CodexActivationUsage } from './codex-activation-request'
-import { log } from './log'
+import { log, logError } from './log'
 import { getTokenSourceForAccount, type TokenSource } from './token-source'
 import { peekSuccessfulUsage } from './usage'
 
@@ -33,6 +33,7 @@ interface Deps {
   now(): number
   random(): number
   log(message: string): void
+  logError?(event: string, error: unknown): void
   close?(): Promise<void>
 }
 
@@ -67,13 +68,18 @@ export class CodexActivation {
     return [...this.entries.values()].find(entry => entry.accountId === accountId)?.error
   }
 
+  private reportFailure(event: 'codex activation scan failed' | 'codex activation failed', error: unknown): void {
+    if (this.deps.logError) this.deps.logError(event, error)
+    else this.deps.log(event)
+  }
+
   private schedule(delay?: number): void {
     clearTimeout(this.timer)
     if (!this.controller) return
     delay ??= Math.min(SCAN_MS, ...[...this.entries.values()].filter(entry => !entry.completed)
       .map(entry => Math.max(0, entry.dueAt - this.deps.now())))
     this.timer = setTimeout(() => {
-      void this.check().catch(error => this.deps.log(`codex activation scan MISS: ${error}`))
+      void this.check().catch(error => this.reportFailure('codex activation scan failed', error))
         .finally(() => this.schedule())
     }, delay)
     this.timer.unref?.()
@@ -125,21 +131,20 @@ export class CodexActivation {
         const revision = account.revision
         if (this.deps.loginPending(account.id)) throw new Error('账号正在登录，后台激活延后')
         const effort = activationEffort(this.deps.source(account.id))
-        const result = await this.deps.activate({ accountId: account.id, identity, effort, signal,
+        await this.deps.activate({ accountId: account.id, identity, effort, signal,
           eligible: fresh => !signal.aborted && this.deps.accounts().some(current => current.id === account.id
             && current.revision === revision && current.usage?.accountFingerprint === identity)
             && !this.deps.loginPending(account.id) && !this.deps.used(identity, fresh),
-          used: (fresh, tokens) => {
+          used: fresh => {
             entry!.completed = true
             this.deps.recordUsage(account.id, fresh)
-            this.deps.log(`codex activation: ${account.name} ${CODEX_ACTIVATION_MODEL}/${effort} completed tokens=${tokens}`)
+            this.deps.log('codex activation completed')
           },
         })
         entry.error = undefined
-        if (result === 'skipped') this.deps.log(`codex activation: ${account.name} skipped after fresh quota/account check`)
       } catch (error) {
         entry.error = error instanceof Error ? error.message : String(error)
-        this.deps.log(`codex activation: ${account.name} MISS: ${entry.error}`)
+        this.reportFailure('codex activation failed', error)
       }
     }
   }
@@ -151,5 +156,5 @@ export const codexActivation = new CodexActivation({
   source: id => getTokenSourceForAccount('codex-sub', id), loginPending: isCodexLoginPending,
   used: (identity, usage) => codexAccountScheduler.weekWasUsed(identity, usage, ''),
   recordUsage: (id, usage) => codexAccountScheduler.recordUsage(id, CODEX_ACTIVATION_MODEL, usage),
-  activate: activateCodexAccount, now: Date.now, random: Math.random, log, close: closeCodexActivationClients,
+  activate: activateCodexAccount, now: Date.now, random: Math.random, log, logError, close: closeCodexActivationClients,
 })

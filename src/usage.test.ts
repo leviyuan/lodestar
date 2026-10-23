@@ -230,8 +230,7 @@ describe('usage read snapshot semantics', () => {
       expect(rankCodexQuota(standalone, 'model', quotaNow)).toMatchObject({ state: 'miss',
         score: null, shares: null, reason: '未知周额度套餐：free' })
       if (standalone.state !== 'ok') throw new Error('expected quota snapshot')
-      expect(logged.mock.calls.some(([line]) => line.includes(`account=${standalone.accountFingerprint}`)
-        && line.includes('account/read="pro"') && line.includes('account/rateLimits/read="free"'))).toBe(true)
+      expect(logged).not.toHaveBeenCalled()
     } finally { logged.mockRestore(); invalidateCodexUsage(account) }
   })
   test('a missing quota plan retains the explicitly read identity without inventing a plan', () => {

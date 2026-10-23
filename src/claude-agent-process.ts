@@ -21,7 +21,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk'
 import { agentPackagePath, loadClaudeSdk } from './agent-updates'
 import { config, type ProjectProfile } from './config'
-import { log } from './log'
+import { logError, logDiagnostic } from './log'
 import {
   CLAUDE_EFFORT,
   isClaudeReasoningEffort,
@@ -362,11 +362,6 @@ function totalUsageFromModelUsage(modelUsage: any): { usage: CodexUsage | null; 
 
 function cloneUsage(usage: CodexUsage): CodexUsage {
   return { ...usage }
-}
-
-function objectKeys(raw: unknown): string[] {
-  if (!raw || typeof raw !== 'object') return []
-  return Object.keys(raw as Record<string, unknown>).slice(0, 20)
 }
 
 function addUsageTotals(total: CodexUsage | null, delta: CodexUsage): CodexUsage {
@@ -742,9 +737,6 @@ export class ClaudeAgentProcess extends EventEmitter {
   private async initializeQuery(): Promise<void> {
     const model = resolveClaudeSdkModel(this.opts.model)
     const profile = this.opts.profile
-    if (profile) {
-      log(`claude-agent-process: project profile active — settingSources=${profile.settingSources ?? '-'} strictMcp=${profile.strictMcp ?? false} tools=${profile.tools ?? '-'} loadProjectMcp=${profile.loadProjectMcp ?? true}`)
-    }
     const settingSources = this.opts.settingSources ?? settingSourcesFromProfile(profile)
     const managedSkillOptions = claudeManagedSkillOptions(
       settingSources,
@@ -791,7 +783,6 @@ export class ClaudeAgentProcess extends EventEmitter {
       // the host opts in. The session card consumes these Task tool events.
       env.CLAUDE_CODE_ENABLE_TODO_TOOLS = '1'
       if (this.opts.effort === 'default') env.CLAUDE_CODE_EFFORT_LEVEL = 'unset'
-      log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} cwd=${this.opts.workDir} executable=${executable.description}`)
       this.query = query({
         prompt: this.opts.validateAccount ? this.validatedInput() : this.input,
         options: {
@@ -833,10 +824,8 @@ export class ClaudeAgentProcess extends EventEmitter {
             // verbatim on resume, including a different invocation's input policy.
             ...(this.opts.appendSystemPrompt ? { append: this.opts.appendSystemPrompt, snapshot: false } : {}),
           },
-          stderr: data => {
-            const text = data.trim()
-            if (text) log(`claude-agent-process[stderr]: ${text}`)
-          },
+          // Native stderr can contain prompts, paths and account details.
+          stderr: () => {},
         },
       })
     } catch (e) {
@@ -865,7 +854,6 @@ export class ClaudeAgentProcess extends EventEmitter {
       return
     }
     if (!this.alive) {
-      log('claude-agent-process: sendUserText ignored on dead process')
       return
     }
     if (this.translationContextFailure) { this.failTurnStart(this.translationContextFailure); return }
@@ -893,7 +881,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       this.pushUserText(fileHints + text)
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e))
-      log(`claude-agent-process: sendUserText failed: ${err.message}`)
+      logError('claude-agent-process: sendUserText failed', err)
       this.failTurnStart(err)
     }
   }
@@ -1055,7 +1043,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   private reportTranslationFailure(boundary: string, cause: unknown, awaitNativeResult = true): Error {
     const error = this.translationError(boundary, cause)
     if (awaitNativeResult) this.translationFailure ??= error
-    log(`claude-agent-process: ${error.message}`)
+    logError('claude-agent-process: translation failed', cause)
     this.emit('error', error)
     this.emit('turn_input_error', { error: error.message })
     // Background presentation can outlive the main turn. An idle query will
@@ -1098,7 +1086,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         throw new Error('停止请求未确认全部追加消息已取消')
       }
     }).catch(e => {
-      log(`claude-agent-process: interrupt failed: ${e}`)
+      logError('claude-agent-process: interrupt failed', e)
       this.emit('turn_input_error', { error: `停止请求失败：${e instanceof Error ? e.message : String(e)}` })
     })
   }
@@ -1112,7 +1100,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     // AskUserQuestion(allow 回填 answers / deny 取消)和普通工具审批卡片。
     const pending = this.pendingPermissions.get(String(requestId))
     if (!pending) {
-      log(`claude-agent-process: permission response for unknown request ${requestId}`)
+      logDiagnostic('claude-agent-process: permission response for unknown request')
       return
     }
     if (this.opts.translation && pending.originalInput) {
@@ -1136,7 +1124,6 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   sendHookResponse(_requestId: string, _output: object = {}): void {
-    log('claude-agent-process: sendHookResponse ignored; hooks are handled by SDK callbacks')
   }
 
   isAlive(): boolean {
@@ -1176,12 +1163,12 @@ export class ClaudeAgentProcess extends EventEmitter {
         `claude Agent SDK query did not exit within ${timeoutMs}ms after close/abort`,
         closeError ? { cause: closeError } : undefined,
       )
-      log(`claude-agent-process: kill failed: ${error.message}`)
+      logError('claude-agent-process: kill failed', error)
       throw error
     }
     if (closeError) {
       const error = new Error(`claude Agent SDK close failed: ${closeError.message}`, { cause: closeError })
-      log(`claude-agent-process: kill failed: ${error.message}`)
+      logError('claude-agent-process: kill failed', error)
       throw error
     }
   }
@@ -1320,7 +1307,6 @@ export class ClaudeAgentProcess extends EventEmitter {
     // 点选,再以 allow + updatedInput.answers 回送,模型据此续跑。
     const questions = normalizeDialogQuestions(input, !!this.opts.translation)
     if (questions.length === 0) {
-      log('claude-agent-process: AskUserQuestion 无有效 questions — allow 原样')
       return Promise.resolve({ behavior: 'allow', updatedInput: input })
     }
     const normalizedInput = { ...input, questions }
@@ -1523,11 +1509,10 @@ export class ClaudeAgentProcess extends EventEmitter {
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e))
       if (this.expectedExit && this.abortController.signal.aborted) {
-        log(`claude-agent-process: read loop stopped after requested shutdown: ${err.message}`)
         this.finishExit(null, null)
         return
       }
-      log(`claude-agent-process: read loop failed: ${err.message}`)
+      logError('claude-agent-process: read loop failed', err)
       this.emit('error', err)
       this.finishExit(1, null)
     }
@@ -1550,7 +1535,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.deferredSteeringResult = null
     this.denyPendingPermissions('claude process exited')
     this.resolveExit()
-    log(`claude-agent-process: exited code=${code} signal=${signal} expected=${this.expectedExit}`)
+    if (!this.expectedExit) logDiagnostic('claude-agent-process: unexpected process exit')
     this.emit('exit', { code, signal, expected: this.expectedExit })
   }
 
@@ -1582,7 +1567,6 @@ export class ClaudeAgentProcess extends EventEmitter {
     const context = this.opts.translationContext
     if (!raw.parent_tool_use_id && typeof raw.session_id === 'string' && raw.session_id) {
       context.bindSession(raw.session_id)
-      this.opts.translation?.bindSession?.(raw.session_id)
     }
     if (raw.type === 'command_lifecycle' && typeof raw.command_uuid === 'string') {
       if (raw.state === 'started' || raw.state === 'completed') context.confirmInput(raw.command_uuid)
@@ -1720,16 +1704,16 @@ export class ClaudeAgentProcess extends EventEmitter {
       if (raw.type === 'result') {
         const error = this.resultErrorText(raw)
         if (error) {
-          log(`claude-agent-process: untranslated native error: ${error}`)
-          this.translatedErrors.set(error, '原生错误翻译失败，原始诊断已保留在日志中。')
+          logError('claude-agent-process: untranslated native error', error)
+          this.translatedErrors.set(error, '原生错误翻译失败，故障摘要已记录。')
         }
       }
     }
     if (raw.type === 'result' && display.failed) {
       const error = this.resultErrorText(raw)
       if (error && !this.translatedErrors.has(error)) {
-        log(`claude-agent-process: untranslated native error: ${error}`)
-        this.translatedErrors.set(error, '原生错误未能翻译，原始诊断已保留在日志中。')
+        logError('claude-agent-process: untranslated native error', error)
+        this.translatedErrors.set(error, '原生错误未能翻译，故障摘要已记录。')
       }
     }
     if (!display.failed && !this.translationContextFailure) {
@@ -1847,7 +1831,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         return
       case 'command_lifecycle':
         if (typeof raw.command_uuid !== 'string' || !['queued', 'started', 'completed', 'cancelled'].includes(raw.state)) {
-          log(`claude-agent-process: malformed command lifecycle ${JSON.stringify(raw)}`)
+          logDiagnostic('claude-agent-process: malformed command lifecycle')
           return
         }
         if (raw.state === 'started' || raw.state === 'completed') {
@@ -1873,9 +1857,10 @@ export class ClaudeAgentProcess extends EventEmitter {
         this.emit('rate_limits_updated', raw.rate_limit_info)
         return
       case 'stream_event':
+      case 'tool_progress':
         return
       default:
-        log(`claude-agent-process: unhandled message type=${raw.type ?? 'unknown'} subtype=${raw.subtype ?? ''}`)
+        logDiagnostic('claude-agent-process: unknown message')
     }
   }
 
@@ -1886,6 +1871,11 @@ export class ClaudeAgentProcess extends EventEmitter {
         typeof display.system?.[key] === 'string' ? display.system[key] : '翻译失败，详情见本轮错误提示。']))
     }
     switch (raw.subtype) {
+      case 'background_tasks_changed':
+      case 'vcs_state_changed':
+      case 'hook_started':
+      case 'hook_response':
+        return
       case 'init':
         if (this.opts.forkSession && raw.session_id === this.nativeSessionId) this.sessionLease?.releaseSource()
         if (typeof raw.model === 'string' && raw.model) this.lastModel = claudeModelKey(raw.model)
@@ -1919,18 +1909,18 @@ export class ClaudeAgentProcess extends EventEmitter {
         })
         return
       case 'api_retry':
-        log(`claude-agent-process: api retry attempt=${raw.attempt}/${raw.max_retries} status=${raw.error_status} error=${raw.error}`)
+        logError('claude-agent-process: native request retry', raw.error)
         return
       case 'thinking_tokens':
         if (typeof raw.estimated_tokens !== 'number' || !Number.isFinite(raw.estimated_tokens) || raw.estimated_tokens < 0) {
-          log('claude-agent-process: invalid thinking_tokens estimate')
+          logDiagnostic('claude-agent-process: invalid thinking token estimate')
           return
         }
         this.lastThinkingTokens = raw.estimated_tokens
         this.emit('thinking_progress', { estimatedTokens: raw.estimated_tokens })
         return
       case 'permission_denied':
-        log(`claude-agent-process: permission denied ${raw.tool_name} ${raw.tool_use_id}: ${raw.message}`)
+        logDiagnostic('claude-agent-process: permission denied')
         return
       // ── 后台任务 / 子 agent 生命周期(SDK 的 task_* 消息族,统一 type:'system')
       // 全部 emit 出去给 session 维护 backgroundTasks 状态 + 驱动后台游标卡。
@@ -1968,11 +1958,11 @@ export class ClaudeAgentProcess extends EventEmitter {
       case 'task_notification':
         // task_notification 是任务结算的权威信号:带终态 status + 最终 usage。
         if (typeof raw.task_id !== 'string' || !raw.task_id) {
-          log('claude-agent-process: task_notification missing task_id')
+          logDiagnostic('claude-agent-process: malformed task notification')
           return
         }
         if (raw.status !== 'completed' && raw.status !== 'failed' && raw.status !== 'stopped') {
-          log(`claude-agent-process: task_notification unknown status=${String(raw.status)} task=${raw.task_id}`)
+          logDiagnostic('claude-agent-process: unknown task status')
           return
         }
         this.emit('bg_task_settled', {
@@ -1985,7 +1975,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         })
         return
       default:
-        log(`claude-agent-process: unhandled system subtype=${String(raw.subtype ?? 'unknown')}`)
+        logDiagnostic('claude-agent-process: unknown system event')
         return
     }
   }
@@ -2054,7 +2044,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (this.emittedToolUseIds.has(id)) return
     this.emittedToolUseIds.add(id)
     if (!name.trim()) {
-      log(`claude-agent-process: tool_use ${id} has an empty name`)
+      logDiagnostic('claude-agent-process: tool name missing')
       name = 'MISS'
     }
     // parentToolUseId:子 agent 内的工具调用 = 触发它的 Task tool_use id;主线程为 null。
@@ -2166,7 +2156,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     const modelUsageRaw = raw.modelUsage ?? raw.model_usage
     const total = totalUsageFromModelUsage(modelUsageRaw)
     if (!usage && !total.usage) {
-      log(`claude-agent-process: result usage missing rootKeys=${objectKeys(raw).join(',') || '-'} usageKeys=${objectKeys(raw.usage).join(',') || '-'} modelUsageKeys=${objectKeys(modelUsageRaw).join(',') || '-'}`)
+      logDiagnostic('claude-agent-process: result usage missing')
     }
     this.lastUsage = usage
     if (total.usage) {
@@ -2225,7 +2215,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       if (this.steeringInputs.size) {
         this.deferredSteeringResult = { raw, subtype, error: resultError }
         if (resultError) this.emit('turn_input_error', { error: resultError, displayError: this.translatedErrors.get(resultError) })
-        log(`claude-agent-process: native result has ${this.steeringInputs.size} unconsumed steering inputs`)
+        logDiagnostic('claude-agent-process: additional input consumption unconfirmed')
         return
       }
     }

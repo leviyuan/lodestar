@@ -2,7 +2,6 @@ import { config, type ProjectProfile } from './config'
 import { createClaudeTranslation } from './claude-translation'
 import { ClaudeTranslationContext } from './claude-translation-context'
 import { claudeTranslationModeEnabled } from './claude-translation-mode'
-import { ClaudeTranslationTrace } from './claude-translation-trace'
 import type {
   AgentProcess,
   AgentProvider,
@@ -152,8 +151,7 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
         ...(translationContext ? {
           translationContext,
           translation: createClaudeTranslation({ validationRules: config.claude.translation_validation_rules,
-            context: () => translationContext.snapshot(),
-            trace: new ClaudeTranslationTrace({ workDir: opts.workDir, sourceId: source?.id }) }),
+            context: () => translationContext.snapshot() }),
         } : {}),
         transformEnv,
         hostEnv: opts.hostEnv,

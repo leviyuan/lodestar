@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { log } from './log'
+import { log, logError } from './log'
 import { writeStateFileAtomic } from './state-store'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { removeManagedSkill as cleanupManagedSkill } from './managed-skill-cleanup.cjs'
@@ -15,7 +15,6 @@ export interface ManagedSkill {
  * main-agent backends. */
 export function syncManagedSkill(skill: ManagedSkill, roots?: string[]): void {
   if (process.env.LODESTAR_DISABLE_SKILL_SYNC === '1') {
-    log(`skill: sync disabled, skip ${skill.name}`)
     return
   }
   const targetRoots = roots ?? [
@@ -28,9 +27,8 @@ export function syncManagedSkill(skill: ManagedSkill, roots?: string[]): void {
       const current = existsSync(skillFile) ? readFileSync(skillFile, 'utf8') : null
       if (current === skill.body) continue
       writeStateFileAtomic(skillFile, skill.body)
-      log(`skill: ${current === null ? 'installed' : 'updated'} ${skillFile}`)
     } catch (error) {
-      log(`skill: sync failed (${skillFile}): ${error}`)
+      logError('skill: sync failed', error)
     }
   }
   if (!roots) syncClaudePluginSkill(skill, MANAGED_CLAUDE_PLUGIN_DIR)
@@ -42,7 +40,6 @@ export function syncManagedSkill(skill: ManagedSkill, roots?: string[]): void {
  * loads this path without importing user settings, hooks, env, or MCP. */
 export function syncClaudePluginSkill(skill: ManagedSkill, pluginRoot: string): void {
   if (process.env.LODESTAR_DISABLE_SKILL_SYNC === '1') {
-    log(`skill: sync disabled, skip Claude plugin ${skill.name}`)
     return
   }
   const manifestFile = join(pluginRoot, '.claude-plugin', 'plugin.json')
@@ -58,9 +55,8 @@ export function syncClaudePluginSkill(skill: ManagedSkill, pluginRoot: string): 
       const current = existsSync(file) ? readFileSync(file, 'utf8') : null
       if (current === content) continue
       writeStateFileAtomic(file, content)
-      log(`skill: ${current === null ? 'installed' : 'updated'} ${file}`)
     } catch (error) {
-      log(`skill: Claude plugin sync failed (${file}): ${error}`)
+      logError('skill: Claude plugin sync failed', error)
     }
   }
 }
@@ -68,5 +64,8 @@ export function syncClaudePluginSkill(skill: ManagedSkill, pluginRoot: string): 
 /** Remove an obsolete daemon-owned Skill only when its exact SKILL.md still
  * identifies itself by that name. A same-named user replacement is preserved. */
 export function removeManagedSkill(name: string, roots?: string[]): void {
-  cleanupManagedSkill(name, roots, log)
+  cleanupManagedSkill(name, roots, message => {
+    if (/failed/i.test(message)) logError('skill: obsolete managed skill removal failed', message)
+    else log('skill: obsolete managed skill checked')
+  })
 }

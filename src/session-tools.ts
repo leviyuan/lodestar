@@ -12,7 +12,7 @@ import { normalizeOutboundPath } from './outbound-markers'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
-import { log } from './log'
+import { logError, logDiagnostic } from './log'
 import { announceAsk, askRenderState } from './session-ask'
 import { formatFeishuError } from './feishu-errors'
 
@@ -291,7 +291,7 @@ function deliverGeneratedImage(s: Session, turn: TurnState, meta: TurnState['too
     }
     catch (error) {
       failures.push(`图片上传：${formatFeishuError(error)}`)
-      log(`generated image upload failed: ${error}`)
+      logError('session-tools: generated image upload failed', error)
     }
     if (imageKey) {
       let landed = false
@@ -301,14 +301,14 @@ function deliverGeneratedImage(s: Session, turn: TurnState, meta: TurnState['too
           { notifyCardFailure: false, onFailure: failure => { failures.push(`图片嵌入：${formatFeishuError(failure)}`) } })
       } catch (error) {
         failures.push(`图片嵌入：${formatFeishuError(error)}`)
-        log(`generated image embed failed: ${error}`)
+        logError('session-tools: generated image embed failed', error)
       }
       if (landed) {
         meta.imageKey = imageKey
         turn.outboundSentPaths.add(path)
         return
       }
-      log(`generated image could not be embedded in card ${cardId}; sending it as a separate message`)
+      logDiagnostic('session-tools: generated image requires separate delivery')
     }
     // The user explicitly prefers a separate image when embedding is unavailable.
     let sendFailure: unknown
@@ -316,7 +316,7 @@ function deliverGeneratedImage(s: Session, turn: TurnState, meta: TurnState['too
       ? await feishu.sendImage(s.chatId, imageKey, error => { sendFailure = error }) !== null
       : await feishu.uploadAndSend(s.chatId, path)
     if (sent) turn.outboundSentPaths.add(path)
-    else log(`generated image delivery failed: ${path}`)
+    else logDiagnostic('session-tools: generated image delivery failed')
     if (!sent && imageKey) failures.push(`图片发送：${formatFeishuError(sendFailure)}`)
     meta.resolvedNote = [sent ? '图片已单独发送。' : '图片发送失败。', ...failures].join('\n')
     let noteFailure: unknown
@@ -329,7 +329,7 @@ function deliverGeneratedImage(s: Session, turn: TurnState, meta: TurnState['too
       noteFailure = error
     }
     if (!noteLanded) {
-      log(`generated image status write failed card=${cardId} path=${path}: ${formatFeishuError(noteFailure)}\n${meta.resolvedNote}`)
+      logError('session-tools: generated image status write failed', noteFailure)
     }
     // Delivery failures remain visible even when the auxiliary status cannot
     // be updated; uploadAndSend already reports its own failure to the chat.
@@ -337,14 +337,14 @@ function deliverGeneratedImage(s: Session, turn: TurnState, meta: TurnState['too
       await feishu.sendText(s.chatId, `❌ 生成图片发送失败：${failures.join('\n')}`)
     }
   })().catch(async error => {
-    log(`generated image delivery failed: ${error}`)
+    logError('session-tools: generated image delivery failed', error)
     await feishu.sendText(s.chatId, `❌ 生成图片发送失败：${[...new Set([...failures, formatFeishuError(error)])].join('\n')}`)
   })
   tasks.add(task)
   void task.finally(() => {
     tasks.delete(task)
     if (!tasks.size) byCard.delete(cardId)
-  }).catch(error => log(`generated image failure notice failed: ${error}`))
+  }).catch(error => logError('session-tools: generated image failure notice failed', error))
 }
 
 export async function waitForImageDeliveries(turn: TurnState, cardId?: string): Promise<void> {

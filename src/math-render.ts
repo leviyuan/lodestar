@@ -15,7 +15,7 @@ import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { log } from './log.ts'
+import { log, logError } from './log.ts'
 import { findMarkdownCodeRanges } from './markdown-code.ts'
 
 const require_ = createRequire(import.meta.url)
@@ -156,7 +156,7 @@ function renderTeXToSVG(texSrc: string, em = DISPLAY_EM, display = true): Formul
     ].join('')
     return { svg, width, height }
   } catch (error) {
-    log(`math-render: TeX→SVG failed for ${texSrc.slice(0, 80)}…: ${error}`)
+    logError('math-render: TeX to SVG failed', error)
     return null
   }
 }
@@ -191,7 +191,7 @@ export function renderTeXToPNG(
     }
     return { png, width, height }
   } catch (error) {
-    log(`math-render: SVG→PNG failed for ${texSrc.slice(0, 80)}…: ${error}`)
+    logError('math-render: SVG to PNG failed', error)
     return null
   }
 }
@@ -404,7 +404,7 @@ async function uploadTeX(tex: string, uploader: FormulaUploader): Promise<Upload
         height: rendered.height,
       })
       if (!key) {
-        log(`math-render: upload returned no image key for ${tex.slice(0, 80)}…`)
+        log('math-render: upload returned no image key')
         return null
       }
       const uploaded = { key, width: rendered.width, height: rendered.height }
@@ -417,14 +417,14 @@ async function uploadTeX(tex: string, uploader: FormulaUploader): Promise<Upload
       }
       return uploaded
     } catch (error) {
-      log(`math-render: upload failed for ${tex.slice(0, 80)}…: ${error}`)
+      logError('math-render: upload failed', error)
       return null
     } finally {
       if (tempDir) {
         try {
           await rm(tempDir, { recursive: true, force: true })
         } catch (error) {
-          log(`math-render: temp cleanup failed for ${tempDir}: ${error}`)
+          logError('math-render: temporary file cleanup failed', error)
         }
       }
     }

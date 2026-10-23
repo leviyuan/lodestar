@@ -54,7 +54,7 @@ export function apply(ctx: Context): void {
   }
   const fail = (error: unknown): void => {
     const message = nativeErrorMessage(error)
-    process.stderr.write(`lodestar-dsh: ${message}\n`)
+    process.stderr.write('lodestar-dsh: runtime failure\n')
     notify('failure', { message })
   }
   const live = (): Agent => {
@@ -112,7 +112,7 @@ export function apply(ctx: Context): void {
   })
   ctx.on('agent/error', ({ agent, error }) => {
     const message = nativeErrorMessage(error)
-    process.stderr.write(`lodestar-dsh agent error: ${message}\n`)
+    process.stderr.write('lodestar-dsh: agent failure\n')
     if (agent.session.id === rootId) turnFailure = message
     notify('agent.error', { sessionId: agent.session.id, message })
   })
@@ -341,7 +341,7 @@ export function apply(ctx: Context): void {
         lifecycle.abort(Object.freeze({ kind: 'disposed' as const }))
         if (opening) {
           try { await opening }
-          catch (error) { process.stderr.write(`lodestar-dsh: initialization cancelled during shutdown: ${String(error)}\n`) }
+          catch { process.stderr.write('lodestar-dsh: initialization cancelled during shutdown\n') }
         }
         for (const pending of questions.values()) pending.reject(new Error('DSH shutdown'))
         questions.clear()

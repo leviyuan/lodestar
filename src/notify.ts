@@ -53,7 +53,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { log } from './log'
+import { log, logError } from './log'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
 import { FeishuRequestError } from './feishu-retry'
@@ -368,7 +368,7 @@ export function startNotifyServer(opts: NotifyOptions): Server | undefined {
         if (!await opts.extraHandler?.(req, res, url)) await handleNotifyRequest(req, res)
       })
       work.catch((err: any) => {
-        log(`notify: handler crash: ${err?.message ?? err}`)
+        logError('notify.handler.failed', err)
         if (!res.headersSent) {
           res.statusCode = 500
           res.setHeader('content-type', 'text/plain; charset=utf-8')
@@ -379,14 +379,14 @@ export function startNotifyServer(opts: NotifyOptions): Server | undefined {
       })
     })
     server.on('error', (err: Error) => {
-      log(`notify: server bind failed (${opts.bind}:${opts.port}): ${err.message}`)
+      logError('notify.server.bind_failed', err)
     })
     server.listen(opts.port, opts.bind, () => {
-      log(`notify: HTTP listening at http://${opts.bind}:${opts.port}/notify`)
+      log('notify.server.ready')
     })
     return server
   } catch (e) {
-    log(`notify: server bind failed (${opts.bind}:${opts.port}): ${e}`)
+    logError('notify.server.bind_failed', e)
   }
 }
 
@@ -478,7 +478,7 @@ export async function handleNotifyRequest(
   const sessionName = transport.sanitizeSessionName(project)
   const chatId = transport.chatIdForSession(sessionName)
   if (!chatId) {
-    log(`notify: project "${project}" (sanitized "${sessionName}") has no chat binding → 404`)
+    log('notify.binding_missing')
     return sendText(404,
       `project "${project}" has no conversation ID (chat_id) binding — send a message in the intended Feishu conversation, then retry`)
   }
@@ -501,7 +501,7 @@ export async function handleNotifyRequest(
   let sendFailure: unknown
   const messageId = await transport.sendCard(chatId, card, error => { sendFailure = error })
   if (!messageId) {
-    log(`notify: sendCard failed → 502 (project="${project}" chat=${chatId.slice(0, 8)}…)`)
+    logError('notify.card.send_failed', sendFailure)
     return sendText(502, `feishu sendCard failed: ${formatFeishuError(sendFailure)}`)
   }
 
@@ -523,7 +523,6 @@ export async function handleNotifyRequest(
     registerCallback(reg)
   }
 
-  log(`notify: → ${project} (${chatId.slice(0, 8)}…) level=${level} bytes=${text.length} images=${images.length} buttons=${buttons?.length ?? 0} allowReply=${allowReply} push=${interactive && !!callbackUrlOrDefault ? 1 : 0} msg=${messageId}`)
   sendJson(200, {
     ok: true,
     chat_id: chatId,

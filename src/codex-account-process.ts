@@ -6,7 +6,6 @@ import { bindProcessCodexAccount } from './codex-accounts'
 import { codexAccountScheduler, type CodexAccountCandidate, type CodexAccountDecision, type CodexSelectionOptions } from './codex-account-scheduler'
 import type { CodexQuotaFailure } from './codex-quota'
 import { peekUsage } from './usage'
-import { log } from './log'
 
 const CONTINUE_TASK = '上一轮因当前账号额度耗尽而中断，现已切换账号。请基于本会话已有记录继续完成用户尚未完成的任务，保留已完成的修改和工具结果。执行有副作用的操作前先确认现状，不要重复已完成的操作。'
 const FORWARDED_EVENTS = ['error', 'conversation_materialized', 'conversation_materialization_failed',
@@ -95,7 +94,6 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
   private scheduler() { return this.opts.scheduler ?? codexAccountScheduler }
   private notice(message: string, delayMs = 0): void {
     this.ownRetry = { reason: 'quota', phase: delayMs ? 'waiting' : 'retrying', attempt: this.retryCount, delayMs, message }
-    log(`codex account: ${message}`)
     this.emit('turn_retry', this.ownRetry)
   }
   private async choose(preferred?: string | null, failedAccountId?: string): Promise<CodexAccountDecision & { selected: CodexAccountCandidate }> {
@@ -115,7 +113,6 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
         throw new Error(`${summary}${detail ? `；${detail}` : ''}`)
       }
       const delay = Math.max(1000, Math.min(60_000, decision.retryAt - Date.now()))
-      log(`codex account: waiting for quota: ${detail}`)
       this.notice('暂无可用账号 · 自动等待恢复', delay)
       this.resolveQuotaWait()
       await (this.opts.wait ?? waitForQuota)(delay, this.lifetime.signal)

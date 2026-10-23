@@ -27,7 +27,7 @@ import { localFetch } from './network'
  */
 
 import { readFileSync } from 'node:fs'
-import { log } from './log'
+import { log, logError } from './log'
 import { NOTIFY_CALLBACKS_FILE } from './paths'
 import { writeJsonStateAtomic } from './state-store'
 
@@ -135,7 +135,7 @@ function saveCallbacks(): void {
     for (const [k, v] of map) obj[k] = v
     writeJsonStateAtomic(storeFile, obj)
   } catch (e) {
-    log(`notify-callbacks: save failed (${storeFile}): ${e}`)
+    logError('notify.callbacks.save_failed', e)
     throw e
   }
 }
@@ -149,7 +149,7 @@ export function loadCallbacks(): NotifyRegistration[] {
     raw = readFileSync(storeFile, 'utf8')
   } catch (error: any) {
     if (error?.code === 'ENOENT') return []
-    log(`notify-callbacks: read failed (${storeFile}): ${error}`)
+    logError('notify.callbacks.read_failed', error)
     throw error
   }
   try {
@@ -179,11 +179,10 @@ export function loadCallbacks(): NotifyRegistration[] {
       map.set(rec.notifyId, rec as NotifyRegistration)
       if ((rec.replyState?.status === 'sending' || rec.dispatchState) && rec.unknownAt) interruptedCallbacks.push(rec)
     }
-    log(`notify-callbacks: loaded ${map.size} registration(s)${dropped ? `, dropped ${dropped} stale` : ''}`)
-    if (interrupted) log(`notify-callbacks: ${interrupted} interrupted callback(s) marked UNKNOWN`)
+    if (interrupted) log('notify.callbacks.interrupted_state_unknown')
     if (dropped > 0 || interrupted > 0) saveCallbacks()
   } catch (e) {
-    log(`notify-callbacks: load failed (${storeFile}): ${e}`)
+    logError('notify.callbacks.load_failed', e)
     throw e
   }
   return interruptedCallbacks

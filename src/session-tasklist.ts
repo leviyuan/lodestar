@@ -2,7 +2,7 @@ import type { Session } from './session'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
-import { log } from './log'
+import { logError } from './log'
 import * as tasklist from './tasklist'
 import { messageOf, type TasklistActionResult } from './session-util'
 
@@ -40,7 +40,7 @@ export async function onTasklistEnable(s: Session): Promise<TasklistActionResult
     }
   } catch (e) {
     const message = `启用失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": tasklist enable failed: ${messageOf(e)}`)
+    logError('session-tasklist: tasklist enable failed', e)
     return {
       ok: false,
       message,
@@ -87,7 +87,7 @@ export async function onTasklistDeleteConfirm(s: Session, guidRaw: string): Prom
     }
   } catch (e) {
     const message = `删除失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": tasklist delete failed: ${messageOf(e)}`)
+    logError('session-tasklist: tasklist delete failed', e)
     return {
       ok: false,
       message,

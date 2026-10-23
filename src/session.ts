@@ -75,7 +75,7 @@ import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
-import { log } from './log'
+import { logError, logDiagnostic } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { readSysInfo } from './sysinfo'
 import { observeRateLimitsNotification, captureCodexUsageCache, type UsageSnapshot } from './usage'
@@ -280,7 +280,6 @@ export class Session {
    * `restart` commands can overlap; without this gate both callers can observe
    * `proc === null` while the first kill is pending and each spawn a process. */
   private lifecycleTail: Promise<void> = Promise.resolve()
-  private lifecycleSequence = 0
   /** Generation of the process currently owned by this Session. Event
    * listeners capture it at wire time so a late event from a killed/replaced
    * process cannot mutate the new process' turn, queue, usage, or cards. */
@@ -544,23 +543,16 @@ export class Session {
         this.selectedEffort = 'max'
       }
     }
-    if (this.selectedModel) {
-      log(`session "${sessionName}": restored selected provider=${this.selectedProvider} model=${this.selectedModel} effort=${this.selectedEffort ?? 'unset'}`)
-    }
     // Restore last-known thread/session id for the selected backend from
     // disk so a daemon restart (systemctl, crash, watchdog) doesn't
     // strand the user with a fresh conversation when they next type
     // `restart`.
     this.lastSessionRef = feishu.getSessionResumeRef(sessionName, this.selectedProvider)
     this.lastSessionId = this.lastSessionRef?.sessionId ?? null
-    if (this.lastSessionId) {
-      log(`session "${sessionName}": restored ${this.selectedProvider} lastSessionId=${this.lastSessionId}`)
-    }
     const pendingLaunch = feishu.getPendingConversationLaunch(sessionName)
     if (pendingLaunch) {
       if (this.selectedProvider !== 'claude') {
         feishu.replaceTurnAnchors(sessionName, [], null, null)
-        log(`session "${sessionName}": cleared pending Claude fork after provider changed`)
       } else {
         validateConversationLaunch(pendingLaunch.launch, 'claude', this.workDir)
         const stillPending = this.lastSessionId === pendingLaunch.previousSessionId
@@ -574,7 +566,6 @@ export class Session {
           throw new Error(`pending Claude fork has inconsistent resume binding for session "${sessionName}"`)
         }
         this.pendingConversationMaterialization = pendingLaunch
-        log(`session "${sessionName}": restored ${materialized ? 'materialized' : 'pending'} Claude fork source=${pendingLaunch.launch.source.sessionId}`)
       }
     }
   }
@@ -1183,7 +1174,6 @@ export class Session {
     if (!this.proc || !this.modelSelectionNeedsProcessStop(provider, tokenSourceId, model, effort)) return
     if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return
     const proc = this.proc
-    log(`session "${this.sessionName}": stop idle ${proc.provider} process before switching to ${provider}`)
     this.beginProcStop(proc)
     this.initCount = 0
     // 进程换掉:恢复轮标记 / 孤儿缓冲随旧进程作废,否则会泄漏到新进程的
@@ -1217,11 +1207,10 @@ export class Session {
     return await this.runLifecycle('stop-idle-current', () => this.stopIdleCurrentProcessUnlocked(reason))
   }
 
-  private async stopIdleCurrentProcessUnlocked(reason: string): Promise<boolean> {
+  private async stopIdleCurrentProcessUnlocked(_reason: string): Promise<boolean> {
     if (!this.proc?.isAlive()) return false
     if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return false
     const proc = this.proc
-    log(`session "${this.sessionName}": stop idle ${proc.provider} process: ${reason}`)
     this.beginProcStop(proc)
     this.initCount = 0
     this.bgResumePending = false
@@ -1320,14 +1309,14 @@ export class Session {
     let sendFailure: unknown
     const messageId = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
     if (!messageId) {
-      log(`session "${this.sessionName}": status card send failed title=${title}`)
+      logDiagnostic('session: status card send failed')
       await feishu.sendTextRaw(this.chatId, `❌ 创建状态卡片失败: ${title}\n${formatFeishuError(sendFailure)}`)
       return null
     }
     let cardId: string
     try { cardId = await cardkit.convertMessageToCard(messageId) }
     catch (e) {
-      log(`session "${this.sessionName}": status card id_convert failed title=${title}: ${e}`)
+      logError('session: status card id_convert failed', e)
       await feishu.sendTextRaw(this.chatId, `❌ 状态卡片初始化失败: ${title}\n${formatFeishuError(e)}`)
       return null
     }
@@ -1370,23 +1359,20 @@ export class Session {
       await cardkit.dispose(handle.cardId)
     } else {
       const detail = `footer=${footerLanded ? 'ok' : 'MISS'}, settings=${settingsLanded ? 'ok' : 'MISS'}`
-      log(`session "${this.sessionName}": status card terminal transaction incomplete card=${handle.cardId.slice(0, 12)} ${detail}`)
+      logError('session: status card terminal transaction incomplete', detail)
       await feishu.sendTextRaw(this.chatId, `⚠️ 状态卡片终态写入失败 (${detail})：${finalStatus}\n${cardFailureDetails(failures)}`)
     }
   }
 
-  private async runLifecycle<T>(label: string, operation: () => Promise<T>): Promise<T> {
+  private async runLifecycle<T>(_label: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.lifecycleTail
     let release!: () => void
     this.lifecycleTail = new Promise<void>(resolve => { release = resolve })
     await previous
-    const sequence = ++this.lifecycleSequence
-    log(`session "${this.sessionName}": lifecycle#${sequence} ${label} begin`)
     try {
       return await operation()
     } finally {
       release()
-      log(`session "${this.sessionName}": lifecycle#${sequence} ${label} end`)
     }
   }
 
@@ -1522,7 +1508,7 @@ export class Session {
     }
     this.blockedProc = proc
     this.blockedProcReason = error ? messageOf(error) : 'kill returned while process still reports alive'
-    log(`session "${this.sessionName}": process stop unconfirmed; lifecycle blocked: ${this.blockedProcReason}`)
+    logError('session: process stop unconfirmed; lifecycle blocked', this.blockedProcReason)
     return false
   }
 
@@ -1687,7 +1673,7 @@ export class Session {
       proc = this.spawnAgent()
     } catch (e) {
       const message = `${this.backendLabel()} 启动失败: ${messageOf(e)}`
-      log(`session "${this.sessionName}": ${message}`)
+      logError('session: Agent startup failed', e)
       report?.(`❌ ${message}`)
       if (announce) await feishu.sendText(this.chatId, `❌ ${message}`)
       this.status = 'stopped'
@@ -1733,13 +1719,12 @@ export class Session {
         : await this.waitForCodexInitialization(
             this.requireCodexInitializationPromise(initialization),
             () => {
-              log(`session "${this.sessionName}": codex init still pending after ${CODEX_INIT_NOTICE_MS / 1000}s`)
               report?.(this.withModel(`⏳ 仍在等待 ${backend} init 确认`))
             },
           )
     if (init.state === 'error' || init.state === 'exit') {
       const detail = init.error ? messageOf(init.error) : init.state
-      log(`session "${this.sessionName}": ${this.selectedProvider} init failed: ${detail}`)
+      logError('session: init failed', detail)
       const stopConfirmed = await this.stopOwnedProc(proc, 1000)
       const cleanup = stopConfirmed
         ? ''
@@ -1753,7 +1738,7 @@ export class Session {
     }
     if (init.state === 'timeout') {
       const timeoutMs = this.selectedProvider === 'claude' ? 30_000 : CODEX_INIT_TIMEOUT_MS
-      log(`session "${this.sessionName}": ${this.selectedProvider} init wait timeout (${timeoutMs / 1000}s)`)
+      logDiagnostic('session: init wait timeout')
       const stopConfirmed = await this.stopOwnedProc(proc, 1000)
       const cleanup = stopConfirmed
         ? ''
@@ -1767,7 +1752,7 @@ export class Session {
     }
     if (this.proc !== proc || !proc.isAlive()) {
       const message = `${backend} 启动期间已退出`
-      log(`session "${this.sessionName}": ${message}`)
+      logDiagnostic('session: Agent exited during startup')
       report?.(`❌ ${message}`)
       if (announce) await feishu.sendText(this.chatId, `❌ ${message}`)
       this.detachProc(proc)
@@ -1918,9 +1903,8 @@ export class Session {
     this.currentBatchReactionIds = new Map()
   }
 
-  clearStaleIdleQueueState(reason: string): void {
+  clearStaleIdleQueueState(_reason: string): void {
     if (this.initCount < 1 || this.currentTurn || this.openingTurn || this.pendingUserMessageCount === 0) return
-    log(`session "${this.sessionName}": clear stale pending queue before ${reason} pendingCount=${this.pendingUserMessageCount} reactions=${this.pendingReactionIds.size}`)
     this.pendingUserMessageCount = 0
     // Release stale ⏳ reactions left on the abandoned batch's chat
     // messages. addReaction callbacks still in flight will fall through
@@ -1975,15 +1959,14 @@ export class Session {
     // the user explicitly killed. Reordering the null-out fixes that
     // race (bug observed 2026-05-15: `kill` immediately followed by
     // `systemctl restart` revived the killed session on boot).
-    log(`session "${this.sessionName}": stop (${reason})`)
     this.invalidateTurnOpen()
     if (this.currentTurn) {
       void this.closeTurnCard(`🛑 ${reason}`).catch(e => {
-        log(`session "${this.sessionName}": stop current main-card close failed: ${messageOf(e)}`)
+        logError('session: stop current main-card close failed', e)
       })
     }
     const turnClose = this.waitForTurnCloses()
-      .catch(e => log(`session "${this.sessionName}": stop main-card close failed: ${messageOf(e)}`))
+      .catch(e => logError('session: stop main-card close failed', e))
     this.beginProcStop(proc)
     this.status = 'stopped'
     const lifecycleErrors: unknown[] = []
@@ -1993,7 +1976,7 @@ export class Session {
     try { this.opts.onLifecycleChange?.() }
     catch (e) {
       lifecycleErrors.push(e)
-      log(`session "${this.sessionName}": stop intent lifecycle write failed: ${messageOf(e)}`)
+      logError('session: stop intent lifecycle write failed', e)
     }
     const materializationBarrier = proc.conversationMaterializationBarrier?.()
     if (materializationBarrier) {
@@ -2040,13 +2023,13 @@ export class Session {
       .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
       .map(result => result.reason)
     for (const error of cleanupErrors) {
-      log(`session "${this.sessionName}": stop terminal cleanup failed: ${messageOf(error)}`)
+      logError('session: stop terminal cleanup failed', error)
     }
     const confirmed = this.finishProcStop(proc, killError)
     try { this.opts.onLifecycleChange?.() }
     catch (e) {
       lifecycleErrors.push(e)
-      log(`session "${this.sessionName}": stop final lifecycle write failed: ${messageOf(e)}`)
+      logError('session: stop final lifecycle write failed', e)
     }
     const failures: unknown[] = [
       ...(cancellationError ? [cancellationError] : []),
@@ -2200,11 +2183,11 @@ export class Session {
     for (const delivery of this.fileDeliveries) delivery.cancel('会话正在重启')
     if (this.currentTurn) {
       void this.closeTurnCard('🔁 已中止，正在重启').catch(e => {
-        log(`session "${this.sessionName}": restart current main-card close failed: ${messageOf(e)}`)
+        logError('session: restart current main-card close failed', e)
       })
     }
     const turnClose = this.waitForTurnCloses()
-      .catch(e => log(`session "${this.sessionName}": restart main-card close failed: ${messageOf(e)}`))
+      .catch(e => logError('session: restart main-card close failed', e))
     let killError: unknown = null
     let cancellationError: unknown = null
     let stoppedProc: AgentProcess | null = null
@@ -2242,8 +2225,8 @@ export class Session {
           this.agentCapability = previousCapability
         }
         this.status = statusBeforeResumeValidation
+        logError('session: restart checkpoint refresh failed', resumeRefreshError)
         const finalStatus = `❌ ${this.backendLabel(proc.provider)} 恢复点尚未安全落盘，已保留当前进程: ${resumeRefreshError}`
-        log(`session "${this.sessionName}": abort restart before kill: ${resumeRefreshError}`)
         report?.(finalStatus)
         if (announceText) await feishu.sendText(this.chatId, finalStatus)
         await closeInternalStatusCard(finalStatus)
@@ -2283,7 +2266,7 @@ export class Session {
       .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
       .map(result => result.reason)
     for (const error of cleanupErrors) {
-      log(`session "${this.sessionName}": restart terminal cleanup failed: ${messageOf(error)}`)
+      logError('session: restart terminal cleanup failed', error)
     }
     const stopConfirmed = stoppedProc ? this.finishProcStop(stoppedProc, killError) : true
     const stopFailures = [
@@ -2320,7 +2303,7 @@ export class Session {
         proc = this.spawnAgent(prevSessionRef ?? undefined, explicitLaunch ?? undefined)
       } catch (e) {
         const finalStatus = `❌ ${this.backendLabel()} 恢复失败: ${messageOf(e)}`
-        log(`session "${this.sessionName}": ${this.selectedProvider} resume failed before spawn: ${messageOf(e)}`)
+        logError('session: resume failed before spawn', e)
         report?.(finalStatus)
         if (announceText) await feishu.sendText(this.chatId, finalStatus)
         this.status = 'stopped'
@@ -2352,7 +2335,6 @@ export class Session {
           : await this.waitForCodexInitialization(
               this.requireCodexInitializationPromise(initialization),
               () => {
-                log(`session "${this.sessionName}": codex resume init still pending after ${CODEX_INIT_NOTICE_MS / 1000}s`)
                 report?.(this.withModel(`⏳ 仍在等待 ${backend} init 确认 thread=${prevThreadLabel}`))
               },
             )
@@ -2363,7 +2345,7 @@ export class Session {
         const detail = [init.error ? messageOf(init.error) : init.state, invalidation]
           .filter(Boolean)
           .join('；')
-        log(`session "${this.sessionName}": ${this.selectedProvider} resume failed: ${detail}`)
+        logError('session: resume failed', detail)
         const stopConfirmed = await this.stopOwnedProc(proc, 1000)
         const cleanup = stopConfirmed
           ? ''
@@ -2380,7 +2362,6 @@ export class Session {
       }
       if (this.proc !== proc || !proc.isAlive()) {
         const finalStatus = `❌ ${backend} 恢复期间已退出`
-        log(`session "${this.sessionName}": ${this.selectedProvider} resume process exited before ready`)
         report?.(finalStatus)
         if (announceText) await feishu.sendText(this.chatId, finalStatus)
         this.detachProc(proc)
@@ -2407,7 +2388,7 @@ export class Session {
       if (init.state !== 'waiting_quota') this.daemonRestoreRequired = false
       this.opts.onLifecycleChange?.()
       try { await closeInternalStatusCard(msg) } catch (error) {
-        log(`session "${this.sessionName}": restart succeeded but status-card close failed: ${messageOf(error)}`)
+        logError('session: restart succeeded but status-card close failed', error)
         await feishu.sendTextRaw(this.chatId, `⚠️ ${msg}\n状态卡收尾失败: ${messageOf(error)}`)
       }
       return true
@@ -2652,7 +2633,7 @@ export class Session {
       || checkpoint.source.cwd !== this.workDir
     ) {
       const message = `拒绝了与当前会话不匹配的 checkpoint provider=${checkpoint.provider} source=${checkpoint.source.sessionId}`
-      log(`session "${this.sessionName}": ${message}`)
+      logDiagnostic('session: checkpoint ownership mismatch')
       this.lastTurnUserPreview = ''
       return message
     }
@@ -2667,11 +2648,10 @@ export class Session {
       const pendingForProc = this.pendingCodexTurnAnchors.filter(pending => pending.proc === proc).length
       if (pendingForProc >= 64) {
         const message = 'Codex rollout 长期未确认，延迟 checkpoint 队列已满'
-        log(`session "${this.sessionName}": ${message} thread=${proc.sessionId}`)
+        logDiagnostic('session: checkpoint confirmation queue exhausted')
         return message
       }
       this.pendingCodexTurnAnchors.push({ proc, anchor })
-      log(`session "${this.sessionName}": defer Codex turn checkpoint until rollout confirmation thread=${proc.sessionId} checkpoint=${checkpoint.id}`)
       return null
     }
     return this.appendTurnAnchor(anchor)
@@ -2683,7 +2663,7 @@ export class Session {
       return null
     } catch (error) {
       const message = `分叉 checkpoint 持久化失败: ${messageOf(error)}`
-      log(`session "${this.sessionName}": ${message}`)
+      logError('session: checkpoint persistence failed', error)
       return message
     }
   }
@@ -2703,14 +2683,9 @@ export class Session {
     return failure
   }
 
-  private discardPendingCodexTurnAnchors(proc: AgentProcess, reason: string): void {
+  private discardPendingCodexTurnAnchors(proc: AgentProcess, _reason: string): void {
     if (proc.provider !== 'codex') return
-    const before = this.pendingCodexTurnAnchors.length
     this.pendingCodexTurnAnchors = this.pendingCodexTurnAnchors.filter(pending => pending.proc !== proc)
-    const dropped = before - this.pendingCodexTurnAnchors.length
-    if (dropped > 0) {
-      log(`session "${this.sessionName}": dropped ${dropped} unmaterialized Codex checkpoint(s): ${reason}`)
-    }
   }
 
   private collectTurnWrites(): feishu.TurnWrite[] {
@@ -2811,7 +2786,7 @@ export class Session {
   resumeInputAfterModelSettingsChange(): void {
     void this.drainMidTurnAndOpen().catch(async error => {
       const message = `模型设置已完成，但排队输入提交失败：${messageOf(error)}`
-      log(`session "${this.sessionName}": ${message}`)
+      logError('session: queued input submission failed', error)
       await feishu.sendTextRaw(this.chatId, `❌ ${message}`)
     })
   }
@@ -2885,7 +2860,7 @@ export class Session {
       disable: chatId => groupFileDelivery.disable(chatId, this.workDir),
       sendCard: (card, onFailure) => feishu.sendCard(this.chatId, card, onFailure),
       reportError: async message => {
-        log(`session "${this.sessionName}": ${message}`)
+        logError('session: file delivery settings failed', message)
         if (!await feishu.sendText(this.chatId, message)) throw new Error(message)
       },
     }, this.workDir)
@@ -2930,7 +2905,7 @@ export class Session {
     try { opts.accountUsages = await readAllAccountUsage() }
     catch (error) {
       const reason = messageOf(error)
-      log(`console usage MISS: ${reason}`)
+      logError('session: console usage MISS', reason)
       opts.accountUsages = [{ id: 'error', label: '额度', usage: { state: 'network', windows: [], reason } }]
     }
     let failure: cardkit.CardWriteFailure | undefined
@@ -2959,7 +2934,7 @@ export class Session {
     } catch (e) {
       mutationLanded = false
       failures.push(messageOf(e))
-      log(`session "${this.sessionName}": ${label} mutation failed: ${messageOf(e)}`)
+      logError('session: mutation failed', e)
     }
     let closed = false
     try {
@@ -2968,16 +2943,15 @@ export class Session {
       })
     } catch (e) {
       failures.push(formatFeishuError(e))
-      log(`session "${this.sessionName}": ${label} streaming-off failed: ${messageOf(e)}`)
+      logError('session: streaming-off failed', e)
     }
     if (!mutationLanded || !closed) {
-      log(`session "${this.sessionName}": ${label} state retained after checked MISS mutation=${mutationLanded} streamingOff=${closed} card=${cardId.slice(0, 12)}`)
       await feishu.sendTextRaw(this.chatId, `⚠️ 卡片更新失败 (${label})。\n${failures.join('\n') || formatFeishuError(undefined)}`)
       return false
     }
     try { await cardkit.dispose(cardId) }
     catch (e) {
-      log(`session "${this.sessionName}": ${label} dispose failed: ${messageOf(e)}`)
+      logError('session: dispose failed', e)
       return false
     }
     return mutationLanded
@@ -3041,7 +3015,6 @@ export class Session {
     this.steeringBoundary?.start()
     this.steeringBoundary = null
     if (!this.proc) return
-    log(`session "${this.sessionName}": interrupt`)
     // Keep the last submitted delivery mode for background work.
     if (processUsesClaudeTranslation(this.proc)) {
       this.procPendingFileDeliveryModes.delete(this.proc)
@@ -3241,7 +3214,7 @@ export class Session {
           void feishu.deleteReaction(id, rid)
         }
       })().catch(e => {
-        log(`session "${this.sessionName}": reaction tracking failed: ${messageOf(e)}`)
+        logError('session: reaction tracking failed', e)
       })
     }
 
@@ -3391,14 +3364,10 @@ export class Session {
     if (proc.isConversationResumable?.()) {
       throw new Error('fresh Codex thread was unexpectedly marked resumable during init')
     }
-    const previous = feishu.getSessionResumeRef(this.sessionName, 'codex')
     feishu.clearSessionResumeChecked(this.sessionName, 'codex')
     if (this.selectedProvider === 'codex') {
       this.lastSessionRef = null
       this.lastSessionId = null
-    }
-    if (previous) {
-      log(`session "${this.sessionName}": cleared pre-fresh Codex resume binding thread=${previous.sessionId}`)
     }
   }
 
@@ -3424,7 +3393,7 @@ export class Session {
       feishu.clearSessionResumeChecked(this.sessionName, 'codex')
     } catch (clearError) {
       const failure = `已确认恢复点无 rollout，但作废失败: ${messageOf(clearError)}`
-      log(`session "${this.sessionName}": ${failure} thread=${sessionId}`)
+      logError('session: resume checkpoint invalidation failed', clearError)
       return failure
     }
     if (this.lastSessionRef?.provider === 'codex' && this.lastSessionRef.sessionId === sessionId) {
@@ -3433,7 +3402,6 @@ export class Session {
     }
     onInvalidated?.(sessionId)
     const receipt = `已作废无 rollout 的恢复点 thread=${diagnosticIdLabel(sessionId)}`
-    log(`session "${this.sessionName}": ${receipt} fullThread=${sessionId}`)
     return receipt
   }
 
@@ -3454,7 +3422,7 @@ export class Session {
     if (!sessionId) {
       if (!pendingMaterialization) return null
       const error = new Error('Claude pending fork did not provide a materialized session id')
-      log(`session "${this.sessionName}": ${error.message}`)
+      logError('session: fork checkpoint missing', error)
       if (fatal) throw error
       return error.message
     }
@@ -3473,7 +3441,7 @@ export class Session {
       )
     ) {
       const error = new Error(`Claude fork did not materialize an independent session id (${sessionId})`)
-      log(`session "${this.sessionName}": ${error.message}`)
+      logError('session: fork checkpoint invalid', error)
       if (fatal) throw error
       return error.message
     }
@@ -3487,7 +3455,7 @@ export class Session {
         this.lastSessionRef = ref
         this.lastSessionId = sessionId
       }
-      log(`session "${this.sessionName}": ${message}`)
+      logError('session: resume checkpoint persistence failed', error)
       if (fatal) throw error
       if (firstReport && notify) {
         void feishu.sendTextRaw(this.chatId, `⚠️ ${message}；当前进程可继续，但 daemon 重启前请先解决本机状态目录写入问题。`)
@@ -3526,7 +3494,7 @@ export class Session {
       || ref.sessionId === pending.previousSessionId
     ) {
       const message = 'Claude 待生成分支没有可验证的新会话恢复点，保留 pending marker'
-      log(`session "${this.sessionName}": ${message}`)
+      logDiagnostic('session: fork checkpoint unavailable')
       return message
     }
     try {
@@ -3535,7 +3503,7 @@ export class Session {
       return null
     } catch (error) {
       const message = `Claude 待生成分支标记清除失败: ${messageOf(error)}`
-      log(`session "${this.sessionName}": ${message}`)
+      logError('session: fork marker cleanup failed', error)
       return message
     }
   }
@@ -3609,7 +3577,7 @@ export class Session {
 
   private async reportBackgroundWriteFailure(error: unknown): Promise<void> {
     const messages = backgroundFailureNotices(error)
-    log(`session "${this.sessionName}": task panel update failed: ${messages.join('; ')}`)
+    logDiagnostic('session: task panel update failed')
     const notices = messages.filter(message => {
       // A new request id does not mean a new fault. Keep each original error
       // in the log, and show each cause once until the panel sync recovers.
@@ -3635,7 +3603,7 @@ export class Session {
     // own authoritative snapshot and propagates any final failure to stop().
     if (this.backgroundSync) {
       try { await this.backgroundSync }
-      catch (error) { log(`session "${this.sessionName}": retrying terminal delegation update after: ${messageOf(error)}`) }
+      catch { /* The terminal refresh below retries the failed presentation. */ }
     }
     await this.refreshBackgroundCardFull()
     if (this.backgroundRefreshTimer) clearTimeout(this.backgroundRefreshTimer)
@@ -3655,7 +3623,7 @@ export class Session {
     p: AgentProcess,
     epoch: number,
     text: string,
-    promptId: string | null,
+    _promptId: string | null,
   ): void {
     if (this.proc !== p || this.procEpoch !== epoch || !p.isAlive()) return
     // If another visible owner already exists, the SDK has folded this prompt
@@ -3672,18 +3640,16 @@ export class Session {
     try {
       openOwner = this.beginTurnOpen(p, epoch, true)
     } catch (error) {
-      log(`session "${this.sessionName}": scheduled turn-open ownership conflict: ${messageOf(error)}`)
+      logError('session: scheduled turn-open ownership conflict', error)
       return
     }
     const preview = text.replace(/\s+/g, ' ').trim()
     this.lastTurnUserPreview = `⏰ ${preview.slice(0, 78)}`
-    log(`session "${this.sessionName}": scheduled wakeup prompt=${promptId ?? 'MISS'}`)
 
     void (async () => {
       try {
         const opened = await this.openTurnCard(openOwner, '', 'scheduled_wakeup')
         if (this.proc !== p || this.procEpoch !== epoch) {
-          log(`session "${this.sessionName}": scheduled ${p.provider} turn became stale while opening epoch=${epoch}`)
           if (opened && this.currentTurn === opened) {
             await this.closeTurnCard(`⚠️ ${this.backendLabel(p.provider)} 已退出`)
           }
@@ -3697,14 +3663,13 @@ export class Session {
           this.bgResumeCardless = true
           if (openOwner.sawResult) {
             openOwner.sawResult = false
-            log(`session "${this.sessionName}": scheduled open failed after result — flushing orphan now`)
+            logDiagnostic('session: scheduled open failed after result')
             this.flushOrphanAssistantToChat('scheduled open failed, result already arrived')
           } else {
-            log(`session "${this.sessionName}": scheduled open failed — orphan text flush will cover the output`)
+            logDiagnostic('session: scheduled open failed')
           }
         } else if (openOwner.sawResult) {
           openOwner.sawResult = false
-          log(`session "${this.sessionName}": scheduled result raced card-open — closing freshly-opened card`)
           await this.closeTurnCard(openOwner.terminalSuffix, {
             forcePush: openOwner.terminalForcePush,
             hasFreshResult: true,
@@ -3717,7 +3682,7 @@ export class Session {
         this.releaseTurnOpen(openOwner)
       }
     })().catch(error => {
-      log(`session "${this.sessionName}": scheduled turn-open handler failed: ${messageOf(error)}`)
+      logError('session: scheduled turn-open handler failed', error)
     })
   }
 
@@ -3741,8 +3706,6 @@ export class Session {
       if (event.kind === 'tool_result' && event.toolName === 'AskUserQuestion') return 'hidden'
       return 'main'
     })
-    let staleEventLogged = false
-    let stoppedEventLogged = false
     const on = <K extends keyof AgentProcessEventMap>(
       event: K,
       handler: (payload: AgentProcessEventMap[K], snapshot: { result: CodexResultMeta; totalUsage: CodexUsage | null }) => void,
@@ -3752,10 +3715,6 @@ export class Session {
         const snapshot = { result: { ...p.lastResult }, totalUsage: p.lastTotalUsage ? { ...p.lastTotalUsage } : null }
         const dispatch = (): void => {
           if (!isCurrent()) {
-            if (!staleEventLogged) {
-              staleEventLogged = true
-              log(`session "${this.sessionName}": ignore stale ${p.provider} event=${String(event)} epoch=${epoch} currentEpoch=${this.procEpoch}`)
-            }
             return
           }
           if (generation !== this.steeringGeneration && event !== 'exit' && event !== 'error') return
@@ -3782,10 +3741,6 @@ export class Session {
             return
           }
           if (event !== 'exit' && (this.stoppingProc === p || this.blockedProc === p)) {
-            if (!stoppedEventLogged) {
-              stoppedEventLogged = true
-              log(`session "${this.sessionName}": ignore ${p.provider} event=${String(event)} while process stop is pending`)
-            }
             return
           }
           handler(payload, snapshot)
@@ -3795,7 +3750,7 @@ export class Session {
     }
 
     on('error', err => {
-      log(`session "${this.sessionName}": ${p.provider} process error: ${err}`)
+      logError('session: process error', err)
     })
     on('user_input_submitted', () => {
       const mode = this.procPendingFileDeliveryModes.get(p)
@@ -3815,7 +3770,6 @@ export class Session {
         this.persistResumableSessionId(true)
       }
       this.initCount++
-      log(`session "${this.sessionName}": SDK init#${this.initCount} pendingCount=${this.pendingUserMessageCount} midBuffer=${this.pendingMidTurnMsgs.length} currentTurn=${this.currentTurn ? 'yes' : 'no'} openingTurn=${this.openingTurn}`)
 
       // Boot init (initCount === 1) is claimed by `onUserMessage`'s
       // eager-open path — if a user message landed before the init
@@ -3837,7 +3791,6 @@ export class Session {
       // those belong to later daemon-buffered messages, not this open turn.
       if (this.currentTurn || this.openingTurn) {
         if (this.pendingUserMessageCount > 0) {
-          log(`session "${this.sessionName}": SDK init claimed eager input pendingCount=${this.pendingUserMessageCount}`)
           this.pendingUserMessageCount = 0
         }
         this.steerPendingInputs()
@@ -3859,7 +3812,7 @@ export class Session {
         // Preserve pendingCount/bgResumePending/reactions so a later boundary
         // can still claim this turn. An invariant violation is visible in logs
         // but must not escape EventEmitter and tear down the whole SDK process.
-        log(`session "${this.sessionName}": init turn-open ownership conflict: ${messageOf(error)}`)
+        logError('session: init turn-open ownership conflict', error)
         return
       }
       this.bgResumePending = false
@@ -3883,7 +3836,6 @@ export class Session {
         try {
           const opened = await this.openTurnCard(openOwner, userOpenId, isUserBatch ? 'user_message' : 'bg_task_resume')
           if (!isCurrent()) {
-            log(`session "${this.sessionName}": ${p.provider} became stale while opening turn card epoch=${epoch}`)
             if (opened && this.currentTurn === opened) {
               await this.closeTurnCard(`⚠️ ${this.backendLabel(p.provider)} 已退出`)
             }
@@ -3908,7 +3860,7 @@ export class Session {
               // model burns tokens. Release the reactions this batch
               // inherited (init handler moved them above) — otherwise
               // they stay ⏳ forever on the user's chat messages.
-              log(`session "${this.sessionName}": init-path openTurnCard failed — sendInterrupt + release reactions`)
+              logDiagnostic('session: init-path openTurnCard failed')
               this.proc?.sendInterrupt()
               releaseClaimedReactions()
             } else {
@@ -3919,10 +3871,10 @@ export class Session {
               this.bgResumeCardless = true
               if (openOwner.sawResult) {
                 openOwner.sawResult = false
-                log(`session "${this.sessionName}": bg-resume openTurnCard failed, result already arrived — flushing orphan now`)
+                logDiagnostic('session: bg-resume openTurnCard failed, result already arrived')
                 this.flushOrphanAssistantToChat('bg-resume open failed, result already arrived')
               } else {
-                log(`session "${this.sessionName}": bg-resume openTurnCard failed — orphan text flush will cover the output`)
+                logDiagnostic('session: bg-resume openTurnCard failed')
               }
             }
           } else if (openOwner.sawResult) {
@@ -3930,7 +3882,6 @@ export class Session {
             // result 处理器当时 currentTurn 还是 null,closeTurnCard 空转了。
             // 这里补一次收尾,否则卡片 footer 永远计时、session 卡在 working。
             openOwner.sawResult = false
-            log(`session "${this.sessionName}": result raced card-open — closing freshly-opened turn card now`)
             await this.closeTurnCard(openOwner.terminalSuffix, {
               forcePush: openOwner.terminalForcePush,
               hasFreshResult: true,
@@ -3943,42 +3894,35 @@ export class Session {
           this.releaseTurnOpen(openOwner)
         }
       })().catch(e => {
-        log(`session "${this.sessionName}": init turn-open handler failed: ${messageOf(e)}`)
+        logError('session: init turn-open handler failed', e)
       })
     })
     on('scheduled_turn_input', ({ text, displayText, promptId }) => {
       if (p.provider !== 'claude' && p.provider !== 'dsh') return
       this.startScheduledTurnCard(p, epoch, displayText ?? text, promptId)
     })
-    on('conversation_materialized', ({ session_id: sessionId, source }) => {
+    on('conversation_materialized', ({ session_id: sessionId }) => {
       if (p.provider !== 'codex') return
       if (p.sessionId !== sessionId) {
-        log(`session "${this.sessionName}": ignore mismatched Codex materialization session=${sessionId} current=${p.sessionId ?? 'MISS'} source=${source}`)
         return
       }
-      log(`session "${this.sessionName}": Codex resume point materialized thread=${sessionId} source=${source}`)
       this.persistResumableSessionId()
     })
-    on('conversation_materialization_failed', ({ session_id: sessionId, source, error }) => {
+    on('conversation_materialization_failed', ({ session_id: sessionId, error }) => {
       if (p.provider !== 'codex' || p.sessionId !== sessionId) return
       const message = `Codex 会话落盘确认失败，未写恢复点: ${messageOf(error)}`
       const firstReport = this.resumePersistenceError !== message
       this.resumePersistenceError = message
-      log(`session "${this.sessionName}": ${message} thread=${sessionId} source=${source}`)
+      logError('session: checkpoint confirmation failed', error)
       if (firstReport) void feishu.sendTextRaw(this.chatId, `⚠️ ${message}`)
     })
     on('turn_retry', () => {
       if (this.currentTurn) this.startThinkingFooter(this.currentTurn)
     })
-    on('codex_account_changed', ({ accountId, diagnostics }) => {
-      log(`session "${this.sessionName}": Codex account=${accountId}`)
+    on('codex_account_changed', () => {
       this.pendingAsks.clear()
       this.pendingPermissions.clear()
-      // Selection succeeded. Other accounts' diagnostics belong in logs and
-      // explicit account inspection; only blocking failures warrant a notice.
-      if (diagnostics.length) {
-        log(`session "${this.sessionName}": Codex 未参与选号的账号: ${diagnostics.join('；')}`)
-      }
+      // Unused-account diagnostics remain available in explicit account inspection.
     })
     on('turn_started', ({ retry }, snapshot) => {
       // Codex app-server emits init only at process startup, not for every
@@ -3986,7 +3930,6 @@ export class Session {
       // already given an eager-opened card. Claude normally consumed it in
       // init above; this is an idempotent second boundary.
       if ((this.currentTurn || this.openingTurn) && this.pendingUserMessageCount > 0) {
-        log(`session "${this.sessionName}": turn_started claimed eager input pendingCount=${this.pendingUserMessageCount}`)
         this.pendingUserMessageCount = 0
       }
       this.persistResumableSessionId()
@@ -4007,7 +3950,7 @@ export class Session {
       this.currentTurnUsageBaselineKnown = true
     })
     on('turn_input_error', ({ error, displayError }) => {
-      log(`session "${this.sessionName}": native input processing failed: ${error}`)
+      logError('session: native input processing failed', error)
       void feishu.sendTextRaw(this.chatId, `⚠️ ${this.backendLabel(p.provider)} 输入处理错误：${displayError ?? error}`)
     })
     on('user_input_consumed', ({ inputId }) => this.onSteeringInputConsumed(p, epoch, inputId))
@@ -4173,9 +4116,6 @@ export class Session {
         this.userInterrupted = false
         this.discardOrphanAssistant()
         this.bgResumePending = false
-        const subtype = this.proc?.lastResult.subtype ?? 'unknown'
-        const isError = this.proc?.lastResult.is_error === true
-        log(`session "${this.sessionName}": SDK result after user stop subtype=${subtype} isError=${isError} — ignored`)
         this.status = 'idle'
         return
       }
@@ -4219,15 +4159,15 @@ export class Session {
         void feishu.sendTextRaw(this.chatId, `⚠️ ${stateError}`)
       }
 
-      log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} midBuffer=${this.pendingMidTurnMsgs.length} forcePush=${forcePush}`)
+      if (isError) logError('session: Agent turn failed', failureDetail)
       void this.closeTurnCard(suffix, { forcePush, hasFreshResult: true }).catch(e => {
-        log(`session "${this.sessionName}": result card close failed: ${messageOf(e)}`)
+        logError('session: result card close failed', e)
       })
       this.status = 'idle'
 
       if (hasMidTurn) {
         void this.drainMidTurnAndOpen().catch(e => {
-          log(`session "${this.sessionName}": mid-turn drain failed: ${messageOf(e)}`)
+          logError('session: mid-turn drain failed', e)
         })
       }
     })
@@ -4237,7 +4177,6 @@ export class Session {
       const toolUseId = e.tool_use_id ?? (p.provider === 'claude' ? this.lastMainTaskToolUseId : null) ?? undefined
       const nativeTool = toolUseId ? this.nativeAgentTools.get(toolUseId) : undefined
       if (nativeTool) nativeTool.confirmed = true
-      log(`session "${this.sessionName}": bg_task_started task=${e.task_id} type=${e.task_type ?? '-'} subagent=${e.subagent_type ?? '-'} toolUseId=${toolUseId?.slice(0, 8) ?? '-'} desc=${(e.description ?? '').slice(0, 40)}`)
       this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), { ...e, ...e.display, tool_use_id: toolUseId }))
       this.onBackgroundTaskChanged(true)
     })
@@ -4250,7 +4189,6 @@ export class Session {
       this.onBackgroundTaskChanged(!!e.patch.status || e.patch.is_backgrounded === true)
     })
     on('bg_task_settled', (e: BgTaskSettledEvent) => {
-      log(`session "${this.sessionName}": bg_task_settled task=${e.task_id} status=${e.status}`)
       this.applyBgStore(cards.applyBgTaskSettled(this.bgStore(), { ...e, ...e.display }))
       this.onBackgroundTaskChanged(true)
       // turn 已收尾后才结算的任务:Claude SDK 会自发开一轮恢复轮合并结果,
@@ -4267,7 +4205,6 @@ export class Session {
       this.onBackgroundTaskChanged()
     })
     on('exit', ({ code, signal, expected }: any) => {
-      log(`session "${this.sessionName}": ${p.provider} exited code=${code} signal=${signal} expected=${expected}`)
       if (this.stoppingProc === p || this.blockedProc === p) {
         if (this.blockedProc === p) {
           const materializationFailure = p.conversationMaterializationFailure?.()
@@ -4283,7 +4220,6 @@ export class Session {
           }
           this.discardPendingCodexTurnAnchors(p, 'blocked process finally exited')
         }
-        log(`session "${this.sessionName}": blocked/stopping ${p.provider} exit confirmed`)
         this.detachProc(p)
         this.status = 'stopped'
         this.opts.onLifecycleChange?.()
@@ -4291,7 +4227,7 @@ export class Session {
       }
       this.discardPendingCodexTurnAnchors(p, 'unexpected process exit')
       void this.cancelAgentRuns(`${p.provider} process exited`).catch(error => {
-        log(`session "${this.sessionName}": cancel Agent runs after process exit failed: ${messageOf(error)}`)
+        logError('session: cancel Agent runs after process exit failed', error)
       })
       const backend = this.backendLabel(p.provider)
       const exitDetail = `code=${code ?? 'null'}, signal=${signal ?? 'null'}`
@@ -4304,12 +4240,12 @@ export class Session {
       // streaming mode.
       if (this.currentTurn) {
         void this.closeTurnCard(terminalSuffix).catch(e => {
-          log(`session "${this.sessionName}": process-exit current main-card close failed: ${messageOf(e)}`)
+          logError('session: process-exit current main-card close failed', e)
         })
       }
       const turnClose = this.waitForTurnCloses()
         .catch(e => {
-          log(`session "${this.sessionName}": process-exit main-card close failed: ${messageOf(e)}`)
+          logError('session: process-exit main-card close failed', e)
         })
       this.detachProc(p)
       // 进程死了,残留的孤儿正文再不兜底就永远丢了(非用户主动停止的崩溃
@@ -4345,7 +4281,7 @@ export class Session {
         ])
         for (const outcome of settled) {
           if (outcome.status === 'rejected') {
-            log(`session "${this.sessionName}": process-exit terminal cleanup failed: ${messageOf(outcome.reason)}`)
+            logError('session: process-exit terminal cleanup failed', outcome.reason)
           }
         }
         // `expected` is the process wrapper's explicit contract. Every exit
@@ -4358,7 +4294,7 @@ export class Session {
           )
         }
       }).catch(e => {
-        log(`session "${this.sessionName}": process-exit cleanup rejected: ${messageOf(e)}`)
+        logError('session: process-exit cleanup rejected', e)
       })
     })
   }
@@ -4452,7 +4388,7 @@ export class Session {
       // Only user_input_consumed owns the rendering boundary. The backend
       // can acknowledge a queued message well before the model sees it.
     }).catch(async error => {
-      log(`session "${this.sessionName}": steering input failed: ${messageOf(error)}`)
+      logError('session: steering input failed', error)
       await feishu.sendTextRaw(this.chatId, `❌ 追加消息${input.consumed ? '已确认进入执行流，但提交回执异常' : '提交未获确认，未自动重发'}：${messageOf(error)}`)
     }).finally(() => {
       turn.steeringInflight?.delete(operation)
@@ -4465,7 +4401,7 @@ export class Session {
       }
       if (!ownsInput()) return
       if (!this.currentTurn && !this.openingTurn && this.pendingMidTurnMsgs.length) {
-        void this.drainMidTurnAndOpen().catch(error => log(`session "${this.sessionName}": input drain failed: ${messageOf(error)}`))
+        void this.drainMidTurnAndOpen().catch(error => logError('session: input drain failed', error))
       } else if (accepted) this.steerPendingInputs()
     })
     this.steeringSend = operation
@@ -4490,7 +4426,7 @@ export class Session {
     }
     if (count) {
       const message = `本轮已结束，但 ${count} 条追加消息缺少原生处理位置确认，未据此换卡或自动重发。`
-      log(`session "${this.sessionName}": ${message}`)
+      logDiagnostic('session: additional input consumption unconfirmed')
       void feishu.sendTextRaw(this.chatId, `⚠️ ${message}`)
     }
   }
@@ -4507,7 +4443,6 @@ export class Session {
       this.releaseSteeringReactions(input)
       return
     }
-    log(`session "${this.sessionName}": steering consumed input=${inputId} messages=${input.batch.length}`)
     const pending = this.steeringBoundary
     if (pending?.collecting && pending.turn === turn && pending.proc === proc && pending.epoch === epoch) {
       pending.inputs.push(...input.batch.map(msg => msg.text))
@@ -4534,7 +4469,6 @@ export class Session {
       if (turn.rotating) await turn.rotating
       if (!ownsBoundary()) return
       this.finalizeCurrentAssistantSegment()
-      log(`session "${this.sessionName}": steering input batch inputs=${boundary.inputs.length} receipts=${boundary.inputIds.length} — rotate at native boundary`)
       this.startMidTurnRotate(turn, {
         userInputs: boundary.inputs,
         onCardSent: () => {
@@ -4544,7 +4478,7 @@ export class Session {
       })
       await turn.rotating
     }).catch(async error => {
-      log(`session "${this.sessionName}": input-boundary card handoff failed: ${messageOf(error)}`)
+      logError('session: input-boundary card handoff failed', error)
       await feishu.sendTextRaw(this.chatId, `⚠️ 追加消息已进入执行流，但换卡失败：${messageOf(error)}`)
     }).finally(() => {
       turn.steeringInflight?.delete(operation)
@@ -4597,7 +4531,7 @@ export class Session {
       // Keep the batch and reactions in their pending maps. This guard should
       // be unreachable after waitForTurnOpenSlot, but an invariant violation
       // must never silently delete user input.
-      log(`session "${this.sessionName}": mid-turn open ownership conflict: ${messageOf(error)}`)
+      logError('session: mid-turn open ownership conflict', error)
       return
     }
     const batch = this.pendingMidTurnMsgs
@@ -4646,7 +4580,7 @@ export class Session {
       try {
         if (!await this.sendClaimedUserText(proc, merged)) return
       } catch (e) {
-        log(`session "${this.sessionName}": mid-turn sendUserText failed after card open: ${e}`)
+        logError('session: mid-turn sendUserText failed after card open', e)
         await this.closeTurnCard(`❌ ${this.backendLabel(proc.provider)} 接收消息失败`)
         await feishu.sendTextRaw(
           this.chatId,
@@ -4696,7 +4630,7 @@ export class Session {
       return
     }
     const detail = `footer=${footerLanded ? 'ok' : 'MISS'}, settings=${settingsLanded ? 'ok' : 'MISS'}`
-    log(`session "${this.sessionName}": superseded card terminal transaction incomplete card=${cardId.slice(0, 12)} ${detail}`)
+    logError('session: superseded card terminal transaction incomplete', detail)
     await feishu.sendTextRaw(this.chatId, `⚠️ 已作废卡片未能正常关闭 (${detail})。\n${cardFailureDetails(failures)}`)
   }
 
@@ -4717,7 +4651,6 @@ export class Session {
     const userInputs = this.pendingTurnInputs
     this.pendingTurnInputs = []
     this.lastTurnUserPreview = userInputs[0]?.slice(0, 80) ?? this.lastTurnUserPreview
-    log(`session "${this.sessionName}": openTurnCard turn=${turn} trigger=${trigger} inputs=${userInputs.length}`)
     const turnSelection = this.runtimeModelSelection()
     const initialFooter = this.withModel(opts.initialFooter ?? 'Waiting...(0s)', turnSelection)
     const card = cards.mainConversationCard({
@@ -4735,7 +4668,7 @@ export class Session {
     const messageId = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
     if (!messageId) {
       if (!this.ownsTurnOpen(owner)) return null
-      log(`session "${this.sessionName}": openTurnCard sendCard failed — surfacing via raw text`)
+      logDiagnostic('session: openTurnCard sendCard failed')
       // Transient failures have exhausted their retry budget; permanent
       // API rejections fail immediately. The user just sent us a message and
       // it's gone into a black hole — surface that explicitly so they
@@ -4759,7 +4692,7 @@ export class Session {
     let cardId: string
     try { cardId = await cardkit.convertMessageToCard(messageId) }
     catch (e) {
-      log(`session "${this.sessionName}": id_convert failed: ${e}`)
+      logError('session: id_convert failed', e)
       if (trigger === 'user_message' && this.ownsTurnOpen(owner)) {
         await feishu.sendTextRaw(
           this.chatId,
@@ -4835,7 +4768,6 @@ export class Session {
     if (opts.startThinking !== false) this.startThinkingFooter(turnState)
     if (owner.pendingCompactions.length > 0) {
       const buffered = owner.pendingCompactions.splice(0)
-      log(`session "${this.sessionName}": replay ${buffered.length} context compaction event(s) buffered during card open`)
       for (const notice of buffered) this.handleContextCompacted(notice)
     }
     // 开卡 await 窗口期(sendCard/id_convert)先到的 assistant 正文攒在
@@ -4896,19 +4828,15 @@ export class Session {
   ): void {
     const turn = this.currentTurn
     if (turn !== owner) {
-      log(`session "${this.sessionName}": ignore stale card failure card=${sourceCardId.slice(0, 12)} code=${code ?? 'n/a'} (turn owner changed)`)
       return
     }
     if (turn.cardId !== sourceCardId) {
-      log(`session "${this.sessionName}": ignore retired-card failure card=${sourceCardId.slice(0, 12)} current=${turn.cardId.slice(0, 12)} code=${code ?? 'n/a'}`)
       return
     }
     if (turn.rotating) return
     if (turn.cardRotationFailed) return
     if (!cardkit.isCardCapacityFailure(code, failure)) {
-      const operation = failure?.operation ?? 'unknown operation'
-      const element = failure?.elementId ? ` element=${failure.elementId}` : ''
-      log(`session "${this.sessionName}": non-capacity card write failure card=${sourceCardId.slice(0, 12)} operation=${operation}${element} code=${code ?? 'n/a'} — not rotating`)
+      logError('session: card write failed', failure)
       this.reportCardWriteFailure(turn, code, failure,
         '未识别为卡片容量超限，未自动换卡；其余输出继续处理。')
       return
@@ -4917,7 +4845,7 @@ export class Session {
     if (fingerprint) {
       const notified = turn.cardCapacityFailures.get(fingerprint)
       if (notified !== undefined) {
-        log(`session "${this.sessionName}": unchanged content still exceeds card capacity card=${sourceCardId} operation=${failure.operation} element=${failure.elementId ?? 'MISS'} code=${code ?? 'MISS'}`)
+        logError('session: unchanged content exceeds card capacity', failure)
         if (!notified) {
           turn.cardCapacityFailures.set(fingerprint, true)
           void feishu.sendTextRaw(
@@ -4929,7 +4857,6 @@ export class Session {
       }
       turn.cardCapacityFailures.set(fingerprint, false)
     }
-    log(`session "${this.sessionName}": confirmed card capacity limit (${code}) on card=${turn.cardId.slice(0, 8)}… — rotating to fresh card`)
     turn.failureRotateCount++
     this.startMidTurnRotate(turn)
   }
@@ -4974,7 +4901,6 @@ export class Session {
     }
     turn.rotating = (async () => {
       try {
-        log(`session "${this.sessionName}": mid-turn rotate triggered card=${oldCardId.slice(0, 8)}… elementCount=${cardkit.getElementCount(oldCardId)}`)
         const card = cards.mainConversationCard({
           sessionName: this.sessionName,
           turn: this.turnCounter,
@@ -4987,7 +4913,7 @@ export class Session {
         let sendFailure: unknown
         const newMessageId = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
         if (!newMessageId) {
-          log(`session "${this.sessionName}": mid-turn rotate sendCard failed reason=${forSteering ? 'user_steering' : 'capacity'}`)
+          logDiagnostic('session: mid-turn rotate sendCard failed')
           if (!forSteering && this.currentTurn === turn) {
             turn.cardRotationFailed = true
             this.stopFooterStatus(turn)
@@ -5004,7 +4930,7 @@ export class Session {
         let newCardId: string
         try { newCardId = await cardkit.convertMessageToCard(newMessageId) }
         catch (e) {
-          log(`session "${this.sessionName}": mid-turn rotate id_convert failed: ${e}`)
+          logError('session: mid-turn rotate id_convert failed', e)
           if (forSteering || this.currentTurn === turn) {
             if (!forSteering) {
               turn.cardRotationFailed = true
@@ -5192,16 +5118,15 @@ export class Session {
           const settingsLanded = await cardkit.patchSettingsChecked(oldCardId, cards.streamingOffSettings({ suffix: '📨 转下一张' }), onFailure)
           if (footerLanded && settingsLanded) await cardkit.dispose(oldCardId)
           else {
-            log(`session "${this.sessionName}": rotate old-card terminal MISS footer=${footerLanded} settings=${settingsLanded}`)
+            logDiagnostic('session: rotate old-card terminal MISS')
             await feishu.sendTextRaw(
               this.chatId,
               `⚠️ 上一张对话卡未能正常关闭 (footer=${footerLanded ? 'ok' : 'MISS'}, settings=${settingsLanded ? 'ok' : 'MISS'})，本轮输出已续到新卡。\n${cardFailureDetails(failures)}`,
             )
           }
         } catch (e) {
-          log(`session "${this.sessionName}": mid-turn rotate close-old failed: ${e}`)
+          logError('session: mid-turn rotate close-old failed', e)
         }
-        log(`session "${this.sessionName}": mid-turn rotate done old=${oldCardId.slice(0, 8)}… new=${newCardId.slice(0, 8)}…`)
       } finally {
         turn.rotating = null
         // 新卡在 swap/rebuild 窗口里的写失败不能递归换卡；释放本轮锁后
@@ -5280,7 +5205,6 @@ export class Session {
         this.lastManualContextCompactionCompletedAt = Date.now()
         this.lastManualContextCompactionWasAnonymous = receiptKeys.length === 0
       }
-      log(`session "${this.sessionName}": manual context compaction ${notice.phase ?? 'event'} handled by command status card`)
       return
     }
     if (notice.phase === 'start') {
@@ -5289,7 +5213,6 @@ export class Session {
       (receiptKeys.length === 0 || this.lastManualContextCompactionWasAnonymous) &&
       Date.now() - this.lastManualContextCompactionCompletedAt < ANONYMOUS_COMPACTION_DEDUPE_MS
     ) {
-      log(`session "${this.sessionName}": late anonymous manual compaction duplicate ignored`)
       return
     }
 
@@ -5324,7 +5247,6 @@ export class Session {
     if (!turn) {
       if (this.openingTurnOwner?.backendTurnStarted) {
         this.openingTurnOwner.pendingCompactions.push(notice)
-        log(`session "${this.sessionName}": buffer context compaction ${notice.phase ?? 'event'} while turn card opens`)
         return
       }
       if (receiptKeys.length > 0) {
@@ -5332,18 +5254,15 @@ export class Session {
       }
       // A terminal compaction notification may legally arrive after result.
       // It carries no assistant content and needs no user action.
-      log(`session "${this.sessionName}": context compaction ${notice.phase ?? 'event'} with no current turn thread=${notice.threadId ?? '-'} turn=${notice.turnId ?? '-'} item=${notice.itemId ?? '-'}`)
       return
     }
 
     if (receiptLookupKey && receipt?.completed) {
-      log(`session "${this.sessionName}": duplicate context compaction ${notice.phase ?? 'event'} ignored receipt=${receiptLookupKey}`)
       return
     }
     const ownerId = this.contextCompactionOwnerId(turn)
     if (receiptLookupKey && receipt && receipt.ownerId !== ownerId) {
       this.rememberContextCompactionReceipt(receiptKeys, null, true)
-      log(`session "${this.sessionName}": late context compaction ${notice.phase ?? 'event'} ignored receipt=${receiptLookupKey} (turn owner changed)`)
       return
     }
     if (
@@ -5351,7 +5270,6 @@ export class Session {
       receipt?.completionKey &&
       turn.contextCompactionCompleting.has(receipt.completionKey)
     ) {
-      log(`session "${this.sessionName}": context compaction alias already writing receipt=${receiptLookupKey}`)
       return
     }
     if (
@@ -5360,7 +5278,6 @@ export class Session {
       turn.contextCompactionPending.size === 0 &&
       turn.contextCompactionCompleting.has('__anonymous__')
     ) {
-      log(`session "${this.sessionName}": identified context compaction duplicate ignored while anonymous completion writes`)
       return
     }
     if (
@@ -5370,14 +5287,12 @@ export class Session {
       turn.lastContextCompactionWasAnonymous &&
       Date.now() - turn.lastContextCompactionCompletedAt < ANONYMOUS_COMPACTION_DEDUPE_MS
     ) {
-      log(`session "${this.sessionName}": identified context compaction duplicate ignored after anonymous completion`)
       return
     }
 
     if (notice.phase === 'start') {
       const key = compactionKey(notice)
       if (turn.contextCompactionPending.has(key) || turn.contextCompactionCompleted.has(key)) {
-        log(`session "${this.sessionName}": duplicate context compaction start ignored key=${key}`)
         return
       }
       this.startWorkingFooter(turn)
@@ -5414,7 +5329,6 @@ export class Session {
         return result.landed
       })
       turn.contextCompactionPending.set(key, pending)
-      log(`session "${this.sessionName}": context compaction start #${i + 1} key=${key}`)
       cardkit.patchSummaryThrottled(turn.cardId, `🚨 压缩×${turn.contextCompactCount}`)
       return
     }
@@ -5424,7 +5338,6 @@ export class Session {
       !notice.turnId &&
       turn.contextCompactionCompleting.size > 0
     ) {
-      log(`session "${this.sessionName}": anonymous context compaction duplicate ignored while completion writes`)
       return
     }
     if (
@@ -5433,12 +5346,10 @@ export class Session {
       turn.contextCompactionPending.size === 0 &&
       Date.now() - turn.lastContextCompactionCompletedAt < ANONYMOUS_COMPACTION_DEDUPE_MS
     ) {
-      log(`session "${this.sessionName}": immediate anonymous context compaction duplicate ignored`)
       return
     }
     const explicitKey = notice.itemId || notice.turnId
     if (explicitKey && turn.contextCompactionCompleted.has(explicitKey)) {
-      log(`session "${this.sessionName}": duplicate context compaction completion ignored key=${explicitKey}`)
       return
     }
     const key = notice.itemId
@@ -5447,7 +5358,6 @@ export class Session {
     const pending = key ? turn.contextCompactionPending.get(key) : undefined
     const completionKey = key ?? explicitKey ?? '__anonymous__'
     if (turn.contextCompactionCompleting.has(completionKey)) {
-      log(`session "${this.sessionName}": context compaction completion already writing key=${completionKey}`)
       return
     }
 
@@ -5476,7 +5386,6 @@ export class Session {
     }
     const elementId = cards.ELEMENTS.contextCompact(i)
     const element = cards.contextCompactionElement(i, merged, elementId)
-    log(`session "${this.sessionName}": context compaction completion write #${i + 1} key=${completionKey}`)
     void (async () => {
       let landed = false
       if (!pending) {
@@ -5541,7 +5450,7 @@ export class Session {
       }
       turn.contextCompactionCompleting.delete(completionKey)
       if (!landed) {
-        log(`session "${this.sessionName}": context compaction completion write MISS #${i + 1} key=${completionKey}`)
+        logDiagnostic('session: context compaction completion write failed')
         return
       }
       if (key && turn.contextCompactionPending.get(key) === pending) {
@@ -5563,10 +5472,9 @@ export class Session {
           true,
         )
       }
-      log(`session "${this.sessionName}": context compaction completed #${i + 1} key=${completionKey}`)
     })().catch(error => {
       turn.contextCompactionCompleting.delete(completionKey)
-      log(`session "${this.sessionName}": context compaction completion transaction failed: ${messageOf(error)}`)
+      logError('session: context compaction completion transaction failed', error)
     })
     cardkit.patchSummaryThrottled(turn.cardId, `🚨 压缩×${turn.contextCompactCount}`)
   }
@@ -5620,14 +5528,13 @@ export class Session {
   private handleTurnPlanUpdated(update: TurnPlanUpdated): void {
     const turn = this.currentTurn
     if (!turn) {
-      log(`session "${this.sessionName}": turn/plan/updated with no current turn`)
       return
     }
     this.startWorkingFooter(turn)
     if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
     turn.openBatchI = null
     if (!Array.isArray(update.plan)) {
-      log(`session "${this.sessionName}": turn/plan/updated missing plan array`)
+      logDiagnostic('session: turn/plan/updated missing plan array')
       turn.planSteps = []
     } else {
       turn.planSteps = update.plan.map(step => ({
@@ -5662,21 +5569,21 @@ export class Session {
 
   private handlePlanDelta(delta: PlanDelta): void {
     if (typeof delta.delta !== 'string' || !delta.delta) {
-      log(`session "${this.sessionName}": item/plan/delta missing delta text`)
+      logDiagnostic('session: item/plan/delta missing delta text')
       return
     }
     if (typeof delta.itemId !== 'string' || !delta.itemId) {
-      log(`session "${this.sessionName}": item/plan/delta missing itemId`)
+      logDiagnostic('session: item/plan/delta missing itemId')
     }
   }
 
   private handleThreadGoalUpdated(goal: ThreadGoal): void {
     if (!goal || typeof goal.objective !== 'string') {
-      log(`session "${this.sessionName}": thread/goal/updated missing objective`)
+      logDiagnostic('session: thread/goal/updated missing objective')
       return
     }
     if (goal.tokenBudget != null && typeof goal.tokenBudget !== 'number') {
-      log(`session "${this.sessionName}": thread/goal/updated invalid tokenBudget`)
+      logDiagnostic('session: thread/goal/updated invalid tokenBudget')
     }
     const previousGoal = this.currentGoal
     const currentGoal: cards.ThreadGoal = {
@@ -5779,12 +5686,11 @@ export class Session {
   }
 
   /** 无卡兜底:孤儿正文以纯文本消息推进聊天 —— 宁可丢排版,不可丢内容。 */
-  private flushOrphanAssistantToChat(reason: string): void {
+  private flushOrphanAssistantToChat(_reason: string): void {
     const text = this.takeOrphanAssistantText()
     if (!text) return
     const display = this.cleanAssistantTextForDisplay(text).trim()
     if (!display) return
-    log(`session "${this.sessionName}": flushing ${display.length} chars of orphan assistant text (${reason})`)
     void feishu.sendText(this.chatId, `📄 后台轮输出(未能建卡,纯文本兜底):\n\n${display}`)
   }
 
@@ -5834,14 +5740,12 @@ export class Session {
       { notifyCardFailure: false },
     )
     if (!okReplace) {
-      log(`session "${this.sessionName}": math render ${segId} write dropped (card closed/element dead) — raw text stays`)
       return
     }
 
     turn.mathRendered ??= new Map()
     turn.mathRendered.get(cardId) ?? (turn.mathRendered.set(cardId, new Set()), undefined)
     turn.mathRendered.get(cardId)!.add(segId)
-    log(`session "${this.sessionName}": math rendered ${segId} (${rendered.renderedImageCount} img, ${rendered.blocks.length} blocks)`)
   }
 
   private addCompletedAssistantSegment(turn: TurnState, segId: string, text: string): Promise<boolean> {
@@ -5856,13 +5760,13 @@ export class Session {
         { type: 'insert_before', targetElementId },
       )
       if (!added) {
-        log(`session "${this.sessionName}": assistant segment ${segId} raw write failed on card=${cardId}`)
+        logDiagnostic('session: assistant text write failed')
         return false
       }
 
       if (mathRender.hasMathSpans(text)) {
         const rp = this.replaceSegmentWithMathImgs(turn, cardId, segId, text)
-          .catch(e => log(`session "${this.sessionName}": math render ${segId} failed: ${e}`))
+          .catch(e => logError('session: math render failed', e))
         turn.mathRenderInflight ??= new Map()
         turn.mathRenderInflight.get(cardId) ?? (turn.mathRenderInflight.set(cardId, new Set()), undefined)
         turn.mathRenderInflight.get(cardId)!.add(rp)
@@ -5884,7 +5788,7 @@ export class Session {
     const message = `⚠️ 对话卡片正文写入失败(${reason}),以下为 agent 原始回复:\n\n${raw}`
     const sent = await feishu.sendText(this.chatId, message)
     if (!sent) {
-      log(`session "${this.sessionName}": ASSISTANT_TEXT_PRESERVATION_FAILED (${reason}, ${raw.length} chars)`)
+      logDiagnostic('session: assistant text preservation failed')
     }
   }
 
@@ -5928,7 +5832,7 @@ export class Session {
     return cards.sanitizeMarkdownForCardKit(text)
   }
 
-  sendOutboundPath(rawPath: string, source: string): void {
+  sendOutboundPath(rawPath: string, _source: string): void {
     // 归一化 MSYS/Git Bash 风格路径(/c/Users/... → C:\Users\...);否则
     // Windows 上 statSync 把 /c 当成当前盘根下的相对路径,stat 成
     // C:\c\Users\... 而 ENOENT。
@@ -5938,10 +5842,8 @@ export class Session {
     if (turn?.outboundSeenPaths.has(p)) return
     turn?.outboundSeenPaths.add(p)
     if (!isAbsolute(p)) {
-      log(`session "${this.sessionName}": ignore non-absolute outbound path from ${source}: ${p}`)
       return
     }
-    log(`session "${this.sessionName}": outbound send from ${source}: ${p}`)
     try {
       // Input can reach the backend before its card opens. Reuse its captured
       // mode even if the group switch changed during that opening window.
@@ -5961,7 +5863,7 @@ export class Session {
       }
       turn.fileDelivery.add(p)
     } catch (error) {
-      log(`session "${this.sessionName}": file delivery rejected: ${messageOf(error)}`)
+      logError('session: file delivery rejected', error)
       void feishu.sendText(this.chatId, `❌ 文件交付失败：${messageOf(error)}`)
     }
   }
@@ -6210,7 +6112,7 @@ export class Session {
       try {
         for (const path of await turn.fileDelivery.finish()) turn.outboundSentPaths.add(path)
       } catch (error) {
-        log(`session "${this.sessionName}": file delivery close failed: ${messageOf(error)}`)
+        logError('session: file delivery close failed', error)
         await feishu.sendTextRaw(this.chatId, `❌ 文件交付收尾失败：${messageOf(error)}`)
       } finally {
         this.fileDeliveries.delete(turn.fileDelivery)
@@ -6334,7 +6236,7 @@ export class Session {
       // would make the in-memory state claim success while Feishu still shows
       // a streaming/running card, and would prevent any later repair attempt.
       const detail = `footer=${footerLanded ? 'ok' : 'MISS'}, settings=${settingsLanded ? 'ok' : 'MISS'}`
-      log(`session "${this.sessionName}": terminal card transaction incomplete card=${cardId.slice(0, 12)} ${detail}`)
+      logError('session: terminal card transaction incomplete', detail)
       await feishu.sendTextRaw(
         this.chatId,
         `⚠️ 对话卡片终态写入失败 (${detail})。本轮已结束: ${stateMark}\n${cardFailureDetails(failures)}`,

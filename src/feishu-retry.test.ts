@@ -97,7 +97,8 @@ test('a shared recovery window accepts success at 55 seconds and records only ac
     }
   `)
   expect(stderr).not.toContain('first-attempt success')
-  expect(stderr.match(/cardkit PUT recovered: attempts=5 elapsed=55000ms/g)).toHaveLength(2)
+  expect(stderr.match(/feishu request recovered/g)).toHaveLength(1)
+  expect(stderr).not.toContain('cardkit PUT')
   expect(stderr).not.toContain('FINAL')
 })
 
@@ -125,8 +126,8 @@ test('request time and waits share one deadline and exhaustion retains the final
       api: 'cardkit', recovery,
     }).catch(error => error)
     assert.equal(expired, lastFailure)
-    assert.equal(logs.filter(entry => entry.text.includes('; FINAL')).length, 1)
-    assert.ok(logs.filter(entry => entry.text.includes('; FINAL')).every(entry => entry.time === startedAt + 60000))
+    assert.equal(logs.filter(entry => entry.text.includes('feishu request failed')).length, 1)
+    assert.ok(logs.filter(entry => entry.text.includes('feishu request failed')).every(entry => entry.time === startedAt + 60000))
     const empty = new FeishuRecoveryWindow()
     now += 60000
     assert.throws(() => empty.timeoutMs(15000), error => error.name === 'TimeoutError')
@@ -147,8 +148,8 @@ test('a fast outage is retried through the full minute instead of exhausting an 
     assert.deepEqual(delays, [3000, 8000, 15000, 15000, 15000, 4000])
     assert.equal(now - startedAt, 60000)
     assert.equal(failure, lastFailure)
-    assert.equal(logs.filter(entry => entry.text.includes('; FINAL')).length, 1)
-    assert.ok(logs.filter(entry => entry.text.includes('; FINAL')).every(entry => entry.time === startedAt + 60000))
+    assert.equal(logs.filter(entry => entry.text.includes('feishu request failed')).length, 1)
+    assert.ok(logs.filter(entry => entry.text.includes('feishu request failed')).every(entry => entry.time === startedAt + 60000))
   `)
 })
 
@@ -174,11 +175,11 @@ test('a configured retry cap allows six attempts and returns the final error wit
       assert.equal(recovery.remainingMs(), duration - 56000)
       if (succeedsOnLastAttempt) {
         assert.equal(result, 'uploaded')
-        assert.equal(logs.filter(entry => entry.text.includes('; FINAL')).length, 0)
+        assert.equal(logs.filter(entry => entry.text.includes('feishu request failed')).length, 0)
       } else {
         assert.equal(result, lastFailure)
         assert.equal(result.message, 'upload timeout 6')
-        const finalLogs = logs.filter(entry => entry.text.includes('; FINAL'))
+        const finalLogs = logs.filter(entry => entry.text.includes('feishu request failed'))
         assert.equal(finalLogs.length, 1)
         assert.equal(finalLogs[0].time, startedAt + 56000)
       }

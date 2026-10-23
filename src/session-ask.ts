@@ -11,7 +11,7 @@ import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
-import { log } from './log'
+import { logError } from './log'
 import { findPendingReply } from './notify-callbacks'
 
 function currentAsk(s: Session) {
@@ -56,7 +56,7 @@ export function announceAsk(s: Session, toolUseId: string): void {
       || pending.announcementVersion !== announcementVersion || pending.currentIdx === undefined
       || askBlockReason(s, toolUseId)) return
     await feishu.urgentApp(turn.messageId, [turn.userOpenId])
-  })().catch(error => log(`session "${s.sessionName}": question notification failed: ${error}`))
+  })().catch(error => logError('session-ask: question notification failed', error))
 }
 
 /** Repaint after a reply opens/closes or the current question completes.
@@ -94,7 +94,6 @@ export function hasPendingAsk(s: Session): boolean {
 export async function onAskMessageAnswer(s: Session, text: string, user: string, msgId: string): Promise<void> {
   const active = currentAsk(s)
   if (!active) {
-    log(`session "${s.sessionName}": no unanswered question; routing text to Agent`)
     await s.onUserMessage(text, [], user, msgId)
     return
   }
@@ -125,9 +124,8 @@ export async function onAskAnswer(
   user: string,
 ): Promise<boolean> {
   const pending = s.pendingAsks.get(toolUseId)
-  if (!pending) { log(`session "${s.sessionName}": stray ask answer for ${toolUseId}`); return false }
+  if (!pending) {  return false }
   if (questionIdx !== pending.currentIdx) {
-    log(`session "${s.sessionName}": stale ask click q=${questionIdx} current=${pending.currentIdx}`)
     return false
   }
   return advanceAsk(s, toolUseId, { optionIdx, user })
@@ -148,11 +146,10 @@ export async function onAskCustomAnswer(
   user: string,
 ): Promise<boolean> {
   const pending = s.pendingAsks.get(toolUseId)
-  if (!pending) { log(`session "${s.sessionName}": stray ask custom for ${toolUseId}`); return false }
+  if (!pending) {  return false }
   const trimmed = (customText ?? '').trim()
-  if (!trimmed) { log(`session "${s.sessionName}": empty custom answer, ignoring`); return false }
+  if (!trimmed) {  return false }
   if (questionIdx !== pending.currentIdx) {
-    log(`session "${s.sessionName}": stale ask custom q=${questionIdx} current=${pending.currentIdx}`)
     return false
   }
   return advanceAsk(s, toolUseId, { customText: trimmed, user })
@@ -170,20 +167,19 @@ export function advanceAsk(
   const pending = s.pendingAsks.get(toolUseId)
   if (!pending || pending.currentIdx === undefined) return false
   const blocked = askBlockReason(s, toolUseId)
-  if (blocked) { log(`session "${s.sessionName}": ask ${toolUseId} waiting: ${blocked}`); return false }
+  if (blocked) {  return false }
   const cur = pending.currentIdx
   const q = pending.questions[cur]
-  if (!q) { log(`session "${s.sessionName}": advanceAsk currentIdx=${cur} out of range`); return false }
+  if (!q) {  return false }
   // Resolve the literal answer value — custom text wins if both set.
   let value: string
   if (answer.customText !== undefined) {
     value = answer.customText
   } else if (answer.optionIdx !== undefined) {
     const opt = q.options?.[answer.optionIdx]
-    if (!opt) { log(`session "${s.sessionName}": advanceAsk option ${answer.optionIdx} out of range`); return false }
+    if (!opt) {  return false }
     value = opt.label
   } else {
-    log(`session "${s.sessionName}": advanceAsk with neither customText nor optionIdx`)
     return false
   }
   pending.answers[q.question] = value
@@ -218,7 +214,6 @@ export function advanceAsk(
     // otherwise renderPermission will pick it up when it arrives.
     if (pending.requestId) finalizeAsk(s, toolUseId)
     else {
-      log(`session "${s.sessionName}": ask ${toolUseId} all answered, waiting for can_use_tool`)
       refreshPendingAsks(s)
     }
   }

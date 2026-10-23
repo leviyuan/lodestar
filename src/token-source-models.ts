@@ -11,7 +11,7 @@ import { AppServerOnce, requestCodexControlWithRetry } from './usage'
 import type { TokenSourceModel } from './token-source'
 import type { AgentReasoningEffort } from './agent-process'
 import { homedir } from 'node:os'
-import { log } from './log'
+import { logError } from './log'
 import type { ClaudeSpawnOpts } from './claude-agent-process'
 import { observeCodexAccountEmail } from './codex-account-info'
 import { codexAccounts } from './codex-accounts'
@@ -47,7 +47,7 @@ export async function fetchNativeClaudeModels(options: NativeClaudeModelOptions 
     settingSources: ['user'], profile: { loadProjectMcp: false }, ...spawn, controlOnly: true }) }
   catch (error) { release?.(); throw error }
   if (release) proc.once('exit', release)
-  proc.on('error', error => log(`Claude model catalog MISS: ${error.message}`))
+  proc.on('error', error => logError('claude model catalog failed', error))
   try {
     const catalog = await withTimeout(proc.listModels())
     if (!catalog.length) throw new Error('Claude SDK model catalog is empty')

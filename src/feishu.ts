@@ -36,7 +36,7 @@ import {
   SESSION_TURNS_MAP_FILE,
   TEMP_SESSION_LEASES_FILE,
 } from './paths'
-import { log } from './log'
+import { log, logError } from './log'
 import { sync as spawnSync } from 'cross-spawn'
 import { codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
 import { writeJsonStateAtomic } from './state-store'
@@ -82,7 +82,7 @@ export function loadTempSessionLeases(): void {
         || typeof lease.sessionName !== 'string' || !tempProjectName(lease.sessionName)
         || typeof lease.createdAt !== 'number' || !Number.isFinite(lease.createdAt)
       ) {
-        log(`feishu: rejected malformed temp-session lease chat=${chatId}`)
+        log('feishu temporary-session lease invalid')
         continue
       }
       tempSessionLeaseByChat.set(chatId, {
@@ -91,9 +91,8 @@ export function loadTempSessionLeases(): void {
         createdAt: lease.createdAt,
       })
     }
-    log(`feishu: loaded ${tempSessionLeaseByChat.size} temporary-session leases`)
   } catch (error: any) {
-    if (error?.code !== 'ENOENT') log(`feishu: load temp-session leases failed: ${error?.message ?? error}`)
+    if (error?.code !== 'ENOENT') logError('feishu temporary-session leases load failed', error)
   }
 }
 
@@ -183,6 +182,12 @@ const sdkHttp: SdkHttp = {
 export const client = new lark.Client({
   appId: APP_ID, appSecret: APP_SECRET, disableTokenCache: false,
   httpInstance: sdkHttp,
+  // SDK defaults can print request bodies and credentials directly to console.
+  logger: {
+    error: (...messages: unknown[]) => { for (const message of messages.flat(2)) logError('feishu sdk error', message) },
+    warn: (...messages: unknown[]) => { for (const message of messages.flat(2)) logError('feishu sdk warning', message) },
+    info: () => {}, debug: () => {}, trace: () => {},
+  },
 })
 
 function sdkApiError(label: string, raw: unknown): FeishuRequestError {
@@ -282,15 +287,14 @@ export function loadSessionChatMap(): void {
     for (const [name, id] of Object.entries(obj)) {
       if (typeof id === 'string') preferredChatForSession.set(name, id)
     }
-    log(`feishu: loaded ${preferredChatForSession.size} session→chat bindings`)
   } catch (e: any) {
-    if (e?.code !== 'ENOENT') log(`feishu: load session-chat-map failed: ${e?.message ?? e}`)
+    if (e?.code !== 'ENOENT') logError('feishu chat bindings load failed', e)
   }
 }
 
 function saveSessionChatMap(): void {
   try { saveSessionChatMapChecked() }
-  catch (e) { log(`feishu: save session-chat-map failed: ${e}`) }
+  catch (e) { logError('feishu chat bindings save failed', e) }
 }
 
 function saveSessionChatMapChecked(): void {
@@ -301,10 +305,8 @@ function saveSessionChatMapChecked(): void {
 
 export function bindSessionToChat(sessionName: string, chatId: string): void {
   if (preferredChatForSession.get(sessionName) === chatId) return
-  const prev = preferredChatForSession.get(sessionName)
   preferredChatForSession.set(sessionName, chatId)
   saveSessionChatMap()
-  log(`feishu: bound session "${sessionName}" → ${chatId}${prev ? ` (was ${prev})` : ''}`)
 }
 
 export function unbindSessionChat(sessionName: string): void {
@@ -312,7 +314,6 @@ export function unbindSessionChat(sessionName: string): void {
   if (!prev) return
   preferredChatForSession.delete(sessionName)
   saveSessionChatMap()
-  log(`feishu: unbound session "${sessionName}" from ${prev}`)
 }
 
 // ── Session resume map ────────────────────────────────────────────────
@@ -400,9 +401,8 @@ export function loadSessionResumeMap(): void {
         if (ref) setSessionResumeInMemory(name, ref)
       }
     }
-    log(`feishu: loaded ${lastSessionRefByName.size} session→resume bindings`)
   } catch (e: any) {
-    if (e?.code !== 'ENOENT') log(`feishu: load session-resume-map failed: ${e?.message ?? e}`)
+    if (e?.code !== 'ENOENT') logError('feishu resume bindings load failed', e)
   }
 }
 
@@ -682,7 +682,6 @@ export function loadSessionTurnsMap(): void {
       throw new Error('turns map must contain an object')
     }
     turnsBySession.clear()
-    let n = 0
     let rejected = 0
     for (const [name, value] of Object.entries(obj)) {
       let arr: unknown[]
@@ -740,14 +739,12 @@ export function loadSessionTurnsMap(): void {
           anchors: clean,
           ...(pendingLaunch ? { pendingLaunch } : {}),
         })
-        n += clean.length
       }
     }
-    log(`feishu: loaded ${n} turn anchors across ${turnsBySession.size} sessions`)
-    if (rejected > 0) log(`feishu: rejected ${rejected} malformed turn anchors while loading`)
+    if (rejected > 0) log('feishu malformed turn anchors rejected')
   } catch (e: any) {
     // ENOENT(首次启动无文件)静默;其他(JSON 损坏等)要暴露,符合 no-fallbacks。
-    if (e?.code !== 'ENOENT') log(`feishu: load session-turns-map failed: ${e?.message ?? e}`)
+    if (e?.code !== 'ENOENT') logError('feishu turn anchors load failed', e)
   }
 }
 
@@ -926,15 +923,14 @@ export function loadSessionModelMap(): void {
         ...(tokenSourceId ? { tokenSourceId } : {}),
       })
     }
-    log(`feishu: loaded ${selectedModelByName.size} session→model bindings`)
   } catch (e: any) {
-    if (e?.code !== 'ENOENT') log(`feishu: load session-model-map failed: ${e?.message ?? e}`)
+    if (e?.code !== 'ENOENT') logError('feishu model bindings load failed', e)
   }
 }
 
 function saveSessionModelMap(): void {
   try { saveSessionModelMapChecked() }
-  catch (e) { log(`feishu: save session-model-map failed: ${e}`) }
+  catch (e) { logError('feishu model bindings save failed', e) }
 }
 
 function saveSessionModelMapChecked(): void {
@@ -1063,17 +1059,13 @@ export function readAliveMarker(): string[] {
 export function chatIdForSession(sessionName: string): string | null {
   const preferred = preferredChatForSession.get(sessionName)
   if (preferred) {
-    const cachedName = chatNameCache.get(preferred)
-    if (cachedName && cachedName !== sessionName) {
-      log(`feishu: chatIdForSession("${sessionName}"): persisted binding ${preferred} has cached name "${cachedName}", using persisted binding`)
-    }
     return preferred
   }
   const matches: string[] = []
   for (const [id, name] of chatNameCache) if (name === sessionName) matches.push(id)
   if (matches.length === 1) return matches[0]
   if (matches.length > 1) {
-    log(`feishu: chatIdForSession("${sessionName}"): ${matches.length} candidates with no binding — [${matches.join(', ')}]`)
+    log('feishu chat binding ambiguous')
   }
   return null
 }
@@ -1091,8 +1083,7 @@ export async function refreshChatList(): Promise<void> {
       }
       pageToken = res.data?.page_token
     } while (pageToken)
-    log(`feishu: refreshed chat list — ${chatNameCache.size} groups`)
-  } catch (e) { log(`feishu: refresh chat list failed: ${e}`) }
+  } catch (e) { logError('feishu chat list refresh failed', e) }
 }
 
 export async function listNormalChatIdsByName(): Promise<Map<string, string[]>> {
@@ -1269,13 +1260,12 @@ export async function fetchChatName(chatId: string): Promise<string | null> {
     const name = json.data?.name
     if (typeof name === 'string' && name) {
       chatNameCache.set(chatId, name)
-      log(`feishu: fetchChatName ${chatId} → "${name}" (point lookup)`)
       return name
     }
-    log(`feishu: fetchChatName ${chatId} — chat has no name (unnamed group?)`)
+    log('feishu chat name unavailable')
     return null
   } catch (e) {
-    log(`feishu: fetchChatName ${chatId} failed: ${e}`)
+    logError('feishu chat name read failed', e)
     return null
   }
 }
@@ -1394,7 +1384,7 @@ async function sendTextRawOrdered(chatId: string, text: string): Promise<string 
     const json = await readFeishuResponse(res, `sendTextRaw chat=${chatId}`)
     return json.data?.message_id ?? null
   } catch (e) {
-    log(`feishu: sendTextRaw chat=${chatId} failed: ${e}`)
+    logError('feishu text delivery failed', e)
     return null
   }
 }
@@ -1413,7 +1403,7 @@ export async function addReaction(messageId: string, emojiType: string): Promise
     })
     if (res?.code && res.code !== 0) throw sdkApiError('feishu messageReaction.create', res)
     return res?.data?.reaction_id ?? null
-  } catch (e) { log(`feishu: addReaction ${emojiType} on ${messageId} failed: ${e}`); return null }
+  } catch (e) { logError('feishu reaction add failed', e); return null }
 }
 
 /** Remove a previously-added reaction by its reaction_id (returned from
@@ -1429,7 +1419,7 @@ export async function deleteReaction(messageId: string, reactionId: string): Pro
       path: { message_id: messageId, reaction_id: reactionId },
     })
     if (res?.code && res.code !== 0) throw sdkApiError('feishu messageReaction.delete', res)
-  } catch (e) { log(`feishu: deleteReaction ${reactionId} on ${messageId} failed: ${e}`) }
+  } catch (e) { logError('feishu reaction delete failed', e) }
 }
 
 // ── Urgent push ───────────────────────────────────────────────────────
@@ -1455,8 +1445,8 @@ export async function deleteReaction(messageId: string, reactionId: string): Pro
  *   230023 — recipient has 200 unread urgent already
  *   230052 — missing scope / chat restricts urgent */
 export async function urgentApp(messageId: string, openIds: string[]): Promise<void> {
-  if (!messageId) { log(`feishu: urgentApp skip — missing messageId`); return }
-  if (openIds.length === 0) { log(`feishu: urgentApp skip — empty openIds (msg=${messageId})`); return }
+  if (!messageId) { log('feishu urgent delivery missing message'); return }
+  if (openIds.length === 0) { log('feishu urgent delivery missing recipients'); return }
   const token = await getTenantToken()
   const url = `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/urgent_app?user_id_type=open_id`
   try {
@@ -1467,9 +1457,8 @@ export async function urgentApp(messageId: string, openIds: string[]): Promise<v
     })
     const json = await readFeishuResponse(res, `urgentApp ${messageId}`)
     const invalid = json.data?.invalid_user_id_list ?? []
-    const delivered = openIds.length - invalid.length
-    log(`feishu: urgentApp ${messageId} ok — delivered=${delivered}${invalid.length ? ` invalid=${invalid.length}` : ''}`)
-  } catch (e) { log(`feishu: urgentApp ${messageId} failed: ${e}`) }
+    if (invalid.length) log('feishu urgent delivery partially rejected')
+  } catch (e) { logError('feishu urgent delivery failed', e) }
 }
 
 // ── Attachment download (image/file) ───────────────────────────────────
@@ -1493,10 +1482,9 @@ export async function downloadAttachment(
     // previous message's bytes (including a pre-existing symlink).
     const path = join(INBOX_DIR, `${Date.now()}-${randomUUID()}-${safeName}`)
     writeFileSync(path, buf, { flag: 'wx' })
-    log(`feishu: downloaded ${type} ${path} (${buf.length}B)`)
     return path
   } catch (e) {
-    log(`feishu: download ${type} failed: ${e instanceof Error ? e.message : e}`)
+    logError('feishu attachment download failed', e)
     return undefined
   }
 }
@@ -1523,7 +1511,7 @@ async function uploadMultipart(filePath: string, type: 'image' | 'file'): Promis
     file = new Blob([Uint8Array.from(await readFile(filePath))])
     if (file.size > MAX_UPLOAD_BYTES) throw new Error(`${basename(filePath)} 超过 30 MB`)
   } catch (error) {
-    log(`feishu: ${label} local file validation failed ${filePath}: ${error}`)
+    logError('feishu attachment validation failed', error)
     throw error
   }
   const upload = async (recovery: FeishuRecoveryWindow): Promise<string> => {
@@ -1552,7 +1540,6 @@ async function uploadMultipart(filePath: string, type: 'image' | 'file'): Promis
   }
   if (type === 'image') return withOutputRecovery(`${label} ${filePath}`, upload)
   const recovery = new FeishuRecoveryWindow(FILE_UPLOAD_RECOVERY_MS, FILE_UPLOAD_MAX_RETRIES)
-  log(`feishu: ${label} ${filePath} started: bytes=${file.size} timeout=${FILE_UPLOAD_TIMEOUT_MS}ms maxAttempts=${FILE_UPLOAD_MAX_RETRIES + 1} recovery=${FILE_UPLOAD_RECOVERY_MS}ms`)
   // Unlike message/card recovery, rejected uploads and exhausted attempts must
   // report immediately instead of waiting out the entire long upload window.
   return withFeishuRetry(`${label} ${filePath}`, () => upload(recovery), { recovery })
@@ -1567,17 +1554,17 @@ export async function uploadImageKey(filePath: string, onFailure?: (error: unkno
   try {
     const stats = statSync(filePath)
     if (!stats.isFile()) {
-      log(`feishu: uploadImageKey not a file — ${filePath}`)
+      log('feishu image upload rejected: not a file')
       onFailure?.(new Error('路径不是普通文件'))
       return null
     }
     if (stats.size > MAX_UPLOAD_BYTES) {
-      log(`feishu: uploadImageKey oversize — ${filePath} (${(stats.size / 1024 / 1024).toFixed(1)} MB)`)
+      log('feishu image upload rejected: size limit')
       onFailure?.(new Error(`${basename(filePath)} 超过 30 MB`))
       return null
     }
   } catch (e) {
-    log(`feishu: uploadImageKey stat failed — ${filePath}: ${e}`)
+    logError('feishu image validation failed', e)
     onFailure?.(e)
     return null
   }
@@ -1605,17 +1592,17 @@ export async function uploadAndSend(chatId: string, filePath: string): Promise<b
   try {
     const stats = statSync(filePath)
     if (!stats.isFile()) {
-      log(`feishu: uploadAndSend not a file — ${filePath}`)
+      log('feishu attachment upload rejected: not a file')
       await sendText(chatId, `❌ 出站文件: 路径不是文件 — ${filePath}`)
       return false
     }
     if (stats.size > MAX_UPLOAD_BYTES) {
-      log(`feishu: uploadAndSend oversize — ${filePath} (${stats.size}B)`)
+      log('feishu attachment upload rejected: size limit')
       await sendText(chatId, `❌ 出站文件: ${basename(filePath)} 超过 30 MB (${(stats.size / 1024 / 1024).toFixed(1)} MB)`)
       return false
     }
   } catch (e) {
-    log(`feishu: uploadAndSend stat failed — ${filePath}: ${e}`)
+    logError('feishu attachment validation failed', e)
     await sendText(chatId, `❌ 出站文件: 无法读取 ${filePath} (${e})`)
     return false
   }
@@ -1627,14 +1614,14 @@ export async function uploadAndSend(chatId: string, filePath: string): Promise<b
     const onFailure = (error: unknown) => { sendError = error }
     const msgId = await (type === 'image' ? sendImage(chatId, key, onFailure) : sendFile(chatId, key, onFailure))
     if (!msgId) {
-      log(`feishu: uploadAndSend ${filePath} send failed after upload`)
+      logError('feishu attachment delivery failed after upload', sendError)
       await sendText(chatId, `❌ ${label}发送失败: ${basename(filePath)}（上传已完成）\n${formatFeishuError(sendError)}`)
       return false
     }
-    log(`feishu: uploadAndSend ${filePath} delivered msg=${msgId}`)
+    log('feishu attachment delivered')
     return true
   } catch (e) {
-    log(`feishu: uploadAndSend ${filePath} failed: ${e}`)
+    logError('feishu attachment upload failed', e)
     await sendText(chatId, `❌ ${label}上传失败: ${basename(filePath)} — ${formatFeishuError(e)}`)
     return false
   }
@@ -1646,7 +1633,6 @@ export async function uploadAndSend(chatId: string, filePath: string): Promise<b
 // a real repo.
 export function provisionProject(workDir: string): void {
   mkdirSync(workDir, { recursive: true })
-  log(`feishu: provisioned ${workDir}`)
   const codexConfigPath = join(homedir(), '.codex', 'config.toml')
   try {
     mkdirSync(join(homedir(), '.codex'), { recursive: true })
@@ -1658,7 +1644,7 @@ export function provisionProject(workDir: string): void {
       text = `${prefix}${prefix ? '\n\n' : ''}${header}\ntrust_level = "trusted"\n`
       writeFileSync(codexConfigPath, text)
     }
-  } catch (e) { log(`feishu: codex trust write failed for ${workDir}: ${e}`) }
+  } catch (e) { logError('codex trust settings write failed', e) }
   try { execSync('git init -q', { cwd: workDir, stdio: 'ignore' }) } catch {}
 }
 
@@ -1667,7 +1653,7 @@ export function isOpenAIChatGPTAuthenticated(accountId = DEFAULT_CODEX_ACCOUNT):
     timeout: 10_000, shell: false, encoding: 'utf8',
     env: codexAccounts.env(accountId, { ...process.env, ...config.codex.env }),
   })
-  if (result.error) log(`codex login status failed: ${result.error.message}`)
+  if (result.error) logError('codex login status failed', result.error)
   return result.status === 0 && /Logged in using ChatGPT/i.test(`${result.stdout}\n${result.stderr}`)
 }
 

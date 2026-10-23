@@ -74,7 +74,7 @@ function harness() {
       delivered.push({ notifyId: reg.notifyId, response, openId })
       return controls.dispatch()
     },
-    log: (_text: string) => {},
+    logError: (_event: string, _error: unknown) => {},
     onWaitingChanged: (chatId: string) => controls.waitingChanged(chatId),
   }
   const runtime = createNotifyReplyRuntime(io)

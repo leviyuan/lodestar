@@ -8,7 +8,6 @@ import type { TokenSourceConfig } from './config'
 import type { AccountInfo, Settings } from '@anthropic-ai/claude-agent-sdk'
 import type { CodexApiProvider } from './codex-process'
 import type { CodexCredits } from './codex-credits'
-import { log } from './log'
 import { codexAccounts } from './codex-accounts'
 
 export type TokenSourceAgent = AgentProvider
@@ -285,7 +284,6 @@ export function refreshAllTokenSourceModels(): Promise<void> {
     : source.forAccount ? tokenSourceAccounts(source).map(account => source.forAccount!(account.id)) : [source])
   const promise = Promise.allSettled(targets.map(async ts => {
     await ts.refreshModels()
-    log(`token-source ${ts.id}: ${ts.models.length} models loaded`)
   }))
     .then(() => {})
     .finally(() => {

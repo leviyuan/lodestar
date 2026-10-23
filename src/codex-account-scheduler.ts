@@ -6,7 +6,6 @@ import { getTokenSourceForAccount, tokenSourceRuntimeModel, type TokenSource } f
 import type { AgentReasoningEffort } from './agent-process'
 import { CODEX_QUOTA_BLOCKS_FILE } from './paths'
 import { writeJsonStateAtomic } from './state-store'
-import { log } from './log'
 import { codexCreditsReplenished, parseCodexCredits, type CodexCredits } from './codex-credits'
 
 export interface CodexAccountCandidate extends CodexQuotaRank {
@@ -197,7 +196,6 @@ export class CodexAccountScheduler {
     const selected = ready[0] ?? null
     const exhausted = candidates.filter(c => c.state === 'exhausted' || c.state === 'waiting')
     const retryAt = exhausted.length ? Math.min(...exhausted.map(c => c.retryAt ?? now + 60_000)) : undefined
-    for (const c of candidates) log(`codex scheduler${cached ? ' [cache]' : ''}: ${c.account.name} ${c.state} priority=${c.funding ?? c.priority ?? 'score'} score=${c.score ?? (c.funding === 'credits' || c.priority === 'expiring' ? 'N/A' : 'MISS')}${c.reason ? ` (${c.reason})` : ''}`)
     return { selected, candidates, ...(retryAt !== undefined ? { retryAt } : {}) }
   }
 }

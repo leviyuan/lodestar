@@ -51,8 +51,6 @@ export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
 export const SESSION_ACTIVITY_FILE = join(DATA_DIR, 'session-activity.json')
 /** Private bilingual exchanges visible at the Claude translation boundary; never native transcripts. */
 export const CLAUDE_TRANSLATION_CONTEXT_DIR = join(DATA_DIR, 'claude-translation-context')
-/** Private complete Flash translation request/response traces, one file per translator. */
-export const CLAUDE_TRANSLATION_TRACES_DIR = join(DATA_DIR, 'claude-translation-traces')
 /** Exact chats created by the temporary-session runtime; required before `bye` may delete. */
 export const TEMP_SESSION_LEASES_FILE = join(DATA_DIR, 'temp-session-leases.json')
 export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')

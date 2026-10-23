@@ -63,6 +63,8 @@ Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`�
 
 默认配置文件是 `~/.config/lodestar/config.toml`，可通过 `LODESTAR_CONFIG` 指定文件。日志和会话状态位于 `~/.local/share/lodestar/`；Windows 使用相应的应用数据目录。完整路径定义见 [src/paths.ts](../src/paths.ts)。
 
+运行日志按日保存，保留近 7 天。正常流程仅记录关键状态；不记录协议大包、工具输出、代码 diff、请求/响应正文或内部阶段流水。日志省略用户、群、项目和账号名称、路径、聊天/消息/会话/任务标识，以及人数和群数，不生成可关联的匿名编号。故障记录保留固定操作说明、错误类别、错误码和 HTTP 状态；相同摘要在 10 分钟内合并，不显示重复次数。用户收到的错误详情不因此省略。会话历史、任务结果和恢复绑定是功能状态，仍由相应模块保存。
+
 ```toml
 [runtime]
 projects_root = "/abs/projects"
@@ -91,9 +93,9 @@ bin = "/abs/path/to/claude-wrapper"  # 可选的 Claude 可执行文件
 
 `[claude].translation_validation_rules` 指定可选的输入审查规则；未配置或留空时只做忠实翻译，不推断身份、地区或账号风险。启用安全模式的会话复用本机 GLM Key，通过国际 Coding Plan `https://api.z.ai/api/coding/paas/v4/chat/completions` 调用 `glm-5.3-flash`。拒绝或调用失败会明确报错，不换模型或放行原文。
 
-`[claude.safe_mode]` 按 Token Source 与模型目录中的 ID 精确匹配，只作用于 Claude Code。`"*"` 表示该来源全部模型，`"GLM-5.3,GLM-5.2"` 表示指定模型，`""` 表示关闭该来源；所有来源（包括 `claude-sub`）默认关闭，只有显式配置的来源和模型才会开启。主会话、委派、续跑与分叉共用此配置。同来源切模型若跨越安全模式边界，只能在空闲时换进程并保留恢复点；同模式仍沿用原热切换。修改本机配置后重启 daemon 生效。当前安全模式面向 macOS/Linux，Windows 的日志文件权限检查尚未适配；Windows 上需保持关闭，已配置开启的来源需删除对应条目或设为空串，例如 `claude-sub = ""`。
+`[claude.safe_mode]` 按 Token Source 与模型目录中的 ID 精确匹配，只作用于 Claude Code。`"*"` 表示该来源全部模型，`"GLM-5.3,GLM-5.2"` 表示指定模型，`""` 表示关闭该来源；所有来源（包括 `claude-sub`）默认关闭，只有显式配置的来源和模型才会开启。主会话、委派、续跑与分叉共用此配置。同来源切模型若跨越安全模式边界，只能在空闲时换进程并保留恢复点；同模式仍沿用原热切换。修改本机配置后重启 daemon 生效。
 
-上下文自动按 Claude 会话保存，只包含带来源说明的可见原文与译文，不读取原生完整上下文。用户输入译为英文，已有的飞书自然语言展示译为中文；主模型输出语言不限，代码、文件与指令保持原样。调用日志保存在本机 `claude-translation-traces` 目录。完整边界见 [Claude 启动配置](claude-agent-backend.md#claude-启动配置)。
+上下文自动按 Claude 会话保存，只包含带来源说明的可见原文与译文，不读取原生完整上下文。用户输入译为英文，已有的飞书自然语言展示译为中文；主模型输出语言不限，代码、文件与指令保持原样。不额外保存翻译请求/响应调试日志；错误只记录不含身份的故障摘要。完整边界见 [Claude 启动配置](claude-agent-backend.md#claude-启动配置)。
 
 项目名用于定位工作目录；工具、MCP 等启动配置按实际目录匹配。同目录的 BTW/FK 与项目别名共享配置，别名配置冲突时明确报错。WT 的目录独立，不自动套用主目录的启动配置；需要配置某个 WT 时，可新增一个项目配置项，将 `cwd` 指向该 WT 的实际路径。工作目录内的 Agent 原生配置仍由相应后端读取。
 

@@ -10,7 +10,7 @@ import type { ChildProcessByStdio } from 'node:child_process'
 import { spawn } from 'cross-spawn'
 import type { Readable, Writable } from 'node:stream'
 import { resolveCodexBin } from './codex-process'
-import { log } from './log'
+import { log, logError, logDiagnostic } from './log'
 import { EventEmitter } from 'node:events'
 import { StringDecoder } from 'node:string_decoder'
 import { createHash } from 'node:crypto'
@@ -143,16 +143,16 @@ export function consumeCodexResetCredit(
       }
       if (usageGenerations.get(accountId) !== generation) usage = { state: 'auth_failed' }
       else cacheUsage(accountId, usage)
-      if (usage.state !== 'ok') log(`codex-reset: ${accountId} quota refresh failed: ${usage.state === 'network' ? usage.reason : usage.state}`)
+      if (usage.state !== 'ok') logDiagnostic('codex reset quota refresh failed', { reason: usage.state })
       result = { outcome: response.outcome, usage }
     } catch (error) {
       failure = error
-      log(`codex-reset: ${accountId}: ${error}`)
+      logError('codex quota reset failed', error)
     }
     try { await app.close() }
     catch (error) {
       const message = `控制连接关闭失败：${error instanceof Error ? error.message : String(error)}`
-      log(`codex-reset: ${accountId}: ${message}`)
+      logError('codex quota reset connection close failed', error)
       // Preserve a confirmed redemption even if cleanup fails, so the receipt cannot suggest using another card.
       if (result) result.cleanupError = message
       else throw new AggregateError([failure, error], `${String(failure)}；${message}`)
@@ -190,10 +190,8 @@ export class AppServerOnce extends EventEmitter {
     }) as ChildProcessByStdio<Writable, Readable, Readable>
     this.exitPromise = new Promise(resolve => { this.resolveExit = resolve })
     this.proc.stdout.on('data', (chunk: Buffer) => this.onStdout(chunk))
-    this.proc.stderr.on('data', (chunk: Buffer) => {
-      const s = chunk.toString().trim()
-      if (s) log(`usage[codex stderr]: ${s}`)
-    })
+    // Native stderr may contain account data; protocol/exit failures retain safe diagnostics.
+    this.proc.stderr.resume()
     const finish = (error: Error) => {
       if (!this.alive) return
       this.alive = false
@@ -208,7 +206,7 @@ export class AppServerOnce extends EventEmitter {
     }
     this.proc.on('error', error => finish(new Error(`codex app-server spawn failed: ${error.message}`)))
     this.proc.stdin.on('error', error => {
-      log(`usage: codex stdin failed: ${error.message}`)
+      logError('codex control input failed', error)
       this.emit('protocolError', error)
     })
     // Drain stdout before rejecting requests; exit can precede buffered JSON-RPC responses.
@@ -237,7 +235,7 @@ export class AppServerOnce extends EventEmitter {
         if (!hasId) this.emit('notification', msg.method, msg.params)
         else {
           // Server request IDs are a different namespace. Never consume a pending client read with the same ID.
-          log(`usage: unsupported Codex server request: ${msg.method}`)
+          log('codex control request unsupported')
           this.proc.stdin.write(JSON.stringify({ id: msg.id, error: { code: -32601, message: `Unsupported server request: ${msg.method}` } }) + '\n')
         }
         continue
@@ -373,37 +371,9 @@ function bucketsFromReadResponse(limitsRes: any): { buckets: UsageBucket[]; defa
   return { buckets, defaultLimitId: limitsRes?.rateLimits?.limitId ?? undefined }
 }
 
-/** 通知负载的形态签名,只用于日志(归属判断不可信,2026-08-20 源码核实:
- * 上游 SSE/WS 事件缺 metered_limit_name 时客户端解析器把 limitId 强补
- * "codex" —— Spark 桶的内容会被贴上主桶标签)。 */
-function describeNotification(rateLimits: any): string {
-  if (!rateLimits) return 'empty'
-  const w = (x: any): string => x ? `${x.usedPercent ?? '?'}%/${x.windowDurationMins ?? '?'}m` : 'null'
-  return `limitId=${rateLimits.limitId ?? 'null'} name=${rateLimits.limitName ?? 'null'} primary=${w(rateLimits.primary)} secondary=${w(rateLimits.secondary)}`
-}
-
-/** rolling 通知的观察日志:记录通知形态,并和 cache 里已知桶对比。通知
- * limitId 与内容可能错标(见 describeNotification),只用于异常可见性,
- * 不写 cache —— 权威状态只来自 readUsage 的 read 端点(整体替换)。 */
-export function observeRateLimitsNotification(rateLimits: any, accountId = DEFAULT_CODEX_ACCOUNT): void {
-  const desc = describeNotification(rateLimits)
-  const cache = caches.get(accountId)
-  const known = cache?.state === 'ok' ? (cache.buckets ?? []) : []
-  const matches = known.filter(b =>
-    windowsEqual(b.fiveHour, windowFromRateLimit(rateLimits?.primary))
-    && windowsEqual(b.weekly, windowFromRateLimit(rateLimits?.secondary)))
-  if (known.length > 0 && matches.length === 0) {
-    log(`usage: rate-limit notification matches NO known bucket — possible relabel or new bucket, will resolve on next read. (${desc})`)
-  } else if (rateLimits?.limitId && matches.length === 1 && matches[0].limitId !== rateLimits.limitId) {
-    log(`usage: rate-limit notification labeled limitId=${rateLimits.limitId} but content matches bucket ${matches[0].limitId} (known codex parser fallback relabels; ignoring notification payload)`)
-  }
-}
-
-function windowsEqual(a: UsageWindow | null, b: UsageWindow | null): boolean {
-  if (!a || !b) return !a && !b
-  return a.percent === b.percent && a.durationMins === b.durationMins
-    && a.resetsAt?.getTime() === b.resetsAt?.getTime()
-}
+/** Rolling quota notifications are not authoritative and cannot update cached usage.
+ * Keep the observer entry point without logging account/bucket identifiers. */
+export function observeRateLimitsNotification(_rateLimits: any, _accountId = DEFAULT_CODEX_ACCOUNT): void {}
 
 async function fetchUsage(accountId: string): Promise<UsageSnapshot> {
   const revision = codexAccounts.revision(accountId)
@@ -424,7 +394,7 @@ async function fetchUsage(accountId: string): Promise<UsageSnapshot> {
     })
     return snapshotFromReadResponse(limitsRes, account.planType, readStartedAt)
   } catch (e: any) {
-    log(`usage: codex app-server usage failed: ${e?.message ?? e}`)
+    logError('codex quota read failed', e)
     if (isUsageAuthError(e)) return { state: 'auth_failed' }
     if (isUsageRateLimitError(e)) return { state: 'rate_limited' }
     return { state: 'network', reason: e?.message ?? String(e) }
@@ -443,9 +413,6 @@ export function snapshotFromReadResponse(limitsRes: any, planType?: string | nul
   const subscriptionType = quotaPlanType ?? planType ?? undefined
   const accountFingerprint = typeof limitsRes?.accountId === 'string' && limitsRes.accountId
     ? createHash('sha256').update(limitsRes.accountId).digest('hex') : undefined
-  if (quotaPlanType != null && planType != null && quotaPlanType !== planType) {
-    log(`usage: codex plan mismatch account=${accountFingerprint ?? 'MISS'} account/read=${JSON.stringify(planType)} account/rateLimits/read=${JSON.stringify(quotaPlanType)}; using quota plan`)
-  }
   return {
     state: 'ok',
     subscriptionType,
@@ -492,7 +459,7 @@ export function readUsage(accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnaps
   const generation = usageGenerations.get(accountId) ?? 0
   return usageReads.read(accountId, async () => {
     try { return await fetchUsage(accountId) }
-    catch (error) { log(`usage: ${accountId} fetch failed: ${error}`); throw error }
+    catch (error) { logError('codex quota fetch failed', error); throw error }
   })
     .catch((e): UsageSnapshot => {
       if (isUsageAuthError(e)) return { state: 'auth_failed' }
@@ -510,7 +477,7 @@ export async function readUsageForDisplay(accountId = DEFAULT_CODEX_ACCOUNT): Pr
   return peekUsage(accountId) ?? { state: 'network', reason: '额度缓存尚未就绪，后台刷新中' }
 }
 
-/** 用现有连接刷新额度；请求失败返回 null 并记录原始错误。
+/** 用现有连接刷新额度；请求失败返回 null 并记录安全诊断。
  * 成功快照另存供启动与页脚使用，页脚沿用原额度格式。 */
 export function refreshUsageFromConnection(request: (method: string, params: any) => Promise<any>, accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot | null> {
   const generation = usageGenerations.get(accountId) ?? 0
@@ -522,10 +489,10 @@ export function refreshUsageFromConnection(request: (method: string, params: any
         return request('account/rateLimits/read', {})
       })
       const snap = snapshotFromReadResponse(response, undefined, readStartedAt)
-      if (snap.state !== 'ok') log(`usage: refresh from connection: ${snap.state === 'network' ? snap.reason : snap.state}`)
+      if (snap.state !== 'ok') logDiagnostic('codex live quota refresh failed', { reason: snap.state })
       return snap
     } catch (error) {
-      log(`usage: refresh from connection failed: ${error instanceof Error ? error.message : String(error)}`)
+      logError('codex live quota refresh failed', error)
       throw error
     }
   }).then((snap) => {
@@ -574,7 +541,6 @@ export async function requestCodexControlWithRetry<T>(request: () => Promise<T>,
       const transient = /error sending request|timed? ?out|timeout|ECONNRESET|ETIMEDOUT|EAI_AGAIN|connection (?:reset|closed)|\b(?:429|502|503|504)\b/i.test(message)
       if (!transient) throw error
       if (attempt >= delays.length) throw new Error(`Codex ${operation}失败（已尝试 ${attempt + 1} 次）：${message}`, { cause: error })
-      log(`usage: ${operation} retry ${attempt + 1}/${delays.length} in ${delays[attempt]}ms: ${message}`)
       await new Promise(resolve => setTimeout(resolve, delays[attempt]))
     }
   }

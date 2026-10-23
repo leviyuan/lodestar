@@ -9,6 +9,7 @@
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { config, type TokenSourceConfig } from './config'
+import { logError } from './log'
 import {
   type TokenSource,
   type UsageSnapshotUnified,
@@ -19,7 +20,6 @@ import {
 import { readUsage, type UsageSnapshot, type UsageWindow } from './usage'
 import { fetchCodexModels } from './token-source-models'
 import type { AgentReasoningEffort } from './agent-process'
-import { log } from './log'
 import { codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
 import { withModelVisibility } from './token-source-visibility'
 
@@ -96,9 +96,11 @@ registerTokenSourceFactory({
             if (!cfgDefaultModel) ts.defaultModel = ts.models[0]?.model ?? ''
             ts.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
           } catch (e: any) {
-            log(`codex-sub ${accountId} refreshModels MISS: ${e?.message ?? e}`)
             ts.models = []
-            if (e?.code === 'CODEX_AUTH_MISSING') ts.enabled = false
+            if (e?.code === 'CODEX_AUTH_MISSING') {
+              ts.enabled = false
+              logError('codex model catalog authentication missing', e)
+            }
             ts.modelCatalogState = { status: ts.enabled ? 'failed' : 'disabled', updatedAt: Date.now(), error: e?.message ?? String(e) }
           }
         },

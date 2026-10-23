@@ -12,7 +12,7 @@ import { codexAccountScheduler } from './codex-account-scheduler'
 import { codexActivation } from './codex-activation'
 import { CodexAccountCard } from './codex-account-card'
 import { codexAccountCard, type CodexAccountCardView } from './cards/codex-account'
-import { log } from './log'
+import { logError } from './log'
 import { consumeCodexResetCredit, invalidateCodexUsage, peekSuccessfulUsage, type CodexResetOutcome } from './usage'
 
 const loginReceipts = new Map<string, Promise<void>>()
@@ -119,7 +119,7 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
         const usage = stale ?? c.usage
         return usage ? [{ account: c.account, usage, fingerprint: c.identity.startsWith('record:') ? null : c.identity }] : []
       })) : await readAllCodexUsage()
-      if (catalogError) log(`codex-accounts: scheduling MISS: ${catalogError}`)
+      if (catalogError) logError('session-codex-accounts: scheduling MISS', catalogError)
       await card.finish({ phase: 'accounts', total: await readCodexAccountEmails(total), currentId: accountId,
         activationErrors: Object.fromEntries(total.entries.flatMap(entry => {
           const error = codexActivation.error(entry.account.id)
@@ -187,9 +187,9 @@ export async function runCodexAccountCommand(s: Session, command: string, argume
     })()
     loginReceipts.set(account.id, receipt)
     const release = () => { if (loginReceipts.get(account.id) === receipt) loginReceipts.delete(account.id) }
-    void receipt.then(release, error => { log(`codex-login: terminal card write failed: ${error}`); release() })
+    void receipt.then(release, error => { logError('session-codex-accounts: terminal card write failed', error); release() })
   } catch (error) {
-    log(`codex-${command}: ${error}`)
+    logError('session-codex-accounts: account command failed', error)
     await card.finish(errorView(error, name))
   }
 }
@@ -212,14 +212,14 @@ async function runCodexResetCommand(s: Session, argument: string, messageId?: st
     }
     // Capture the actual account before the first await; a queued preference is not the active account.
     account = argument ? codexAccounts.find(argument) : codexAccounts.get(processCodexAccount(s.proc))
-  } catch (error) { log(`codex-reset: ${error}`); await sendErrorCard(s, error); return }
+  } catch (error) { logError('session-codex-accounts: quota reset failed', error); await sendErrorCard(s, error); return }
   const card = await CodexAccountCard.open(s.chatId, { phase: 'checking', name: account.name,
     title: '正在使用重置卡', message: '正在提交重置请求…' })
   let result
   try {
     const idempotencyKey = createHash('sha256').update(JSON.stringify(['lodestar-codex-reset', s.chatId, messageId])).digest('hex')
     result = await consumeCodexResetCredit(account.id, idempotencyKey)
-  } catch (error) { log(`codex-reset: ${error}`); await card.finish(errorView(error, account.name)); return }
+  } catch (error) { logError('session-codex-accounts: quota reset failed', error); await card.finish(errorView(error, account.name)); return }
   const view = RESET_MESSAGES[result.outcome]
   const usageError = result.usage.state === 'ok' ? undefined
     : `额度刷新失败：${result.usage.state === 'network' ? result.usage.reason ?? 'MISS' : result.usage.state}`

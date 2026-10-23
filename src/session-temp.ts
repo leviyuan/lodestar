@@ -9,7 +9,6 @@ import type { Session } from './session'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
 import * as cards from './cards'
-import { log } from './log'
 import { claudeTranscriptDir } from './claude-agent-process'
 import { isAgentSession } from './agent-session-registry'
 import {
@@ -440,7 +439,6 @@ export async function onForkSelect(s: Session, panelId: string, choiceId: string
     if (choice.kind !== 'fork') return { ok: false, message: '选择项类型不匹配' }
     if (!s.opts.onCreateTempSession) return { ok: false, message: '临时群能力未就绪' }
     const chatName = reserveTempChatName(panel.baseName)
-    log(`session-temp: fork ${s.sessionName} → ${chatName} (${choice.launch.kind})`)
     await feishu.sendText(s.chatId, `🔱 正在分叉到 ${chatName}…`)
     let result
     try {
@@ -479,7 +477,6 @@ export async function onBackSelect(s: Session, panelId: string, choiceId: string
     } catch (error) {
       writeLogWarning = `；文件变更记录卡发送失败: ${formatFeishuError(error)}`
     }
-    log(`session-temp: back ${s.sessionName} (${choice.launch.kind}, writes=${choice.writes.length})`)
     const ok = await s.rollbackTo(choice.launch, {
       anchors: choice.seedAnchors,
       base: choice.branchBase,
@@ -539,7 +536,6 @@ export async function onResumeSelect(s: Session, panelId: string, choiceId: stri
     if (choice.sourceStatus === 'active') {
       return finish(false, '所选 Codex 会话仍在运行；请先在原位置停止后再创建完整分支', 'unchanged')
     }
-    log(`session-temp: history fork ${s.sessionName} ← ${choice.launch.source.provider} ${sourceId}`)
     const ok = await s.rollbackTo(choice.launch, {
       anchors: [],
       base: choice.launch,

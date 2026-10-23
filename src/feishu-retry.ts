@@ -1,4 +1,4 @@
-import { log } from './log'
+import { logError, logDiagnostic } from './log'
 import { feishuErrorDetails, formatFeishuError } from './feishu-errors'
 
 const RETRY_DELAYS_MS = [1000, 4000]
@@ -85,7 +85,7 @@ export class FeishuRecoveryWindow {
     }
   }
 
-  async waitForRetry(label: string, error: unknown, minimumDelayMs = 0): Promise<boolean> {
+  async waitForRetry(_label: string, error: unknown, minimumDelayMs = 0): Promise<boolean> {
     this.lastFailure = error
     const remaining = this.remainingMs()
     if (remaining <= 0 || this.retries >= this.maxRetries) return false
@@ -93,9 +93,6 @@ export class FeishuRecoveryWindow {
     const delay = Math.max(backoff, minimumDelayMs, feishuRetryAfterMs(error))
     const retryAt = Date.now() + delay
     const retryFits = retryAt < this.deadline
-    log(`feishu: ${label} failed: ${formatFeishuError(error)}; ${retryFits
-      ? `retry in ${delay}ms (recovery remaining ${remaining}ms)`
-      : `waiting ${remaining}ms for recovery deadline; next retry requires ${delay}ms`}`)
     const wakeAt = Math.min(this.deadline, retryAt)
     // Recheck the clock after waking so an early timer cannot skip Retry-After
     // or cause a final failure notification before the shared deadline.
@@ -117,18 +114,18 @@ export async function withFeishuRetry<T>(
     options.recovery?.timeoutMs(60_000)
     try {
       const result = await operation()
-      if (attempt > 0) log(`feishu: ${label} recovered: attempts=${attempt + 1} elapsed=${Date.now() - startedAt}ms`)
+      if (attempt > 0) logDiagnostic('feishu request recovered', { attempt: attempt + 1, durationMs: Date.now() - startedAt })
       return result
     }
     catch (error) {
       const transient = isTransientFeishuError(error, options)
       if (options.recovery) {
         if (transient && await options.recovery.waitForRetry(label, error)) continue
-        log(`feishu: ${label} attempt ${attempt + 1} failed: ${formatFeishuError(error)}; FINAL`)
+        logError('feishu request failed', error)
       } else {
         const delay = Math.max(RETRY_DELAYS_MS[attempt] ?? 0, feishuRetryAfterMs(error))
         const retry = transient && attempt < RETRY_DELAYS_MS.length && delay <= 60_000
-        log(`feishu: ${label} attempt ${attempt + 1}/${RETRY_DELAYS_MS.length + 1} failed: ${formatFeishuError(error)}; ${retry ? `retry in ${delay}ms` : 'FINAL'}`)
+        if (!retry) logError('feishu request failed', error)
         if (retry) {
           await new Promise(resolve => setTimeout(resolve, delay))
           continue

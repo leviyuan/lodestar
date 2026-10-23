@@ -12,7 +12,7 @@ import type { ProjectProfile } from './config'
 import { DSH_HOME_DIR } from './paths'
 import { DSH_PROTOCOL_VERSION, type DshNotification } from './dsh-protocol'
 import { agentRuntimeRoot } from './agent-updates'
-import { log } from './log'
+import { log, logError } from './log'
 
 export interface DshRuntimeOptions {
   cwd: string
@@ -88,7 +88,6 @@ export class DshRuntime extends EventEmitter {
     const require = createRequire(join(runtimeRoot, 'package.json'))
     const manifestPath = require.resolve('@deepseek-ai/dsh/package.json')
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-    log(`dsh runtime: ${manifest.version} (${runtimeRoot})`)
     const providerPatches = dshProviderPatches(opts.env)
     const home = opts.home ?? DSH_HOME_DIR
     mkdirSync(home, { recursive: true, mode: 0o700 })
@@ -151,7 +150,6 @@ export class DshRuntime extends EventEmitter {
     this.child.stderr!.setEncoding('utf8')
     this.child.stderr!.on('data', (chunk: string) => {
       this.stderr = (this.stderr + chunk).slice(-16_384)
-      log(`dsh stderr: ${chunk.trimEnd()}`)
     })
     this.child.stdin!.on('error', error => this.transportFailure(error))
     const lines = createInterface({ input: this.child.stdout!, crlfDelay: Infinity })
@@ -200,7 +198,7 @@ export class DshRuntime extends EventEmitter {
       if (frame.jsonrpc !== '2.0') throw new Error('invalid DSH JSON-RPC envelope')
       if (typeof frame.id === 'number') {
         const pending = this.pending.get(frame.id)
-        if (!pending) { log(`dsh: unexpected response id=${frame.id}`); return }
+        if (!pending) { log('dsh.response_unmatched'); return }
         this.pending.delete(frame.id)
         clearTimeout(pending.timer)
         if (frame.error) pending.reject(new Error(`DSH RPC error: ${frame.error.message}`))
@@ -227,7 +225,7 @@ export class DshRuntime extends EventEmitter {
     this.closing = true
     if (this.initialized) {
       try { await this.request('shutdown', {}, timeoutMs) }
-      catch (error) { log(`dsh shutdown: ${error}`) }
+      catch (error) { logError('dsh.shutdown.failed', error) }
     }
     this.child.stdin!.end()
     const waitExit = async (ms: number): Promise<boolean> => {
@@ -237,10 +235,9 @@ export class DshRuntime extends EventEmitter {
       return this.exited
     }
     if (await waitExit(timeoutMs)) return
-    log(`dsh: terminate owned child pid=${this.pid}`)
     this.child.kill('SIGTERM')
     if (await waitExit(timeoutMs)) return
-    log(`dsh: kill unresponsive owned child pid=${this.pid}`)
+    log('dsh.shutdown.force_termination')
     this.child.kill('SIGKILL')
     if (!await waitExit(timeoutMs)) throw new Error(`DSH child exit not confirmed: pid=${this.pid}`)
   }
@@ -249,7 +246,7 @@ export class DshRuntime extends EventEmitter {
 /** Read-only native catalog operations always reap their own process. */
 export async function queryDshRuntime(opts: DshRuntimeOptions, method: 'model/list' | 'session/list', params = {}): Promise<any> {
   const runtime = new DshRuntime(opts)
-  runtime.on('failure', error => log(`dsh catalog: ${error}`))
+  runtime.on('failure', error => logError('dsh.catalog.failed', error))
   let failure: unknown
   let result: unknown
   try { await runtime.initialize(); result = await runtime.request(method, params) }

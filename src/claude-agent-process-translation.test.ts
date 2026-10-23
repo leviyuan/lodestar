@@ -75,16 +75,13 @@ describe('Claude host conversation translation', () => {
     expect(JSON.stringify(context.snapshot())).not.toContain('Caller description')
   })
 
-  test('binds translation diagnostics only after the main native session matches its context', async () => {
-    const bindings: string[] = []
-    const { proc } = running({ ...defaultTranslation, bindSession: id => { bindings.push(id) } })
+  test('keeps translation history bound to its main native session', async () => {
+    const { proc } = running()
     const context = await attachContext(proc)
     await proc.handleTranslatedMessage({ type: 'system', subtype: 'init', session_id: 'boundary-session' })
     await proc.handleTranslatedMessage({ ...assistant('Child progress'), session_id: 'child-session', parent_tool_use_id: 'child-tool' })
-    expect(bindings).toEqual(['boundary-session'])
     expect(context.snapshot().sessionId).toBe('boundary-session')
     await proc.handleTranslatedMessage({ type: 'system', subtype: 'init', session_id: 'wrong-main-session' })
-    expect(bindings).toEqual(['boundary-session'])
     expect(proc.translationContextFailure?.message).toContain('session mismatch')
   })
 

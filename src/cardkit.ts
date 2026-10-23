@@ -17,7 +17,7 @@ import { networkFetch } from './network'
 import { createHash, randomUUID } from 'node:crypto'
 import { getTenantToken } from './feishu'
 import { FeishuRequestError, FeishuRecoveryWindow, isTransientFeishuError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
-import { log } from './log'
+import { log, logError, logDiagnostic } from './log'
 import { ELEMENTS, neutralizeMarkdownImagesInCard } from './cards/elements'
 
 const BASE = 'https://open.feishu.cn/open-apis/cardkit/v1'
@@ -290,7 +290,7 @@ async function callStateMutation(cardId: string, method: 'PUT' | 'PATCH', path: 
       await call(method, path, { ...body, sequence: nextSeq(cardId) }, recovery, error => {
         if (isAmbiguousMutationFailure(error)) uncertain = true
       })
-      if (confirming) log(`cardkit confirmed ${method} ${path}: same state accepted with new UUID and sequence`)
+      if (confirming) log('cardkit uncertain write confirmed')
       return
     } catch (error) {
       if (!uncertain || !isUuidConsumedFailure(error)) throw error
@@ -327,7 +327,7 @@ async function addElementMutation(cardId: string, s: CardState, element: object,
     await callStateMutation(cardId, 'PUT', `/cards/${cardId}/elements/${elementId}`, {
       element: JSON.stringify(element),
     }, recovery)
-    log(`cardkit reconciled uncertain add ${cardId} element=${elementId}: latest content accepted with PUT`)
+    log('cardkit uncertain insertion reconciled')
   }
   if (!elementId || !s.confirmedAdds.has(elementId)) s.elementCount++
   if (elementId) {
@@ -409,12 +409,12 @@ async function withReopenOnStreamingClosed(
         state(cardId).onFailure?.(failure.code, failure)
       }
     } catch (error) {
-      log(`cardkit failure callback ${cardId}: ${error}`)
+      logError('cardkit failure callback failed', error)
     }
     try {
       onFailure?.(failure)
     } catch (error) {
-      log(`cardkit per-call failure callback ${cardId}: ${error}`)
+      logError('cardkit write failure callback failed', error)
     }
   }
   try {
@@ -422,23 +422,23 @@ async function withReopenOnStreamingClosed(
     return
   } catch (e) {
     if (!isStreamingClosed(e)) {
-      log(`cardkit ${label} ${cardId}: ${e}`)
+      logError('cardkit write failed', e)
       await fail(e)
       return
     }
-    log(`cardkit ${label} ${cardId}: streaming closed (code=${(e as any).code}) — reopening`)
+    log('cardkit streaming reopening')
   }
   try {
     await reopenStreaming(cardId, recovery)
   } catch (re) {
-    log(`cardkit STREAMING_REOPEN_FAILED ${cardId}: ${re}`)
+    logError('cardkit streaming reopen failed', re)
     await fail(re)
     return
   }
   try {
     await op(recovery)
   } catch (e2) {
-    log(`cardkit ${label} ${cardId} retry-after-reopen: ${e2}`)
+    logError('cardkit write failed after reopen', e2)
     await fail(e2)
   }
 }
@@ -482,7 +482,7 @@ export async function convertMessageToCard(
         continue
       }
       const nextDelay = delays[i + 1] ?? 0
-      log(`cardkit id_convert ${messageId}: empty result, retry ${i + 2}/${delays.length} in ${nextDelay}ms`)
+      logDiagnostic('cardkit lookup retry', { attempt: i + 2, retryInMs: nextDelay })
     }
   }
   throw lastErr

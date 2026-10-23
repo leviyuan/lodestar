@@ -1,7 +1,7 @@
 import { homedir } from 'node:os'
 import type { ClaudeSpawnOpts } from './claude-agent-process'
 import type { UsageSnapshotUnified, UsageWindowUnified } from './token-source'
-import { log } from './log'
+import { log, logError } from './log'
 import { resolveClaudeSdkModel } from './claude-models'
 import { UsageReadCache, isUsageRateLimitError } from './usage-cache'
 
@@ -56,7 +56,7 @@ export function claudeWeeklyUsageWindow(snapshot: UsageSnapshotUnified, model: s
     return scope !== null && claudeModelFamily(scope) === family
   })
   if (matching.length > 1) {
-    log(`Claude weekly usage MISS: ${model} 匹配多个模型专属周额度窗口`)
+    log('claude weekly quota ambiguous')
     return null
   }
   // 专属桶已返回但数据缺失时，继续显示其 MISS，不替换为总额度。
@@ -138,7 +138,7 @@ async function requestClaudeSubscriptionUsage(options: Pick<ClaudeSpawnOpts,
       profile: { loadProjectMcp: false }, ...options, controlOnly: true }) }
     catch (error) { release?.(); throw error }
     if (release) proc.once('exit', release)
-    proc.on('error', error => log(`Claude subscription usage MISS: ${error.message}`))
+    proc.on('error', error => logError('claude subscription usage failed', error))
     let timer: ReturnType<typeof setTimeout> | undefined
     let failure: Error | undefined
     try {
@@ -163,7 +163,7 @@ async function requestClaudeSubscriptionUsage(options: Pick<ClaudeSpawnOpts,
     }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
-    log(`claude-sub readUsage MISS: ${reason}`)
+    logError('claude subscription usage read failed', error)
     return {
       state: (error as { code?: string })?.code === 'CLAUDE_SUBSCRIPTION_AUTH_MISSING' ? 'no_credentials'
         : isUsageRateLimitError(error) ? 'rate_limited' : 'network',

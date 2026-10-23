@@ -6,7 +6,7 @@ import type { AgentRunSnapshot } from './agent-run-types'
 import type { BgTaskEntry } from './cards/background'
 import type { AgentCardTaskKind } from './cards/task-kind'
 import { withChatMessageOrder } from './chat-message-order'
-import { log } from './log'
+import { logError } from './log'
 
 // Each row has one panel and one Markdown body. Leave room below the
 // component ceiling, and also honor actual byte-capacity errors from Card Kit.
@@ -162,7 +162,7 @@ export class AgentCards {
         if (progressOnly && !terminal && !row.terminal && !group.pendingSettings && !isCapacity(result)
           && previous?.status === 'running' && row.status === previous.status
           && row.kind === previous.kind && row.summary === previous.summary && row.progressState === previous.progressState) {
-          log(`agent: task progress refresh failed task=${row.key}: ${writeError('agent task row update', result).message}`)
+          logError('agent: task progress refresh failed', writeError('agent task row update', result))
           return false
         }
         if (!isCapacity(result) || group.rows.size === 1) throw writeError('agent task row update', result)

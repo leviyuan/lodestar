@@ -7,7 +7,7 @@ import {
   type TokenSource, type TokenSourceModel, type UsageSnapshotUnified,
 } from './token-source'
 import { observedContextWindow } from './context-window-observe'
-import { log } from './log'
+import { logError } from './log'
 import { openRouterModelExcluded, openRouterModelPreset, openRouterModelVisibilityKey, selectOpenRouterDefaultModels } from './openrouter-defaults'
 import { fetchApiModelData } from './token-source-model-api'
 import { UsageReadCache, usageCredentialKey, usageRetryAfter } from './usage-cache'
@@ -133,7 +133,7 @@ async function requestOpenRouterUsage(base: string, apiKey: string): Promise<Usa
     }
   } catch (error) {
     const reason = messageOf(error)
-    log(`openrouter readUsage MISS: ${reason}`)
+    logError('openrouter usage read failed', error)
     return { kind: 'balance', state: error instanceof OpenRouterHttpError && error.status === 429 ? 'rate_limited' : 'network',
       windows: [], reason, ...(error instanceof OpenRouterHttpError ? { retryAfterMs: error.retryAfterMs } : {}) }
   }
@@ -202,7 +202,6 @@ registerTokenSourceFactory({
           source.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
         } catch (error) {
           const message = messageOf(error)
-          log(`openrouter refreshModels MISS: ${message}`)
           source.modelCatalogState = { status: 'failed', updatedAt: Date.now(), error: message }
         }
       },

@@ -25,7 +25,7 @@ import { execFile } from 'node:child_process'
 import { readFileSync, statfsSync, statSync } from 'node:fs'
 import { cpus, homedir, loadavg, totalmem } from 'node:os'
 import { promisify } from 'node:util'
-import { log } from './log'
+import { logError } from './log'
 
 const execFileAsync = promisify(execFile)
 
@@ -103,7 +103,7 @@ function readCpu(): CpuInfo | null {
     }
     return { cores, load1, load5, load15 }
   } catch (e) {
-    log(`sysinfo: read CPU failed: ${e}`)
+    logError('sysinfo: read CPU failed', e)
     return null
   }
 }
@@ -125,7 +125,7 @@ function readMem(): MemInfo | null {
       percent: Math.round((usedBytes / totalBytes) * 100),
     }
   } catch (e) {
-    log(`sysinfo: read /proc/meminfo failed: ${e}`)
+    logError('sysinfo: read memory failed', e)
     return null
   }
 }
@@ -168,7 +168,7 @@ export async function readMacMemory(command: HostCommand = runHostCommand): Prom
   try {
     return parseMacMemory(await command('/usr/bin/vm_stat', []), totalmem())
   } catch (e) {
-    log(`sysinfo: read macOS memory failed: ${e}`)
+    logError('sysinfo: read macOS memory failed', e)
     return null
   }
 }
@@ -229,7 +229,7 @@ export async function readMacServices(command: HostCommand = runHostCommand): Pr
   try {
     jobs = parseLaunchctlList(await command('/bin/launchctl', ['list']))
   } catch (e) {
-    log(`sysinfo: launchctl list failed: ${e}`)
+    logError('sysinfo: launchctl list failed', e)
     return { services: [], error: `launchctl 查询失败: ${e instanceof Error ? e.message : String(e)}` }
   }
   const running = jobs.filter(job => job.pid !== null)
@@ -240,14 +240,14 @@ export async function readMacServices(command: HostCommand = runHostCommand): Pr
         const elapsed = times.get(job.pid!)
         if (elapsed === undefined) {
           job.error = 'ps 未返回该进程，运行时长 MISS'
-          log(`sysinfo: ${job.name}: ${job.error}`)
+          logError('sysinfo: service status failed', job.error)
         } else {
           job.lastActiveAgoSec = elapsed
           job.stateAgoSec = elapsed
         }
       }
     } catch (e) {
-      log(`sysinfo: read launchd process elapsed failed: ${e}`)
+      logError('sysinfo: read service uptime failed', e)
       for (const job of running) job.error = `运行时长 MISS: ${e instanceof Error ? e.message : String(e)}`
     }
   }
@@ -271,7 +271,7 @@ function readDiskFor(label: string, path: string): DiskInfo | null {
       percent: Math.round((usedBytes / totalBytes) * 100),
     }
   } catch (e) {
-    log(`sysinfo: statfs ${path} failed: ${e}`)
+    logError('sysinfo: read filesystem statistics failed', e)
     return null
   }
 }
@@ -321,7 +321,7 @@ async function runSystemctl(args: string[], timeoutMs = 2000): Promise<string | 
     })
     return stdout
   } catch (e) {
-    log(`sysinfo: systemctl ${args.join(' ')} failed: ${e}`)
+    logError('sysinfo: systemctl failed', e)
     return null
   }
 }

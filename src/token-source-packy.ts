@@ -5,7 +5,6 @@ import { fetchPackyBalance, fetchPackyModels, fetchPackyUsage, packyApiRoot, pac
 import { packyModelVisibilityKey, selectPackyDefaultModels } from './packy-defaults'
 import { customModelEfforts, modelList } from './token-source-visibility'
 import { tokenSourceErrorMessage } from './token-source-errors'
-import { log } from './log'
 import { usageCredentialKey } from './usage-cache'
 import { registerTokenSourceFactory, scrubAnthropicEnv, tokenSourceRuntimeModels, type TokenSource, type TokenSourceModel } from './token-source'
 
@@ -126,7 +125,6 @@ for (const definition of definitions) {
           } catch (error) {
             source.models = []; catalog = []
             const message = tokenSourceErrorMessage(error, [key])
-            log(`${id} refreshModels MISS: ${message}`)
             source.modelCatalogState = { status: 'failed', updatedAt: Date.now(), error: message }
           }
         },

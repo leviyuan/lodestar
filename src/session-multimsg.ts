@@ -1,6 +1,5 @@
 import type { Session } from './session'
 import * as feishu from './feishu'
-import { log } from './log'
 import { parseInboundMarker } from './inbound-markers'
 
 export interface MultiMsgSegment {
@@ -52,7 +51,6 @@ export async function onMultiMessageInbound(
     if (s.multiMsgBuffer === null) {
       // 没在缓冲却收到收尾标记:body 有内容当普通消息直通,空则忽略
       if (body.trim() || files.length) return false
-      log(`session "${s.sessionName}": end marker without active multi-msg buffer, ignoring`)
       return true
     }
     pushSegment(s, body, files, userOpenId, msgId)
@@ -113,7 +111,6 @@ async function flushMultiMessage(
   }
   const segments = batch.filter(m => m.text.trim() || m.files.length)
   if (segments.length === 0) {
-    log(`session "${s.sessionName}": multi-msg flush with empty buffer, not sent`)
     await feishu.sendText(s.chatId, '⚠️ 多条消息缓冲为空,未发送(只收到标记没有正文)。')
     return
   }
@@ -125,7 +122,6 @@ async function flushMultiMessage(
     return prefix + m.text
   }).join('\n\n')
   const last = segments[segments.length - 1]
-  log(`session "${s.sessionName}": multi-msg flush ${segments.length} segment(s) → 1 turn`)
   await s.onUserMessage(merged, [], last.userOpenId, last.msgId)
 }
 
@@ -133,10 +129,8 @@ async function flushMultiMessage(
  * 丢弃当前多条消息缓冲。给每条缓冲消息的 📌 换成 ❌ (CrossMark),
  * 表示"已收录但被取消"。用于 stop / kill / restart / clear 和 proc exit。
  * flush 正常完成不走这里(它自己释放 📌,不打 ❌)。no-op if 无缓冲。*/
-export function clearMultiMsgBuffer(s: Session, reason: string): void {
+export function clearMultiMsgBuffer(s: Session, _reason: string): void {
   if (s.multiMsgBuffer === null) return
-  const n = s.multiMsgBuffer.length
-  log(`session "${s.sessionName}": clear multi-msg buffer (${reason}): ${n} segment(s)`)
   for (const [msgId, rid] of s.multiMsgReactions) {
     if (rid) void feishu.deleteReaction(msgId, rid)
     void feishu.addReaction(msgId, 'CrossMark')

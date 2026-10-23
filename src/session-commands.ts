@@ -1,7 +1,7 @@
 import type { Session } from './session'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
-import { log } from './log'
+import { logError } from './log'
 import { diagnosticIdLabel, messageOf } from './session-util'
 
 type ControlCommand = 'hi' | 'stop' | 'kill' | 'restart' | 'clear' | 'compact' | 'model'
@@ -21,12 +21,12 @@ const sourceCommandWork = new Set<Promise<void>>()
 function backgroundSourceCommand(s: Session, work: Promise<void>): void {
   const tracked = work.catch(async error => {
     const message = `账号操作或结果呈现失败：${messageOf(error)}`
-    log(message)
+    logError('session-commands: account operation failed', error)
     await feishu.sendTextRaw(s.chatId, `❌ ${message}`)
     throw error
   })
   sourceCommandWork.add(tracked)
-  void tracked.finally(() => sourceCommandWork.delete(tracked)).catch(error => log(`账号操作结果发送失败：${messageOf(error)}`))
+  void tracked.finally(() => sourceCommandWork.delete(tracked)).catch(error => logError('session-commands: account operation result delivery failed', error))
 }
 
 export function pendingSourceCommands(): Promise<void>[] { return [...sourceCommandWork] }
@@ -210,7 +210,6 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
         }
         return true
       }
-      log(`session "${s.sessionName}": stop command — interrupt + drop count=${s.pendingUserMessageCount} midBuffer=${s.pendingMidTurnMsgs.length}`)
       // Cancelled queued msgs: remove the OneSecond (no longer waiting)
       // and stamp a CrossMark (explicit cancelled state, distinct from
       // a natural release where reactions just disappear). Cancelled
@@ -273,7 +272,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
           try {
             await s.closeStatusCard(statusCard, finalStatus)
           } catch (e) {
-            log(`session "${s.sessionName}": kill status card close failed: ${messageOf(e)}`)
+            logError('session-commands: kill status card close failed', e)
             await feishu.sendTextRaw(s.chatId, `${finalStatus}\n⚠️ kill 状态卡片终态写入失败: ${messageOf(e)}`)
           }
         }

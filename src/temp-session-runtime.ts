@@ -1,3 +1,4 @@
+import { formatLogError } from './log'
 import {
   validateConversationLaunch,
   type ConversationLaunch,
@@ -127,7 +128,7 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
       }
     } catch (error) {
       const failure = messageOf(error)
-      deps.log(`temp-session: create "${opts.chatName}" failed: ${failure}`)
+      deps.log(formatLogError('temp-session: create failed', failure))
       return { ok: false, error: failure }
     }
 
@@ -151,13 +152,13 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
         return { ok: true, chatId: ensured.chatId }
       } catch (error) {
         const failure = messageOf(error)
-        deps.log(`temp-session: initialize "${opts.chatName}" failed: ${failure}`)
+        deps.log(formatLogError('temp-session: initialize failed', failure))
         if (tempSession) {
           try {
             await tempSession.stop('临时群启动失败清理', { announce: false })
           } catch (stopError) {
             const stopFailure = messageOf(stopError)
-            deps.log(`temp-session: failed-create stop "${opts.chatName}" failed: ${stopFailure}`)
+            deps.log(formatLogError('temp-session: failed-create stop failed', stopFailure))
             return {
               ok: false,
               chatId: ensured.chatId,
@@ -173,7 +174,7 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
           deletedChatId = confirmDeleted(opts.chatName, ensured.chatId, deleted)
         } catch (deleteError) {
           const cleanupFailure = messageOf(deleteError)
-          deps.log(`temp-session: create cleanup "${opts.chatName}" failed: ${cleanupFailure}`)
+          deps.log(formatLogError('temp-session: create cleanup failed', cleanupFailure))
           return {
             ok: false,
             chatId: ensured.chatId,
@@ -187,7 +188,7 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
           deps.clearSessionConversationState(opts.chatName)
         } catch (cleanupError) {
           const cleanupFailure = messageOf(cleanupError)
-          deps.log(`temp-session: local cleanup "${opts.chatName}" failed: ${cleanupFailure}`)
+          deps.log(formatLogError('temp-session: local cleanup failed', cleanupFailure))
           return { ok: false, error: `${failure}；临时群已确认解散，但本地状态清理失败: ${cleanupFailure}` }
         }
         return { ok: false, error: `${failure}；本次新建的临时群已确认解散` }
@@ -200,7 +201,7 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
         : await initializeAndCompensate()
     } catch (error) {
       const failure = messageOf(error)
-      deps.log(`temp-session: target actor "${opts.chatName}" failed: ${failure}`)
+      deps.log(formatLogError('temp-session: target actor failed', failure))
       return { ok: false, chatId: ensured.chatId, error: `${failure}；临时群/session 仍保留` }
     }
   }
@@ -212,12 +213,12 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
     const knownChatId = deps.chatIdForSession(chatName)
     if (!expectedChatId || knownChatId !== expectedChatId) {
       const failure = `临时群 chat_id 已变化: expected=${expectedChatId || '-'} bound=${knownChatId ?? '-'}`
-      deps.log(`temp-session: disband identity rejected "${chatName}": ${failure}`)
+      deps.log(formatLogError('temp-session: disband identity rejected', failure))
       return { ok: false, error: `${failure}；未执行停止或删群` }
     }
     if (!deps.hasTempSessionLease(chatName, expectedChatId)) {
       const failure = `群 ${expectedChatId} 没有 Lodestar 临时会话 lease，拒绝解散`
-      deps.log(`temp-session: disband lease rejected "${chatName}": ${failure}`)
+      deps.log(formatLogError('temp-session: disband lease rejected', failure))
       return { ok: false, error: `${failure}；未执行停止或删群` }
     }
     const session = deps.registry.get(knownChatId)
@@ -225,7 +226,7 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
       if (session) await session.stop('bye 解散', { announce: false })
     } catch (stopError) {
       const failure = messageOf(stopError)
-      deps.log(`temp-session: stop before disband "${chatName}" failed: ${failure}`)
+      deps.log(formatLogError('temp-session: stop before disband failed', failure))
       return { ok: false, error: `${failure}；无法确认 Session 已停止，未执行删群` }
     }
 
@@ -235,7 +236,7 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
       deletedChatId = confirmDeleted(chatName, knownChatId, deleted)
     } catch (deleteError) {
       const failure = messageOf(deleteError)
-      deps.log(`temp-session: disband "${chatName}" failed: ${failure}`)
+      deps.log(formatLogError('temp-session: disband failed', failure))
       return { ok: false, error: `${failure}；临时群/session 仍保留` }
     }
 
@@ -246,7 +247,7 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
       return { ok: true }
     } catch (cleanupError) {
       const failure = messageOf(cleanupError)
-      deps.log(`temp-session: local cleanup after disband "${chatName}" failed: ${failure}`)
+      deps.log(formatLogError('temp-session: local cleanup after disband failed', failure))
       return { ok: false, error: `临时群已确认解散，但本地状态清理失败: ${failure}` }
     }
   }

@@ -247,7 +247,7 @@ describe('Codex account process ownership and recovery', () => {
       h.proc.sendUserText('queued original'); await h.proc.quotaWaitPromise()
       expect(h.proc.turnRetry?.message).toBe('暂无可用账号 · 自动等待恢复')
       expect(h.children).toHaveLength(0)
-      expect(logged.mock.calls.some(([line]) => line.includes(reason))).toBe(true)
+      expect(logged).not.toHaveBeenCalled()
       resume(); await h.proc.initializationPromise()
       expect(h.children[0].sent.map(s => s.text)).toEqual(['queued original'])
     } finally { logged.mockRestore() }

@@ -2,6 +2,7 @@ import { homedir, tmpdir } from 'node:os'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, unlinkSync, symlinkSync, realpathSync } from 'node:fs'
 import { delimiter, join, win32 } from 'node:path'
 import { beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import * as logModule from './log'
 
 const {
   buildClaudeSpawnPath,
@@ -1626,5 +1627,31 @@ describe('Claude project profile overrides', () => {
       await proc.kill()
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+
+describe('Claude protocol log privacy', () => {
+  test('known progress events are silent and unknown events log only fixed diagnoses', () => {
+    const diagnostic = spyOn(logModule, 'logDiagnostic').mockImplementation(() => {})
+    const failure = spyOn(logModule, 'logError').mockImplementation(() => {})
+    try {
+      const proc = new ClaudeAgentProcess({ workDir: '/private/project', effort: 'high' }) as any
+      const privateText = 'private-user private-group private-task /private/source.ts'
+      proc.handleMessage({ type: 'tool_progress', session_id: 'private-session', tool_use_id: privateText })
+      for (const subtype of ['background_tasks_changed', 'vcs_state_changed', 'hook_started', 'hook_response']) {
+        proc.handleMessage({ type: 'system', subtype, session_id: 'private-session', text: privateText })
+      }
+      expect(diagnostic).not.toHaveBeenCalled()
+      expect(failure).not.toHaveBeenCalled()
+      proc.handleMessage({ type: privateText, session_id: 'private-session', text: privateText })
+      proc.handleMessage({ type: 'system', subtype: privateText, text: privateText })
+      proc.handleMessage({ type: 'command_lifecycle', command_uuid: privateText, state: privateText })
+      expect(diagnostic.mock.calls).toEqual([
+        ['claude-agent-process: unknown message'],
+        ['claude-agent-process: unknown system event'],
+        ['claude-agent-process: malformed command lifecycle'],
+      ])
+    } finally { diagnostic.mockRestore(); failure.mockRestore() }
   })
 })

@@ -15,7 +15,7 @@ import {
 import * as cards from './cards'
 import * as cardkit from './cardkit'
 import * as feishu from './feishu'
-import { log } from './log'
+import { logError, logDiagnostic } from './log'
 import { messageOf, type ModelActionResult } from './session-util'
 import { formatFeishuError } from './feishu-errors'
 
@@ -77,7 +77,7 @@ export async function finishModelSettingsChange(
   if (error !== null) {
     change.phase = 'failed'
     change.error = `${error}。本次完整设置未保存，后续输入暂停；请重新发送 md 完成选择，或 restart 恢复已保存的设置。`
-    log(`session "${s.sessionName}": model settings incomplete: ${change.error}`)
+    logError('session-model: model settings incomplete', change.error)
     return modelChangeFailure(s, change.error)
   }
   s.modelSettingsChange = null
@@ -353,7 +353,7 @@ export async function consumeModelCustomMessage(
       closed = await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } }, failure => { settingsFailure = failure })
       if (!closed) throw new Error(`model panel streaming-off rejected: ${formatFeishuError(settingsFailure)}`)
     } catch (e: any) {
-      log(`model-custom: card update MISS (${e?.message ?? e})`)
+      logError('session-model: card update failed', e)
       cardFailures.push(messageOf(e))
     } finally {
       if (cardId) {
@@ -366,15 +366,13 @@ export async function consumeModelCustomMessage(
             closed = await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } }, failure => { settingsFailure = failure })
             if (!closed) cardFailures.push(`model panel streaming-off rejected: ${formatFeishuError(settingsFailure)}`)
           } catch (e: any) {
-            log(`model-custom: streaming-off retry MISS (${e?.message ?? e})`)
+            logError('session-model: streaming close retry failed', e)
             cardFailures.push(formatFeishuError(e))
           }
         }
         if (replaced && closed) {
           try { await cardkit.dispose(cardId) }
-          catch (e: any) { log(`model-custom: card dispose MISS (${e?.message ?? e})`) }
-        } else {
-          log(`model-custom: retain card state after checked MISS mutation=${replaced} streamingOff=${closed} card=${cardId.slice(0, 12)}`)
+          catch (e: any) { logError('session-model: card disposal failed', e) }
         }
       }
     }
@@ -386,7 +384,7 @@ export async function consumeModelCustomMessage(
     const details = [...new Set(cardFailures)].join('\n')
     const fallback = `⚠️ 模型补录结果未能写回原卡。${result}${details ? `\n${details}` : ''}\n请重新发送 model 打开面板。`
     const sent = await feishu.sendTextRaw(s.chatId, fallback)
-    if (!sent) log(`model-custom: visible fallback send MISS (${result})`)
+    if (!sent) logDiagnostic('session-model: visible fallback send MISS')
     return false
   }
   const failCard = (reason: string) => updateCardOrFallback(
@@ -411,11 +409,10 @@ export async function consumeModelCustomMessage(
   try {
     await registerCustomTokenSourceModel(ts.id, model, s.tokenSourceAccountId(ts.id))
   } catch (error) {
-    log(`model-custom: config/refresh MISS (${messageOf(error)})`)
+    logError('session-model: config/refresh MISS', error)
     await failCard(`配置写入或模型刷新失败：${messageOf(error)}`)
     return true
   }
-  log(`model-custom: ${ts.id} 补录 ${model} by ${user}(记录已持久化)`)
   for (const session of Session.all) {
     for (const [id, panel] of session.modelPanels) {
       if (panel.sourceId === ts.id && (session !== s || id !== pending.panelId)) session.modelPanels.delete(id)
@@ -451,7 +448,7 @@ export async function consumeModelCustomMessage(
     if (result.completion) {
       void result.completion.then(present).catch(async error => {
         const message = `模型补录后的切换结果呈现失败：${messageOf(error)}`
-        log(`model-custom: ${message}`)
+        logError('session-model: custom model result delivery failed', error)
         await feishu.sendTextRaw(s.chatId, `❌ ${message}`)
       })
     }
@@ -684,7 +681,7 @@ export async function onModelEffortSelect(
     }
   } catch (e) {
     const message = `模型切换失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": set model settings failed: ${messageOf(e)}`)
+    logError('session-model: set model settings failed', e)
     return { ok: false, message }
   }
 }

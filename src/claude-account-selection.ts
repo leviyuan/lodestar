@@ -8,7 +8,7 @@ import { compareClaudeQuota, rankClaudeQuota, type ClaudeQuotaRank } from './cla
 import { assertClaudeDefaultSettingsEnvironment, claudeSubscriptionSettings, validateClaudeSubscriptionAccount } from './token-source-claude'
 import { getTokenSourceForAccount, scrubAnthropicEnv, tokenSourceRuntimeModel } from './token-source'
 import { peekTokenSourceUsage, refreshTokenSourceUsage } from './token-source-cache'
-import { log } from './log'
+import { logError } from './log'
 
 /** Startup selection only; this function neither queries upstream nor changes any running process. */
 export function selectClaudeAccount(options: { model?: string | null; effort?: AgentReasoningEffort | null;
@@ -62,7 +62,7 @@ export async function enrollClaudeAccount(name: string): Promise<string> {
       transformEnv: base => claudeAccounts.candidateEnv(candidate, { ...scrubAnthropicEnv(base), ...settings.env }) }) }
     catch (error) { release(); throw error }
     proc.once('exit', release)
-    proc.on('error', error => log(`Claude account enrollment MISS: ${error.message}`))
+    proc.on('error', error => logError('claude account enrollment failed', error))
     let timer: ReturnType<typeof setTimeout> | undefined
     let failure: unknown
     try {
@@ -88,6 +88,6 @@ export async function enrollClaudeAccount(name: string): Promise<string> {
   if (current !== source) { source = current; await source.refreshModels() }
   if (source.modelCatalogState?.status !== 'ready') throw new Error(`Claude 账号已收录，模型目录 MISS：${source.modelCatalogState?.error ?? '后台刷新中'}`)
   try { await refreshTokenSourceUsage(source) }
-  catch (error) { log(`Claude account enrolled; quota warming MISS: ${error instanceof Error ? error.message : String(error)}`) }
+  catch (error) { logError('claude quota warmup failed', error) }
   return account.id
 }

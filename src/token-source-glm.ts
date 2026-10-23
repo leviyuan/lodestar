@@ -22,7 +22,6 @@ import { fetchGlmUsage, isGlmBaseUrl, type GlmUsageSnapshot, type GlmUsageWindow
 import { fetchGlmModels, CLAUDE_EFFORTS } from './token-source-models'
 import { resolveModelWithWindow, observedContextWindow } from './context-window-observe'
 import { verifyModelExists } from './model-existence'
-import { log } from './log'
 import { fetchGlmAnthropicModelIds, glmAnthropicBaseUrl, GLM_ANTHROPIC_BASE_URL } from './glm-models'
 
 type Env = Record<string, string | undefined>
@@ -141,7 +140,6 @@ registerTokenSourceFactory({
           }
           ts.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
         } catch (e: any) {
-          log(`glm refreshModels MISS: ${e?.message ?? e}`)
           ts.models = []
           ts.modelCatalogState = { status: 'failed', updatedAt: Date.now(), error: e?.message ?? String(e) }
         }

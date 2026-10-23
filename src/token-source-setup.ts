@@ -6,7 +6,7 @@ import { addTokenSource, configureTokenSource, TokenSourceSetupError } from './t
 import type { Session } from './session'
 import { codexAccountCard } from './cards/codex-account'
 import { config } from './config'
-import { log } from './log'
+import { logError } from './log'
 import { tokenSourceErrorMessage } from './token-source-errors'
 import { sharedAccountSourceIds } from './token-source-accounts'
 import { agentProviderLabel } from './agent-process'
@@ -23,7 +23,7 @@ export async function runClaudeSubscriptionCommand(s: Session, action: string): 
       await addTokenSource('claude-sub', { enabled: action === 'on' })
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
-      log(`claude-sub ${action} failed: ${reason}`)
+      logError('claude subscription setup failed', error)
       await feishu.sendText(s.chatId, `❌ Claude Code 订阅开关更新失败：${reason}`)
       return
     }

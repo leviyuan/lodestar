@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { TASKLIST_MAP_FILE } from './paths'
 import * as feishu from './feishu'
-import { log } from './log'
+import { logError } from './log'
 import { writeJsonStateAtomic } from './state-store'
 
 export interface TasklistDeletionState {
@@ -121,7 +121,6 @@ async function finishTasklistDeletion(projectName: string, expectedGuid: string)
   try {
     const remote = await deleteTasklistRemoteIdempotently(expectedGuid)
     if (remote === 'already_deleted') {
-      log(`tasklist: ${projectName} remote list ${expectedGuid} already deleted; finishing tombstone`)
     }
     const next = new Map(bindings)
     next.delete(projectName)
@@ -147,7 +146,6 @@ export async function reconcileTasklistDeletions(): Promise<void> {
   for (const item of pending) {
     try {
       await withTasklistLifecycleLock(item.projectName, () => finishTasklistDeletion(item.projectName, item.guid))
-      log(`tasklist: reconciled pending deletion for ${item.projectName}`)
     } catch (error) {
       failures.push(`${item.projectName}: ${error instanceof Error ? error.message : String(error)}`)
     }
@@ -175,9 +173,8 @@ function loadTasklistMap(): void {
       }
       bindings.set(projectName, binding)
     }
-    log(`tasklist: loaded ${bindings.size} project bindings`)
   } catch (error) {
-    log(`tasklist: load map failed: ${error}`)
+    logError('tasklist: load map failed', error)
   }
 }
 

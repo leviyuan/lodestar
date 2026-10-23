@@ -11,7 +11,7 @@ import type { CanUseToolRequest } from './codex-process'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
-import { log } from './log'
+import { logError, logDiagnostic } from './log'
 import { finalizeAsk } from './session-ask'
 
 export async function onPermissionDecision(
@@ -22,12 +22,12 @@ export async function onPermissionDecision(
 ): Promise<{ ok: boolean; message: string }> {
   const pending = s.pendingPermissions.get(requestId)
   if (!pending) {
-    log(`session "${s.sessionName}": stray permission ${requestId}`)
+    logDiagnostic('session-permission: stray permission')
     return { ok: false, message: '此权限请求已失效或已处理' }
   }
   const proc = s.proc
   if (!proc) {
-    log(`session "${s.sessionName}": permission ${requestId} has no active process`)
+    logDiagnostic('session-permission: permission has no active process')
     return { ok: false, message: '后端进程已退出，权限决定未送达' }
   }
 
@@ -37,7 +37,7 @@ export async function onPermissionDecision(
       ? { updatedPermissions: pending.permissionSuggestions }
       : undefined)
   } catch (error) {
-    log(`session "${s.sessionName}": permission response ${requestId} failed: ${error}`)
+    logError('session-permission: permission response failed', error)
     return { ok: false, message: `权限决定发送失败: ${error instanceof Error ? error.message : error}` }
   }
   // The protocol response is the commit point. Only now consume the pending
@@ -69,7 +69,6 @@ export async function onPermissionDecision(
     }
   }
 
-  log(`session "${s.sessionName}": permission decision request=${requestId} tool_use_id=${pending.toolUseId} decision=${decision}`)
   if (s.pendingPermissions.size === 0 && s.status === 'awaiting_permission') {
     s.status = 'working'
   }
@@ -96,19 +95,17 @@ export async function onPermissionDecision(
 export function renderPermission(s: Session, req: CanUseToolRequest): void {
   const turn = s.currentTurn
   if (!turn) {
-    log(`session "${s.sessionName}": can_use_tool with no current turn — auto-deny req=${req.request_id}`)
     s.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'no active turn' })
     return
   }
   const toolUseId = req.tool_use_id
   if (!toolUseId) {
-    log(`session "${s.sessionName}": can_use_tool without tool_use_id — auto-deny req=${req.request_id}`)
     s.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'no tool_use_id' })
     return
   }
   const meta = turn.toolByUseId.get(toolUseId)
   if (!meta) {
-    log(`session "${s.sessionName}": can_use_tool for unknown tool_use_id=${toolUseId} — auto-deny req=${req.request_id}`)
+    logDiagnostic('session-permission: permission requested for unknown tool')
     s.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'unknown tool_use_id' })
     return
   }
@@ -125,7 +122,7 @@ export function renderPermission(s: Session, req: CanUseToolRequest): void {
   if (meta.name === 'AskUserQuestion') {
     const ask = s.pendingAsks.get(toolUseId)
     if (!ask) {
-      log(`session "${s.sessionName}": AskUserQuestion ${toolUseId} missing pendingAsk — deny`)
+      logDiagnostic('session-permission: AskUserQuestion missing pendingAsk')
       s.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'no pending ask' })
       return
     }
@@ -139,7 +136,6 @@ export function renderPermission(s: Session, req: CanUseToolRequest): void {
   }
   s.status = 'awaiting_permission'
   s.pendingPermissions.set(req.request_id, { toolUseId, permissionSuggestions: req.permission_suggestions })
-  log(`session "${s.sessionName}": can_use_tool request=${req.request_id} tool_use_id=${toolUseId} tool=${meta.name}`)
   const el = cards.toolCallPermissionElement(meta.i, meta.name, meta.displayInput ?? meta.input, req.request_id)
   void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
   // Phone push — Codex is blocked until the user approves/denies.

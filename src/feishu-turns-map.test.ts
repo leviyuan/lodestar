@@ -433,7 +433,8 @@ describe('session turn checkpoint persistence', () => {
 
     expect(result.exitCode, result.stderr).toBe(0)
     expect(extract(result)).toEqual({ pending: null, anchors: [] })
-    expect(result.stderr).toContain('rejected 1 malformed turn anchors')
+    expect(result.stderr).toContain('feishu malformed turn anchors rejected')
+    expect(result.stderr).not.toMatch(/unsafe|source-session|rejected 1/)
   })
 
   test('append and ordinary replace preserve pending; explicit null consumes it', () => {

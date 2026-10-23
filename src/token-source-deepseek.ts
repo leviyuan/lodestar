@@ -29,7 +29,7 @@ import {
 import { CLAUDE_EFFORTS } from './token-source-models'
 import { resolveModelWithWindow, observedContextWindow } from './context-window-observe'
 import { verifyModelExists } from './model-existence'
-import { log } from './log'
+import { logError, logDiagnostic } from './log'
 import { fetchApiModelData } from './token-source-model-api'
 import { UsageReadCache, usageCredentialKey, usageRetryAfter } from './usage-cache'
 
@@ -114,7 +114,7 @@ async function requestDeepseekBalance(origin: string, apiKey: string): Promise<U
       signal: AbortSignal.timeout(BALANCE_TIMEOUT_MS),
     })
     if (!res.ok) {
-      log(`deepseek readUsage MISS: HTTP ${res.status}`)
+      logDiagnostic('deepseek balance read failed', { status: res.status })
       return { kind: 'balance', state: res.status === 429 ? 'rate_limited' : 'network', windows: [],
         reason: `HTTP ${res.status}`, retryAfterMs: usageRetryAfter(res.headers) }
     }
@@ -131,7 +131,7 @@ async function requestDeepseekBalance(origin: string, apiKey: string): Promise<U
       balance: { remaining: Number(total), currency },
     }
   } catch (e: any) {
-    log(`deepseek readUsage MISS: ${e?.message ?? e}`)
+    logError('deepseek balance read failed', e)
     return { kind: 'balance', state: 'network', windows: [], reason: e?.message ?? String(e) }
   }
 }
@@ -183,7 +183,6 @@ registerTokenSourceFactory({
           }
           ts.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
         } catch (e: any) {
-          log(`deepseek refreshModels MISS: ${e?.message ?? e}`)
           ts.models = []
           ts.modelCatalogState = { status: 'failed', updatedAt: Date.now(), error: e?.message ?? String(e) }
         }

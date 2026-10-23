@@ -112,7 +112,7 @@ describe('bare Codex account commands', () => {
     '模型目录 MISS',
     '额度查询失败：HTTP 503',
     'auth_failed',
-  ])('successful startup and account changes keep unused-account diagnostics in logs: %s', async reason => {
+  ])('successful account changes do not log account diagnostics: %s', async reason => {
     const account = store.ensure('replacement')
     const s = session(); s.status = 'idle'
     const proc = new Proc(); procs.push(proc); s.wireProc(proc)
@@ -132,7 +132,7 @@ describe('bare Codex account commands', () => {
       expect(sentTexts).toHaveLength(0)
       expect(sentRawTexts).toHaveLength(0)
     }
-    expect(logged.mock.calls.some(([line]) => line.includes(s.sessionName) && line.includes(reason))).toBe(true)
+    expect(logged).not.toHaveBeenCalled()
   })
 
   test('explicit account inspection still explains skipped accounts after a successful selection', async () => {

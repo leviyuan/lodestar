@@ -3,7 +3,7 @@
 
 import { existsSync, readFileSync } from 'node:fs'
 import { CONTEXT_WINDOW_CACHE_FILE as CACHE_FILE_CONST } from './paths'
-import { log } from './log'
+import { logError } from './log'
 import { writeJsonStateAtomic } from './state-store'
 
 /** 惰性取缓存路径:paths 常量是 import 时按当时 LODESTAR_DATA_DIR 求值的,
@@ -28,7 +28,7 @@ function loadCache(): WindowCache {
       ? JSON.parse(readFileSync(cacheFile(), 'utf8'))
       : {}
   } catch (e: any) {
-    log(`context-window-observe: cache read MISS (${e?.message ?? e}), starting fresh`)
+    logError('context-window-observe: cache read failed', e)
     cache = {}
   }
   return cache ?? {}
@@ -38,7 +38,7 @@ function saveCache(): void {
   try {
     writeJsonStateAtomic(cacheFile(), loadCache())
   } catch (e: any) {
-    log(`context-window-observe: cache write MISS (${e?.message ?? e})`)
+    logError('context-window-observe: cache write failed', e)
   }
 }
 
@@ -55,7 +55,6 @@ export function observeContextWindow(sourceId: string, model: string, window: nu
   if (prev === window) return
   loadCache()[key] = window
   saveCache()
-  log(`context-window-observe: ${key} → ${window} (prev ${prev ?? '-'})`)
 }
 
 /** spawn 决策:观测到 1M → 加 [1m];观测 <1M → 裸名;未观测 → 默认 [1m]

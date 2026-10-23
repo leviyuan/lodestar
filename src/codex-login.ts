@@ -120,7 +120,7 @@ export class CodexLogins {
       }
       if (attempt.loginSucceeded) return
       attempt.loginSucceeded = true
-      log(`codex-login: authorization completed account=${accountId} authUpdated=${attempt.authUpdated}`)
+      log('codex-login: authorization completed')
       if (attempt.timer) clearTimeout(attempt.timer)
       // Completion reports the OAuth flow; account/updated is the app-server's auth-state barrier.
       // Reading immediately on completion can still see the pre-login cached null account.

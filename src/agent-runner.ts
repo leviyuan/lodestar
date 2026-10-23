@@ -9,7 +9,6 @@ import type { ConversationLaunch } from './conversation'
 import type { ProjectProfile } from './config'
 import { getTokenSourceForAccount } from './token-source'
 import { DELEGATED_AGENT_INSTRUCTIONS, PROJECT_AGENT_INSTRUCTIONS } from './agent-skill'
-import { log } from './log'
 import { shellCommandPresentation } from './cards/shell-command'
 
 export interface AgentWorkerResult {
@@ -276,7 +275,6 @@ export function collectAgentTurn(
     if (settled) return
     try { callbacks.onCodexAccount?.(event.accountId) }
     catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
-    if (event.diagnostics.length) log(`agent-runner: selected Codex account=${event.accountId}; diagnostics: ${event.diagnostics.join('；')}`)
   }
   const onRetry = (retry: AgentTurnRetry) => {
     const tool = retry.reason === 'quota' ? 'Codex 额度换号'

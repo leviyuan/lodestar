@@ -1,13 +1,10 @@
-import { randomUUID } from 'node:crypto'
 import { networkFetch } from './network'
 import { getTokenSource } from './token-source'
 import { tokenSourceErrorMessage } from './token-source-errors'
 import { CLAUDE_TRANSLATION_ORIGINS, claudeTranslationOriginForRole, type ClaudeTranslationContextSnapshot } from './claude-translation-context'
 import { findMarkdownCodeRanges, findMarkdownFencedCodeRanges, type TextRange } from './claude-translation-code'
-import { ClaudeTranslationTraceError, type ClaudeTranslationTrace } from './claude-translation-trace'
 
 export interface ClaudeTranslation {
-  bindSession?(sessionId: string): void
   toEnglish(text: string, signal: AbortSignal, origin?: string): Promise<string>
   toChinese(text: string, signal: AbortSignal, origin?: string): Promise<string>
   toChineseFields(texts: string[], signal: AbortSignal, origin?: string | readonly string[]): Promise<string[]>
@@ -30,7 +27,6 @@ type TranslationOptions = {
   fetch?: typeof networkFetch
   timeoutMs?: number
   context?: () => ClaudeTranslationContextSnapshot
-  trace?: ClaudeTranslationTrace
 }
 
 function configuredCredential(): string {
@@ -167,15 +163,13 @@ export function createClaudeTranslation(options: TranslationOptions = {}): Claud
   const credential = options.credential ?? configuredCredential
   const rules = options.validationRules?.trim() ?? ''
 
-  async function request(key: string, signal: AbortSignal, body: object, requestId: string, direction: 'en' | 'zh'): Promise<Record<string, unknown>> {
+  async function request(key: string, signal: AbortSignal, body: object): Promise<Record<string, unknown>> {
     signal.throwIfAborted()
     const controller = new AbortController()
     const abort = () => controller.abort(signal.reason)
     signal.addEventListener('abort', abort, { once: true })
     const timer = setTimeout(() => controller.abort(new Error('GLM translation request timed out')), options.timeoutMs ?? 120_000)
     try {
-      options.trace?.append({ event: 'request', requestId, direction, body,
-        endpoint: `${CLAUDE_TRANSLATION_API}/chat/completions` }, [key])
       const response = await fetch(`${CLAUDE_TRANSLATION_API}/chat/completions`, {
         method: 'POST',
         redirect: 'error',
@@ -184,7 +178,6 @@ export function createClaudeTranslation(options: TranslationOptions = {}): Claud
         body: JSON.stringify(body),
       })
       const raw = await response.text()
-      options.trace?.append({ event: 'response', requestId, status: response.status, bodyText: raw }, [key])
       signal.throwIfAborted()
       controller.signal.throwIfAborted()
       let data: Record<string, unknown>
@@ -206,13 +199,13 @@ export function createClaudeTranslation(options: TranslationOptions = {}): Claud
     }
   }
 
-  async function complete(messages: ChatMessage[], key: string, signal: AbortSignal, requestId: string, direction: 'en' | 'zh'): Promise<string> {
+  async function complete(messages: ChatMessage[], key: string, signal: AbortSignal): Promise<string> {
     const data = await request(key, signal, {
       model: CLAUDE_TRANSLATION_MODEL,
       max_tokens: 16384,
       stream: false,
       messages,
-    }, requestId, direction)
+    })
     if (data.model !== CLAUDE_TRANSLATION_MODEL) throw new Error('GLM 翻译验证失败：响应模型与 glm-5.3-flash 不符')
     if (!Array.isArray(data.choices) || data.choices.length !== 1) throw new Error('GLM 翻译响应 choices 数量无效')
     const choice = object(data.choices[0])
@@ -230,15 +223,13 @@ export function createClaudeTranslation(options: TranslationOptions = {}): Claud
     signal.throwIfAborted()
     const key = credential()
     if (!key.trim()) throw new Error('Claude 英文模式缺少 GLM Key')
-    const requestId = randomUUID()
-    const direction = target === 'English' ? 'en' : 'zh'
     try {
       const review = validateInput && !!rules
       const requirement = review ? `Review against the explicit rules, then translate into ${target}:` : `Translate into ${target}:`
       const result = await complete([
         { role: 'system', content: system }, ...history,
         { role: 'user', content: `${sourceHeading(origin)}\n${requirement}\n\n${text}` },
-      ], key, signal, requestId, direction)
+      ], key, signal)
       const marked = result.match(/^\[\[TRANSLATION_(REJECT|REVIEW)\]\](?:[ \t]+|\r?\n)([\s\S]*)$/)
       if (marked) {
         const reason = marked[2]!.trim()
@@ -257,14 +248,10 @@ export function createClaudeTranslation(options: TranslationOptions = {}): Claud
         throw new Error('GLM 翻译验证失败：英文译文仍含未保护的中文正文')
       }
       signal.throwIfAborted()
-      options.trace?.append({ event: 'result', requestId, text: translated }, [key])
       history.push(originalMessage(text, origin), { role: 'assistant', content: translated })
       return translated
     } catch (error) {
-      if (error instanceof ClaudeTranslationTraceError) throw error
       const message = tokenSourceErrorMessage(signal.aborted ? signal.reason : error, [key])
-      try { options.trace?.append({ event: 'error', requestId, message, cancelled: signal.aborted }, [key]) }
-      catch (traceError) { throw new AggregateError([new Error(message), traceError], `${message}; ${String(traceError)}`) }
       if (signal.aborted) throw signal.reason
       if (error instanceof ClaudeInputRejectedError) {
         const rejected = new ClaudeInputRejectedError('')
@@ -303,7 +290,6 @@ export function createClaudeTranslation(options: TranslationOptions = {}): Claud
   }
 
   return {
-    ...(options.trace ? { bindSession: (id: string) => options.trace!.bindSession(id) } : {}),
     toEnglish: async (text, signal, origin = CLAUDE_TRANSLATION_ORIGINS.userMessage) => (await translateFields([text], 'English', signal, true, origin))[0]!,
     toChinese: async (text, signal, origin = CLAUDE_TRANSLATION_ORIGINS.reply) => (await translateFields([text], 'Simplified Chinese', signal, false, origin))[0]!,
     toChineseFields: (texts, signal, origin = CLAUDE_TRANSLATION_ORIGINS.reply) => translateFields(texts, 'Simplified Chinese', signal, false, origin),

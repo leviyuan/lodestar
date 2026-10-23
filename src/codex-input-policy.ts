@@ -2,7 +2,6 @@ import { spawn } from 'cross-spawn'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { log } from './log'
 
 /** Native Codex registers these tools from model metadata, independently of
  * tools.experimental_request_user_input.enabled. Restrict only the per-process
@@ -91,7 +90,6 @@ async function runNativePolicyQuery(options: NativePolicyOptions, command: strin
   try { code = await closed }
   finally { clearTimeout(timer); if (killTimer) clearTimeout(killTimer); options.signal.removeEventListener('abort', abort) }
   const diagnostic = Buffer.concat(stderr).toString('utf8').trim()
-  if (diagnostic) log(`${operation}[stderr]: ${diagnostic}`)
   if (failure) throw failure
   if (code !== 0) throw new Error(`${operation} failed (exit ${code}): ${diagnostic || 'no diagnostic'}`)
   // Native catalog refresh can log a failure and still exit with a bundled

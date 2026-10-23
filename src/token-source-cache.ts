@@ -184,7 +184,7 @@ export function cachedTokenSource(
     const { refreshModels: _refresh, readUsage: _usage, forAccount: _accounts, ...snapshot } = next
     Object.assign(source, snapshot)
   }
-  const model = new BackgroundRefresh(`token-source ${source.id}${accountId ? `/${accountId}` : ''} models`, MODEL_REFRESH_MS, async () => {
+  const model = new BackgroundRefresh('model catalog', MODEL_REFRESH_MS, async () => {
     let work = modelLoads.get(identity)
     if (!work) {
       let next: TokenSource
@@ -230,7 +230,7 @@ export function cachedTokenSource(
     }
     publish(next)
   }, old?.identity === identity ? old.model?.nextRefreshAt : 0)
-  const usage = new BackgroundRefresh(`token-source ${source.id}${accountId ? `/${accountId}` : ''} usage`, USAGE_REFRESH_MS, async () => {
+  const usage = new BackgroundRefresh('usage', USAGE_REFRESH_MS, async () => {
     let snapshot: UsageSnapshotUnified
     try { snapshot = await committed.readUsage() }
     catch (error) {

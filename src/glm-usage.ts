@@ -21,7 +21,7 @@ import { networkFetch } from './network'
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { log } from './log'
+import { logError, logDiagnostic } from './log'
 import { UsageReadCache, usageCredentialKey, usageRetryAfter } from './usage-cache'
 
 const API_TIMEOUT_MS = 10_000
@@ -76,7 +76,7 @@ export function readClaudeSettingsEnv(): Record<string, string> {
     const env = JSON.parse(raw)?.env
     return env && typeof env === 'object' ? env as Record<string, string> : {}
   } catch (e) {
-    log(`glm-usage: read settings.json env failed: ${e}`)
+    logError('glm usage configuration read failed', e)
     return {}
   }
 }
@@ -182,7 +182,7 @@ async function requestGlmUsage(domain: string, token: string): Promise<GlmUsageS
       signal: controller.signal,
     })
     if (!res.ok) {
-      log(`glm-usage: quota/limit HTTP ${res.status}`)
+      logDiagnostic('glm quota read failed', { status: res.status })
       return { state: res.status === 429 ? 'rate_limited' : 'network', reason: `HTTP ${res.status}`,
         retryAfterMs: usageRetryAfter(res.headers) }
     }
@@ -192,16 +192,16 @@ async function requestGlmUsage(domain: string, token: string): Promise<GlmUsageS
       const message = json?.error?.message ?? json?.msg ?? json?.message ?? (typeof json?.error === 'string' ? json.error : undefined)
       const reason = [code === undefined ? '' : `code ${code}`, message === undefined ? '' : String(message)]
         .filter(Boolean).join(': ').replaceAll(token, '[redacted]') || 'GLM 额度接口返回失败'
-      log(`glm-usage: quota/limit MISS: ${reason}`)
+      logError('glm quota response invalid', reason)
       return { state: String(code) === '429' ? 'rate_limited' : 'network', reason, retryAfterMs: usageRetryAfter(res.headers) }
     }
     const data = json?.data ?? json
     const snapshot = parseQuotaLimit(data)
-    if (snapshot.state === 'network') log(`glm-usage: quota/limit MISS: ${snapshot.reason}`)
+    if (snapshot.state === 'network') logError('glm quota response invalid', snapshot.reason)
     return snapshot
   } catch (e: any) {
     const reason = (e?.name === 'AbortError' ? `timeout ${API_TIMEOUT_MS}ms` : (e?.message ?? String(e))).replaceAll(token, '[redacted]')
-    log(`glm-usage: quota/limit fetch failed: ${reason}`)
+    logError('glm quota fetch failed', e)
     return { state: 'network', reason }
   } finally {
     clearTimeout(timer)

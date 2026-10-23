@@ -9,7 +9,7 @@ import { networkFetch } from './network'
  * 调用方不猜。校验通过的模型由调用方补进列表并持久化(config models 键)。
  */
 
-import { log } from './log'
+import { logDiagnostic, logError } from './log'
 
 const VERIFY_TIMEOUT_MS = 15_000
 
@@ -42,10 +42,10 @@ export async function verifyModelExists(
         ? 'not_found'
         : 'no_verdict'
     }
-    log(`model-existence: ${model} HTTP ${res.status}, no verdict`)
+    logDiagnostic('model-existence: verification failed', { status: res.status })
     return 'no_verdict'
   } catch (e: any) {
-    log(`model-existence: ${model} MISS (${e?.message ?? e})`)
+    logError('model-existence: verification failed', e)
     return 'no_verdict'
   }
 }

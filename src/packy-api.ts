@@ -3,7 +3,7 @@ import { fetchApiModelData } from './token-source-model-api'
 import { tokenSourceErrorMessage } from './token-source-errors'
 import type { UsageSnapshotUnified } from './token-source'
 import { UsageReadCache, usageCredentialKey, usageRetryAfter } from './usage-cache'
-import { log } from './log'
+import { logError } from './log'
 
 export const PACKY_BASE_URL = 'https://cf.api.fan'
 export const PACKY_MANAGEMENT_URL = 'https://www.packyapi.ai'
@@ -119,7 +119,7 @@ export async function fetchPackyBalance(base: string, token: string, userId: str
       return { state: 'ok', kind: 'balance', windows: [], fetchedAt: Date.now(), balance: { remaining, currency: 'USD' } }
     } catch (error) {
       const reason = tokenSourceErrorMessage(error, [token])
-      log(`PackyAPI balance MISS: ${reason}`)
+      logError('packy balance read failed', error)
       return { state: error instanceof PackyHttpError && [401, 403].includes(error.status) ? 'no_credentials'
         : error instanceof PackyHttpError && error.status === 429 ? 'rate_limited' : 'network',
         kind: 'balance', windows: [], reason,
@@ -159,7 +159,7 @@ export async function fetchPackyUsage(base: string, key: string): Promise<UsageS
         quota: { remaining: remaining / status.quota_per_unit, limit: limit / status.quota_per_unit, currency: 'USD' } }
     } catch (error) {
       const reason = tokenSourceErrorMessage(error, [key])
-      log(`PackyAPI quota MISS: ${reason}`)
+      logError('packy quota read failed', error)
       return { state: error instanceof PackyHttpError && [401, 403].includes(error.status) ? 'no_credentials'
         : error instanceof PackyHttpError && error.status === 429 ? 'rate_limited' : 'network',
         kind: 'quota', windows: [], reason,

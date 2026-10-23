@@ -644,3 +644,28 @@ test('upload and send exhaustion produce visible errors; invalid files and perma
     } finally { rmSync(root, { recursive: true, force: true }) }
   `)
 })
+
+
+test('SDK logger drops normal chatter and excludes identities, bodies, paths and credentials from failures', async () => {
+  await runIsolated(`
+    const output = []
+    const originalWrite = process.stderr.write
+    process.stderr.write = chunk => { output.push(String(chunk)); return true }
+    try {
+      const privateText = 'user-private@example.invalid oc_private_chat project-private /Users/private/report.txt Bearer private-token'
+      const details = Object.assign(new Error('permission denied ' + privateText), {
+        code: 'EACCES', response: { status: 403, data: { code: 99991672, msg: privateText } },
+        config: { headers: { Authorization: privateText }, data: privateText },
+      })
+      for (const level of ['info', 'debug', 'trace']) feishu.client.logger[level](privateText, details)
+      assert.equal(output.length, 0)
+      feishu.client.logger.error(details)
+      feishu.client.logger.warn(details)
+      const text = output.join('')
+      assert.match(text, /feishu sdk error/)
+      assert.match(text, /status=403/)
+      assert.match(text, /code=99991672/)
+      assert.doesNotMatch(text, /user-private|oc_private_chat|project-private|Users|report[.]txt|private-token|Authorization/)
+    } finally { process.stderr.write = originalWrite }
+  `)
+})

@@ -4,7 +4,7 @@ import { codexUsageToUnified } from './token-source-codex'
 import { listTokenSources, tokenSourceRegistryRevision, tokenSourceAccounts, tokenSourceAccountRevision, type UsageSnapshotUnified } from './token-source'
 import { sharedAccountId } from './token-source-accounts'
 import { codexUsageCacheRevision } from './usage'
-import { log } from './log'
+import { logError } from './log'
 
 export interface AccountUsage {
   id: string
@@ -58,7 +58,7 @@ export function readAllAccountUsage(): Promise<AccountUsage[]> {
       : source.kind === 'claude-subscription' ? 'Claude 订阅' : source.display)
     reads.push(Promise.resolve().then(() => source.readUsage()).catch((error): UsageSnapshotUnified => {
       const reason = error instanceof Error ? error.message : String(error)
-      log(`account usage ${id} MISS: ${reason}`)
+      logError('account usage read failed', error)
       return { state: 'network', windows: [], reason }
     }).then(usage => [{ id, label, usage }]))
   }

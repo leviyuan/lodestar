@@ -382,7 +382,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
             source: { provider: 'dsh', sessionId: this.sessionId, cwd: this.opts.workDir } } })
         return
       }
-      default: log(`dsh: unknown notification ${method}`)
+      default: log('dsh.notification_unknown')
     }
   }
   private observeUsage(u: any): void {

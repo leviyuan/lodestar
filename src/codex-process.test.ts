@@ -18,6 +18,7 @@ import {
   usageFromTokenUsagePayload,
 } from './codex-process'
 import { resetAgentSessionRegistryForTest } from './agent-session-registry'
+import * as logModule from './log'
 
 function makeCodexLifecycleHarness(stdinOverrides: Record<string, unknown> = {}): any {
   const proc = Object.create(CodexProcess.prototype) as any
@@ -25,7 +26,6 @@ function makeCodexLifecycleHarness(stdinOverrides: Record<string, unknown> = {})
   proc.expectedExit = false
   proc.exitEventEmitted = false
   proc.stdoutBuf = ''
-  proc.stderrBuf = ''
   proc.childExitCode = null
   proc.childExitSignal = null
   proc.requestCounter = 0
@@ -1911,7 +1911,7 @@ describe('codex process compaction notifications', () => {
       threadId: 'thread-4',
       turnId: 'turn-4',
     })).not.toThrow()
-    // reasoning item 走 UNMAPPED log(不 emit raw);thread/status/changed 已被
+    // 已知 reasoning item 静默忽略(不 emit raw);thread/status/changed 已被
     // 子 agent 状态机消费(exec-cell 编排的终态信号),不再落 raw。
     expect(raw).toHaveLength(0)
     expect(compacted).toHaveLength(1)
@@ -2651,5 +2651,50 @@ describe('codex review-round-3 fixes', () => {
     expect(events.filter(([e]) => e === 'bg_task_settled').length).toBe(settledBefore)
     const starteds = events.filter(([e]) => e === 'bg_task_started')
     expect(starteds.length).toBe(1) // 只有 spawn-first 那次
+  })
+})
+
+
+describe('Codex protocol log privacy', () => {
+  test('normal protocol payloads and compaction never enter ordinary logs', () => {
+    const diagnostic = spyOn(logModule, 'logDiagnostic').mockImplementation(() => {})
+    const failure = spyOn(logModule, 'logError').mockImplementation(() => {})
+    try {
+      const { proc, events } = makeCodexProtocolHarness()
+      const privateText = 'private-user private-project private-group /private/source.ts oc_private'
+      proc.sessionId = 'private-session'
+      for (const method of ['turn/moderationMetadata', 'turn/diff/updated', 'item/commandExecution/outputDelta',
+        'item/commandExecution/terminalInteraction', 'thread/readState/changed', 'remoteControl/status/changed', 'account/updated']) {
+        proc.handleNotification(method, { threadId: 'private-session', turnId: 'private-turn', itemId: 'private-item',
+          delta: privateText, diff: privateText, metadata: privateText, stdin: privateText })
+      }
+      for (const type of ['reasoning', 'sleep']) {
+        for (const method of ['item/started', 'item/completed']) proc.handleNotification(method, {
+          threadId: 'private-session', turnId: 'private-turn', item: { id: 'private-item', type, content: privateText },
+        })
+      }
+      proc.handleNotification('item/started', { item: { id: 'private-item', type: 'agentMessage', text: privateText } })
+      proc.handleNotification('item/completed', { threadId: 'private-session', turnId: 'private-turn',
+        item: { id: 'private-compaction', type: 'contextCompaction', summary: privateText } })
+      expect(events.some(([event]) => event === 'context_compacted')).toBe(true)
+      expect(diagnostic).not.toHaveBeenCalled()
+      expect(failure).not.toHaveBeenCalled()
+    } finally { diagnostic.mockRestore(); failure.mockRestore() }
+  })
+
+  test('unknown and malformed events retain fixed diagnoses without identities or payloads', () => {
+    const diagnostic = spyOn(logModule, 'logDiagnostic').mockImplementation(() => {})
+    try {
+      const { proc } = makeCodexProtocolHarness()
+      const privateText = 'private-user private-project private-group /private/source.ts oc_private'
+      proc.handleNotification(privateText, { text: privateText, threadId: 'private-session' })
+      proc.handleNotification('item/started', { item: { id: 'private-item', type: privateText, text: privateText } })
+      proc.handleNotification('item/started', { item: { text: privateText } })
+      expect(diagnostic.mock.calls).toEqual([
+        ['codex-process: unsupported protocol notification'],
+        ['codex-process: unsupported protocol item'],
+        ['codex-process: malformed protocol event'],
+      ])
+    } finally { diagnostic.mockRestore() }
   })
 })
