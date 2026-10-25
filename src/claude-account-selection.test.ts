@@ -211,3 +211,79 @@ test('named-only authentication keeps one visible source, account-isolated quota
     } finally { disposeCachedTokenSource(root); rmSync(dir, { recursive: true, force: true }) }
   `)
 })
+
+test('named onboarding retains one native process and gates queries until sync and close finish', () => {
+  isolated(`
+    import assert from 'node:assert/strict'
+    import { mock } from 'bun:test'
+    import { EventEmitter } from 'node:events'
+    import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+    import { tmpdir } from 'node:os'
+    import { join } from 'node:path'
+    const dir = mkdtempSync(join(tmpdir(), 'claude-sync-order-'))
+    const native = await import('./src/claude-accounts')
+    const manager = new native.ClaudeAccounts({ home: dir, accountsDir: join(dir, 'accounts'), stateFile: join(dir, 'state.json'), env: {} })
+    mkdirSync(join(manager.root, 'new'), { recursive: true })
+    mock.module('./src/claude-accounts', () => ({ ...native, claudeAccounts: manager }))
+    const events = []
+    let info = { email: 'new@example.test', organization: 'org', apiProvider: 'firstParty', subscriptionType: 'max' }
+    let warmupFailure
+    let process, syncDone, closeDone, syncEntered, closeEntered
+    const syncing = new Promise(resolve => { syncEntered = resolve })
+    const closing = new Promise(resolve => { closeEntered = resolve })
+    const syncGate = new Promise(resolve => { syncDone = resolve })
+    const closeGate = new Promise(resolve => { closeDone = resolve })
+    mock.module('./src/claude-agent-process', () => ({ ClaudeAgentProcess: class extends EventEmitter {
+      constructor(options) { super(); this.alive = true; this.options = options; process = this; events.push('spawn') }
+      async readAccountInfo() { events.push('auth'); this.options.validateAccount(info); return info }
+      isAlive() { return this.alive }
+      async kill() { events.push('closing'); closeEntered(); await closeGate; this.alive = false; events.push('closed'); this.emit('exit', 0, null) }
+    } }))
+    mock.module('./src/claude-sync-warmup', () => ({
+      captureClaudeSyncWarmup: () => undefined,
+      waitForClaudeSyncWarmup: async options => {
+        events.push('sync'); assert.equal(options.isAlive(), true)
+        assert.equal(manager.candidate(options.configDir.split('/').pop()).state, 'syncing'); syncEntered(); await syncGate
+        if (warmupFailure) throw warmupFailure
+        assert.equal(options.isAlive(), true); events.push('synced')
+      },
+    }))
+    const source = { modelCatalogState: { status: 'ready' }, refreshModels: async () => {
+      assert.equal(manager.find('new').state, 'ready'); assert.equal(process.alive, false); events.push('models')
+    } }
+    const registry = await import('./src/token-source')
+    mock.module('./src/token-source', () => ({ ...registry, getTokenSourceForAccount: () => source }))
+    const cache = await import('./src/token-source-cache')
+    mock.module('./src/token-source-cache', () => ({ ...cache, refreshTokenSourceUsage: async () => {
+      assert.equal(manager.find('new').state, 'ready'); events.push('usage')
+    } }))
+    const { enrollClaudeAccount, selectClaudeAccount } = await import('./src/claude-account-selection')
+    const phases = []
+    try {
+      const enrollment = enrollClaudeAccount('new', phase => { phases.push(phase) })
+      await syncing
+      const id = manager.find('new').id
+      assert.deepEqual(events, ['spawn', 'auth', 'sync'])
+      assert.deepEqual(phases, ['authenticating', 'syncing'])
+      assert.deepEqual(manager.list().map(account => account.id), ['default'])
+      assert.throws(() => selectClaudeAccount({ preferred: id }), /首次同步/)
+      const concurrent = enrollClaudeAccount('new')
+      syncDone(); await closing
+      assert.equal(manager.find('new').state, 'syncing')
+      assert.throws(() => manager.acquireUse(id), /尚未完成/)
+      closeDone(); assert.equal(await enrollment, id); assert.equal(await concurrent, id)
+      assert.deepEqual(events, ['spawn', 'auth', 'sync', 'synced', 'closing', 'closed', 'models', 'usage'])
+      assert.equal(await enrollClaudeAccount('new'), id)
+      assert.equal(events.length, 8)
+      mkdirSync(join(manager.root, 'failed'), { recursive: true })
+      info = { ...info, email: 'failed@example.test' }
+      warmupFailure = new Error('首次同步未完成：synthetic timeout')
+      await assert.rejects(enrollClaudeAccount('failed'), /首次同步未完成/)
+      assert.equal(manager.find('failed').state, 'sync_failed')
+      assert.equal(process.alive, false)
+      assert.deepEqual(events.slice(8), ['spawn', 'auth', 'sync', 'closing', 'closed'])
+      await assert.rejects(enrollClaudeAccount('failed'), /秒后重试 hi failed/)
+      assert.equal(events.length, 13)
+    } finally { syncDone(); closeDone(); rmSync(dir, { recursive: true, force: true }) }
+  `)
+})

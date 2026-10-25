@@ -7,6 +7,60 @@ function isolated(script: string): void {
   expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
 }
 
+test('unfinished Claude onboarding is excluded from catalogs and cannot start model or usage queries', () => {
+  isolated(`
+    import assert from 'node:assert/strict'
+    import { mock } from 'bun:test'
+    import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+    import { join } from 'node:path'
+    import { tmpdir } from 'node:os'
+    const dir = mkdtempSync(join(tmpdir(), 'claude-onboarding-gate-'))
+    process.env.CLAUDE_CONFIG_DIR = join(dir, 'native')
+    const { config } = await import('./src/config'); config.claude.env = {}
+    const accounts = await import('./src/claude-accounts')
+    const stateFile = join(dir, 'accounts.json')
+    const manager = new accounts.ClaudeAccounts({ home: dir, accountsDir: join(dir, 'accounts'), stateFile, env: process.env })
+    mkdirSync(join(manager.root, 'named'), { recursive: true })
+    const account = await manager.enroll('named', async () => ({ email: 'named@example.test', organization: 'test',
+      subscriptionType: 'max', apiProvider: 'firstParty' }))
+    mock.module('./src/claude-accounts', () => ({ ...accounts, claudeAccounts: manager }))
+    const modelsModule = await import('./src/token-source-models')
+    const usageModule = await import('./src/claude-usage')
+    let modelReads = 0, usageReads = 0
+    mock.module('./src/token-source-models', () => ({ ...modelsModule, fetchNativeClaudeModels: async () => {
+      modelReads++; return [{ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' }]
+    } }))
+    mock.module('./src/claude-usage', () => ({ ...usageModule, fetchClaudeSubscriptionUsage: async () => {
+      usageReads++; return { state: 'ok', windows: [] }
+    } }))
+    const { tokenSourceFactories } = await import('./src/token-source')
+    await import('./src/token-source-claude')
+    const root = tokenSourceFactories().find(item => item.kind === 'claude-subscription').build({})
+    const retained = root.forAccount(account.id)
+    try {
+      for (const phase of ['authenticating', 'syncing', 'sync_failed', 'enrolling']) {
+        const state = JSON.parse(readFileSync(stateFile, 'utf8'))
+        state.accounts[0].state = phase
+        writeFileSync(stateFile, JSON.stringify(state))
+        assert.deepEqual(root.listAccounts().map(value => value.id), ['default'])
+        assert.throws(() => root.forAccount(account.id), /收录|首次同步/)
+        await retained.refreshModels()
+        assert.equal(retained.modelCatalogState.status, 'failed')
+        await assert.rejects(retained.readUsage(), /收录|首次同步/)
+        assert.equal(modelReads, 0)
+        assert.equal(usageReads, 0)
+      }
+      // Existing default-account work remains independent of named-account warm-up.
+      const native = root.forAccount('default')
+      await native.refreshModels()
+      assert.equal(native.modelCatalogState.status, 'ready')
+      assert.equal((await native.readUsage()).state, 'ok')
+      assert.equal(modelReads, 1)
+      assert.equal(usageReads, 1)
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  `)
+})
+
 test('named Claude accounts synchronize once at model startup and never during catalog, quota or ready-account checks', () => {
   isolated(`
     import assert from 'node:assert/strict'

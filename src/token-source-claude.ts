@@ -118,6 +118,7 @@ registerTokenSourceFactory({
         source.models = []
         source.modelCatalogState = { status: 'loading', updatedAt: null }
         try {
+          claudeAccounts.assertReady(accountId)
           const models = await fetchNativeClaudeModels({
             settingSources: ['user'], settings, transformEnv: source.spawnEnv,
             validateAccount: source.validateClaudeAccount, tokenSourceId: source.id,
@@ -151,6 +152,9 @@ registerTokenSourceFactory({
       readUsage() {
         if (!source.enabled) return Promise.resolve({ state: 'not_applicable' as const, windows: [],
           reason: source.modelCatalogState?.error ?? disabledReason })
+        // A retained view must not start another short-lived process during onboarding.
+        try { claudeAccounts.assertReady(accountId) }
+        catch (error) { return Promise.reject(error) }
         // 并发的 hi/收尾共用本次查询；完成后下一次调用重新读取原生接口。
         const expectedRevision = revision
         usageRequest ??= fetchClaudeSubscriptionUsage({
@@ -170,6 +174,7 @@ registerTokenSourceFactory({
     root.listAccounts = () => claudeAccounts.list().map(account => ({ id: account.id, name: account.name }))
     const children = new Map<string, { revision: string; source: TokenSource }>()
     root.forAccount = accountId => {
+      claudeAccounts.assertReady(accountId)
       const revision = claudeAccounts.revision(accountId)
       const current = children.get(accountId)
       if (current?.revision === revision) return current.source

@@ -8,13 +8,14 @@ import { compareClaudeQuota, rankClaudeQuota, type ClaudeQuotaRank } from './cla
 import { assertClaudeDefaultSettingsEnvironment, claudeSubscriptionSettings, validateClaudeSubscriptionAccount } from './token-source-claude'
 import { getTokenSourceForAccount, scrubAnthropicEnv, tokenSourceRuntimeModel } from './token-source'
 import { peekTokenSourceUsage, refreshTokenSourceUsage } from './token-source-cache'
-import { logError } from './log'
+import { logDiagnostic, logError } from './log'
+import { captureClaudeSyncWarmup, waitForClaudeSyncWarmup } from './claude-sync-warmup'
 
 /** Startup selection only; this function neither queries upstream nor changes any running process. */
 export function selectClaudeAccount(options: { model?: string | null; effort?: AgentReasoningEffort | null;
   preferred?: string | null; activeSessions?: ReadonlyMap<string, number> }): string {
   if (config.token_sources?.['claude-sub']?.enabled === false) throw new Error('Claude 订阅已禁用；发送 claude-sub on 启用')
-  if (options.preferred) return claudeAccounts.get(options.preferred).id
+  if (options.preferred) return claudeAccounts.assertReady(options.preferred).id
   const diagnostics: string[] = []
   const identities = new Set<string>()
   const candidates: Array<ClaudeQuotaRank & { id: string }> = []
@@ -45,16 +46,35 @@ export function selectClaudeAccount(options: { model?: string | null; effort?: A
 }
 
 /** Explicit hi <name> may discover/authenticate a new manually logged-in directory. */
-export async function enrollClaudeAccount(name: string): Promise<string> {
+export type ClaudeEnrollmentProgress = 'authenticating' | 'syncing'
+const enrollmentRequests = new Map<string, Promise<string>>()
+export async function enrollClaudeAccount(name: string, onProgress?: (phase: ClaudeEnrollmentProgress) => void | Promise<void>): Promise<string> {
   if (config.token_sources?.['claude-sub']?.enabled === false) throw new Error('Claude 订阅已禁用；发送 claude-sub on 启用')
   const candidate = claudeAccounts.candidate(name)
+  const pending = enrollmentRequests.get(candidate.id)
+  if (pending) {
+    await onProgress?.(candidate.state === 'syncing' ? 'syncing' : 'authenticating')
+    return pending
+  }
   if (candidate.state === 'ready' && candidate.identity) return candidate.id
-  const account = await claudeAccounts.enroll(name, async candidate => {
+  const request = performClaudeEnrollment(name, onProgress)
+  enrollmentRequests.set(candidate.id, request)
+  try { return await request }
+  catch (error) { logError('claude account enrollment failed', error); throw error }
+  finally { if (enrollmentRequests.get(candidate.id) === request) enrollmentRequests.delete(candidate.id) }
+}
+
+async function performClaudeEnrollment(name: string, onProgress?: (phase: ClaudeEnrollmentProgress) => void | Promise<void>): Promise<string> {
+  const account = await claudeAccounts.enroll(name, async (candidate, syncing) => {
+    await onProgress?.('authenticating')
     if (candidate.id === DEFAULT_CLAUDE_ACCOUNT && candidate.configDir === undefined) {
       assertClaudeDefaultSettingsEnvironment(claudeAccounts.sharedConfigDir())
     }
     const settings = claudeSubscriptionSettings(claudeAccounts.candidateEnv(candidate, {}))
+    const baseline = candidate.id !== DEFAULT_CLAUDE_ACCOUNT && candidate.state !== 'ready'
+      ? await captureClaudeSyncWarmup({ configDir: candidate.configDir!, sharedConfigDir: claudeAccounts.sharedConfigDir(), settings }) : undefined
     const release = claudeAccounts.acquireCandidateUse(candidate)
+    const startedAt = Date.now()
     let proc: ClaudeAgentProcess
     try { proc = new ClaudeAgentProcess({ workDir: homedir(), effort: 'default', controlOnly: true,
       tokenSourceId: 'claude-sub', settingSources: ['user'], settings,
@@ -65,18 +85,34 @@ export async function enrollClaudeAccount(name: string): Promise<string> {
     proc.on('error', error => logError('claude account enrollment failed', error))
     let timer: ReturnType<typeof setTimeout> | undefined
     let failure: unknown
+    let warmingUp = false
     try {
       const info = await Promise.race([proc.readAccountInfo(), new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error('Claude 原生账号认证查询超时（30s）')), 30_000)
       })]) as AccountInfo
+      clearTimeout(timer)
       validateClaudeSubscriptionAccount(info)
+      if (candidate.id !== DEFAULT_CLAUDE_ACCOUNT && candidate.state !== 'ready') {
+        syncing(info)
+        warmingUp = true
+        logDiagnostic('claude_sync_warmup_started')
+        await onProgress?.('syncing')
+        await waitForClaudeSyncWarmup({ configDir: candidate.configDir!, sharedConfigDir: claudeAccounts.sharedConfigDir(),
+          startedAt, isAlive: () => proc.isAlive(), accountInfo: info, settings, baseline })
+        logDiagnostic('claude_sync_warmup_completed', { durationMs: Date.now() - startedAt })
+      }
       return info
-    } catch (error) { failure = error; throw error }
+    } catch (error) {
+      failure = error
+      if (warmingUp) logError('claude_sync_warmup_failed', error)
+      throw error
+    }
     finally {
       clearTimeout(timer)
       try { await proc.kill() }
       catch (error) {
-        if (failure) throw new AggregateError([failure, error], 'Claude 账号认证失败且查询进程关闭失败')
+        if (failure) throw new AggregateError([failure, error],
+          `${failure instanceof Error ? failure.message : String(failure)}；Claude 账号查询进程关闭失败：${error instanceof Error ? error.message : String(error)}`)
         throw error
       } finally { if (!proc.isAlive()) release() }
     }

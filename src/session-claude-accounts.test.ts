@@ -67,7 +67,7 @@ beforeEach(async () => {
   store = new ClaudeAccounts({ home, stateFile: join(root, 'accounts.json'), env: {} })
   accountA = (await store.enroll('A', async () => accountInfo('a@example.test'))).id
   accountB = (await store.enroll('B', async () => accountInfo('b@example.test'))).id
-  for (const key of ['list', 'get', 'find', 'candidate', 'revision', 'sharedConfigDir', 'prepareShared', 'env', 'acquireUse'] as const) {
+  for (const key of ['list', 'get', 'find', 'candidate', 'revision', 'assertReady', 'sharedConfigDir', 'prepareShared', 'env', 'acquireUse'] as const) {
     spies.push(spyOn(claudeAccounts, key).mockImplementation((...args: any[]) => (store[key] as any)(...args)))
   }
   previous = listTokenSources(); resetTokenSourceRegistry()
@@ -109,8 +109,58 @@ describe('Claude named hi integration', () => {
     })
     spies.push(enroll, start)
     expect(await s.startWithClaudeAccount('B')).toBe(true)
-    expect(enroll).toHaveBeenCalledWith('B')
+    expect(enroll).toHaveBeenCalledWith('B', expect.any(Function))
     expect(observed).toEqual([accountB])
+    expect(s.claudeStartAccountOverride).toBeUndefined()
+  })
+  test('named hi keeps its progress card open and the old account alive until initial sync completes', async () => {
+    const s = session(), proc = running(s, accountA)
+    let complete!: () => void
+    const waiting = new Promise<void>(resolve => { complete = resolve })
+    const card = { title: 'Claude 订阅账号', cardId: 'sync-status-card' }
+    const updates: string[] = []
+    const enroll = spyOn(selection, 'enrollClaudeAccount').mockImplementation(async (_name, onProgress) => {
+      await onProgress?.('authenticating')
+      await onProgress?.('syncing')
+      await waiting
+      return accountB
+    })
+    const close = spyOn(s, 'closeStatusCard').mockResolvedValue(undefined)
+    const restart = spyOn(s, 'restartUnlocked').mockResolvedValue(true)
+    spies.push(enroll, close, restart,
+      spyOn(s, 'openStatusCard').mockResolvedValue(card),
+      spyOn(s, 'setStatusCard').mockImplementation((_card: unknown, value: string) => { updates.push(value) }),
+      spyOn(s, 'showConsole').mockResolvedValue(undefined))
+    const pending = commands.runClaudeNamedHi(s, 'B')
+    try {
+      for (let i = 0; i < 20 && !updates.some(value => value.includes('正在完成首次同步')); i++) {
+        await new Promise(resolve => setTimeout(resolve, 1))
+      }
+      expect(updates.some(value => value.includes('已登录，正在完成首次同步'))).toBe(true)
+      expect(close).not.toHaveBeenCalled()
+      expect(restart).not.toHaveBeenCalled()
+      expect(proc.killCalls).toBe(0)
+      expect(s.claudeStartAccountOverride).toBeUndefined()
+    } finally { complete(); await pending }
+    expect(restart).toHaveBeenCalledTimes(1)
+    expect(close).toHaveBeenCalledWith(card, '✅ Claude 订阅「B」已就绪 · 本次指定')
+  })
+  test('failed initial sync presents the retry instruction without switching the running account', async () => {
+    const s = session(), proc = running(s, accountA)
+    const card = { title: 'Claude 订阅账号', cardId: 'failed-sync-status-card' }
+    const close = spyOn(s, 'closeStatusCard').mockResolvedValue(undefined)
+    const restart = spyOn(s, 'restartUnlocked').mockResolvedValue(true)
+    spies.push(close, restart,
+      spyOn(s, 'openStatusCard').mockResolvedValue(card),
+      spyOn(s, 'setStatusCard').mockImplementation(() => {}),
+      spyOn(selection, 'enrollClaudeAccount').mockImplementation(async (_name, onProgress) => {
+        await onProgress?.('syncing')
+        throw new Error('首次同步未完成，请稍后重试 hi B')
+      }))
+    await commands.runClaudeNamedHi(s, 'B')
+    expect(close).toHaveBeenCalledWith(card, '❌ 首次同步未完成，请稍后重试 hi B')
+    expect(restart).not.toHaveBeenCalled()
+    expect(proc.killCalls).toBe(0)
     expect(s.claudeStartAccountOverride).toBeUndefined()
   })
   test('invalid discovery does not start or switch anything', async () => {
@@ -131,7 +181,7 @@ describe('Claude named hi integration', () => {
     const start = spyOn(s, 'startUnlocked').mockResolvedValue(true)
     spies.push(enroll, start)
     expect(await s.startWithClaudeAccount('B')).toBe(true)
-    expect(enroll).toHaveBeenCalledWith('B')
+    expect(enroll).toHaveBeenCalledWith('B', expect.any(Function))
     expect(start).toHaveBeenCalledTimes(1)
   })
   test('an existing same-account process is reused even while working', async () => {

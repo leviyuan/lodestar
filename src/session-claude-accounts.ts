@@ -16,7 +16,7 @@ export async function runClaudeNamedHi(session: Session, name: string): Promise<
   try {
     const ok = await session.startWithClaudeAccount(name, {
       announce: false,
-      onStatus: value => { status = value },
+      onStatus: value => { status = value; session.setStatusCard(card, value) },
     })
     if (!ok) throw new Error(status || '指定账号启动失败')
     status = `✅ Claude 订阅「${name}」已就绪 · 本次指定`

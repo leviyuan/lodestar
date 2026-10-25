@@ -195,7 +195,7 @@ describe('Claude native environment and explicit account enrollment', () => {
     mkdirSync(globalSkill, { recursive: true }); writeFileSync(join(globalSkill, 'SKILL.md'), 'global')
     symlinkSync(join(root, 'missing-source'), join(accounts.sharedConfigDir(), 'commands'), process.platform === 'win32' ? 'junction' : 'dir')
     await expect(accounts.enroll('备用一', async () => nativeInfo())).rejects.toThrow('全局配置共享失败')
-    expect(existsSync(accounts.stateFile)).toBe(false)
+    expect(accounts.find('备用一').state).toBe('authenticating')
     oldPresent(path); protect()
   })
   test.each(['.', '..', '../escape', '/absolute', 'a/b', 'a\\b', 'bad\nname', 'bad\0name', ' leading', 'trailing ', 'trailing.', 'CON', 'a:b'])('rejects unsafe explicit remark %j', async name => {
@@ -209,7 +209,7 @@ describe('Claude native environment and explicit account enrollment', () => {
   ] satisfies AccountInfo[])('unverified subscription identity never clears legacy history %#', async info => {
     const { accounts, profile, oldPresent, protect } = fixture(); const path = profile()
     await expect(accounts.enroll('备用一', async () => info)).rejects.toThrow('Claude')
-    oldPresent(path); protect(); expect(existsSync(accounts.stateFile)).toBe(false)
+    oldPresent(path); protect(); expect(accounts.find('备用一').state).toBe('authenticating')
   })
   test('authentication failure releases enrollment ownership and can be retried', async () => {
     const { accounts, profile, oldPresent } = fixture(); const path = profile()
@@ -512,6 +512,75 @@ test('synthetic enrollment worker', async () => {
     expect(maximum).toBe(1); expect(new Set(rows.map(row => row.id)).size).toBe(1)
     expect(accounts.get(rows[0]!.id).generation).toBe(1)
   })
+  test('first sync persists its gate across restart and leaves the default account usable', async () => {
+    const { accounts, options, profile, oldPresent, protect } = fixture(); const path = profile()
+    const releaseDefault = accounts.acquireUse('default')
+    let continueSync!: () => void, entered!: () => void
+    const pending = new Promise<void>(resolve => { continueSync = resolve })
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const enrollment = accounts.enroll('备用一', async (candidate, syncing) => {
+      expect(accounts.get(candidate.id).state).toBe('authenticating')
+      // These must already be shared when native startup begins writing.
+      expect(realpathSync(join(path, 'skills'))).toBe(realpathSync(join(accounts.sharedConfigDir(), 'skills')))
+      expect(realpathSync(join(path, 'plugins'))).toBe(realpathSync(join(accounts.sharedConfigDir(), 'plugins')))
+      const release = accounts.acquireCandidateUse(candidate)
+      syncing(nativeInfo()); entered()
+      try { await pending; oldPresent(path); return nativeInfo() } finally { release() }
+    })
+    try {
+      await started
+      const restarted = new ClaudeAccounts(options), row = restarted.find('备用一')
+      expect(row.state).toBe('syncing'); expect(row.identity).toBeTruthy()
+      expect(restarted.list().map(item => item.id)).toEqual(['default'])
+      expect(() => restarted.assertReady(row.id)).toThrow('正在完成首次同步')
+      expect(() => restarted.env(row.id, {})).toThrow('正在完成首次同步')
+      expect(() => restarted.acquireUse(row.id)).toThrow('尚未完成')
+      expect(() => restarted.prepareShared(row.id)).toThrow('尚未完成')
+      expect(() => restarted.observeIdentity(row.id, nativeInfo())).toThrow('尚未完成')
+      restarted.acquireUse('default')()
+      oldPresent(path); protect()
+    } finally { continueSync(); releaseDefault() }
+    expect((await enrollment).state).toBe('ready')
+  })
+  test('sync failure is durable, throttles explicit retries and resumes after cooldown', async () => {
+    const { accounts, options, profile, oldPresent } = fixture(); const path = profile()
+    let calls = 0
+    const fail = async (_candidate: unknown, syncing: (info: AccountInfo) => void) => {
+      calls++; syncing(nativeInfo()); throw new Error('首次同步超时：skills manifest 未完成')
+    }
+    await expect(accounts.enroll('备用一', fail)).rejects.toThrow('首次同步超时')
+    const failed = accounts.find('备用一')
+    expect(failed.state).toBe('sync_failed'); expect(failed.syncFailure?.attempts).toBe(1)
+    expect(failed.syncFailure?.message).toContain('manifest')
+    const restarted = new ClaudeAccounts(options)
+    expect(restarted.list()).toHaveLength(1)
+    await expect(restarted.enroll('备用一', fail)).rejects.toThrow('秒后重试 hi')
+    expect(calls).toBe(1); oldPresent(path)
+    const now = spyOn(Date, 'now').mockReturnValue(failed.syncFailure!.retryAt + 1)
+    try {
+      await expect(restarted.enroll('备用一', fail)).rejects.toThrow('首次同步超时')
+      const second = restarted.find('备用一')
+      expect(second.syncFailure?.attempts).toBe(2)
+      expect(second.syncFailure!.retryAt - Date.now()).toBe(120_000)
+      now.mockReturnValue(second.syncFailure!.retryAt + 1)
+      const ready = await restarted.enroll('备用一', async (_candidate, syncing) => { syncing(nativeInfo()); return nativeInfo() })
+      expect(ready.state).toBe('ready'); expect(ready.syncFailure).toBeUndefined()
+      expect(ready.generation).toBe(1)
+    } finally { now.mockRestore() }
+  })
+  test('interrupted syncing records retry without deleting already shared histories', async () => {
+    const { accounts, options, profile } = fixture(); const path = profile()
+    const ready = await accounts.enroll('备用一', async () => nativeInfo())
+    const state = JSON.parse(readFileSync(accounts.stateFile, 'utf8'))
+    state.accounts[0].state = 'syncing'
+    writeFileSync(accounts.stateFile, JSON.stringify(state))
+    writeFileSync(join(path, 'projects', 'retained.md'), 'keep shared history')
+    const resumed = await new ClaudeAccounts(options).enroll('备用一', async (_candidate, syncing) => {
+      syncing(nativeInfo()); return nativeInfo()
+    })
+    expect(resumed).toEqual(ready)
+    expect(readFileSync(join(path, 'projects', 'retained.md'), 'utf8')).toBe('keep shared history')
+  })
   test('use leases block reinitialization until every exact lease is released', async () => {
     const { accounts, profile } = fixture(); profile()
     const row = await accounts.enroll('备用一', async () => nativeInfo())
@@ -567,7 +636,7 @@ test('synthetic enrollment worker', async () => {
         release = accounts.acquireCandidateUse(candidate)
         return nativeInfo()
       })).rejects.toThrow('退出尚未确认')
-      oldPresent(path); expect(existsSync(accounts.stateFile)).toBe(false)
+      oldPresent(path); expect(accounts.find('备用一').state).toBe('authenticating')
     } finally { release?.() }
   })
   test('default identity and another remark cannot duplicate a real account', async () => {

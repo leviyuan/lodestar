@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 
 test('Claude model, quota and enrollment controls retain account leases until confirmed native exit', () => {
   const script = `
-    import { mock } from 'bun:test'
+    import { mock, spyOn } from 'bun:test'
     import assert from 'node:assert/strict'
     import { EventEmitter } from 'node:events'
     import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs'
@@ -39,6 +39,10 @@ test('Claude model, quota and enrollment controls retain account leases until co
       }
     }
     mock.module('./src/claude-agent-process', () => ({ ClaudeAgentProcess: FakeProcess }))
+    mock.module('./src/claude-sync-warmup', () => ({
+      captureClaudeSyncWarmup: async () => undefined,
+      waitForClaudeSyncWarmup: async options => { assert.equal(options.isAlive(), true) },
+    }))
     const { fetchNativeClaudeModels } = await import('./src/token-source-models')
     const { fetchClaudeSubscriptionUsage } = await import('./src/claude-usage')
     let leases = 0
@@ -60,6 +64,7 @@ test('Claude model, quota and enrollment controls retain account leases until co
     registry.resetTokenSourceRegistry(); registry.registerTokenSource(root)
     const named = join(manager.root, 'named'), sentinel = join(named, 'projects', 'old-history')
     mkdirSync(join(named, 'projects'), { recursive: true }); writeFileSync(sentinel, 'must survive unsuccessful enrollment')
+    let clock
     try {
       await assert.rejects(enrollClaudeAccount('named'), /exit unconfirmed/)
       assert.equal(manager.list().length, 1); assert.equal(existsSync(sentinel), true)
@@ -67,6 +72,9 @@ test('Claude model, quota and enrollment controls retain account leases until co
       await assert.rejects(enrollClaudeAccount('named'), /正在使用|收录/)
       assert.equal(processes.length, count)
       processes.at(-1).finish()
+      assert.equal(manager.find('named').state, 'sync_failed')
+      await assert.rejects(enrollClaudeAccount('named'), /秒后重试/)
+      clock = spyOn(Date, 'now').mockReturnValue(manager.find('named').syncFailure.retryAt + 1)
       failClose = false
       const id = await enrollClaudeAccount('named')
       assert.equal(manager.get(id).state, 'ready')
@@ -77,7 +85,7 @@ test('Claude model, quota and enrollment controls retain account leases until co
       const release = manager.acquireUse(id), before = processes.length
       try { assert.equal(await enrollClaudeAccount('named'), id) } finally { release() }
       assert.equal(processes.length, before)
-    } finally { for (const process of processes) if (process.isAlive()) process.finish(); disposeCachedTokenSource(root); rmSync(dir, { recursive: true, force: true }) }
+    } finally { clock?.mockRestore(); for (const process of processes) if (process.isAlive()) process.finish(); disposeCachedTokenSource(root); rmSync(dir, { recursive: true, force: true }) }
   `
   const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
     cwd: process.cwd(), stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: 20_000,

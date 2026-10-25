@@ -18,14 +18,16 @@ export interface ClaudeAccount {
   name: string
   /** Keep the native spelling: unset and explicit ~/.claude have different Keychain namespaces. */
   configDir?: string
-  state: 'candidate' | 'enrolling' | 'ready'
+  state: 'candidate' | 'authenticating' | 'syncing' | 'sync_failed' | 'enrolling' | 'ready'
   generation: number
   /** SHA-256 of native email + organization; no credentials or raw email are stored. */
   identity?: string
+  /** Private recovery diagnostics; never emitted to ordinary logs. */
+  syncFailure?: { message: string; attempts: number; retryAt: number }
 }
 interface StoredAccount extends ClaudeAccount {
   configDir: string
-  state: 'enrolling' | 'ready'
+  state: Exclude<ClaudeAccount['state'], 'candidate'>
   directoryKey: string
   linked: SharedDir[]
 }
@@ -71,8 +73,12 @@ function nativeConfigDirectory(value: string | undefined): string | undefined {
 }
 function clone(account: ClaudeAccount): ClaudeAccount {
   return { id: account.id, name: account.name, ...(account.configDir !== undefined ? { configDir: account.configDir } : {}),
-    state: account.state, generation: account.generation, ...(account.identity ? { identity: account.identity } : {}) }
+    state: account.state, generation: account.generation, ...(account.identity ? { identity: account.identity } : {}),
+    ...(account.syncFailure ? { syncFailure: { ...account.syncFailure } } : {}) }
 }
+/** The callback owns authentication, first sync and confirmed native exit. Call
+ * syncing immediately after authentication, while that same process is alive. */
+type AuthenticateClaudeAccount = (candidate: ClaudeAccount, syncing: (info: AccountInfo) => void) => Promise<AccountInfo>
 function nameKey(name: string): string { return name.normalize('NFC').toLowerCase() }
 function defaultName(name: string): boolean { return !name.trim() || ['default', '默认'].includes(nameKey(name.trim())) }
 function accountName(name: string): string {
@@ -142,7 +148,10 @@ export class ClaudeAccounts {
       accountName(row.name)
       if (row.id !== accountId(row.name) || ids.has(row.id) || names.has(nameKey(row.name))
         || row.configDir !== join(this.root, row.name) || typeof row.directoryKey !== 'string' || !isAbsolute(row.directoryKey)
-        || !['enrolling', 'ready'].includes(row.state) || !generation(row.generation) || !validIdentity(row.identity)
+        || !['authenticating', 'syncing', 'sync_failed', 'enrolling', 'ready'].includes(row.state) || !generation(row.generation) || !validIdentity(row.identity)
+        || row.syncFailure !== undefined && (!row.syncFailure || typeof row.syncFailure.message !== 'string'
+          || !Number.isSafeInteger(row.syncFailure.attempts) || row.syncFailure.attempts < 1
+          || !Number.isSafeInteger(row.syncFailure.retryAt) || row.syncFailure.retryAt < 0)
         || !Array.isArray(row.linked) || row.linked.some(key => !CLAUDE_SHARED_DIRS.includes(key))
         || new Set(row.linked).size !== row.linked.length
         || row.identity && identities.has(row.identity)) throw new Error('Claude 账号记录重复或无效')
@@ -160,7 +169,7 @@ export class ClaudeAccounts {
       ...(sameNamespace && old?.identity ? { identity: old.identity } : {}) }
   }
   private revisionOf(account: ClaudeAccount): string {
-    return JSON.stringify([account.id, account.configDir ?? null, account.generation, account.identity ?? null])
+    return JSON.stringify([account.id, account.configDir ?? null, account.generation, account.identity ?? null, account.state])
   }
   list(): ClaudeAccount[] {
     const state = this.read()
@@ -191,6 +200,13 @@ export class ClaudeAccounts {
     return candidate
   }
   revision(id: string): string { return this.revisionOf(this.get(id)) }
+  assertReady(id: string): ClaudeAccount {
+    const account = this.get(id)
+    if (account.state === 'syncing') throw new Error(`Claude 账号 ${account.name} 已登录，正在完成首次同步；请稍后重试`)
+    if (account.state === 'sync_failed') throw new Error(`Claude 账号 ${account.name} 首次同步未完成：${account.syncFailure?.message ?? 'MISS'}；请稍后重试 hi ${account.name}`)
+    if (account.state !== 'ready') throw new Error(`Claude 账号 ${account.name} 尚未完成收录，请显式发送 hi ${account.name} 重试`)
+    return account
+  }
 
   /** Prepare shared non-login config even for the first native terminal login.
    * Directory creation does not authenticate or enroll the account. */
@@ -223,8 +239,7 @@ export class ClaudeAccounts {
   env(id: string, base: Env): Env {
     // Native launches must not create or read a default credential directory here.
     if (id === DEFAULT_CLAUDE_ACCOUNT) return this.candidateEnv({ id, name: '默认', state: 'ready', generation: 0 }, base)
-    const account = this.get(id)
-    if (account.state !== 'ready') throw new Error(`Claude 账号 ${account.name} 尚在收录，不能启动任务或查询`)
+    const account = this.assertReady(id)
     this.validateShared(id)
     return this.candidateEnv(account, base)
   }
@@ -356,7 +371,7 @@ export class ClaudeAccounts {
     return state.accounts.find(row => row.id !== id && row.identity === identity)?.name
   }
 
-  enroll(name: string, authenticate: (candidate: ClaudeAccount) => Promise<AccountInfo>): Promise<ClaudeAccount> {
+  enroll(name: string, authenticate: AuthenticateClaudeAccount): Promise<ClaudeAccount> {
     const queueKey = canonical(this.stateFile)
     const before = enrollmentQueues.get(queueKey) ?? Promise.resolve()
     const task = before.catch(() => {}).then(() => this.enrollExclusive(name, authenticate))
@@ -365,16 +380,27 @@ export class ClaudeAccounts {
       () => { if (enrollmentQueues.get(queueKey) === task) enrollmentQueues.delete(queueKey) })
     return task
   }
-  private async authenticateCandidate(candidate: ClaudeAccount, authenticate: (candidate: ClaudeAccount) => Promise<AccountInfo>): Promise<AccountInfo> {
+  private async authenticateCandidate(candidate: ClaudeAccount, authenticate: AuthenticateClaudeAccount): Promise<AccountInfo> {
     const owner = { directory: canonical(candidate.id === DEFAULT_CLAUDE_ACCOUNT ? this.sharedConfigDir() : candidate.configDir!), leases: new Set<symbol>() }
     this.authenticationCandidates.set(candidate, owner)
     try {
-      const info = await authenticate(candidate)
+      const info = await authenticate(candidate, info => {
+        const identity = nativeIdentity(info)
+        if (candidate.id === DEFAULT_CLAUDE_ACCOUNT) return
+        const state = this.read(), row = state.accounts.find(row => row.id === candidate.id)
+        if (!row || row.state === 'ready') throw new Error('Claude 首次同步状态与当前收录不匹配')
+        this.inspect(candidate, state, row)
+        const duplicate = this.duplicate(state, candidate.id, identity)
+        if (duplicate) throw authError(`Claude 账号与已收录账号「${duplicate}」是同一订阅身份，未清理该目录的历史`)
+        if (row.identity !== identity) { row.identity = identity; row.generation++ }
+        row.state = 'syncing'
+        writeJsonStateAtomic(this.stateFile, state)
+      })
       if (owner.leases.size) throw new Error('Claude 原生认证连接退出尚未确认，保留账号占用且不清理历史')
       return info
     } finally { this.authenticationCandidates.delete(candidate) }
   }
-  private async enrollExclusive(name: string, authenticate: (candidate: ClaudeAccount) => Promise<AccountInfo>): Promise<ClaudeAccount> {
+  private async enrollExclusive(name: string, authenticate: AuthenticateClaudeAccount): Promise<ClaudeAccount> {
     const candidate = this.candidate(name)
     if (candidate.id === DEFAULT_CLAUDE_ACCOUNT) {
       const key = canonical(this.sharedConfigDir())
@@ -390,9 +416,26 @@ export class ClaudeAccounts {
     }
     const key = canonical(candidate.configDir!)
     if (directoryUses.get(key)?.size || initializingDirectories.has(key)) throw new Error(`Claude 账号 ${candidate.name} 正在使用或收录，结束任务和查询后再试`)
+    if (candidate.syncFailure && candidate.syncFailure.retryAt > Date.now()) {
+      throw new Error(`Claude 账号 ${candidate.name} 首次同步未完成；请在 ${Math.ceil((candidate.syncFailure.retryAt - Date.now()) / 1000)} 秒后重试 hi ${candidate.name}。${candidate.syncFailure.message}`)
+    }
     initializingDirectories.add(key)
     try {
-      // Authentication owns its raw control connection; it must close before returning.
+      if (candidate.state !== 'ready') {
+        const state = this.read(), old = state.accounts.find(row => row.id === candidate.id)
+        const { directory, shared } = this.inspect(candidate, state, old)
+        const row: StoredAccount = old ?? { ...candidate, configDir: candidate.configDir!, state: 'authenticating', directoryKey: directory, linked: [] }
+        row.state = 'authenticating'
+        if (!old) state.accounts.push(row)
+        state.sharedConfigDir = shared
+        writeJsonStateAtomic(this.stateFile, state)
+        // Share before spawning: replacing a skills/plugins directory while the
+        // native startup sync is writing it can itself interrupt the first round.
+        // Login state and all legacy session histories are still untouched.
+        this.shareConfig(candidate)
+      }
+      // Authentication retains one raw control connection through first sync;
+      // its confirmed exit still precedes any legacy history migration.
       const info = await this.authenticateCandidate(clone(candidate), authenticate)
       if (directoryUses.get(key)?.size) throw new Error('Claude 原生认证连接退出尚未确认，保留账号占用且不清理历史')
       const identity = nativeIdentity(info)
@@ -410,6 +453,7 @@ export class ClaudeAccounts {
       this.shareConfig(candidate)
       const row: StoredAccount = old ?? { ...candidate, configDir: candidate.configDir!, state: 'enrolling', directoryKey: directory, linked: [] }
       if (row.identity !== identity) { row.identity = identity; row.generation++ }
+      row.state = 'enrolling'
       if (!old) state.accounts.push(row)
       state.sharedConfigDir = shared
       // Persist intent before any destructive operation. A new daemon retries this phase without stale locks.
@@ -427,8 +471,19 @@ export class ClaudeAccounts {
         writeJsonStateAtomic(this.stateFile, state)
       }
       row.state = 'ready'
+      delete row.syncFailure
       writeJsonStateAtomic(this.stateFile, state)
       return clone(row)
+    } catch (error) {
+      const state = this.read(), row = state.accounts.find(row => row.id === candidate.id)
+      if (row?.state === 'syncing') {
+        const attempts = (row.syncFailure?.attempts ?? 0) + 1
+        row.state = 'sync_failed'
+        row.syncFailure = { message: error instanceof Error ? error.message : String(error), attempts,
+          retryAt: Date.now() + Math.min(300_000, 60_000 * 2 ** Math.min(attempts - 1, 3)) }
+        writeJsonStateAtomic(this.stateFile, state)
+      }
+      throw error
     } finally { initializingDirectories.delete(key) }
   }
 }

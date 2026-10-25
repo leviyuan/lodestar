@@ -1048,7 +1048,9 @@ export class Session {
         throw new Error('Claude 订阅已禁用；请先发送 claude-sub on')
       }
       opts.onStatus?.(`🔎 检查 Claude 订阅账号「${name}」`)
-      const accountId = await enrollClaudeAccount(name)
+      const accountId = await enrollClaudeAccount(name, phase => opts.onStatus?.(phase === 'syncing'
+        ? `⏳ Claude 订阅「${name}」已登录，正在完成首次同步`
+        : `🔎 验证 Claude 订阅账号「${name}」`))
       const source = getTokenSourceForAccount('claude-sub', accountId)
       if (!source) throw new Error('Claude 账号目录未就绪')
       if (this.selectedProvider !== 'claude' || this.selectedTokenSourceId !== 'claude-sub') {
