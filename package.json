@@ -1,6 +1,6 @@
 {
   "name": "@leviyuan/lodestar",
-  "version": "0.21.16",
+  "version": "0.21.17",
   "publishConfig": {
     "access": "public"
   },
@@ -61,6 +61,7 @@
     "docs/",
     "scripts/postinstall.cjs",
     "src/data-dir.cjs",
+    "src/codex-plugin-cache.cjs",
     "src/managed-skill-cleanup.cjs",
     "README.md",
     "LICENSE"
@@ -75,8 +76,9 @@
     "@resvg/resvg-js": "^2.6.2",
     "@xmldom/xmldom": "0.9.12",
     "axios": "1.20.0",
+    "body-parser": "2.4.0",
     "cross-spawn": "^7.0.6",
-    "fast-uri": "3.1.8",
+    "fast-uri": "3.1.9",
     "fflate": "0.8.3",
     "follow-redirects": "1.16.1",
     "hono": "4.13.12",
@@ -87,9 +89,9 @@
     "node-fetch": "^3.3.2",
     "protobufjs": "7.6.5",
     "proxy-addr": "2.0.8",
-    "qs": "6.16.0",
+    "qs": "6.16.1",
     "ws": "8.21.3",
-    "zod": "^4.4.3"
+    "zod": "4.6.6"
   },
   "bundleDependencies": [
     "mathjax-full"
@@ -99,15 +101,17 @@
     "@modelcontextprotocol/sdk": "1.32.1",
     "@xmldom/xmldom": "0.9.12",
     "axios": "1.20.0",
-    "fast-uri": "3.1.8",
+    "fast-uri": "3.1.9",
     "fflate": "0.8.3",
     "hono": "4.13.12",
     "ip-address": "10.7.4",
     "protobufjs": "7.6.5",
     "proxy-addr": "2.0.8",
-    "qs": "6.16.0",
+    "qs": "6.16.1",
     "ws": "8.21.3",
-    "follow-redirects": "1.16.1"
+    "follow-redirects": "1.16.1",
+    "body-parser": "2.4.0",
+    "zod": "4.6.6"
   },
   "devDependencies": {
     "@anthropic-ai/claude-agent-sdk": "latest",
@@ -356,12 +360,13 @@
     "koffi"
   ],
   "optionalDependencies": {
-    "undici": "^6.28.1"
+    "undici": "^6.29.1"
   },
   "agentRuntimeOverrides": {
     "dsh": {
       "@modelcontextprotocol/client": "2.3.1",
-      "@modelcontextprotocol/core": "2.3.1"
+      "@modelcontextprotocol/core": "2.3.1",
+      "undici": "8.12.2"
     }
   }
 }

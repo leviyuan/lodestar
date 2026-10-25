@@ -4,6 +4,7 @@ import { homedir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { CODEX_ACCOUNTS_DIR, CODEX_ACCOUNTS_FILE } from './paths'
 import { writeJsonStateAtomic } from './state-store'
+import { prepareCodexPluginDirectory } from './codex-plugin-cache.cjs'
 
 export const DEFAULT_CODEX_ACCOUNT = 'default'
 type Env = Record<string, string | undefined>
@@ -22,7 +23,7 @@ interface AccountState {
 }
 
 const SHARED_DIRS = [
-  'sessions', 'archived_sessions', 'skills', 'rules', 'prompts', 'plugins',
+  'sessions', 'archived_sessions', 'skills', 'rules', 'prompts',
   'memories', 'generated_images', 'thread-writer-locks',
 ]
 const SHARED_FILES = ['config.toml', 'AGENTS.md', 'AGENTS.override.md', 'hooks.json',
@@ -166,7 +167,7 @@ export class CodexAccounts {
     return JSON.stringify([this.home(id), account.revision ?? null])
   }
 
-  /** Directory symlinks keep native thread history and locks together. Never link auth or model caches. */
+  /** Share native thread history and locks, but keep auth, model and plugin caches account-local. */
   prepareHome(id: string): string {
     const home = this.home(id)
     if (id === DEFAULT_CODEX_ACCOUNT) return home
@@ -179,6 +180,7 @@ export class CodexAccounts {
     let auth
     try { auth = lstatSync(join(home, 'auth.json')) } catch (error: any) { if (error.code !== 'ENOENT') throw error }
     if (auth?.isSymbolicLink() || (auth && !auth.isFile())) throw new Error('额外账号的 auth.json 必须为独立文件')
+    prepareCodexPluginDirectory(home, this.defaultHome)
     // Ensure a single shared config even on a machine that has never created config.toml.
     try { writeFileSync(join(this.defaultHome, 'config.toml'), '', { flag: 'wx', mode: 0o600 }) }
     catch (error: any) { if (error.code !== 'EEXIST') throw error }

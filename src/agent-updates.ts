@@ -221,7 +221,9 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
     // Runtime-only fixes must not install a Node 20+ dependency into the
     // Node 18-compatible daemon. DSH already owns a separate Node 22+ tree.
     const security = { ...manifest.overrides, ...manifest.agentRuntimeOverrides?.[agent] }
-    const fingerprint = createHash('sha256').update(JSON.stringify({ installFormat: agent === 'dsh' ? 3 : 2, versions: Object.entries(versions).sort(), security,
+    // Format 4 installs through a canonical npm root so security overrides also
+    // apply when the state directory is reached through a filesystem alias.
+    const fingerprint = createHash('sha256').update(JSON.stringify({ installFormat: 4, versions: Object.entries(versions).sort(), security,
       platform: process.platform, arch: process.arch })).digest('hex').slice(0, 20)
     const destination = join(directory, fingerprint)
     if (!existsSync(destination)) {

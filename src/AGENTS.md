@@ -2,6 +2,8 @@
 
 `Session` 管理生命周期，`AgentProcess` 定义共享后端事件，具体进程类转换协议，`cardkit.ts` 串行写卡。
 
+- Codex 的 `plugins` 整个目录按账号独立，不加入共享路径；账号安装清单不同，原生同步会清理缓存。`codex-plugin-cache.cjs` 由 npm postinstall 和账号启动准备共用，将旧的默认插件链接迁为独立副本，保留源缓存、登录态、账号安装状态及其他共享历史。新账号创建空插件目录，已有独立目录不重复填充。安装迁移不启动 Agent/daemon，不读凭据；路径异常和迁移失败须明确报错，不能悄悄继续共享。
+
 - Claude 订阅仅使用 `claude-sub` 来源，统一管理登录验证、模型目录、启动配置和额度；默认选择、MD、hi 和 footer 使用同一来源，不另设本机配置入口或来源别名。
 - 备注 Claude 账号除登录状态外统一使用默认配置目录（通常 `~/.claude`）的内容。`claude-account-config.ts` 枚举全局与备注目录并建立共享链接，覆盖备注账号旧的非登录文件和目录；Skill、插件及其同步内容、指令、规则、命令、子 Agent、hooks、工作流、记忆、设置和普通缓存都共用全局。凭据、认证锁、账号/组织策略缓存及含身份的备份保持独立；`.claude.json` / 旧 `.config.json` 由 `claude-account-config-state.ts` 仅同步原生当前使用的 MCP 配置，目标其余字段（含登录、偏好、缓存、项目信任及未知字段）全部保留，不能整份链接或按非登录字段全量覆盖。新收录、旧 ready 账号启动、终端入口首次登录和打开已有目录均处理；默认目录及默认认证命名空间不能改写，原 v1 历史 linked 协议继续兼容。
 - 原生 JSON 中的 MCP 只在备注账号实际启动（含终端入口）前同步检查一次；后台额度、模型目录查询、已有账号 hi 检查、账号收录及环境/租约解析不触发。比较顶层 `mcpServers` 与 `projects[*]` 的 `mcpServers`、`enabledMcpServers`、`disabledMcpServers`；相同则零写入（保留原字节、inode、mtime），不同才只替换这些字段；不重新导入已由原生迁往 settings.local.json 的旧 MCP 审批字段。流程同步执行，不创建、等待、清理或检查原生文件锁；只更新原生实际使用的 .config.json 或 .claude.json，不改未使用的副本。写入前复核源和目标的字节/inode，发现变化最多重新读取合并三次，持续变化明确报错并清理临时文件；原子替换避免半截 JSON，但不宣称可排除独立 Claude 进程的全部并发写入。
@@ -32,6 +34,7 @@
 - Claude SDK 子进程显式设置 `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`，保留新模型与第三方模型的任务清单事件；不改变项目 `tools` 限制或原生 Task/TodoWrite 选择。Claude Code 2.1.268 起这些模型默认不暴露任务跟踪工具。
 - daemon 启动不得检查、安装或更新 Agent；`[runtime.agent_auto_update]` 的 `codex`、`claude`、`dsh` 三项默认 false，显式开启的 Agent 各自每 6 小时检查，独立防重叠和取消。旧布尔配置按原值迁移为三项并提示更新配置，禁止与新表混用。手动或定期更新选择 upstream latest，接受新版暂时不兼容并后续适配，不设兼容白名单。`agent-updates.ts` 管理独立版本目录与失败状态；更新失败不写 current.json，保留上次成功选中的安装；失败只记录更新日志并返回更新调用方，已开启自动更新的 Agent 下个 6 小时周期再试。启动及 `lodestar-version` 只看实际安装状态，忽略旧记录的 error，不重复提示历史更新错误。没有选择记录或安装不完整仍拒绝启动，不扫描目录猜测旧版本。实际 CLI/SDK 必须从选中目录加载，使用中的目录不覆盖、不移动、不删除。`agent-install.ts` 在 Windows 取消安装时终止精确 npm PID 的进程树并等待退出；未确认退出保留临时目录，文件占用只有限重试并报告最终失败。
 - 普通安全依赖由 package.json 的 overrides 同步进发布依赖和全部 Agent 安装；仅 Agent 使用且 Node 要求更高的依赖使用 agentRuntimeOverrides 按 Agent 应用于独立目录，纳入安装指纹，不引入 daemon 的依赖树。
+- Agent 的 npm 安装须将暂存目录解析为真实路径，并同时用于 `--prefix` 与 `cwd`，避免 macOS `/var` 与 `/private/var` 等目录别名使 npm 将根包误识别为外部依赖而忽略安全覆盖。修复安装布局时升级安装格式指纹，不复用旧的异常安装树。
 - Agent 更新锁内的 PID 必须原子写入，避免并发更新读取到空文件；写入失败清理本次取得的锁，清理失败同时报告。
 - DSH 安装仅把宿主使用的入口包列为顶层依赖，其余同版本包族通过动态解析的 overrides 保持一致；内部插件保留上游依赖层级，不能全部提升到顶层而破坏 Cordis 等 peer 的版本放置。上游 companion 依赖遵循所选 latest 的声明，不另锁旧版本或忽略 peer 冲突。
 - DSH 通过 `dsh-runtime.ts` 启动当前安装的 Node runtime，`dsh-bridge.ts` 与该运行时从同一依赖树加载，只校验 Lodestar 自有通信协议，不硬编码上游版本。它直接调用原生 Agent/持久化/提问服务。恢复点与结果分别经过 flush；只以真实结束原因结算。取消原因须保持不可变，避免 Node fetch 附加 stack 后被原生日志拒绝。

@@ -6,7 +6,7 @@
 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { lodestarDataDir, managedClaudePluginDir } from './data-dir.cjs'
+import { lodestarDataDir, managedClaudePluginDir, codexAccountsDir } from './data-dir.cjs'
 
 const HOME = homedir()
 const IS_WIN = process.platform === 'win32'
@@ -68,7 +68,7 @@ export const MANAGED_CLAUDE_PLUGIN_DIR = managedClaudePluginDir()
 /** Private Harness profiles, skills and native session persistence. */
 export const DSH_HOME_DIR = join(DATA_DIR, 'dsh')
 /** Named Codex credentials and per-group selections; the default account stays in native CODEX_HOME. */
-export const CODEX_ACCOUNTS_DIR = join(DATA_DIR, 'codex-accounts')
+export const CODEX_ACCOUNTS_DIR = codexAccountsDir()
 export const CODEX_ACCOUNTS_FILE = join(DATA_DIR, 'codex-accounts.json')
 export const CODEX_QUOTA_BLOCKS_FILE = join(DATA_DIR, 'codex-quota-blocks.json')
 /** Named Claude subscriptions keep native credentials here; only explicit names are discovered. */

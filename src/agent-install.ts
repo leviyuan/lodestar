@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process'
+import { realpathSync } from 'node:fs'
 import { spawn } from 'cross-spawn'
 
 const REGISTRY = 'https://registry.npmjs.org'
@@ -26,6 +27,10 @@ export async function installAgentPackages(directory: string, signal?: AbortSign
   terminationTimeoutMs?: number
 } = {}): Promise<void> {
   signal?.throwIfAborted()
+  // npm 10 can treat an aliased --prefix (for example /var vs /private/var)
+  // as a linked project and silently drop root overrides. Use one physical
+  // directory for both the project root and cwd before dependency resolution.
+  directory = realpathSync(directory)
   const platform = options.platform ?? process.platform
   const timeoutMs = options.timeoutMs ?? 300_000
   const terminationTimeoutMs = options.terminationTimeoutMs ?? 10_000

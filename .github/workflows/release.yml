@@ -74,8 +74,10 @@ jobs:
         run: bun run ci
       - name: 打包并验收实际安装结果
         run: |
+          # desc: 打包并验证安装审计与插件缓存自动升级修复
           mkdir -p "$RUNNER_TEMP/lodestar-release/pack" "$RUNNER_TEMP/lodestar-release/install"
           npm pack --pack-destination "$RUNNER_TEMP/lodestar-release/pack" --json > "$RUNNER_TEMP/lodestar-release/pack.json"
+          bun scripts/test-codex-plugin-upgrade.ts --tarball "$RUNNER_TEMP"/lodestar-release/pack/*.tgz
           npm install --prefix "$RUNNER_TEMP/lodestar-release/install" --ignore-scripts --no-fund --no-audit "$RUNNER_TEMP"/lodestar-release/pack/*.tgz
           npm audit --prefix "$RUNNER_TEMP/lodestar-release/install" --omit=dev
           bun scripts/check-installed-package.ts "$RUNNER_TEMP/lodestar-release/install"

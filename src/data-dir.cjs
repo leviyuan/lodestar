@@ -15,4 +15,8 @@ function managedClaudePluginDir () {
   return join(lodestarDataDir(), 'managed-claude-plugin')
 }
 
-module.exports = { lodestarDataDir, managedClaudePluginDir }
+function codexAccountsDir () {
+  return join(lodestarDataDir(), 'codex-accounts')
+}
+
+module.exports = { lodestarDataDir, managedClaudePluginDir, codexAccountsDir }

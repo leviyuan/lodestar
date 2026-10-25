@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 清理废弃的受管 Skill 并提示下一步，不在这里拉起向导或 daemon。
+// 迁移账号插件缓存、清理废弃的受管 Skill 并提示下一步，不启动 Agent 或 daemon。
 //
 // 为什么不自动拉向导: npm 7+ pipe 了 postinstall 的 stdio, 自动拉向导只能
 // 靠接管 /dev/tty 把终端塞给子进程 —— 这套机制脆弱 (作者原注 "Tricky")。
@@ -9,7 +9,7 @@
 //
 // 稳的做法是 trigger-on-first-run: 用户在真终端首跑 lodestar-daemon 时,
 // cli.ts 发现没 config + isTTY 就自动进入向导 (真 TTY, readline 一定正常)。
-// 清理仅操作本地 Skill 文件，不读配置或凭据，也不启动子进程。
+// 迁移与清理仅操作本地插件和 Skill 文件，不读凭据，也不启动子进程。
 
 const fs = require('fs')
 
@@ -29,6 +29,8 @@ function termWrite (msg) {
 }
 
 async function main () {
+  const { migrateCodexPluginCaches } = require('../src/codex-plugin-cache.cjs')
+  migrateCodexPluginCaches()
   const { removeManagedSkill } = require('../src/managed-skill-cleanup.cjs')
   removeManagedSkill('lodestar-files')
 
