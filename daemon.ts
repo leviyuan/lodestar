@@ -20,6 +20,7 @@
 import { finishStartupLogging } from './src/daemon-startup-logging'
 import * as lark from '@larksuiteoapi/node-sdk'
 import { startBackgroundRefresh, stopBackgroundRefresh } from './src/background-refresh'
+import { startCodexLiveUsageRefresh, stopCodexLiveUsageRefresh } from './src/codex-live-usage'
 import { codexActivation } from './src/codex-activation'
 import { refreshTokenSourceUsage } from './src/token-source-cache'
 import { pendingSourceCommands } from './src/session-commands'
@@ -128,6 +129,7 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
   if (shutdownPromise) return shutdownPromise
   shutdownRequested = true
   stopBackgroundRefresh()
+  stopCodexLiveUsageRefresh()
   const activationStopped = codexActivation.stop().then(
     value => ({ status: 'fulfilled' as const, value }), reason => ({ status: 'rejected' as const, reason }),
   )
@@ -625,6 +627,7 @@ function modelActionResponse(result: ModelActionResult): any {
     result.pending ? undefined : result.message,
   )
   if (result.completion) response.__modelActionCompletion = result.completion
+  if (result.canPresent) response.__modelActionCanPresent = result.canPresent
   return response
 }
 
@@ -639,6 +642,7 @@ async function sendActionReceipt(chatId: string, text: string): Promise<void> {
 
 async function publishCardActionResult(data: any, result: any): Promise<void> {
   if (result?.__cardActionPresented) return
+  if (result?.__modelActionCanPresent && !result.__modelActionCanPresent()) return
   const kind = String(data?.action?.value?.kind ?? 'unknown')
   const label = cardActionLabel(kind)
   const chatId = String(
@@ -740,7 +744,9 @@ const cardActionAdmission = createCardActionAdmission<any, object>({
       // Start presentation only after the pending card has landed. The actor
       // is released while the backend works, so stop/questions stay usable.
       return modelActionCompletion(modelCompletion,
-        final => publishCardActionResult(data, modelActionResponse(final)))
+        final => final.canPresent
+          ? chatActor.enqueue(String(data?.context?.open_chat_id ?? ''), () => publishCardActionResult(data, modelActionResponse(final)))
+          : publishCardActionResult(data, modelActionResponse(final)))
     }
     const completion = result?.__cardActionCompletion
     return completion && typeof completion.then === 'function' ? completion : null
@@ -852,7 +858,7 @@ async function handleCardAction(data: any): Promise<any> {
       }
     }
     case 'provider_select': {
-      const result = await session.onProviderSelect(String(value.source_id ?? ''), String(value.panel_id ?? ''))
+      const result = await session.onProviderSelect(String(value.source_id ?? ''), String(value.panel_id ?? ''), true)
       return modelActionResponse(result)
     }
     case 'model_page': {
@@ -864,7 +870,7 @@ async function handleCardAction(data: any): Promise<any> {
       const source = String(value.source_id ?? '')
       if (value.mode !== 'add' && value.mode !== 'select') throw new Error('模型管理模式无效')
       return modelActionResponse(await (value.mode === 'add'
-        ? session.onModelAddOpen(panel, source) : session.onProviderSelect(source, panel)))
+        ? session.onModelAddOpen(panel, source, true) : session.onProviderSelect(source, panel, true)))
     }
     case 'model_add':
     case 'model_remove':
@@ -1297,6 +1303,7 @@ async function boot(): Promise<void> {
   await refreshAllTokenSourceModels()
   await Promise.allSettled(listTokenSourceAccounts().map(refreshTokenSourceUsage))
   if (shutdownRequested) return
+  startCodexLiveUsageRefresh()
   startBackgroundRefresh()
   codexActivation.start()
   feishu.loadTempSessionLeases()

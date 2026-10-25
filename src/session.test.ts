@@ -2853,6 +2853,144 @@ describe('Session provider switching', () => {
     }
   })
 
+  test('manual model lists refresh immediately while pagination and internal redraws reuse the committed catalog', async () => {
+    const { cachedTokenSource, disposeCachedTokenSource } = await import('./token-source-cache')
+    const previous = listTokenSources()
+    resetTokenSourceRegistry()
+    let release!: () => void
+    const barrier = new Promise<void>(resolve => { release = resolve })
+    let refreshes = 0
+    const create = () => {
+      const raw: import('./token-source').TokenSource = {
+        id: 'manual-catalog', kind: 'codex-subscription', agent: 'codex', display: 'Codex', enabled: true,
+        models: [], defaultModel: '', accountRevision: () => 'stable', modelCatalogState: { status: 'idle', updatedAt: null },
+        async refreshModels() {
+          refreshes++; await barrier
+          const available = Array.from({ length: 26 }, (_, i) => ({ model: `manual-${i}`, display: `Manual ${i}`, efforts: ['high' as const], defaultEffort: 'high' as const }))
+          raw.models = available.slice(0, 25)
+          raw.modelSelection = { mode: 'catalog', modelIds: raw.models.map(m => m.model), availableModels: available }
+          raw.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
+        },
+        spawnEnv: env => env, resolveSpawnModel: model => model,
+        readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+      }
+      return raw
+    }
+    const source = cachedTokenSource(create, {}, 'manual-account', 'manual-config')
+    registerTokenSource(source)
+    const session = new Session('manual-catalog', 'chat_id')
+    try {
+      await session.showModelPanel()
+      const panelId = [...session.modelPanels.keys()][0]!
+      const pending = await session.onProviderSelect(source.id, panelId, true)
+      expect(pending.pending).toBe(true)
+      expect(pending.canPresent?.()).toBe(true)
+      const repeated = await session.onProviderSelect(source.id, panelId, true)
+      expect(repeated.completion).toBe(pending.completion)
+      expect((await session.onModelPage(panelId, source.id, 0)).ok).toBe(false)
+      // Stop stays usable while the shared lookup is still pending. A new
+      // explicit request must not reuse the cancelled presentation receipt.
+      await session.stop('test', { announce: false })
+      const afterStop = await session.onProviderSelect(source.id, panelId, true)
+      expect(afterStop.completion).not.toBe(pending.completion)
+      release()
+      expect((await pending.completion!).canPresent?.()).toBe(false)
+      const ready = await afterStop.completion!
+      expect(ready.ok).toBe(true)
+      expect(ready.canPresent?.()).toBe(true)
+      expect(refreshes).toBe(1)
+      expect(JSON.stringify(ready.card)).toContain('manual-0')
+      expect((await session.onModelPage(panelId, source.id, 1)).ok).toBe(true)
+      expect((await session.onProviderSelect(source.id, panelId)).ok).toBe(true)
+      expect(refreshes).toBe(1)
+      const add = await session.onModelAddOpen(panelId, source.id, true)
+      expect(add.pending).toBe(true)
+      const hidden = await add.completion!
+      expect(hidden.ok).toBe(true)
+      expect(JSON.stringify(hidden.card)).toContain('manual-25')
+      expect(refreshes).toBe(2)
+      expect((await session.onModelAddOpen(panelId, source.id)).ok).toBe(true)
+      expect(refreshes).toBe(2)
+    } finally {
+      release(); session.dispose(); disposeCachedTokenSource(source); resetTokenSourceRegistry()
+      for (const source of previous) registerTokenSource(source)
+    }
+  })
+
+  test('manual model refresh failures remain visible and can be retried without waiting for the automatic cadence', async () => {
+    const previous = listTokenSources()
+    let fails = true, refreshes = 0
+    const source: import('./token-source').TokenSource = {
+      id: 'manual-failure', kind: 'test', agent: 'claude', display: 'Test', enabled: true,
+      models: [], defaultModel: '', modelCatalogState: { status: 'failed', updatedAt: 1, error: 'previous failure' },
+      async refreshModels() {
+        refreshes++
+        if (fails) throw new Error('HTTP 503 directory unavailable')
+        source.models = [{ model: 'recovered', display: 'Recovered', efforts: ['high'], defaultEffort: 'high' }]
+        source.modelCatalogState = { status: 'ready', updatedAt: 2 }
+      },
+      spawnEnv: env => env, resolveSpawnModel: model => model,
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    }
+    registerTokenSource(source)
+    const session = new Session('manual-failure', 'chat_id')
+    try {
+      session.modelPanels.set('panel', { models: [], messageId: 'om_manual' })
+      const first = await session.onProviderSelect(source.id, 'panel', true)
+      const failed = await first.completion!
+      expect(failed.ok).toBe(false)
+      expect(failed.message).toContain('HTTP 503 directory unavailable')
+      expect(failed.canPresent?.()).toBe(true)
+      fails = false
+      const second = await session.onProviderSelect(source.id, 'panel', true)
+      expect((await second.completion!).ok).toBe(true)
+      expect(refreshes).toBe(2)
+    } finally {
+      session.dispose(); resetTokenSourceRegistry()
+      for (const entry of previous) registerTokenSource(entry)
+    }
+  })
+
+  test.each(['stop', 'dispose', 'shutdown', 'panel', 'source', 'account'] as const)('manual directory receipts cannot overwrite a later %s transition', async transition => {
+    const { modelActionCompletion } = await import('./session-util')
+    const previous = listTokenSources()
+    const source: import('./token-source').TokenSource = {
+      id: 'manual-late', kind: 'codex-subscription', agent: 'codex', display: 'Codex', enabled: true,
+      models: [{ model: 'late', display: 'Late', efforts: ['high'], defaultEffort: 'high' }], defaultModel: 'late',
+      modelCatalogState: { status: 'ready', updatedAt: 1 }, refreshModels: async () => {},
+      spawnEnv: env => env, resolveSpawnModel: model => model,
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    }
+    registerTokenSource(source)
+    const session = new Session('manual-late', 'chat_id')
+    const account = spyOn(session, 'tokenSourceAccountId').mockReturnValue('original')
+    try {
+      session.modelPanels.set('panel', { models: [], messageId: 'om_manual' })
+      const pending = await session.onProviderSelect(source.id, 'panel', true)
+      // The backend can finish while presentation of the pending card is still awaiting I/O.
+      const final = await pending.completion!
+      expect(final.ok).toBe(true)
+      expect(final.canPresent?.()).toBe(true)
+      if (transition === 'stop') await session.stop('test', { announce: false })
+      else if (transition === 'dispose') session.dispose()
+      else if (transition === 'shutdown') session.closeModelSettingsChanges()
+      else if (transition === 'panel') session.modelPanels.set('panel', { models: [] })
+      else if (transition === 'source') registerTokenSource({ ...source, spawnRevision: 'changed' })
+      else account.mockReturnValue('changed')
+      expect(final.canPresent?.()).toBe(false)
+      let presented = false
+      await modelActionCompletion(Promise.resolve(final), async () => { presented = true })
+      expect(presented).toBe(false)
+      if (transition === 'stop') {
+        const retry = await session.onProviderSelect(source.id, 'panel', true)
+        expect((await retry.completion!).canPresent?.()).toBe(true)
+      }
+    } finally {
+      account.mockRestore(); session.dispose(); resetTokenSourceRegistry()
+      for (const entry of previous) registerTokenSource(entry)
+    }
+  })
+
   test('large model catalogs page through a snapshot and reject stale or cross-page choices', async () => {
     const previous = listTokenSources()
     const source = {
@@ -5304,7 +5442,7 @@ describe('Session usage cache cross-backend isolation', () => {
     expect(peekUsage()).toBe(seeded)
   })
 
-  test('codex 的 rate_limits_updated 只观察不写缓存(权威在 read 端点)', () => {
+  test('codex 的 rate_limits_updated 不直接写缓存(权威在 read 端点)', () => {
     const session = new Session('probe', 'chat_id') as any
     const codexProc = new FakeAgentProc('codex')
     session.wireProc(codexProc)
@@ -5313,12 +5451,53 @@ describe('Session usage cache cross-backend isolation', () => {
       primary: { usedPercent: 7, resetsAt: 1_700_000_000, windowDurationMins: 300 },
     })
 
-    // rolling 通知不再驱动 cache —— 2026-08-20 源码核实 codex 解析器在
-    // 上游缺 metered_limit_name 时把 limitId 强补 "codex",通知归属不可信;
-    // turn 收尾由 closeTurnCard 在现有连接 read 端点整体刷新。
+    // Rolling payloads are not authoritative; the live reader uses them only
+    // as a signal to reread the complete account snapshot on its connection.
     const snap = peekUsage() as any
     expect(snap?.fiveHour?.percent).not.toBe(7)
   })
+
+  for (const relogin of [false, true]) {
+    test(`Codex final footer waits for live quota and preserves its captured login generation (relogin=${relogin})`, async () => {
+      const liveUsage = await import('./codex-live-usage')
+      const { bindProcessCodexAccount } = await import('./codex-accounts')
+      const { captureCodexUsageCache } = await import('./usage')
+      invalidateCodexUsage('default')
+      const raw = (percent: number) => ({ rateLimits: { primary: {
+        usedPercent: percent, windowDurationMins: 300, resetsAt: Math.floor(Date.now() / 1000) + 3600,
+      } } })
+      await refreshUsageFromConnection(async () => raw(10))
+      const captured = captureCodexUsageCache('default')
+      const session = new Session('live-footer', 'chat_id') as any
+      const proc = new FakeAgentProc('codex', 'live-footer', 'codex-sub')
+      bindProcessCodexAccount(proc, 'default')
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      const wait = spyOn(liveUsage, 'waitForLiveCodexUsage').mockImplementation(async account => {
+        expect(account).toBe('default')
+        await gate
+        await refreshUsageFromConnection(async () => raw(27), account, { force: true })
+      })
+      try {
+        let settled = false
+        const pending = session.footerUsageSuffix('codex', proc, null, undefined, captured, 'model')
+          .then((value: string) => { settled = true; return value })
+        await Promise.resolve()
+        expect(settled).toBe(false)
+        expect(wait).toHaveBeenCalledTimes(1)
+        if (relogin) invalidateCodexUsage('default')
+        release()
+        const suffix = await pending
+        expect(suffix).toContain(relogin ? '额度 MISS' : '27%')
+        expect(suffix).not.toContain('10%')
+        await proc.kill()
+        await session.footerUsageSuffix('codex', proc, null, undefined, captured, 'model')
+        expect(wait).toHaveBeenCalledTimes(1)
+      } finally {
+        release(); wait.mockRestore(); await proc.kill(); session.dispose(); invalidateCodexUsage('default')
+      }
+    })
+  }
 
   test('额度后缀保留原紧凑倒计时与百分比格式，缺失值显示 MISS', () => {
     const session = new Session('probe', 'chat_id') as any

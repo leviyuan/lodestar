@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { UsageReadCache, usageCredentialKey, usageRetryAfter, isUsageRateLimitError } from './usage-cache'
+import { UsageReadCache, UsageReadSupersededError, usageCredentialKey, usageRetryAfter, isUsageRateLimitError } from './usage-cache'
 
 describe('shared quota freshness and cooldown', () => {
   test('coalesces concurrent callers, reuses a successful minute and refreshes at its boundary', async () => {
@@ -15,6 +15,64 @@ describe('shared quota freshness and cooldown', () => {
     now = 60_000
     expect((await cache.read('account', read)).value).toBe(2)
     expect((await cache.read('other-account', read)).value).toBe(3)
+  })
+
+  test('forced reads bypass successful freshness while sharing an already pending request', async () => {
+    const cache = new UsageReadCache<{ state: string; value: number }>(() => 0)
+    await cache.read('account', async () => ({ state: 'ok', value: 1 }))
+    let release!: (value: { state: string; value: number }) => void
+    let calls = 0
+    const pending = cache.read('account', () => { calls++; return new Promise(resolve => { release = resolve }) }, { force: true })
+    expect(cache.read('account', async () => { throw new Error('duplicate query') }, { force: true })).toBe(pending)
+    await Promise.resolve()
+    expect(calls).toBe(1)
+    release({ state: 'ok', value: 2 })
+    expect((await pending).value).toBe(2)
+    expect(cache.peekSuccessful('account')?.value).toBe(2)
+  })
+
+  test('force respects both returned failure cooldown and thrown Retry-After', async () => {
+    let now = 0, calls = 0
+    const cache = new UsageReadCache<{ state: string; value?: number }>(() => now)
+    const success = async () => ({ state: 'ok', value: ++calls })
+    await cache.read('account', success)
+    await cache.read('account', async () => { calls++; return { state: 'network' } }, { force: true })
+    expect((await cache.read('account', success, { force: true })).state).toBe('network')
+    expect(calls).toBe(2)
+    now = 60_000
+    const error = Object.assign(new Error('HTTP 429'), { retryAfterMs: 600_000 })
+    await expect(cache.read('account', async () => { calls++; throw error }, { force: true })).rejects.toBe(error)
+    now = 659_999
+    await expect(cache.read('account', success, { force: true })).rejects.toBe(error)
+    expect(calls).toBe(3)
+    now++
+    expect((await cache.read('account', success, { force: true })).value).toBe(4)
+  })
+
+  test.each(['success', 'authentication error'])('superseded %s cannot replace data or install a failure cooldown', async outcome => {
+    const cache = new UsageReadCache<{ state: string; value: number }>(() => 0)
+    const original = await cache.read('account', async () => ({ state: 'ok', value: 1 }))
+    let current = true
+    let release!: () => void
+    const pending = cache.read('account', () => new Promise((resolve, reject) => {
+      release = () => outcome === 'success' ? resolve({ state: 'ok', value: 2 }) : reject(new Error('HTTP 401 unauthorized'))
+    }), { force: true, isCurrent: () => current })
+    await Promise.resolve()
+    current = false; release()
+    await expect(pending).rejects.toBeInstanceOf(UsageReadSupersededError)
+    expect(cache.peekSuccessful('account')).toBe(original)
+    expect((await cache.read('account', async () => ({ state: 'ok', value: 3 }), { force: true })).value).toBe(3)
+  })
+
+  test('a connection superseded before its queued loader starts performs no request', async () => {
+    const cache = new UsageReadCache<{ state: string }>(() => 0)
+    let current = true, calls = 0
+    const pending = cache.read('account', async () => { calls++; return { state: 'ok' } }, { isCurrent: () => current })
+    current = false
+    await expect(pending).rejects.toBeInstanceOf(UsageReadSupersededError)
+    expect(calls).toBe(0)
+    expect((await cache.read('account', async () => { calls++; return { state: 'ok' } })).state).toBe('ok')
+    expect(calls).toBe(1)
   })
 
   test('failures replace expired data and back off for 1, 2, 4, then 5 minutes', async () => {

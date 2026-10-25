@@ -9,6 +9,10 @@ import { isUsageAuthError } from './usage-cache'
 
 export const MODEL_REFRESH_MS = 5 * 60_000
 const USAGE_REFRESH_MS = 60_000
+// Each subscription probe starts Codex's native model-catalog refresh too.
+// Keep both periodic reads and failed refreshes within the same cadence.
+const CODEX_MODEL_REFRESH_MS = 2 * 60 * 60_000
+const CODEX_USAGE_REFRESH_MS = 2 * 60 * 60_000
 const metadata = new WeakMap<TokenSource, CachedSource>()
 const modelLoads = new Map<string, { configuration: string; promise: Promise<{ source: TokenSource; error?: unknown }> }>()
 
@@ -174,6 +178,9 @@ export function cachedTokenSource(
   if (old?.active() && old.configuration === configuration && old.identity === identity) return previous!
   if (old?.identity === identity) restoreCatalog(committed, previous!, cfg)
   const source: TokenSource = { ...committed }
+  const codexSubscription = committed.kind === 'codex-subscription'
+  const modelRefreshMs = codexSubscription ? CODEX_MODEL_REFRESH_MS : MODEL_REFRESH_MS
+  const usageRefreshMs = codexSubscription ? CODEX_USAGE_REFRESH_MS : USAGE_REFRESH_MS
   let active = true
   let usageSnapshot = old?.identity === identity ? old.snapshot() : undefined
   const children: CachedSource['children'] = new Map()
@@ -184,7 +191,7 @@ export function cachedTokenSource(
     const { refreshModels: _refresh, readUsage: _usage, forAccount: _accounts, ...snapshot } = next
     Object.assign(source, snapshot)
   }
-  const model = new BackgroundRefresh('model catalog', MODEL_REFRESH_MS, async () => {
+  const model = new BackgroundRefresh('model catalog', modelRefreshMs, async () => {
     let work = modelLoads.get(identity)
     if (!work) {
       let next: TokenSource
@@ -229,8 +236,8 @@ export function cachedTokenSource(
       throw failure ?? new Error(error)
     }
     publish(next)
-  }, old?.identity === identity ? old.model?.nextRefreshAt : 0)
-  const usage = new BackgroundRefresh('usage', USAGE_REFRESH_MS, async () => {
+  }, old?.identity === identity ? old.model?.nextRefreshAt : 0, codexSubscription ? modelRefreshMs : 0)
+  const usage = new BackgroundRefresh('usage', usageRefreshMs, async () => {
     let snapshot: UsageSnapshotUnified
     try { snapshot = await committed.readUsage() }
     catch (error) {
@@ -246,7 +253,7 @@ export function cachedTokenSource(
     if (snapshot.state !== 'ok' && snapshot.state !== 'not_applicable' && snapshot.state !== 'no_credentials') {
       throw Object.assign(new Error(snapshot.reason ?? snapshot.state), { retryAfterMs: snapshot.retryAfterMs })
     }
-  }, old?.identity === identity ? old.usage?.nextRefreshAt : 0)
+  }, old?.identity === identity ? old.usage?.nextRefreshAt : 0, codexSubscription ? usageRefreshMs : 0)
   source.refreshModels = () => model.refresh()
   const snapshot = (): UsageSnapshotUnified | undefined => !currentIdentity()
     ? { state: 'no_credentials', windows: [], reason: '账号认证身份已变化，后台刷新中' }

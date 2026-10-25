@@ -4,7 +4,9 @@ import * as stateStore from './state-store'
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync, existsSync, lstatSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { CodexAccounts, reserveCodexLogin, isCodexLoginPending } from './codex-accounts'
+import { EventEmitter } from 'node:events'
+import { CodexAccounts, reserveCodexLogin, isCodexLoginPending, bindProcessCodexAccount,
+  boundCodexAccount, processCodexAccount, liveCodexQuotaReaders, watchCodexQuotaReaders } from './codex-accounts'
 
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
@@ -15,6 +17,51 @@ function fixture() {
   writeFileSync(join(home, 'auth.json'), '{"native":"must-not-change"}')
   return new CodexAccounts(home, join(root, 'accounts'), join(root, 'accounts.json'))
 }
+
+test('live quota discovery includes native owners, excludes controls/wrappers and fences rebinding', () => {
+  class Reader extends EventEmitter {
+    alive = true
+    isAlive() { return this.alive }
+    readRateLimits() { return Promise.resolve({}) }
+  }
+  const native = new Reader(), wrapper = new Reader(), unboundApi = new Reader()
+  const control = Object.assign(new EventEmitter(), { isAlive: () => true })
+  let changes = 0
+  const unwatch = watchCodexQuotaReaders(() => { changes++ })
+  try {
+    expect(boundCodexAccount(unboundApi)).toBeNull()
+    expect(processCodexAccount(unboundApi)).toBe('default')
+    bindProcessCodexAccount(control, 'registry-a')
+    bindProcessCodexAccount(wrapper, 'registry-a', false)
+    expect(changes).toBe(0)
+    expect(boundCodexAccount(wrapper)).toBe('registry-a')
+    expect(liveCodexQuotaReaders('registry-a')).toHaveLength(0)
+    bindProcessCodexAccount(native, 'registry-a')
+    const first = liveCodexQuotaReaders('registry-a')[0]!
+    expect(first.reader).toBe(native)
+    expect(first.isCurrent()).toBe(true)
+    expect(changes).toBe(1)
+    bindProcessCodexAccount(native, 'registry-a')
+    expect(first.isCurrent()).toBe(true)
+    expect(changes).toBe(1)
+    bindProcessCodexAccount(native, 'registry-b')
+    expect(first.isCurrent()).toBe(false)
+    expect(boundCodexAccount(native)).toBe('registry-b')
+    expect(liveCodexQuotaReaders('registry-a')).toHaveLength(0)
+    const second = liveCodexQuotaReaders('registry-b')[0]!
+    expect(second.isCurrent()).toBe(true)
+    native.alive = false; native.emit('exit')
+    expect(second.isCurrent()).toBe(false)
+    expect(liveCodexQuotaReaders('registry-b')).toHaveLength(0)
+    expect(changes).toBe(3)
+    unwatch()
+    bindProcessCodexAccount(wrapper, 'registry-b', true)
+    expect(changes).toBe(3)
+  } finally {
+    unwatch()
+    for (const proc of [native, wrapper, control]) proc.emit('exit')
+  }
+})
 
 describe('Codex native and named accounts', () => {
   test('new accounts have private plugin caches and never copy another account installation state', () => {

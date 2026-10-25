@@ -98,13 +98,35 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
   }
   private async choose(preferred?: string | null, failedAccountId?: string): Promise<CodexAccountDecision & { selected: CodexAccountCandidate }> {
     const options: CodexSelectionOptions = { model: this.opts.model || this.lastModel || '', effort: this.opts.effort ?? this.lastEffort ?? undefined,
-      preferred, failedAccountId, preferCachedUsage: true, signal: this.lifetime.signal }
+      preferred, failedAccountId, preferCachedUsage: true, refreshUsage: true, signal: this.lifetime.signal }
+    const observedResets = new Map<string, number>()
+    const checkedResets = new Set<string>()
     while (true) {
+      const now = Date.now()
+      const due = [...observedResets].filter(([, reset]) => reset <= now)
+      if (due.length) {
+        options.refreshUsage = due.map(([id]) => id)
+        for (const [id, reset] of due) {
+          checkedResets.add(JSON.stringify([id, reset]))
+          observedResets.delete(id)
+        }
+      }
       const decision = await this.scheduler().choose(options)
       delete options.failedAccountId
+      delete options.refreshUsage
       this.lifetime.signal.throwIfAborted()
       if (decision.selected) return { ...decision, selected: decision.selected }
       options.preferCachedUsage = false
+      for (const candidate of decision.candidates) {
+        // Only the per-account rank carries a real observed reset. The decision
+        // may synthesize a one-minute wakeup; it never authorizes a cold read.
+        const reset = candidate.retryAt
+        if (!candidate.duplicateOf && (candidate.state === 'exhausted' || candidate.state === 'waiting')
+          && reset !== undefined && Number.isFinite(reset)
+          && !checkedResets.has(JSON.stringify([candidate.account.id, reset]))) {
+          observedResets.set(candidate.account.id, reset)
+        }
+      }
       const detail = decision.candidates.map(c => `${c.account.name}：${c.reason ?? c.state}`).join('；')
       if (decision.retryAt === undefined) {
         const missing = decision.candidates.some(c => c.state === 'miss' && !c.duplicateOf)

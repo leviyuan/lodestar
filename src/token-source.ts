@@ -131,7 +131,8 @@ export interface TokenSource {
   /** Committed catalog state. A ready snapshot may include a background refresh error. */
   modelCatalogState?: TokenSourceModelCatalogState
   defaultModel: string
-  /** Startup/background worker only. Interactive consumers must not call or await this. */
+  /** Refresh for startup, scheduled work, or an explicit model-list request.
+   * Other interactive consumers read the committed cache. */
   refreshModels(): Promise<void>
   /** 面板手动补录模型名时的存在性校验(端点 200/1214 判别)。
    *  未声明时允许手动补录并选择 Agent 请求档位，实际请求错误由后端报告。 */

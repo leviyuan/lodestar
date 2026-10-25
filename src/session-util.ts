@@ -27,6 +27,8 @@ export type ModelActionResult = {
   card?: object
   pending?: boolean
   completion?: Promise<ModelActionResult>
+  /** Directory refresh receipts recheck ownership when actually presented. */
+  canPresent?: () => boolean
 }
 
 /** Attach after presenting the pending result so a fast late reply cannot
@@ -35,7 +37,7 @@ export function modelActionCompletion(
   completion: Promise<ModelActionResult> | undefined, present: (final: ModelActionResult) => Promise<void>,
 ): Promise<'complete' | 'retry'> | null {
   return completion?.then(async final => {
-    await present(final)
+    if (!final.canPresent || final.canPresent()) await present(final)
     return final.ok ? 'complete' : 'retry'
   }) ?? null
 }

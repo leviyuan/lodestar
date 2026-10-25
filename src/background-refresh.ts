@@ -12,7 +12,8 @@ export class BackgroundRefresh {
   private retired = false
 
   constructor(readonly label: string, private readonly interval: number,
-    private readonly load: () => Promise<void>, dueAt = 0) {
+    private readonly load: () => Promise<void>, dueAt = 0,
+    private readonly minimumRetryMs = 0) {
     this.dueAt = dueAt
     resources.add(this)
     this.schedule()
@@ -32,6 +33,7 @@ export class BackgroundRefresh {
       this.failures++
       const retryAfter = Number((error as { retryAfterMs?: number })?.retryAfterMs)
       this.dueAt = Date.now() + Math.max(
+        this.minimumRetryMs,
         Math.min(300_000, 60_000 * 2 ** Math.min(this.failures - 1, 3)),
         Number.isFinite(retryAfter) ? retryAfter : 0,
       )

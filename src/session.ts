@@ -59,7 +59,8 @@ import { agentApiUrl } from './agent-runtime'
 import { createAgentCards } from './agent-cards-runtime'
 import type { AgentCards } from './agent-cards'
 import { getTokenSource, getTokenSourceForAccount, listEnabledTokenSourcesByAgent, tokenSourceProcessRevision, tokenSourceRuntimeModel, type TokenSource } from './token-source'
-import { codexAccounts, DEFAULT_CODEX_ACCOUNT, processCodexAccount } from './codex-accounts'
+import { boundCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT, processCodexAccount } from './codex-accounts'
+import { waitForLiveCodexUsage } from './codex-live-usage'
 import { claudeAccounts, DEFAULT_CLAUDE_ACCOUNT, processClaudeAccount } from './claude-accounts'
 import { enrollClaudeAccount } from './claude-account-selection'
 import { countActiveClaudeSessions } from './session-activity'
@@ -78,7 +79,7 @@ import { formatFeishuError } from './feishu-errors'
 import { logError, logDiagnostic } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { readSysInfo } from './sysinfo'
-import { observeRateLimitsNotification, captureCodexUsageCache, type UsageSnapshot } from './usage'
+import { captureCodexUsageCache, type UsageSnapshot } from './usage'
 import { codexCreditsSummary } from './cards/usage'
 import type { GlmUsageSnapshot } from './glm-usage'
 import { readAllAccountUsage } from './account-usage'
@@ -482,6 +483,7 @@ export class Session {
   modelPanels = new Map<string, sessionModel.ModelPanelState>()
   modelSettingsChange: sessionModel.ModelSettingsChange | null = null
   modelSettingsChangesClosed = false
+  modelPanelRefreshEpoch = 0
   /** 补录应答态:点「➕ 补录模型」后置位,下一条群消息(裸词命令除外)作为
    *  模型名消费(校验/补录)。一次性,消费或取消即清。cardMessageId 是补录
    *  提示卡的消息 id —— 消费后原位更新它(通过→effort 卡;失败→红字),
@@ -1912,6 +1914,7 @@ export class Session {
   }
 
   async stop(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
+    this.modelPanelRefreshEpoch++
     this.cancelFileDeliveries(reason)
     await this.runLifecycle('stop', () => this.stopUnlocked(reason, opts))
   }
@@ -2047,6 +2050,7 @@ export class Session {
   }
 
   async restart(resume = false, opts: LifecycleProgressOpts = {}): Promise<boolean> {
+    this.modelPanelRefreshEpoch++
     return await this.runLifecycle('restart', () => this.restartUnlocked(resume, opts))
   }
 
@@ -2617,7 +2621,7 @@ export class Session {
 
   /** daemon 解散临时群(bye)时调:从 Session.all registry 移除,避免长期运行的 daemon
    *  因临时群不断建/散而累积孤立 Session 实例(sessions Map 已 delete,但 static all 不会)。 */
-  dispose(): void { Session.all.delete(this) }
+  dispose(): void { this.modelPanelRefreshEpoch++; Session.all.delete(this) }
 
   /** Clean result 时记 backend-native checkpoint + 用户输入预览 + 文件变更记录。 */
   private recordTurnAnchor(checkpoint: ConversationCheckpoint | null | undefined): string | null {
@@ -2767,6 +2771,7 @@ export class Session {
   }
 
   closeModelSettingsChanges(): void {
+    this.modelPanelRefreshEpoch++
     this.modelSettingsChangesClosed = true
     this.modelSettingsChange?.cancel('daemon 正在停止')
   }
@@ -2798,14 +2803,14 @@ export class Session {
       sessionModel.onModelEffortSelect(this, modelRaw, effortRaw, panelIdRaw, userOpenId, providerRaw)
     )
   }
-  onProviderSelect(sourceIdRaw: string, panelIdRaw = ''): Promise<ModelActionResult> {
-    return sessionModel.onProviderSelect(this, sourceIdRaw, panelIdRaw)
+  onProviderSelect(sourceIdRaw: string, panelIdRaw = '', refresh = false): Promise<ModelActionResult> {
+    return sessionModel.onProviderSelect(this, sourceIdRaw, panelIdRaw, refresh)
   }
   onModelPage(panelId: string, sourceId: string, page: number): Promise<ModelActionResult> {
     return sessionModel.onModelPage(this, panelId, sourceId, page)
   }
-  onModelAddOpen(panelId: string, sourceId: string): Promise<ModelActionResult> {
-    return sessionModel.onModelAddOpen(this, panelId, sourceId)
+  onModelAddOpen(panelId: string, sourceId: string, refresh = false): Promise<ModelActionResult> {
+    return sessionModel.onModelAddOpen(this, panelId, sourceId, refresh)
   }
   onModelListEdit(panelId: string, sourceId: string, model: string, action: 'add' | 'remove' | 'delete'): Promise<ModelActionResult> {
     return this.runLifecycle('model-list-edit', () => sessionModel.onModelListEdit(this, panelId, sourceId, model, action))
@@ -3931,14 +3936,8 @@ export class Session {
     on('context_compacted', (notice: ContextCompactedNotification) => {
       this.handleContextCompacted(notice)
     })
-    on('rate_limits_updated', (rateLimits: any) => {
-      // codex rolling 通知 limitId 不可信(2026-08-20 源码核实:上游 SSE/WS
-      // 事件缺 metered_limit_name 时,codex 解析器把 limitId 强补 "codex",
-      // Spark 桶内容会被贴上主桶标签)—— 通知不写 cache,只观察日志;
-      // 权威状态在 turn 收尾用现有连接 read 端点整体刷新(closeTurnCard)。
-      // claude 的 rate_limit_info 形状不同,同样不进 codex 快照。
-      if (p.provider === 'codex' && !getTokenSource(p.tokenSourceId)?.codexApiProvider) observeRateLimitsNotification(rateLimits, processCodexAccount(p))
-    })
+    // Native Codex owners publish quota-change signals to the shared live
+    // reader. Rolling payloads never directly update the account snapshot.
     on('thread_goal_updated', (goal: ThreadGoal) => {
       this.handleThreadGoalUpdated(goal)
     })
@@ -5939,6 +5938,12 @@ export class Session {
     if (provider === 'codex') {
       const cache = cachedCodexUsage ?? (proc?.provider === 'codex' ? captureCodexUsageCache(processCodexAccount(proc)) : null)
       if (!cache) return '  |  额度 MISS'
+      // The result may arrive before the native quota signal has been read.
+      // Await a bounded same-account live read before formatting the final
+      // footer; stopped/replaced processes keep the captured account cache.
+      if (proc?.isAlive() && boundCodexAccount(proc) === cache.accountId) {
+        await waitForLiveCodexUsage(cache.accountId)
+      }
       const u = cache.read()
       if (!u) return '  |  额度 MISS'
       const credits = codexCreditsSummary(u.credits)

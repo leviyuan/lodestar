@@ -15,8 +15,8 @@ import { EventEmitter } from 'node:events'
 import { StringDecoder } from 'node:string_decoder'
 import { createHash } from 'node:crypto'
 import { config } from './config'
-import { bindProcessCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
-import { UsageReadCache, USAGE_FRESH_MS, isUsageAuthError, isUsageRateLimitError } from './usage-cache'
+import { bindProcessCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT, liveCodexQuotaReaders } from './codex-accounts'
+import { UsageReadCache, UsageReadSupersededError, USAGE_FRESH_MS, isUsageAuthError, isUsageRateLimitError, type UsageReadOptions } from './usage-cache'
 import { observeCodexAccountEmail } from './codex-account-info'
 import { parseCodexCredits, type CodexCredits } from './codex-credits'
 
@@ -458,19 +458,39 @@ export function captureCodexUsageCache(accountId = DEFAULT_CODEX_ACCOUNT) {
   }
 }
 
-export function readUsage(accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot> {
+export function readUsage(accountId = DEFAULT_CODEX_ACCOUNT, options: Pick<UsageReadOptions, 'force'> = {}): Promise<UsageSnapshot> {
   const generation = usageGenerations.get(accountId) ?? 0
+  let live = liveCodexQuotaReaders(accountId)[0]
+  let revision: string | undefined
+  const ownsRead = () => !live || live.isCurrent() && (revision === undefined || codexAccounts.revision(accountId) === revision)
+  const isCurrent = () => (usageGenerations.get(accountId) ?? 0) === generation && ownsRead()
   return usageReads.read(accountId, async () => {
-    try { return await fetchUsage(accountId) }
-    catch (error) { logError('codex quota fetch failed', error); throw error }
-  })
-    .catch((e): UsageSnapshot => {
-      if (isUsageAuthError(e)) return { state: 'auth_failed' }
-      if (isUsageRateLimitError(e)) return { state: 'rate_limited' }
-      return { state: 'network', reason: String(e) }
-    }).then((snapshot): UsageSnapshot => {
+    try {
+      // A selected connection may not fall back to cold startup after exit.
+      // If none existed, include a process registered while this call was queued.
+      live ??= liveCodexQuotaReaders(accountId)[0]
+      if (live) {
+        revision = codexAccounts.revision(accountId)
+        const reader = live.reader
+        return await fetchUsageFromConnection(() => reader.readRateLimits(), isCurrent)
+      }
+      return await fetchUsage(accountId)
+    }
+    catch (error) {
+      if (!(error instanceof UsageReadSupersededError)) logError('codex quota fetch failed', error)
+      throw error
+    }
+  }, { force: options.force, isCurrent }).then((snapshot): UsageSnapshot => {
       if ((usageGenerations.get(accountId) ?? 0) !== generation) return { state: 'auth_failed' }
+      if (!ownsRead()) return { state: 'network', reason: '额度读取所属连接或账号已变化' }
       cacheUsage(accountId, snapshot)
+      return snapshot
+    }, (error): UsageSnapshot => {
+      if ((usageGenerations.get(accountId) ?? 0) !== generation) return { state: 'auth_failed' }
+      const snapshot: UsageSnapshot = isUsageAuthError(error) ? { state: 'auth_failed' }
+        : isUsageRateLimitError(error) ? { state: 'rate_limited' }
+        : { state: 'network', reason: String(error) }
+      if (!(error instanceof UsageReadSupersededError) && ownsRead()) cacheUsage(accountId, snapshot)
       return snapshot
     })
 }
@@ -482,29 +502,26 @@ export async function readUsageForDisplay(accountId = DEFAULT_CODEX_ACCOUNT): Pr
 
 /** 用现有连接刷新额度；请求失败返回 null 并记录安全诊断。
  * 成功快照另存供启动与页脚使用，页脚沿用原额度格式。 */
-export function refreshUsageFromConnection(request: (method: string, params: any) => Promise<any>, accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot | null> {
+export function refreshUsageFromConnection(
+  request: (method: string, params: any) => Promise<any>, accountId = DEFAULT_CODEX_ACCOUNT,
+  options: UsageReadOptions = {},
+): Promise<UsageSnapshot | null> {
   const generation = usageGenerations.get(accountId) ?? 0
+  const isCurrent = () => (usageGenerations.get(accountId) ?? 0) === generation && (options.isCurrent?.() ?? true)
   return usageReads.read(accountId, async () => {
     try {
-      let readStartedAt: number | undefined
-      const response = await requestCodexQuotaWithRetry(() => {
-        readStartedAt = Date.now()
-        return request('account/rateLimits/read', {})
-      })
-      const snap = snapshotFromReadResponse(response, undefined, readStartedAt)
-      if (snap.state !== 'ok') logDiagnostic('codex live quota refresh failed', { reason: snap.state })
-      return snap
+      return await fetchUsageFromConnection(() => request('account/rateLimits/read', {}), isCurrent)
     } catch (error) {
-      logError('codex live quota refresh failed', error)
+      if (!(error instanceof UsageReadSupersededError)) logError('codex live quota refresh failed', error)
       throw error
     }
-  }).then((snap) => {
-      if ((usageGenerations.get(accountId) ?? 0) !== generation) return null
-      if ((usageGenerations.get(accountId) ?? 0) === generation) cacheUsage(accountId, snap)
+  }, { force: options.force, isCurrent }).then((snap) => {
+      if (!isCurrent()) return null
+      cacheUsage(accountId, snap)
       return snap
     })
     .catch((e: any) => {
-      if ((usageGenerations.get(accountId) ?? 0) === generation) {
+      if (!(e instanceof UsageReadSupersededError) && isCurrent()) {
         if (isUsageAuthError(e)) {
           caches.set(accountId, { state: 'auth_failed' })
           successfulCaches.delete(accountId)
@@ -514,6 +531,23 @@ export function refreshUsageFromConnection(request: (method: string, params: any
       }
       return null
     })
+}
+
+async function fetchUsageFromConnection(request: () => Promise<any>, isCurrent: () => boolean): Promise<UsageSnapshot> {
+  let readStartedAt: number | undefined
+  const response = await requestCodexQuotaWithRetry(async () => {
+    if (!isCurrent()) throw new UsageReadSupersededError()
+    readStartedAt = Date.now()
+    try { return await request() }
+    catch (error) {
+      if (!isCurrent()) throw new UsageReadSupersededError()
+      throw error
+    }
+  })
+  if (!isCurrent()) throw new UsageReadSupersededError()
+  const snapshot = snapshotFromReadResponse(response, undefined, readStartedAt)
+  if (snapshot.state !== 'ok') logDiagnostic('codex live quota refresh failed', { reason: snapshot.state })
+  return snapshot
 }
 
 const usageGenerations = new Map<string, number>()

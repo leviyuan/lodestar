@@ -10,6 +10,8 @@ import type { ProjectProfile } from './config'
 import { getTokenSourceForAccount } from './token-source'
 import { DELEGATED_AGENT_INSTRUCTIONS, PROJECT_AGENT_INSTRUCTIONS } from './agent-skill'
 import { shellCommandPresentation } from './cards/shell-command'
+import { boundCodexAccount } from './codex-accounts'
+import { logError } from './log'
 
 export interface AgentWorkerResult {
   output: string
@@ -116,6 +118,9 @@ export function collectAgentTurn(
   let settled = false
   let finishing: Promise<void> | null = null
   let closeError: Error | null = null
+  let quotaWaitCancelled = false
+  let cancelQuotaWait!: () => void
+  const quotaWaitCancellation = new Promise<void>(resolve => { cancelQuotaWait = resolve })
   const presentationController = new AbortController()
   const waiting: Array<{ request: AgentInputRequest; displayRequest?: AgentInputRequest; originalInput: Record<string, unknown> }> = []
   let resolveDone!: (value: AgentWorkerResult) => void
@@ -162,6 +167,22 @@ export function collectAgentTurn(
     waiting.length = 0
     finishing = Promise.resolve().then(async () => {
       const registryError = rememberSession(proc.sessionId)
+      // A terminal result can update quota through this still-running native
+      // connection. Cancellation and failures without a result stop at once.
+      if (result && !quotaWaitCancelled && proc.provider === 'codex' && proc.isAlive()) {
+        const accountId = boundCodexAccount(proc)
+        if (accountId) {
+          try {
+            const refresh = import('./codex-live-usage').then(({ waitForLiveCodexUsage }) => {
+              if (!quotaWaitCancelled && proc.isAlive() && boundCodexAccount(proc) === accountId) {
+                return waitForLiveCodexUsage(accountId)
+              }
+            })
+            await Promise.race([refresh, quotaWaitCancellation])
+          }
+          catch (cause) { logError('agent worker final quota refresh failed', cause) }
+        }
+      }
       try { await proc.kill(3000) }
       catch (cause) { closeError = cause instanceof Error ? cause : new Error(String(cause)) }
       cleanupListeners()
@@ -360,6 +381,8 @@ export function collectAgentTurn(
       if (waiting[0]) callbacks.onNeedsInput?.(waiting[0].request, waiting[0].displayRequest)
     },
     async cancel(reason = 'delegated agent cancelled'): Promise<void> {
+      quotaWaitCancelled = true
+      cancelQuotaWait()
       const wasSettled = settled
       await finish(new Error(reason))
       await done.catch(() => {})

@@ -19,15 +19,33 @@ interface Entry<T> {
   pending?: Promise<T>
 }
 
+export interface UsageReadOptions {
+  /** Skip only successful freshness; pending reads and failure cooldowns still win. */
+  force?: boolean
+  /** Reject late results when the connection/account that owns this read changes. */
+  isCurrent?: () => boolean
+}
+
+export class UsageReadSupersededError extends Error {
+  readonly code = 'USAGE_READ_SUPERSEDED'
+  constructor() { super('额度读取所属连接或账号已变化'); this.name = 'UsageReadSupersededError' }
+}
+
 /** Lazy account reads: one request at a time, one minute freshness, bounded failure backoff. */
 export class UsageReadCache<T extends UsageResult> {
   private readonly entries = new Map<string, Entry<T>>()
   constructor(private readonly now: () => number = () => Date.now()) {}
 
-  read(key: string, load: () => Promise<T>): Promise<T> {
+  read(key: string, load: () => Promise<T>, options: UsageReadOptions = {}): Promise<T> {
+    const assertCurrent = () => {
+      if (options.isCurrent && !options.isCurrent()) throw new UsageReadSupersededError()
+    }
+    try { assertCurrent() } catch (error) { return Promise.reject(error) }
     let entry = this.entries.get(key)
     if (entry?.pending) return entry.pending
-    if (entry && this.now() < entry.retryAt) {
+    const refreshSuccess = options.force && !entry?.failed
+      && (entry?.value?.state === 'ok' || entry?.value?.state === 'not_applicable')
+    if (entry && this.now() < entry.retryAt && !refreshSuccess) {
       return entry.failed ? Promise.reject(entry.error) : Promise.resolve(entry.value!)
     }
     entry ??= { failed: false, failures: 0, retryAt: 0 }
@@ -39,7 +57,8 @@ export class UsageReadCache<T extends UsageResult> {
         : Math.min(USAGE_MAX_COOLDOWN_MS, USAGE_FRESH_MS * 2 ** Math.min(current.failures - 1, 3))
       current.retryAt = this.now() + Math.max(delay, Number.isFinite(retryAfterMs) ? retryAfterMs : 0)
     }
-    const pending = Promise.resolve().then(load).then(value => {
+    const pending = Promise.resolve().then(() => { assertCurrent(); return load() }).then(value => {
+      assertCurrent()
       if (this.entries.get(key) === current) {
         current.value = value
         if (value.state === 'ok') current.successfulValue = value
@@ -50,6 +69,8 @@ export class UsageReadCache<T extends UsageResult> {
       }
       return value
     }, error => {
+      assertCurrent()
+      if (error instanceof UsageReadSupersededError) throw error
       if (this.entries.get(key) === current) {
         current.value = undefined
         if (isUsageAuthError(error)) current.successfulValue = undefined

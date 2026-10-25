@@ -13,7 +13,133 @@ beforeEach(() => {
 })
 afterEach(() => { invalidateCodexUsage('default'); quotaClock.mockRestore() })
 
+test('ordinary quota reads reuse the correct live connection and never cold-start after its failure or replacement', () => {
+  const script = `
+    import assert from 'node:assert/strict'
+    import { mock } from 'bun:test'
+    import { EventEmitter } from 'node:events'
+    let coldStarts = 0
+    mock.module('cross-spawn', () => ({ spawn() { coldStarts++; throw new Error('unexpected cold process') } }))
+    const { bindProcessCodexAccount, codexAccounts } = await import('./src/codex-accounts')
+    const { readUsage, peekUsage, invalidateCodexUsage } = await import('./src/usage')
+    let now = Date.now()
+    Date.now = () => now
+    const raw = percent => ({ rateLimits: { planType: 'pro', primary: { usedPercent: percent, windowDurationMins: 300 } } })
+    class Reader extends EventEmitter {
+      provider = 'codex'; tokenSourceId = 'codex-sub'; alive = true; calls = 0
+      work = async () => raw(10)
+      isAlive() { return this.alive }
+      readRateLimits() { this.calls++; return this.work() }
+      close() { this.alive = false; this.emit('exit') }
+    }
+    const otherAccount = codexAccounts.ensure('quota-live-other')
+    const other = new Reader(); other.work = async () => raw(70)
+    const reader = new Reader()
+    bindProcessCodexAccount(other, otherAccount.id)
+    bindProcessCodexAccount(reader, 'default')
+    let release
+    reader.work = () => new Promise(resolve => { release = resolve })
+    const first = readUsage(), shared = readUsage()
+    await Promise.resolve()
+    assert.equal(reader.calls, 1)
+    assert.equal(other.calls, 0)
+    release(raw(10))
+    const initial = await first
+    assert.equal(initial.state, 'ok')
+    assert.equal(initial.fiveHour.percent, 10)
+    assert.equal(await shared, initial)
+    assert.equal((await readUsage(otherAccount.id)).fiveHour.percent, 70)
+    reader.work = async () => raw(15)
+    assert.equal((await readUsage('default', { force: true })).fiveHour.percent, 15)
+
+    now += 60000
+    reader.work = async () => { throw new Error('HTTP 401 unauthorized') }
+    assert.equal((await readUsage()).state, 'auth_failed')
+    assert.equal(coldStarts, 0)
+
+    // A completed reply from a process that has exited must not populate either cache.
+    invalidateCodexUsage('default')
+    reader.work = () => new Promise(resolve => { release = resolve })
+    const afterExit = readUsage()
+    await Promise.resolve()
+    reader.close(); release(raw(99))
+    assert.equal((await afterExit).state, 'network')
+    assert.equal(peekUsage(), null)
+    assert.equal(coldStarts, 0)
+    const replacement = new Reader(); replacement.work = async () => raw(25)
+    bindProcessCodexAccount(replacement, 'default')
+    assert.equal((await readUsage()).fiveHour.percent, 25)
+
+    // An account revision can change without advancing the quota cache generation yet.
+    invalidateCodexUsage('default')
+    replacement.work = () => new Promise(resolve => { release = resolve })
+    const afterLogin = readUsage()
+    await Promise.resolve()
+    codexAccounts.recordLogin('default', {})
+    release(raw(88))
+    assert.equal((await afterLogin).state, 'network')
+    assert.equal(peekUsage(), null)
+
+    // A rebound native object cannot attribute its late result to its previous account.
+    replacement.work = () => new Promise(resolve => { release = resolve })
+    const rebound = readUsage()
+    await Promise.resolve()
+    bindProcessCodexAccount(replacement, otherAccount.id)
+    release(raw(77))
+    assert.equal((await rebound).state, 'network')
+    assert.equal(peekUsage(), null)
+    assert.equal(peekUsage(otherAccount.id).fiveHour.percent, 70)
+    assert.equal(coldStarts, 0)
+    replacement.close(); other.close()
+    const departing = new Reader()
+    bindProcessCodexAccount(departing, 'default')
+    const queued = readUsage()
+    departing.close()
+    assert.equal((await queued).state, 'network')
+    assert.equal(departing.calls, 0)
+    assert.equal(coldStarts, 0)
+    invalidateCodexUsage('default'); invalidateCodexUsage(otherAccount.id)
+  `
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+    cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+  })
+  expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+})
+
 describe('quota account isolation', () => {
+  test('forced live refresh updates an existing footer reader without invalidating its account generation', async () => {
+    const account = 'forced-footer'
+    try {
+      await refreshUsageFromConnection(async () => ({ rateLimits: { primary: { usedPercent: 10, windowDurationMins: 300 } } }), account)
+      const footer = captureCodexUsageCache(account)
+      const updated = await refreshUsageFromConnection(async () => ({ rateLimits: { primary: { usedPercent: 25, windowDurationMins: 300 } } }), account, { force: true })
+      if (updated?.state !== 'ok') throw new Error('expected a successful forced refresh')
+      expect(updated.fiveHour?.percent).toBe(25)
+      expect(footer.read()).toBe(updated)
+    } finally { invalidateCodexUsage(account) }
+  })
+
+  test.each(['success', 'authentication error'])('a superseded live %s preserves the prior snapshot without delaying a valid reader', async outcome => {
+    const account = `superseded-${outcome}`
+    try {
+      const original = await refreshUsageFromConnection(async () => ({ rateLimits: { primary: { usedPercent: 10, windowDurationMins: 300 } } }), account)
+      if (original?.state !== 'ok') throw new Error('expected an initial quota snapshot')
+      let current = true
+      let release!: () => void
+      const pending = refreshUsageFromConnection(() => new Promise((resolve, reject) => {
+        release = () => outcome === 'success'
+          ? resolve({ rateLimits: { primary: { usedPercent: 90, windowDurationMins: 300 } } }) : reject(new Error('HTTP 401 unauthorized'))
+      }), account, { force: true, isCurrent: () => current })
+      await Promise.resolve()
+      current = false; release()
+      expect(await pending).toBeNull()
+      expect(peekUsage(account)).toBe(original)
+      expect(peekSuccessfulUsage(account)).toBe(original)
+      const updated = await refreshUsageFromConnection(async () => ({ rateLimits: { primary: { usedPercent: 30, windowDurationMins: 300 } } }), account, { force: true })
+      expect(updated?.state === 'ok' && updated.fiveHour?.percent).toBe(30)
+    } finally { invalidateCodexUsage(account) }
+  })
+
   test('a live read retains its actual observation interval for complete unused weeks', async () => {
     const account = 'unused-week-read-interval'
     const started = quotaNow

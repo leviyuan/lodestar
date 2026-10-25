@@ -231,7 +231,62 @@ describe('Codex account process ownership and recovery', () => {
     expect(h.events).toEqual([]); expect(h.children).toHaveLength(0); expect(h.proc.turnRetry?.reason).toBe('quota')
     resume(); await h.proc.initializationPromise()
     expect(h.options.map(opts => opts.preferCachedUsage)).toEqual([true, false])
+    expect(h.options.map(opts => opts.refreshUsage)).toEqual([true, undefined])
     expect(h.events).toEqual(['init']); expect(h.children[0].sent.map(s => s.text)).toEqual(['queued original'])
+  })
+  test('quota waiting allows one passive read at an observed reset, never at synthetic minute wakeups', async () => {
+    let now = 1_900_000_000_000
+    const clock = spyOn(Date, 'now').mockImplementation(() => now)
+    const reset = now + 120_000
+    const row = { ...candidate('blocked'), state: 'exhausted' as const, score: null, retryAt: reset }
+    row.usage = { state: 'ok', subscriptionType: 'pro', fiveHour: null,
+      weekly: { percent: 100, resetsAt: new Date(reset) }, fetchedAt: now }
+    const h = harness([
+      { selected: null, candidates: [row], retryAt: now + 60_000 },
+      { selected: null, candidates: [row], retryAt: reset },
+      { selected: null, candidates: [row], retryAt: reset + 60_000 },
+      decision('recovered'),
+    ], async ms => { now += ms })
+    try {
+      await h.proc.initializationPromise()
+      expect(h.options.map(opts => opts.refreshUsage)).toEqual([true, undefined, ['blocked'], undefined])
+      expect(h.children).toHaveLength(1)
+      expect(h.children[0].id).toBe('recovered')
+    } finally { clock.mockRestore() }
+  })
+  test('unknown reset times never turn repeated quota waits into cold queries', async () => {
+    let now = 1_900_000_000_000
+    const clock = spyOn(Date, 'now').mockImplementation(() => now)
+    const row = { ...candidate('blocked'), state: 'exhausted' as const, score: null }
+    const h = harness([
+      { selected: null, candidates: [row], retryAt: now + 60_000 },
+      { selected: null, candidates: [row], retryAt: now + 120_000 },
+      decision('recovered'),
+    ], async ms => { now += ms })
+    try {
+      await h.proc.initializationPromise()
+      expect(h.options.map(opts => opts.refreshUsage)).toEqual([true, undefined, undefined])
+    } finally { clock.mockRestore() }
+  })
+  test('an observed reset reached while the selection result is returning still gets one recheck', async () => {
+    let now = 1_900_000_000_000
+    const clock = spyOn(Date, 'now').mockImplementation(() => now)
+    const reset = now + 5
+    const row = { ...candidate('blocked'), state: 'exhausted' as const, score: null, retryAt: reset }
+    row.usage = { state: 'ok', subscriptionType: 'pro', fiveHour: null,
+      weekly: { percent: 100, resetsAt: new Date(reset) }, fetchedAt: now }
+    let complete!: (value: CodexAccountDecision) => void
+    const pending = new Promise<CodexAccountDecision>(resolve => { complete = resolve })
+    const h = harness([pending, decision('recovered')], async ms => { now += ms })
+    try {
+      const initialized = h.proc.initializationPromise()
+      await flush()
+      now = reset + 1
+      complete({ selected: null, candidates: [row], retryAt: reset })
+      await initialized
+      expect(h.options.map(opts => opts.refreshUsage)).toEqual([true, ['blocked']])
+      expect(h.children).toHaveLength(1)
+    } finally { clock.mockRestore() }
   })
   test('quota waiting shows recovery status without repeating other account diagnostics', async () => {
     let resume!: () => void

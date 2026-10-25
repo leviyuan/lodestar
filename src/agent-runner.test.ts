@@ -6,6 +6,8 @@ import { join } from 'node:path'
 import { AgentWorkerFailure, collectAgentTurn } from './agent-runner'
 import { ClaudeAgentProcess } from './claude-agent-process'
 import { ClaudeTranslationContext } from './claude-translation-context'
+import { bindProcessCodexAccount } from './codex-accounts'
+import * as liveCodexUsage from './codex-live-usage'
 
 class FakeProcess extends EventEmitter {
   provider = 'claude' as const
@@ -102,6 +104,104 @@ test('worker startup rejects Claude subscriptions before creating a process whil
     === "Lodestar Agent does not support Claude subscription calls; comply with Claude's user agreement." && !entry.started)).toBe(true)
   expect(result.launches).toBe(28)
   expect(result.accepted).toEqual(Array.from({ length: 4 }, () => ['glm', 'deepseek', 'codex-sub', 'dsh-glm', 'packy', 'openrouter', 'packy-secondary']).flat())
+})
+
+describe('delegated Codex final quota refresh', () => {
+  test.each([false, true])('waits on the current bound account before killing a result process (is_error=%s)', async isError => {
+    const proc = new FakeProcess() as any
+    proc.provider = 'codex'; proc.tokenSourceId = 'codex-sub'
+    bindProcessCodexAccount(proc, 'worker-before', false)
+    const order: string[] = []
+    let release!: () => void
+    let markStarted!: () => void
+    const started = new Promise<void>(resolve => { markStarted = resolve })
+    const quota = spyOn(liveCodexUsage, 'waitForLiveCodexUsage').mockImplementation(accountId => {
+      order.push(`quota:${accountId}`)
+      markStarted()
+      return new Promise<void>(resolve => { release = resolve })
+    })
+    const kill = proc.kill.bind(proc)
+    proc.kill = async () => { order.push('kill'); await kill() }
+    const handle = collectAgentTurn(proc, 'work', {}, () => {})
+    const completed = handle.done.then(value => ({ value, error: null }), error => ({ value: null, error }))
+    try {
+      bindProcessCodexAccount(proc, 'worker-current', false)
+      proc.emit('assistant_text', { text: 'retained result' })
+      proc.emit('result', { is_error: isError, error: isError ? 'task failed' : undefined })
+      await started
+      expect(order).toEqual(['quota:worker-current'])
+      expect(proc.isAlive()).toBe(true)
+      release()
+      const result = await completed
+      expect(order).toEqual(['quota:worker-current', 'kill'])
+      if (isError) {
+        expect(result.error).toBeInstanceOf(AgentWorkerFailure)
+        expect(result.error).toMatchObject({ message: 'task failed', output: 'retained result' })
+      } else expect(result.value).toMatchObject({ output: 'retained result', sessionId: 'sid-1' })
+    } finally { release?.(); await handle.cancel(); quota.mockRestore() }
+  })
+
+  test.each(['api', 'unbound', 'claude'])('skips quota waiting for %s workers', async kind => {
+    const proc = new FakeProcess() as any
+    proc.provider = kind === 'claude' ? 'claude' : 'codex'
+    proc.tokenSourceId = kind === 'api' ? 'packy-codex' : kind === 'claude' ? 'glm' : 'codex-sub'
+    const quota = spyOn(liveCodexUsage, 'waitForLiveCodexUsage').mockImplementation(async () => {
+      throw new Error('unexpected quota read')
+    })
+    const handle = collectAgentTurn(proc, 'work', {}, () => {})
+    try {
+      proc.emit('result', { is_error: false })
+      await handle.done
+      expect(quota).not.toHaveBeenCalled()
+      expect(proc.isAlive()).toBe(false)
+    } finally { await handle.cancel(); quota.mockRestore() }
+  })
+
+  test.each(['before-result', 'during-quota', 'submission-error'])('stops without quota delay on %s', async scenario => {
+    const proc = new FakeProcess() as any
+    proc.provider = 'codex'; proc.tokenSourceId = 'codex-sub'
+    bindProcessCodexAccount(proc, 'cancelled-worker', false)
+    let release!: () => void
+    let markStarted!: () => void
+    const started = new Promise<void>(resolve => { markStarted = resolve })
+    const quota = spyOn(liveCodexUsage, 'waitForLiveCodexUsage').mockImplementation(() => {
+      markStarted()
+      return new Promise<void>(resolve => { release = resolve })
+    })
+    if (scenario === 'submission-error') proc.sendUserText = () => { throw new Error('submission failed') }
+    const handle = collectAgentTurn(proc, 'work', {}, () => {})
+    const completed = handle.done.then(value => ({ value, error: null }), error => ({ value: null, error }))
+    try {
+      if (scenario === 'during-quota') {
+        proc.emit('result', { is_error: false })
+        await started
+        expect(quota).toHaveBeenCalledTimes(1)
+        expect(proc.isAlive()).toBe(true)
+      }
+      if (scenario !== 'submission-error') await handle.cancel('stop now')
+      const result = await completed
+      expect(proc.isAlive()).toBe(false)
+      if (scenario !== 'during-quota') {
+        expect(quota).not.toHaveBeenCalled()
+        expect(result.error).toBeInstanceOf(AgentWorkerFailure)
+        expect(result.error.message).toBe(scenario === 'submission-error' ? 'submission failed' : 'stop now')
+      }
+    } finally { release?.(); await handle.cancel(); quota.mockRestore() }
+  })
+
+  test('a final quota failure does not prevent process cleanup or overwrite the completed task', async () => {
+    const proc = new FakeProcess() as any
+    proc.provider = 'codex'; proc.tokenSourceId = 'codex-sub'
+    bindProcessCodexAccount(proc, 'quota-failure-worker', false)
+    const quota = spyOn(liveCodexUsage, 'waitForLiveCodexUsage').mockRejectedValue(new Error('quota unavailable'))
+    const handle = collectAgentTurn(proc, 'work', {}, () => {})
+    try {
+      proc.emit('result', { is_error: false })
+      await expect(handle.done).resolves.toMatchObject({ sessionId: 'sid-1' })
+      expect(quota).toHaveBeenCalledTimes(1)
+      expect(proc.isAlive()).toBe(false)
+    } finally { await handle.cancel(); quota.mockRestore() }
+  })
 })
 
 describe('full delegated Agent runner', () => {

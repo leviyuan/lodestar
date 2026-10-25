@@ -29,6 +29,7 @@ export interface ModelPanelState {
   sourceRevision?: string
   page?: number
   totalPages?: number
+  refresh?: { source: TokenSource; mode: 'select' | 'add'; result: ModelActionResult }
 }
 
 export const MODEL_PAGE_SIZE = 20
@@ -189,11 +190,54 @@ export async function showModelPanel(s: Session): Promise<void> {
   }
 }
 
+/** Explicit list requests bypass the periodic cadence without holding the chat
+ * actor while I/O runs. Internal redraws and pagination keep their snapshot. */
+function refreshModelPanel(s: Session, source: TokenSource, panelId: string, mode: 'select' | 'add'): ModelActionResult {
+  const previous = s.modelPanels.get(panelId)!
+  if (previous.refresh?.source === source && previous.refresh.mode === mode
+    && previous.refresh.result.canPresent?.() !== false) return previous.refresh.result
+  const revision = source.spawnRevision
+  const accountId = source.accountId !== undefined || source.forAccount || source.kind === 'codex-subscription'
+    ? s.tokenSourceAccountId(source.id) : undefined
+  const epoch = s.modelPanelRefreshEpoch
+  const panel: ModelPanelState = { models: [], sourceId: source.id, mode, messageId: previous.messageId }
+  s.modelPanels.set(panelId, panel)
+  const current = (expected = panel) => Session.all.has(s) && !s.modelSettingsChangesClosed
+    && s.modelPanelRefreshEpoch === epoch && s.modelPanels.get(panelId) === expected && s.tokenSource(source.id) === source
+    && source.spawnRevision === revision && (accountId === undefined || s.tokenSourceAccountId(source.id) === accountId)
+  const stale = (): ModelActionResult => ({ ok: false, message: '模型面板或账号已变化，本次刷新未覆盖当前面板，请重新打开模型列表。', canPresent: () => false })
+  const failed = (message: string): ModelActionResult => ({
+    ok: false, message, canPresent: () => current(),
+    card: cards.selectionResultCard({ title: '模型目录刷新失败', message, ok: false }),
+  })
+  const message = `已开始刷新 ${source.display} 的模型列表，完成后会更新本卡。`
+  const result: ModelActionResult = {
+    ok: false, pending: true, message, canPresent: () => current(),
+    card: cards.selectionResultCard({ title: '⏳ 模型目录刷新中', message, ok: true }),
+    completion: Promise.resolve().then(() => source.refreshModels()).then(async () => {
+      if (!current()) return stale()
+      delete panel.refresh
+      const rendering = mode === 'add' ? onModelAddOpen(s, panelId, source.id) : onProviderSelect(s, source.id, panelId)
+      const renderedPanel = s.modelPanels.get(panelId)
+      const rendered = await rendering
+      return rendered.ok ? { ...rendered, canPresent: () => !!renderedPanel && current(renderedPanel) } : failed(rendered.message)
+    }).catch(error => {
+      logError('session-model: manual catalog refresh failed', error)
+      if (!current()) return stale()
+      delete panel.refresh
+      return failed(`模型目录刷新失败：${messageOf(error)}。请重新打开模型列表重试。`)
+    }),
+  }
+  panel.refresh = { source, mode, result }
+  return result
+}
+
 /** 第1级点账号 → 发第2级(该账号的模型列表)。返回第2级卡替换当前卡。 */
 export async function onProviderSelect(
   s: Session,
   sourceIdRaw: string,
   panelIdRaw = '',
+  refresh = false,
 ): Promise<ModelActionResult> {
   const sourceId = sourceIdRaw.trim()
   const ts = s.tokenSource(sourceId)
@@ -201,6 +245,10 @@ export async function onProviderSelect(
   if (!ts.enabled) return { ok: false, message: ts.modelCatalogState?.error ?? `${ts.display} 未配置,请先点「启用」` }
   const panelId = panelIdRaw.trim()
   if (!s.modelPanels.has(panelId)) return { ok: false, message: '模型面板已失效，请重新发送 model' }
+  if (refresh) {
+    if (s.modelSettingsChangesClosed || !Session.all.has(s)) return { ok: false, message: '会话已关闭，不能刷新模型目录' }
+    return refreshModelPanel(s, ts, panelId, 'select')
+  }
   if (ts.modelCatalogState?.status === 'failed') {
     return { ok: false, message: `模型目录 MISS：${ts.modelCatalogState.error ?? '刷新失败'}` }
   }
@@ -242,11 +290,15 @@ export async function onModelPage(s: Session, panelId: string, sourceId: string,
 }
 
 /** 可编辑来源的完整候选目录；不接受回调自行传入候选项或来源。 */
-export async function onModelAddOpen(s: Session, panelId: string, sourceId: string): Promise<ModelActionResult> {
+export async function onModelAddOpen(s: Session, panelId: string, sourceId: string, refresh = false): Promise<ModelActionResult> {
   const panel = s.modelPanels.get(panelId)
   const source = s.tokenSource(sourceId)
   if (!panel || panel.sourceId !== sourceId || !source?.enabled || !source.modelSelection) {
     return { ok: false, message: '模型管理面板已失效，请重新发送 md' }
+  }
+  if (refresh) {
+    if (s.modelSettingsChangesClosed || !Session.all.has(s)) return { ok: false, message: '会话已关闭，不能刷新模型目录' }
+    return refreshModelPanel(s, source, panelId, 'add')
   }
   if (source.modelCatalogState?.status !== 'ready') return { ok: false, message: source.modelCatalogState?.error ?? '目录未就绪' }
   const candidates = source.modelSelection.availableModels.filter(model =>

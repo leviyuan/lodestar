@@ -311,6 +311,63 @@ describe('weekly quota scheduling', () => {
     expect(choice.candidates.find(c => c.account.id === 'cold')?.usage).toBeNull()
     expect(reader).not.toHaveBeenCalled()
   })
+  test('passive startup refresh is skipped whenever a cached account can still launch', async () => {
+    const h = harness({ pro: { state: 'network' } }, { pro: quota('pro') })
+    const refresh = mock(async () => { throw new Error('must use the launchable cache') })
+    ;(h.scheduler as any).deps.refreshUsage = refresh
+    const reader = spyOn((h.scheduler as any).deps, 'usage')
+    expect((await h.scheduler.choose({ model: 'model', preferCachedUsage: true, refreshUsage: true })).selected?.account.id).toBe('pro')
+    expect(refresh).not.toHaveBeenCalled()
+    expect(reader).not.toHaveBeenCalled()
+  })
+  test('an explicit startup check refreshes missing, expired and exhausted quotas once', async () => {
+    for (const old of [{ state: 'network' } as UsageSnapshot, quota('pro', 0, 0), quota('pro', 100)]) {
+      const h = harness({ pro: old }, { pro: old })
+      const refresh = mock(async (id: string) => { h.input[id] = quota('pro'); return h.input[id] })
+      ;(h.scheduler as any).deps.refreshUsage = refresh
+      const choice = await h.scheduler.choose({ model: 'model', preferCachedUsage: true, refreshUsage: true })
+      expect(choice.selected?.account.id).toBe('pro')
+      expect(refresh).toHaveBeenCalledTimes(1)
+      expect(refresh).toHaveBeenCalledWith('pro')
+      expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('pro')
+      expect(refresh).toHaveBeenCalledTimes(1)
+    }
+  })
+  test('a reset-boundary check refreshes only requested accounts and excludes pending login', async () => {
+    const old = quota('pro', 0, 0)
+    const h = harness({ reset: old, other: old, loggingIn: old }, { reset: old, other: old, loggingIn: old })
+    h.pending.add('loggingIn')
+    const refresh = mock(async () => quota('pro'))
+    ;(h.scheduler as any).deps.refreshUsage = refresh
+    const choice = await h.scheduler.choose({ model: 'model', refreshUsage: ['reset', 'loggingIn'] })
+    expect(choice.selected?.account.id).toBe('reset')
+    expect(refresh).toHaveBeenCalledTimes(1)
+    expect(refresh).toHaveBeenCalledWith('reset')
+  })
+  test('passive refresh failures remain MISS and ordinary selection does not repeat them', async () => {
+    const old = quota('pro', 0, 0)
+    const h = harness({ pro: old }, { pro: old })
+    const refresh = mock(async () => { throw new Error('quota recheck unavailable') })
+    ;(h.scheduler as any).deps.refreshUsage = refresh
+    const choice = await h.scheduler.choose({ model: 'model', refreshUsage: true })
+    expect(choice.selected).toBeNull()
+    expect(choice.candidates[0]).toMatchObject({ state: 'miss', reason: 'Error: quota recheck unavailable' })
+    await h.scheduler.choose({ model: 'model' })
+    expect(refresh).toHaveBeenCalledTimes(1)
+  })
+  test('confirmed exhaustion exposes only actual reset observations on the candidate', async () => {
+    const h = harness({ pro: quota('pro', 80) })
+    const selected = (await h.scheduler.choose({ model: 'model' })).selected!
+    h.scheduler.block(selected, 'model')
+    const observed = await h.scheduler.choose({ model: 'model' })
+    expect(observed.candidates[0]).toMatchObject({ state: 'exhausted', retryAt: NOW + 24 * 3600_000 })
+    const state = JSON.parse(readFileSync(h.stateFile, 'utf8'))
+    for (const block of state.blocks) for (const window of block.windows) window.reset = null
+    writeFileSync(h.stateFile, JSON.stringify(state))
+    const unknown = await h.scheduler.choose({ model: 'model' })
+    expect(unknown.candidates[0].retryAt).toBeUndefined()
+    expect(unknown.retryAt).toBe(NOW + 60_000)
+  })
   test('explicit quota queries still refresh and report errors despite a successful startup cache', async () => {
     const h = harness({ pro: { state: 'network', reason: 'quota request failed' } }, { pro: quota('pro') })
     const reader = spyOn((h.scheduler as any).deps, 'usage')
@@ -446,15 +503,18 @@ describe('weekly quota scheduling', () => {
     const { scheduler, input, stateFile, unavailable } = harness({ plus: quota('plus'), pro: quota('pro') })
     const reader = spyOn((scheduler as any).deps, 'usage').mockRejectedValue(new Error('must not read'))
     const compatibility = spyOn((scheduler as any).deps, 'compatible').mockRejectedValue(new Error('must not validate'))
+    const refresh = mock(async () => { throw new Error('manual selection must not refresh') })
+    ;(scheduler as any).deps.refreshUsage = refresh
     unavailable.set('plus', 'ultra unsupported')
     writeFileSync(stateFile, 'corrupted quota state')
-    expect((await scheduler.choose({ model: 'model', preferred: 'plus' })).selected?.account.id).toBe('plus')
+    expect((await scheduler.choose({ model: 'model', preferred: 'plus', refreshUsage: true })).selected?.account.id).toBe('plus')
     input.plus = quota('plus', 100)
     expect((await scheduler.choose({ model: 'model', effort: 'ultra', preferred: 'plus' })).selected).toMatchObject({
       state: 'manual', usage: null, account: { id: 'plus' } })
     input.plus = { state: 'network', reason: 'broken' }
     expect((await scheduler.choose({ model: 'model', preferred: 'plus' })).selected?.account.id).toBe('plus')
     expect(reader).not.toHaveBeenCalled(); expect(compatibility).not.toHaveBeenCalled()
+    expect(refresh).not.toHaveBeenCalled()
     await expect(scheduler.choose({ model: 'model', preferred: 'unknown' })).rejects.toThrow('不存在')
   })
   test('OS-keyring account ids deduplicate aliases; model and login constraints are applied', async () => {
