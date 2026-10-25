@@ -10,7 +10,9 @@ test('short-lived account probes exclude deletion until confirmed close, includi
     import { EventEmitter } from 'node:events'
     import { PassThrough } from 'node:stream'
     const children = []
-    mock.module('cross-spawn', () => ({ spawn: () => {
+    const launches = []
+    mock.module('cross-spawn', () => ({ spawn: (bin, args, options) => {
+      launches.push({ bin, args, options })
       const child = new EventEmitter()
       Object.assign(child, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
         exitCode: null, signalCode: null, kill: () => false })
@@ -20,9 +22,19 @@ test('short-lived account probes exclude deletion until confirmed close, includi
     const { AppServerOnce } = await import('./src/usage')
     const { codexAccounts, codexAccountInUse } = await import('./src/codex-accounts')
     const account = codexAccounts.ensure('probe')
-    const opts = { accountId: account.id, bin: 'mock-codex', env: {}, args: [] }
+    const opts = { accountId: account.id, bin: 'mock-codex', env: {} }
     const first = new AppServerOnce(opts)
-    const second = new AppServerOnce(opts)
+    const customArgs = ['-c', 'features.plugins=true', '-c', 'features.apps=true']
+    const second = new AppServerOnce({ ...opts, args: customArgs, login: true })
+    // Both normal probes and login/custom-argument callers disable startup
+    // catalogs last, while retaining account routing and caller settings.
+    for (const [index, originalArgs] of [codexAccounts.cliArgs(account.id), customArgs].entries()) {
+      assert.equal(launches[index].bin, opts.bin)
+      assert.deepEqual(launches[index].args, ['app-server', '--listen', 'stdio://', ...originalArgs,
+        '-c', 'features.plugins=false', '-c', 'features.apps=false'])
+      assert.equal(launches[index].options.env, opts.env)
+      assert.equal(launches[index].options.shell, false)
+    }
     assert.equal(codexAccountInUse(account.id), true)
     assert.throws(() => codexAccounts.remove(account.id), /正在使用中/)
     await assert.rejects(first.close(1), /rejected SIGTERM/)

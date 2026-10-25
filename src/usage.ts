@@ -182,7 +182,10 @@ export class AppServerOnce extends EventEmitter {
   constructor(opts: { accountId?: string; env?: Record<string, string | undefined>; args?: string[]; bin?: string; login?: boolean; cwd?: string } = {}) {
     super()
     const accountId = opts.accountId ?? DEFAULT_CODEX_ACCOUNT
-    this.proc = spawn(opts.bin ?? resolveCodexBin(), ['app-server', '--listen', 'stdio://', ...(opts.args ?? codexAccounts.cliArgs(accountId))], {
+    // Account/model control RPCs do not need plugins or apps. Disable their
+    // startup work only in this process; task processes keep native features.
+    this.proc = spawn(opts.bin ?? resolveCodexBin(), ['app-server', '--listen', 'stdio://', ...(opts.args ?? codexAccounts.cliArgs(accountId)),
+      '-c', 'features.plugins=false', '-c', 'features.apps=false'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: false,
       cwd: opts.cwd,
