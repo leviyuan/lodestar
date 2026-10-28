@@ -340,6 +340,8 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(await result).toMatchObject({ is_error: false })
     expect(JSON.stringify(f.requests[2].messages)).toContain('continue the same conversation')
     await resumed.kill()
+    const runtimeQuery = { cwd: f.dir, home: f.opts.runtimeOptions!.home,
+      env: f.opts.transformEnv!(process.env), profile: { loadProjectMcp: false } }
     const fork = f.processFor({ kind: 'fork', source: { provider: 'dsh', sessionId, cwd: f.dir }, through: first.checkpoint })
     await fork.initializationPromise()
     expect(fork.sessionId).not.toBe(sessionId)
@@ -348,8 +350,13 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(await result).toMatchObject({ is_error: false })
     expect(JSON.stringify(f.requests[3].messages)).toContain('remember the blue lighthouse')
     expect(JSON.stringify(f.requests[3].messages)).not.toContain('continue the same conversation')
-    const history = await queryDshRuntime({ cwd: f.dir, home: f.opts.runtimeOptions!.home,
-      env: f.opts.transformEnv!(process.env), profile: { loadProjectMcp: false } }, 'session/list', { cwd: f.dir })
+    let history: any[] = []
+    const historyDeadline = Date.now() + 5_000
+    while (Date.now() < historyDeadline) {
+      history = await queryDshRuntime(runtimeQuery, 'session/list', { cwd: f.dir })
+      if (history.length >= 2) break
+      await Bun.sleep(25)
+    }
     expect(history).toHaveLength(2)
     expect(history.every((row: any) => row.provider === 'dsh' && row.cwd === f.dir)).toBe(true)
     expect(history.find((row: any) => row.sessionId === sessionId).preview).toContain('blue lighthouse')

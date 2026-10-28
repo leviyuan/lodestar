@@ -1,14 +1,7 @@
-import { expect, mock, test } from 'bun:test'
+import { expect, test } from 'bun:test'
+import { buildRelayTokenSource } from './token-source-relay'
 
 let capturedEnv: Record<string, string | undefined> | undefined
-mock.module('./dsh-runtime', () => ({
-  queryDshRuntime: async (opts: { env: Record<string, string | undefined> }) => {
-    capturedEnv = opts.env
-    return [{ model: 'model-a', display: 'Model A', efforts: ['high'], defaultEffort: 'high', contextWindow: null, isDefault: true }]
-  },
-}))
-
-const { buildRelayTokenSource } = await import('./token-source-relay')
 
 test('DSH relay model discovery bootstraps with the first catalog model', async () => {
   const originalFetch = globalThis.fetch
@@ -16,7 +9,10 @@ test('DSH relay model discovery bootstraps with the first catalog model', async 
   try {
     const source = buildRelayTokenSource('site', {
       api_key: 'key', base_url: 'https://gateway.test/v1', protocol: 'openai',
-    }, 'dsh')
+    }, 'dsh', async (opts: { env: Record<string, string | undefined> }) => {
+      capturedEnv = opts.env
+      return [{ model: 'model-a', display: 'Model A', efforts: ['high'], defaultEffort: 'high', contextWindow: null, isDefault: true }]
+    })
     await source.refreshModels()
     expect(source.modelCatalogState?.status).toBe('ready')
     expect(source.defaultModel).toBe('model-a')
