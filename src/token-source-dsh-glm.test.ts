@@ -25,3 +25,18 @@ test('DSH GLM takes explicit credentials over the linked account and clears fore
   expect(() => dshProviderPatches({ LODESTAR_DSH_PROVIDER: 'unknown' })).toThrow('Unsupported')
   expect(factory.setup?.parseArgs('key')).toEqual({ config: { agent: 'dsh', api_key: 'key', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' } })
 })
+
+test('DSH OpenAI relay patches use the relay key seam and completions wire protocol', () => {
+  const env = {
+    LODESTAR_DSH_PROVIDER: 'openai-relay',
+    LODESTAR_DSH_OPENAI_API_KEY: 'relay-key',
+    LODESTAR_DSH_BASE_URL: 'https://gateway.test/v1',
+    LODESTAR_DSH_DEFAULT_MODEL: 'model-a',
+    LODESTAR_DSH_MODELS: '["model-a"]',
+  }
+  const patches = dshProviderPatches(env)
+  const rendered = JSON.stringify(patches)
+  expect(rendered).toContain('LODESTAR_DSH_OPENAI_API_KEY')
+  expect(rendered).toContain('openai-completions')
+  expect(rendered).not.toContain('relay-key')
+})

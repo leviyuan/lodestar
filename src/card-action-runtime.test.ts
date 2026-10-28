@@ -93,6 +93,12 @@ describe('card action identity', () => {
       .toBe(cardActionDedupeKey(data({ kind: 'model_effort_select', panel_id: 'p', effort: 'xhigh' })))
   })
 
+  test('keeps relay site choices distinct after opening the nested site card', () => {
+    expect(cardActionDedupeKey(data({ kind: 'relay_site_select', panel_id: 'p', source_id: 'relay:a:codex' })))
+      .not.toBe(cardActionDedupeKey(data({ kind: 'relay_site_select', panel_id: 'p', source_id: 'relay:b:codex' })))
+    expect(validateCardActionAdmission(data({ kind: 'relay_site_select', panel_id: 'p', source_id: 'relay:a:codex' }))).toBeNull()
+  })
+
   test('collapses every choice from one menu/temp source card into one stage', () => {
     expect(cardActionDedupeKey(data({ kind: 'menu', request_id: 'menu-1', choice: 0 })))
       .toBe(cardActionDedupeKey(data({ kind: 'menu', request_id: 'menu-1', choice: 2 })))

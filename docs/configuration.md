@@ -31,6 +31,8 @@ lodestar-setup
 | `lodestar-claude <备注> [原生参数...]` | 用户终端入口，使用 Lodestar 管理的当前 Claude 安装和对应账号目录；例如 `lodestar-claude 工作号 auth login`，不自动收录账号或清理历史 |
 | `lodestar-agent` | 调用已配置模型执行任务；不支持 Claude 订阅，遵守 Claude 用户协议，中转站等第三方 Claude 模型仍可调用 |
 
+群内可用 `relay-setup <站点标识> <anthropic|openai> <base_url> <api_key>` 配置通用中转站。`anthropic` 提供 Claude Code 来源；`openai` 同时提供 Codex 和 DeepSeek Harness 来源。余额脚本可用 `relay-balance-setup <站点标识> <脚本路径>` 绑定，具体 JSON 接口见[模型与账号](models.md#通用中转站覆盖-packy)。
+
 启动和停止命令会核对 PID 对应的实际入口，读取进程信息失败时明确报错。无法识别的运行时选项、macOS 无法区分边界的含空格入口、Windows 相对入口也会拒绝操作，请通过对应服务管理器处理。旧式单行 PID 文件缺少入口标识，`lodestar-stop` 会拒绝发送信号；请先核对该 PID 的完整命令行，再通过服务管理器或精确 PID 停止。停止命令以进程退出为准，删除 PID 文件不会被当作停止成功。
 
 daemon 启动时不检查 Agent 版本，也不安装或更新 Agent。自动更新默认关闭；首次安装缺少运行文件或需要更新时，运行 `lodestar-update --agents-only`。手动更新和显式开启的自动更新都选择上游 `latest`，独立于 Lodestar 发版，不设置兼容版本白名单。
@@ -101,7 +103,7 @@ bin = "/abs/path/to/claude-wrapper"  # 可选的 Claude 可执行文件
 
 Claude 后端启用项目 MCP 时，缺少 `.mcp.json` 表示未配置；文件存在但无法读取、JSON 损坏或缺少有效的 `mcpServers` 对象会阻止会话启动，并显示具体错误。修正配置后再启动会话。
 
-账号配置、OpenRouter 默认模型和 DSH 接入见[模型与账号](models.md)。手动修改配置后需重启 daemon；群内设置自行保存。
+账号配置、OpenRouter 默认模型、通用中转站和 DSH 接入见[模型与账号](models.md)。手动修改配置后需重启 daemon；群内设置自行保存。
 
 ## HTTP 代理
 

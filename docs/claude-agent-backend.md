@@ -30,7 +30,7 @@ Token Source 管理账号凭据、模型目录、启动环境、默认模型、e
 | GLM Coding Plan | `[token_source.glm]` 或本机 Claude settings；模型来自兼容端点，可补录已验证模型 |
 | DeepSeek | `[token_source.deepseek]` 或本机 Claude settings；模型来自兼容端点，可补录已验证模型 |
 | OpenRouter | `[token_source.openrouter]` 或本机 Claude settings；默认精选六个家族最新版（含 Gemini Flash、MiMo Pro），账号目录验证能力，MD 面板维护显隐 |
-| PackyAPI | `[token_source.packy]`、`[token_source.packy-secondary]`；按令牌目录筛选模型，Claude 入口默认精选 MiniMax M、Opus、Fable、Qwen Max 家族最新版；Codex 入口精选 Kimi K、Grok 家族最新版，主令牌与 `packy-codex` 共用凭据 |
+| 通用中转站 | `[relay.<site_id>]`；`anthropic` 站点用于 Claude Code，`openai` 站点提供 Codex 和 DeepSeek Harness 两个来源视图 |
 | DeepSeek Harness | `[token_source.deepseek-harness]`；模型、effort 与上下文容量来自当前安装的 DSH 原生目录 |
 | DSH GLM Coding Plan | `[token_source.dsh-glm]` 或复用 `glm`；账号接口返回模型，DSH 原生适配器提供能力和推理档位 |
 
@@ -52,7 +52,7 @@ Claude 订阅统一由 `claude-sub` 管理登录验证、模型目录和额度�
 
 `model` 按 Claude Code、Codex、DeepSeek Harness 分组，组 ID 由 `ELEMENTS.modelAgentGroup` 生成。两个 Agent 下的 DeepSeek 来源都显示为 DeepSeek，协议 id 保持不变。选账号后进入模型列表；多个档位才展示 effort 卡，只有一个档位时直接应用，获取失败显示 `MISS`。同 provider/source 的切换调用 `setModelSettings`：Claude 和 DSH 从后续 turn 使用，Codex 保存选择并在重启进程后应用。跨 provider/source 或需要变更项目启动配置时，只能在空闲状态更换进程。
 
-OpenRouter 和 PackyAPI 默认按指定家族从兼容目录筛选最新数字版本；显隐保存增量，显式 `models` 仍保留为固定列表，不自动切换运行模型。其余来源由 `withModelVisibility` 在真实接口目录上应用 `hidden_models`。接口项通过显示/隐藏调整可见性，新增上游模型自动进入列表。所有来源都支持用 `custom_models` 补录列表外模型，`origin` 区分接口项和补录项；GLM / DeepSeek 会先做端点验证，补录模型可直接选择请求档位使用，DSH 原生解析目录外模型，其余来源使用 Agent 请求档位；不能用目录白名单挡住用户补录。接口收录同名模型后按接口项管理，不重复展示。
+OpenRouter 保持自己的精选模型规则。通用中转站只按站点协议读取 `/v1/models`，每个站点按其协议生成可用 Agent 来源；`openai` 站点的 Codex 与 DSH 视图共享 Key 和地址，但分别使用 Responses 与 OpenAI Completions。
 
 `tokenSourceRuntimeModel(s)` 使用完整能力目录，隐藏不修改会话、`model`、`effort`、slots 或启动配置指纹。`model_custom_remove` 只删除补录项，拒绝删接口项；删除前要求会话不再选用该项，并清理默认模型和 slots 的悬空引用。补录/删除和显示/隐藏均串行写配置，旧面板失效。
 

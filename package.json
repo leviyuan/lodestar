@@ -1,6 +1,6 @@
 {
   "name": "@leviyuan/lodestar",
-  "version": "0.21.20",
+  "version": "0.21.21",
   "publishConfig": {
     "access": "public"
   },

@@ -414,6 +414,7 @@ export async function handleNotifyRequest(
       'POST /notify        body={project,text,title?,level?,images?,buttons?,allow_reply?,callback?}  → push card to the project\'s bound conversation ID (chat_id)\n' +
       'GET  /notify/result/<notify_id>  → poll a button choice or text reply (pull mode, no callback server)\n' +
       'GET  /agents/identities; POST/GET/DELETE /agents/runs[/<id>]  → capability-protected delegated Agents\n' +
+      'POST /agents/relays/test|configure|reload  → capability-protected relay validation and hot reload\n' +
       'levels: info|warn|error (default info); images=[/abs/*.png] uploaded + embedded\n' +
       'card types: plain (neither field), selection (buttons), text reply (allow_reply:true); do not combine buttons and allow_reply:true\n' +
       'all types support text + images; callback=http://127.0.0.1:PORT/path optional for selection/reply (push) — omit to poll\n')

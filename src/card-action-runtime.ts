@@ -6,7 +6,7 @@ export type ActorEnqueueResult<T> =
   | { accepted: false; reason: 'closed' | 'invalid-key' }
 
 export const SUPPORTED_CARD_ACTION_KINDS = new Set([
-  'permission', 'menu', 'provider_select', 'model_select', 'model_custom_prompt',
+  'permission', 'menu', 'provider_select', 'relay_site_select', 'model_select', 'model_custom_prompt',
   'model_panel_cancel', 'model_effort_select', 'ask', 'worktree_disband',
   'temp_fork_select', 'temp_back_select', 'temp_resume_select', 'tasklist_enable',
   'tasklist_delete_prompt', 'tasklist_delete_confirm', 'token_source_enable',
@@ -205,7 +205,8 @@ function cardActionSemanticKey(data: any): string {
     case 'notify_callback': resource = { notify_id: value.notify_id }; break
     case 'notify_reply': resource = { notify_id: value.notify_id }; break
     case 'notify_reply_cancel': resource = { notify_id: value.notify_id, reply_id: value.reply_id }; break
-    case 'provider_select':
+    case 'provider_select': resource = { panel_id: value.panel_id }; break
+    case 'relay_site_select': resource = { panel_id: value.panel_id, source_id: value.source_id }; break
     case 'model_select':
     case 'model_custom_prompt':
     case 'model_panel_cancel':

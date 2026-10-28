@@ -27,15 +27,17 @@ export interface DshRuntimeOptions {
 export function dshProviderPatches(env: Record<string, string | undefined>): object[] {
   const provider = env.LODESTAR_DSH_PROVIDER ?? 'deepseek-official'
   if (provider === 'deepseek-official') return []
-  if (provider !== 'zai-coding-cn' && provider !== 'zai') throw new Error(`Unsupported DSH provider: ${provider}`)
+  if (provider !== 'zai-coding-cn' && provider !== 'zai' && provider !== 'openai-relay') throw new Error(`Unsupported DSH provider: ${provider}`)
   const modelIds: unknown = env.LODESTAR_DSH_MODELS === undefined ? undefined : JSON.parse(env.LODESTAR_DSH_MODELS)
   if (modelIds !== undefined && (!Array.isArray(modelIds) || !modelIds.every(id => typeof id === 'string' && id))) {
     throw new Error('Invalid DSH GLM model catalog')
   }
+  const apiKeyEnv = provider === 'openai-relay' ? 'LODESTAR_DSH_OPENAI_API_KEY' : 'LODESTAR_DSH_GLM_API_KEY'
   return [
     { id: 'llm-deepseek', disabled: true },
     { id: 'llm-pi-ai', disabled: false, config: { providers: { [provider]: {
-      apiKeyEnv: 'LODESTAR_DSH_GLM_API_KEY', baseURL: env.LODESTAR_DSH_BASE_URL,
+      apiKeyEnv, baseURL: env.LODESTAR_DSH_BASE_URL,
+      ...(provider === 'openai-relay' ? { api: 'openai-completions' } : {}),
       compat: { supportsReasoningEffort: true },
       reasoning: 'high', ...(Array.isArray(modelIds) ? { models: modelIds.map(id => ({ id,
         reasoningEfforts: { off: null, minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },

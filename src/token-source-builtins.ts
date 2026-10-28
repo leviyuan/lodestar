@@ -13,6 +13,7 @@ import { readClaudeSettingsEnv } from './glm-usage'
 import { withModelVisibility } from './token-source-visibility'
 import { sharedTokenSourceConfigs } from './token-source-accounts'
 import { cachedTokenSource, disposeCachedTokenSource } from './token-source-cache'
+import { buildRelayTokenSource, relayAgentTargets } from './token-source-relay'
 
 // provider 模块 —— import 即登记到 factory registry(副作用)。
 import './token-source-codex'
@@ -20,7 +21,6 @@ import './token-source-glm'
 import './token-source-claude'
 import './token-source-deepseek'
 import './token-source-openrouter'
-import './token-source-packy'
 import './token-source-dsh'
 import './token-source-dsh-glm'
 
@@ -32,7 +32,12 @@ export function buildTokenSourcesFromConfig(): number {
     const detected = def.detect?.fromSettingsEnv(settingsEnv)
     return def.configSectionId && detected ? [[def.configSectionId, detected]] : []
   }))
-  const sharedConfigs = sharedTokenSourceConfigs(config.token_sources ?? {}, detectedConfigs)
+  // Packy was replaced by generic [relay.<site_id>] records. Keep the legacy
+  // helpers importable for migration tests, but never let old Packy sections
+  // participate in the production Token Source registry or block boot.
+  const runtimeTokenConfigs = Object.fromEntries(Object.entries(config.token_sources ?? {})
+    .filter(([id]) => !['packy', 'packy-secondary', 'packy-codex'].includes(id)))
+  const sharedConfigs = sharedTokenSourceConfigs(runtimeTokenConfigs, detectedConfigs)
   const previous = new Map(listTokenSources().map(source => [source.id, source]))
   const definitions = tokenSourceFactories().map(def => {
     // config.token_sources ?? {}：防御 test 环境 mock.module('./config') 跨文件污染
@@ -47,7 +52,17 @@ export function buildTokenSourcesFromConfig(): number {
     }
     return { cfg, detected, create, initial: create() }
   })
-  const sources = definitions.map(({ cfg, detected, create, initial }) => {
+  const relayDefinitions = Object.entries(config.relays ?? {}).flatMap(([siteId, relay]) =>
+    relayAgentTargets(relay).map(agent => {
+      const create = () => {
+        const source = buildRelayTokenSource(siteId, relay, agent)
+        source.spawnRevision = JSON.stringify([siteId, relay, agent])
+        return source
+      }
+      return { cfg: relay as unknown as TokenSourceConfig, detected: null, create, initial: create(), relay: true }
+    }))
+  const allDefinitions = [...definitions.map(item => ({ ...item, relay: false })), ...relayDefinitions]
+  const sources = allDefinitions.map(({ cfg, detected, create, initial }) => {
     const routing = (value: Partial<TokenSourceConfig> | null) => {
       const { display, model, effort, models, hidden_models, shown_models, custom_models, slots, default: _default, ...identity } = value ?? {}
       return identity

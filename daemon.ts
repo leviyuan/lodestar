@@ -59,6 +59,7 @@ import { codexLogins } from './src/codex-login'
 import { settleCodexAccountCards } from './src/session-codex-accounts'
 import { handleAgentRequest } from './src/agent-api'
 import { ensureLodestarAgentSkill } from './src/agent-skill'
+import { ensureRelaySkill } from './src/relay-skill'
 import { removeManagedSkill } from './src/managed-skills'
 import { ensureLodestarAgentCommand } from './src/managed-commands'
 import { config } from './src/config'
@@ -579,7 +580,7 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
 // ── Card action handler ────────────────────────────────────────────────
 function cardActionLabel(kind: string): string {
   const labels: Record<string, string> = {
-    permission: '权限决定', menu: '菜单选择', provider_select: '账号选择', model_page: '模型翻页',
+    permission: '权限决定', menu: '菜单选择', provider_select: '账号选择', relay_site_select: '中转站选择', model_page: '模型翻页',
     model_list_open: '模型列表', model_add: '显示模型', model_remove: '隐藏模型', model_custom_remove: '删除补录模型',
     model_select: '模型选择', model_custom_prompt: '模型补录',
     model_panel_cancel: '取消模型补录', model_effort_select: '模型 effort 选择',
@@ -858,6 +859,10 @@ async function handleCardAction(data: any): Promise<any> {
       }
     }
     case 'provider_select': {
+      const result = await session.onProviderSelect(String(value.source_id ?? ''), String(value.panel_id ?? ''), true)
+      return modelActionResponse(result)
+    }
+    case 'relay_site_select': {
       const result = await session.onProviderSelect(String(value.source_id ?? ''), String(value.panel_id ?? ''), true)
       return modelActionResponse(result)
     }
@@ -1598,6 +1603,7 @@ async function boot(): Promise<void> {
   // body matches what's actually listening.
   ensureFeishuNotifySkill()
   ensureLodestarAgentSkill()
+  ensureRelaySkill()
   // File delivery is injected into each hosted session, not exposed as a Skill.
   removeManagedSkill('lodestar-files')
 
