@@ -19,8 +19,12 @@ export function selectClaudeAccount(options: { model?: string | null; effort?: A
   const diagnostics: string[] = []
   const identities = new Set<string>()
   const candidates: Array<ClaudeQuotaRank & { id: string }> = []
+  let quotaEligibleAccounts = 0
+  let quotaExhaustedAccounts = 0
+  let selectionFailures = 0
   const now = Date.now()
   for (const account of claudeAccounts.list()) {
+    let quotaExhausted = false
     try {
       const source = getTokenSourceForAccount('claude-sub', account.id)
       if (!source?.enabled || source.modelCatalogState?.status !== 'ready') {
@@ -32,15 +36,32 @@ export function selectClaudeAccount(options: { model?: string | null; effort?: A
       if (!entry || entry.unavailableReason || !entry.efforts.length) throw new Error(entry?.unavailableReason ?? `${model} 模型目录 MISS`)
       const effort = options.effort ?? entry.defaultEffort
       if (!effort || !entry.efforts.includes(effort)) throw new Error(`${model}/${effort ?? 'MISS'} 档位不可用`)
-      const rank = rankClaudeQuota(peekTokenSourceUsage(source), model, now, options.activeSessions?.get(account.id) ?? 0)
-      if (rank.state !== 'ready') throw new Error(rank.reason ?? '额度缓存 MISS')
       if (!account.identity) throw new Error('原生账号身份 MISS')
+      quotaEligibleAccounts++
+      const rank = rankClaudeQuota(peekTokenSourceUsage(source), model, now, options.activeSessions?.get(account.id) ?? 0)
+      if (rank.state !== 'ready') {
+        quotaExhausted = rank.state === 'exhausted'
+        if (quotaExhausted) quotaExhaustedAccounts++
+        throw new Error(rank.reason ?? '额度缓存 MISS')
+      }
       if (identities.has(account.identity)) continue
       identities.add(account.identity)
       candidates.push({ id: account.id, ...rank })
-    } catch (error) { diagnostics.push(`${account.name}：${error instanceof Error ? error.message : String(error)}`) }
+    } catch (error) {
+      if (!quotaExhausted) selectionFailures++
+      diagnostics.push(`${account.name}：${error instanceof Error ? error.message : String(error)}`)
+    }
   }
   candidates.sort(compareClaudeQuota)
+  // An exhausted subscription should not make rs/restart lose the session.
+  // Keep the native default route when every account that passed model/effort
+  // validation is authoritatively out of quota. Other failures (catalog,
+  // authentication or a missing usage snapshot) remain visible to the caller.
+  if (!candidates.length && quotaEligibleAccounts > 0
+    && quotaExhaustedAccounts === quotaEligibleAccounts && selectionFailures === 0) {
+    logDiagnostic('claude_account_selection_fallback', { reason: 'rate_limit' })
+    return DEFAULT_CLAUDE_ACCOUNT
+  }
   if (!candidates.length) throw new Error(`Claude 自动选号 MISS：${diagnostics.join('；') || '尚无已收录账号'}`)
   return candidates[0]!.id
 }

@@ -188,7 +188,7 @@ test('named-only authentication keeps one visible source, account-isolated quota
       assert.deepEqual(calls, beforeSqueezing)
       percentages.default = 100; percentages[named.id] = 100
       await refreshTokenSourceUsage(root)
-      assert.throws(() => selectClaudeAccount({ model: 'opus', effort: 'high', activeSessions }), /已耗尽/)
+      assert.equal(selectClaudeAccount({ model: 'opus', effort: 'high', activeSessions }), 'default')
       percentages.default = 40; percentages[named.id] = 40
       await refreshTokenSourceUsage(root)
       const old = root.forAccount('default')
