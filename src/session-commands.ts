@@ -104,6 +104,18 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
     await s.showAgentIdentityPanel(userOpenId)
     return true
   }
+  const relaySetup = raw.trim().match(/^relay-setup(?:\s+([\s\S]+))?$/i)
+  if (relaySetup) {
+    const { runRelaySetup } = await import('./relay-setup')
+    backgroundSourceCommand(s, runRelaySetup(s, (relaySetup[1] ?? '').trim()))
+    return true
+  }
+  const relayBalanceSetup = raw.trim().match(/^relay-balance-setup(?:\s+([\s\S]+))?$/i)
+  if (relayBalanceSetup) {
+    const { runRelayBalanceSetup } = await import('./relay-setup')
+    backgroundSourceCommand(s, runRelayBalanceSetup(s, (relayBalanceSetup[1] ?? '').trim()))
+    return true
+  }
   // <source>-setup <args> —— 启用某 token source(generic:路由到 source factory 的 setup.parseArgs,
   // 加新 source 不改本文件 —— 在 token-source-<name>.ts 声明 setup 字段即自动接入)。
   const tsSetup = raw.trim().match(/^([\w-]+)-setup(?:\s+([\s\S]+))?$/i)

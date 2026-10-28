@@ -74,6 +74,8 @@ export interface LodestarConfig {
   projects: Record<string, ProjectProfile>
   /** [token_source.<id>] 账号配置；群内启用和补录会更新对应节。 */
   token_sources: Record<string, TokenSourceConfig>
+  /** 通用中转站端点；每个条目由 API Key、地址和协议类型定义。 */
+  relays: Record<string, RelayConfig>
 }
 
 export interface ClaudeModelConfig {
@@ -118,6 +120,22 @@ export interface TokenSourceConfig {
   slots?: string
   usage?: string
   default?: boolean
+}
+
+/** 通用中转站端点配置。
+ * `anthropic` 为 Claude Code Messages 端点；`openai` 同时提供 Codex
+ * Responses 和 DeepSeek Harness 的 OpenAI Completions 视图。 */
+export interface RelayConfig {
+  display?: string
+  enabled?: boolean
+  api_key?: string
+  base_url?: string
+  protocol?: string
+  balance_script?: string
+  models?: string
+  shown_models?: string
+  hidden_models?: string
+  custom_models?: string
 }
 
 /** [projects.<name>] 主会话启动配置。cwd 用于两个后端，其余字段用于 Claude。
@@ -352,6 +370,30 @@ export function loadConfig(): LodestarConfig {
     }
     return out
   }
+  const relaySections = (): Record<string, RelayConfig> => {
+    const out: Record<string, RelayConfig> = {}
+    const prefix = 'relay.'
+    for (const [sectionName, section] of Object.entries(t)) {
+      if (!sectionName.startsWith(prefix)) continue
+      const id = sectionName.slice(prefix.length).trim()
+      if (!id) continue
+      const relay: RelayConfig = {}
+      for (const [rawKey, value] of Object.entries(section)) {
+        if (typeof value !== 'string') continue
+        const field = rawKey.trim()
+        if (field === 'enabled') {
+          if (value !== 'true' && value !== 'false') throw new Error(`[${sectionName}].enabled 必须为 true 或 false`)
+          relay.enabled = value === 'true'
+        } else if (field === 'display' || field === 'api_key' || field === 'base_url'
+          || field === 'protocol' || field === 'balance_script' || field === 'models'
+          || field === 'shown_models' || field === 'hidden_models' || field === 'custom_models') {
+          ;(relay as Record<string, string>)[field] = value
+        }
+      }
+      out[id] = relay
+    }
+    return out
+  }
   // [codex.env] / [claude.env] 节可选 —— 空 record 就维持各 CLI 自己的登录态。
   const codexEnv = envSection('codex.env')
   const claudeEnv = envSection('claude.env')
@@ -379,6 +421,7 @@ export function loadConfig(): LodestarConfig {
         ? { translation_validation_rules: t.claude.translation_validation_rules } : {}) },
     projects: projectSections(),
     token_sources: tokenSourceSections(),
+    relays: relaySections(),
   }
 }
 
@@ -386,5 +429,7 @@ export const config = loadConfig()
 
 /** 账号配置写入后仅重载 token_sources，由调用方重建目录。 */
 export function reloadTokenSources(): void {
-  config.token_sources = loadConfig().token_sources
+  const next = loadConfig()
+  config.token_sources = next.token_sources
+  config.relays = next.relays
 }

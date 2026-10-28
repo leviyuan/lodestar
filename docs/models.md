@@ -14,11 +14,8 @@ GLM Key 可在首次安装时跳过，之后用群命令添加或更换。以下
 | Z.ai GLM（两个 Agent 共用） | `glm-setup https://api.z.ai/api/anthropic <api_key>` |
 | DeepSeek（两个 Agent 共用） | `deepseek-setup [base_url] <api_key>` |
 | OpenRouter | `openrouter-setup [base_url] <api_key>` |
-| PackyAPI 主令牌 | `packy-setup [base_url] <api_key>` |
-| PackyAPI 第二令牌 | `packy-secondary-setup [base_url] <api_key>` |
-| PackyAPI / Codex（复用主令牌） | `packy-codex-setup [base_url] <api_key>` |
-| PackyAPI 真实余额（主令牌与 Codex 共用） | `packy-balance-setup [management_url] <user_id> <system_token>` |
-| PackyAPI 第二令牌共用主账号余额 | `packy-secondary-balance-setup share packy` |
+| 通用中转站 | `relay-setup <site_id> <anthropic|openai> <base_url> <api_key>` |
+| 中转站余额脚本 | `relay-balance-setup <site_id> <script_path>` |
 | DeepSeek 旧命令，同样更新共享账号 | `deepseek-harness-setup [base_url] <api_key>` |
 | GLM 旧命令，同样更新共享账号 | `dsh-glm-setup [base_url] <api_key>` |
 
@@ -43,7 +40,7 @@ Codex 订阅的模型目录和额度主动轮询均为每 2 小时；其他来�
 | 补录模型 | 添加接口目录外的模型，可选择推理档位并使用 |
 | 删 | 删除补录记录；仍有会话选用时需先切换模型 |
 
-OpenRouter 和 PackyAPI 默认按指定家族精选最新数字版本，其他来源默认显示接口目录中的模型；新模型会随后台目录刷新出现。隐藏、显示和补录只修改本地列表，不重拉全部来源。所有来源都支持补录，记录保存在 `custom_models`；补录按本地规则检查模型 ID 和请求档位，不在交互中查询上游；实际调用不支持时由后端报告错误。目录未收录不会阻止选择，实际不支持的请求由后端报告错误。接口后来收录同名模型时自动转为接口项，不重复显示。删除补录记录也会清理默认模型和辅助模型中的相关引用。
+OpenRouter 保持自己的精选和模型管理规则。通用中转站按站点协议读取 `/v1/models`，不绑定具体厂商；`anthropic` 站点提供 Claude Code，`openai` 站点同时提供 Codex 和 DeepSeek Harness。模型选择为“中转站 → 站点 → 模型 → effort”。
 
 同账号切换 Claude 或 DSH 模型从后续回复生效；Codex 的持久设置需重启会话生效。跨账号或后端切换只允许在空闲时进行。来源禁用或目录获取失败显示 `MISS`。
 
@@ -141,56 +138,43 @@ effort 按上游声明提供。小米、MiniMax、字节等没有 effort 选择�
 
 OpenRouter 余额来自 `/api/v1/credits`，按 `total_credits - total_usage` 计算；接口权限和错误以实际响应为准。账号目录可见不代表所有工具和请求都能成功，上游拒绝或路由不可用会明确报错。兼容接口、模型与档位的处理见[后端说明](claude-agent-backend.md#openrouter)。
 
-## PackyAPI
+## 通用中转站（覆盖 Packy）
 
-PackyAPI 提供三个来源入口：Claude Code 下的 `PackyAPI`、`PackyAPI · 令牌2`，以及 Codex 下的 `PackyAPI`。第二令牌独立保存；Codex 与主令牌共用一次存储的 Key 和平台地址，模型、effort、可见性分别维护。
-
-Packy 的 Claude 入口默认展示 MiniMax M、Claude Opus、Claude Fable、Qwen Max 四个家族在兼容目录中的最新数字版本；Codex 入口展示 Kimi K、Grok 两个家族的最新版。Opus 5.5 的 API ID 为 `claude-opus-5-5`，目录包含时自动进入精选。版本逐段按数字比较，同版本再比较发布日期；保留接口原始 ID，不自动纳入 preview、thinking 等变体，也不构造不存在的模型。
-
-精选随现有每 5 分钟目录刷新更新；当前运行模型与 effort 不随目录切换。点「隐」隐藏自动精选项后，同家族后续版本保持隐藏；手动显示的旧版本仍可独立显隐。「显示模型」中加入的额外接口项保存到 `shown_models`，隐藏记录保存到 `hidden_models`（自动家族同时记录 `family:opus` 等标记与当前 ID），显隐操作不会冻结整个精选列表。已配置的 `model` 和 `custom_models` 保留。
-
-显式 `models` 仍是固定列表，优先于自动精选；`models = ""` 保持空列表。以前通过面板显隐生成的 `models` 也按固定列表保留，移除该配置项后才恢复自动精选。其余兼容模型继续留在「显示模型」目录，可手动显示或补录。
+中转站不绑定具体厂商，只配置站点标识、API Key、地址和协议类型。Packy 的旧 `[token_source.packy]`、`packy-secondary`、`packy-codex` 配置不再读取，需要按新格式重新配置。
 
 ```toml
-[token_source.packy]
-api_key = "填写主令牌"
-base_url = "https://cf.api.fan"
-model = "MiniMax-M3"
-effort = "default"
-# models = "MiniMax-M3,qwen3.8-max-0902" # 可选：固定列表，停止默认精选自动追新
-# shown_models = "other-model" # 可选：在自动精选之外保留指定接口模型
-management_token = "填写个人设置中的系统访问令牌"
-management_user_id = "填写该账号用户 ID"
-management_url = "https://www.packyapi.ai"
-
-[token_source.packy-secondary]
-api_key = "填写第二令牌"
-model = "qwen3.8-max-0902"
-effort = "default"
-billing_source = "packy" # 仅当第二令牌也属于同一余额账号
-
-[token_source.packy-codex]
-model = "kimi-k3"
-effort = "medium"
+[relay.packy]
+display = "Packy"
+api_key = "填写 API Key"
+base_url = "https://gateway.example"
+protocol = "anthropic"        # Claude Code；OpenAI 类型同时提供 Codex 和 DSH
+# balance_script = "/abs/path/relay-balance"
 ```
 
-目录由各令牌的 `GET /v1/models` 实时返回，保留原始 ID 和大小写。预设只筛选真实目录项；目录外模型须显式补录，不把预设伪装成上游模型。Claude Code 默认列声明 `anthropic` 的模型，Codex 默认列声明 `openai-response` 的模型。目录声明可能不完整：确认某个模型实际兼容后，可以通过补录或 `custom_models` 显式启用；条目仍标记为补录项，不改写上游协议声明。隐藏/显示、补录/删除与其他来源一致；目录失败显示 MISS，不更换令牌或模型。
+协议类型为 `anthropic` 或 `openai`：
 
-有推理档位声明时沿用声明。目录只给模型 ID 和协议、未声明推理档位时，面板提供 Agent 的请求选项：Claude Code 默认 `default`（不发送 effort），Codex 默认请求 `medium`；这些请求选项不保证所有上游模型接受，拒绝会如实报错。`effort` 可覆盖本来源默认请求档位。
+- `anthropic`：在 Claude Code → 中转站下显示，使用 Anthropic Messages。
+- `openai`：同时在 Codex → 中转站和 DeepSeek Harness → 中转站下显示；Codex 使用 Responses，DSH 使用 OpenAI Completions。
 
-Claude Code 使用官方 SDK 和 `/v1/messages`，辅助角色也使用当前令牌与所选模型，保留项目 MCP、Skill 和原生 resume。Codex 使用独立 Responses provider 和进程环境变量注入 Key；不要求 ChatGPT 登录，不参与 Codex 订阅自动选号、重置卡或订阅额度查询，也不加载需要订阅认证的 ChatGPT 连接器。模型目录由 Lodestar 直接读取；上游 Codex 自身的模型元数据刷新若遇到 New API 的 `data` / `models` 格式差异，仍保留原始诊断，不伪造原生元数据。
+发送 `relay-setup <site_id> <anthropic|openai> <base_url> <api_key>` 可校验模型目录并保存站点。模型面板路径为“中转站 → 站点 → 模型 → effort”。模型目录读取站点的 `/v1/models`，模型 ID 和显示名称按上游返回保留；未声明 effort 时按当前 Agent 提供可用档位。
 
-Gemini 3.8 Flash 默认使用 OpenRouter 的 `google/gemini-3.8-flash`，Packy 默认隐藏。Packy 的 Messages 转换可能拒绝 Claude 工具 schema 中的 `propertyNames`、`const`；显式使用该路由时会显示真实 HTTP 400 错误。
+余额查询是可选的。发送 `relay-balance-setup <site_id> <script_path>` 绑定脚本。脚本通过 stdin 接收 JSON：
 
-Gemini 3.8 Flash 使用 Claude Code 原生重试：请求超时 `API_TIMEOUT_MS=60000`、字节流空闲超时 `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=45000`、请求重试预算 `CLAUDE_CODE_MAX_RETRIES=2`，关闭无限重试看门狗。该策略只在选择 Gemini 3.8 Flash 为 Claude 主模型时注入；切换请求策略会替换空闲进程并保留原生会话。宿主不重放整轮用户输入或已完成的工具，不更换 Key、模型或来源；SDK 判定的最终失败仍会显示。
+```json
+{"site_id":"packy","base_url":"https://gateway.example","protocol":"anthropic","api_key":"..."}
+```
 
-官方推理入口为 `https://cf.api.fan`，管理入口为 `https://www.packyapi.ai`。真实余额使用系统访问令牌及 `New-Api-User` 用户 ID 请求 `/api/user/self`，读取账户剩余 `quota`，按 `/api/status` 声明的 `quota_per_unit` 换算 USD。`hi` 与回复页脚显示同一余额；不会使用 API Key 的令牌配额或无限额度占位值代替。
+stdout 返回统一额度快照，例如：
 
-系统访问令牌与模型 Key 分开保存，余额凭据不传入 Agent。`packy-codex` 自动共用主来源的余额；第二令牌只有显式设置 `billing_source = "packy"` 才共用。此引用只复用余额凭据，第二个模型 Key 保持独立，同一余额账号在 `hi` 中只列一行。第二令牌属于其他账号时，用 `packy-secondary-balance-setup [management_url] <user_id> <system_token>` 配置独立余额。模型与余额配置命令均先调用上游验证，失败不覆盖已有配置。
+```json
+{"state":"ok","kind":"balance","balance":{"remaining":12.34,"currency":"USD"},"windows":[]}
+```
 
-同一余额凭据跨 Agent、模型 Key 共享 60 秒惰性缓存与并发查询；刷新失败显示 MISS，遵守失败冷却和 Retry-After，不展示旧成功余额或改查令牌配额。余额配置更新不改变 Agent 的启动身份。自建地址未指定 `management_url` 时按自己的 API 根地址查询管理接口，系统令牌请求拒绝重定向。引用其他余额来源时使用被引用来源的管理地址。
+没有余额脚本时显示“余额 —”；脚本超时、退出失败或返回无效 JSON 时显示 `MISS`。脚本通过直接可执行文件启动，Key 不放在命令行参数中。
 
-未配置系统访问令牌时，只能通过 `/api/usage/token/` 查询令牌配额：有限令牌显示“额度”，无限令牌显示 `余额 —`。这不代表真实账户余额。
+受管 Agent 不需要重启 Lodestar：使用继承的 `LODESTAR_AGENT_URL` 与 `LODESTAR_AGENT_CAPABILITY` 调用 `POST /agents/relays/test`（只读验证）、`POST /agents/relays/configure`（保存并刷新单个站点）或 `POST /agents/relays/reload`（重新读取并刷新站点）。项目绑定的 Agent 不允许修改全局 relay 配置。
+
+OpenRouter 保持独立来源，不纳入通用中转站。
 
 ## DeepSeek Harness
 

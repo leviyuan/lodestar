@@ -99,6 +99,9 @@ export function scrubDshEnv(base: Env): Env {
 export interface TokenSource {
   id: string
   /** One visible source, with separate native auth/catalog bindings for each account. */
+  /** Generic relay metadata used by the model panel and runtime diagnostics. */
+  relaySiteId?: string
+  relayProtocol?: 'anthropic' | 'openai'
   forAccount?(accountId: string): TokenSource
   listAccounts?(): Array<{ id: string; name: string }>
   accountRevision?(accountId: string): string

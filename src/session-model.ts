@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 
 import { Session } from './session'
 import { listTokenSources, type TokenSource } from './token-source'
+import type { RelayAgent } from './token-source-relay'
 import { editTokenSourceModels, registerCustomTokenSourceModel, removeCustomTokenSourceModel } from './token-source-config'
 import { isCodexReasoningEffort } from './codex-process'
 import {
@@ -128,13 +129,47 @@ async function changeLiveModelSettings(
 // ── 第1级:账号(provider)选项 —— 每个 token source 一项 ─────
 function providerChoices(s: Session): cards.ProviderChoice[] {
   const cur = s.currentTokenSource()
-  return listTokenSources().map(source => s.tokenSource(source.id)!)
+  const sources = listTokenSources().map(source => s.tokenSource(source.id)!).filter(Boolean)
+  const normal = sources.filter(source => !source.relaySiteId)
+  const relay = sources.filter(source => !!source.relaySiteId)
+  const relayGroups = (['claude', 'codex', 'dsh'] as const).map(agent => {
+    const sites = relay.filter(source => source.agent === agent)
+    return {
+      provider: agent as AgentProvider,
+      sourceId: `relay-group:${agent}`,
+      display: '中转站',
+      enabled: sites.some(source => source.enabled),
+      modelCount: sites.reduce((sum, source) => sum + source.models.length, 0),
+      virtual: 'relay-group' as const,
+      catalogStatus: sites.some(source => source.modelCatalogState?.status === 'ready') ? 'ready' as const
+        : sites.some(source => source.modelCatalogState?.status === 'loading') ? 'loading' as const
+        : sites.length ? sites[0]!.modelCatalogState?.status : 'disabled' as const,
+      selected: relay.some(source => source.id === cur?.id && source.agent === agent),
+    }
+  })
+  const normalChoices: cards.ProviderChoice[] = normal.map(source => ({
+      provider: source.agent as AgentProvider,
+      sourceId: source.id,
+      display: source.display,
+      enabled: source.enabled,
+      modelCount: source.models.length,
+      catalogStatus: source.modelCatalogState?.status,
+      catalogError: source.modelCatalogState?.error,
+      selected: cur?.id === source.id,
+    }))
+  return [...normalChoices, ...relayGroups]
+}
+
+function relaySiteChoices(s: Session, agent: RelayAgent): cards.ProviderChoice[] {
+  const cur = s.currentTokenSource()
+  return listTokenSources().filter(source => source.relaySiteId && source.agent === agent).map(source => s.tokenSource(source.id)!)
     .map(ts => ({
       provider: ts.agent as AgentProvider,
       sourceId: ts.id,
       display: ts.display,
       enabled: ts.enabled,
       modelCount: ts.models.length,
+      relaySite: true,
       catalogStatus: ts.modelCatalogState?.status,
       catalogError: ts.modelCatalogState?.error,
       selected: cur?.id === ts.id,
@@ -240,6 +275,22 @@ export async function onProviderSelect(
   refresh = false,
 ): Promise<ModelActionResult> {
   const sourceId = sourceIdRaw.trim()
+  const relayGroup = /^relay-group:(claude|codex|dsh)$/.exec(sourceId)
+  if (relayGroup) {
+    const panelId = panelIdRaw.trim()
+    if (!s.modelPanels.has(panelId)) return { ok: false, message: '模型面板已失效，请重新发送 model' }
+    const agent = relayGroup[1] as RelayAgent
+    const providers = relaySiteChoices(s, agent)
+    if (!providers.length) return { ok: false, message: '当前没有配置可用的中转站' }
+    const messageId = s.modelPanels.get(panelId)?.messageId
+    s.modelPanels.set(panelId, { models: [], sourceId, messageId, mode: 'select' })
+    return {
+      ok: true,
+      message: '',
+      card: cards.providerSelectionCard({ sessionName: s.sessionName, panelId,
+        currentDisplay: '中转站', title: '选择中转站', providers }),
+    }
+  }
   const ts = s.tokenSource(sourceId)
   if (!ts) return { ok: false, message: `未知账号: ${sourceId}` }
   if (!ts.enabled) return { ok: false, message: ts.modelCatalogState?.error ?? `${ts.display} 未配置,请先点「启用」` }
@@ -282,7 +333,7 @@ export async function onModelPage(s: Session, panelId: string, sourceId: string,
       models: panel.models,
       sourceId,
       editable: panel.editable,
-      allowCustom: true,
+      allowCustom: !s.tokenSource(sourceId)?.relaySiteId,
       mode: panel.mode,
       ...(totalPages > 1 ? { pagination: { sourceId, page, totalPages } } : {}),
     }),

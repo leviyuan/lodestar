@@ -25,7 +25,7 @@ import { DSH_PROTOCOL_VERSION } from './dsh-protocol.ts'
 export const name = 'lodestar-bridge'
 export const inject = ['agents', 'llm', 'agentDefaultModel', 'sessionPersistence', 'tools', 'systemPrompt', 'userQuestions', 'compaction', 'shellEnv', 'attachments', 'sdkAppStartup']
 const PROVIDER = process.env.LODESTAR_DSH_PROVIDER ?? 'deepseek-official'
-if (!['deepseek-official', 'zai-coding-cn', 'zai'].includes(PROVIDER)) throw new Error(`Unsupported DSH provider: ${PROVIDER}`)
+if (!['deepseek-official', 'zai-coding-cn', 'zai', 'openai-relay'].includes(PROVIDER)) throw new Error(`Unsupported DSH provider: ${PROVIDER}`)
 
 function nativeErrorMessage(error: unknown, depth = 0): string {
   if (!(error instanceof Error)) return String(error)

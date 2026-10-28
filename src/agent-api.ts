@@ -10,6 +10,8 @@ import {
   parseAgentRunRequest,
   type AgentRunSnapshot,
 } from './agent-run-types'
+import { configureRelay, reloadRelays, testRelay } from './relay-config'
+import type { RelayConfig } from './config'
 
 export interface AgentApiContext {
   service: AgentService
@@ -41,6 +43,38 @@ export async function handleAgentRequest(
       : authorizePrincipal(context, capability)
   } catch (error) { return send(409, { error: messageOf(error) }) }
   if (!principal) return send(403, { error: 'invalid or stale agent capability' })
+
+  // Relay maintenance is allowed only from a session-bound Agent capability;
+  // project workers must not mutate the daemon's global configuration.
+  if (url.pathname.startsWith('/agents/relays/')) {
+    if (principal.kind !== 'session' && agentPrincipalContext(principal).owner.kind !== 'session') {
+      return send(403, { error: 'relay configuration requires a session-bound Agent capability' })
+    }
+    try {
+      if (req.method === 'POST' && url.pathname === '/agents/relays/test') {
+        const input = parseRelayRequest(await readJsonBody(req))
+        const tested = await testRelay(input.config)
+        return send(200, { ok: true, site_id: input.siteId, protocol: tested.protocol,
+          base_url: tested.base_url, models: tested.models.map(model => ({ id: model.id, display: model.display,
+            ...(model.efforts ? { efforts: model.efforts } : {}), ...(model.defaultEffort ? { default_effort: model.defaultEffort } : {}) })) })
+      }
+      if (req.method === 'POST' && url.pathname === '/agents/relays/configure') {
+        const input = parseRelayRequest(await readJsonBody(req))
+        await configureRelay(input.siteId, input.config)
+        return send(200, { ok: true, site_id: input.siteId, sources: await reloadRelays(input.siteId) })
+      }
+      if (req.method === 'POST' && url.pathname === '/agents/relays/reload') {
+        const body = await readJsonBody(req)
+        const siteId = body && typeof body === 'object' && !Array.isArray(body)
+          && typeof (body as Record<string, unknown>).site_id === 'string'
+          ? String((body as Record<string, unknown>).site_id).trim() : undefined
+        return send(200, { ok: true, sources: await reloadRelays(siteId || undefined) })
+      }
+    } catch (error) {
+      return send(409, { error: messageOf(error) })
+    }
+    return send(405, { error: 'unsupported relay endpoint' })
+  }
 
   if (req.method === 'GET' && url.pathname === '/agents/identities') {
     return send(200, serializeCatalog(await getAgentSkillIdentityCatalog(agentPrincipalContext(principal).codexAccountId)))
@@ -81,6 +115,22 @@ export async function handleAgentRequest(
     return send(409, { error: messageOf(error) })
   }
   return send(405, { error: 'unsupported agent endpoint' })
+}
+
+function parseRelayRequest(value: unknown): { siteId: string; config: RelayConfig } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('relay request must be an object')
+  const body = value as Record<string, unknown>
+  const siteId = typeof body.site_id === 'string' ? body.site_id.trim() : ''
+  const protocol = typeof body.protocol === 'string' ? body.protocol.trim().toLowerCase() : ''
+  const baseUrl = typeof body.base_url === 'string' ? body.base_url.trim() : ''
+  const apiKey = typeof body.api_key === 'string' ? body.api_key : ''
+  if (!siteId || !/^[\w.-]{1,96}$/.test(siteId)) throw new Error('invalid relay site_id')
+  if (protocol !== 'anthropic' && protocol !== 'openai') throw new Error('relay protocol must be anthropic or openai')
+  if (!baseUrl || !apiKey) throw new Error('relay base_url and api_key are required')
+  const balanceScript = typeof body.balance_script === 'string' ? body.balance_script.trim() : undefined
+  const display = typeof body.display === 'string' ? body.display.trim() : undefined
+  return { siteId, config: { protocol, base_url: baseUrl, api_key: apiKey,
+    ...(display ? { display } : {}), ...(balanceScript ? { balance_script: balanceScript } : {}) } }
 }
 
 function authorizePrincipal(context: AgentApiContext, capability: string): AgentPrincipal | null {

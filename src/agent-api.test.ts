@@ -51,6 +51,37 @@ async function serve(onStart?: (request: any) => void, projectMode = false) {
 }
 
 describe('delegated Agent HTTP API', () => {
+  test('session-bound Agents can test a relay without saving or restarting the daemon', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).startsWith('http://127.0.0.1:')) return originalFetch(input, init)
+      expect(String(input)).toBe('https://gateway.test/v1/models')
+      return Response.json({ data: [{ id: 'model-a', name: 'Model A' }] })
+    }) as unknown as typeof fetch
+    try {
+      const base = await serve()
+      const response = await fetch(`${base}/agents/relays/test`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer secret', 'content-type': 'application/json' },
+        body: JSON.stringify({ site_id: 'demo', protocol: 'openai', base_url: 'https://gateway.test/v1', api_key: 'relay-key' }),
+      })
+      const value = await response.json() as any
+      expect(response.status).toBe(200)
+      expect(value).toMatchObject({ ok: true, site_id: 'demo', protocol: 'openai', base_url: 'https://gateway.test',
+        models: [{ id: 'model-a', display: 'Model A' }] })
+    } finally { globalThis.fetch = originalFetch }
+  })
+
+  test('project-bound Agents cannot mutate the global relay registry', async () => {
+    const base = await serve(undefined, true)
+    const response = await fetch(`${base}/agents/relays/test?project=project`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer project-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ site_id: 'demo', protocol: 'openai', base_url: 'https://gateway.test/v1', api_key: 'relay-key' }),
+    })
+    expect(response.status).toBe(403)
+  })
+
   test.each(['session', 'project'] as const)('%s preserves inputs beyond the former character and HTTP body limits', async kind => {
     const projectMode = kind === 'project'
     const base = await serve(undefined, projectMode)

@@ -493,6 +493,10 @@ export interface ProviderChoice {
   display: string
   enabled: boolean
   modelCount: number
+  /** Synthetic entry used to open the generic relay site list. */
+  virtual?: 'relay-group'
+  /** Site row in the second relay-selection stage. */
+  relaySite?: boolean
   catalogStatus?: TokenSourceModelCatalogState['status']
   catalogError?: string
   selected?: boolean
@@ -503,6 +507,7 @@ interface ProviderSelectionCardOpts {
   panelId: string
   currentDisplay?: string | null
   providers: ProviderChoice[]
+  title?: string
 }
 
 /** 第1级 model 面板:选账号(codex订阅/glm)。点 enabled 账号 → 第2级(该账号模型)。 */
@@ -510,7 +515,7 @@ export function providerSelectionCard(opts: ProviderSelectionCardOpts): object {
   return modelCard(opts.sessionName, {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.modelPanel,
-    header: { title: { tag: 'plain_text', content: '选择账号' } },
+    header: { title: { tag: 'plain_text', content: opts.title ?? '选择账号' } },
     expanded: true,
     elements: [
       {
@@ -538,6 +543,13 @@ export function providerSelectionCard(opts: ProviderSelectionCardOpts): object {
 }
 
 function providerChoiceElement(p: ProviderChoice, panelId: string): object {
+  if (p.virtual === 'relay-group' && !p.enabled) {
+    return {
+      tag: 'column_set',
+      columns: [{ tag: 'column', width: 'weighted', weight: 4,
+        elements: [{ tag: 'markdown', content: `⚙️ **${escapeMarkdown(p.display)}** · 未配置` }] }],
+    }
+  }
   if (!p.enabled) {
     return {
       tag: 'column_set',
@@ -578,7 +590,7 @@ function providerChoiceElement(p: ProviderChoice, panelId: string): object {
           behaviors: [{
             type: 'callback',
             value: {
-              kind: 'provider_select', panel_id: panelId, source_id: p.sourceId,
+              kind: p.relaySite ? 'relay_site_select' : 'provider_select', panel_id: panelId, source_id: p.sourceId,
               ...(p.provider ? { provider: p.provider } : {}),
             },
           }],
