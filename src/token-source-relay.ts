@@ -63,7 +63,10 @@ function dshModels(models: readonly TokenSourceModel[], native: readonly DshMode
   })
 }
 
-export function buildRelayTokenSource(siteId: string, cfg: RelayConfig, agent: RelayAgent): TokenSource {
+type RelayDshCatalogQuery = typeof queryDshRuntime
+
+export function buildRelayTokenSource(siteId: string, cfg: RelayConfig, agent: RelayAgent,
+  dshCatalogQuery: RelayDshCatalogQuery = queryDshRuntime): TokenSource {
   const protocol = cfg.protocol?.trim().toLowerCase() as RelayProtocol | undefined
   const key = cfg.api_key?.trim() ?? ''
   let base = ''
@@ -109,7 +112,7 @@ export function buildRelayTokenSource(siteId: string, cfg: RelayConfig, agent: R
           // DSH model discovery needs a route before source.defaultModel is
           // committed. Bootstrap the child with the first catalog model; the
           // selected/default model is published after native discovery.
-          const native = await queryDshRuntime({ cwd: DSH_HOME_DIR,
+          const native = await dshCatalogQuery({ cwd: DSH_HOME_DIR,
             env: source.spawnEnv(process.env, models[0]?.model), profile: { loadProjectMcp: false } }, 'model/list')
           source.models = dshModels(models, Array.isArray(native) ? native : [])
         } else source.models = models
