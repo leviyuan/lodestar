@@ -62,7 +62,8 @@ export class FeishuDriveClient {
       try {
         const response = await this.deps.fetch(`https://open.feishu.cn/open-apis${path}`, {
           method,
-          headers: { Authorization: `Bearer ${token}`, ...(!multipart && data !== undefined ? { 'Content-Type': 'application/json' } : {}) },
+          // Match the media type required by Feishu's Drive endpoints exactly.
+          headers: { Authorization: `Bearer ${token}`, ...(!multipart && data !== undefined ? { 'Content-Type': 'application/json; charset=utf-8' } : {}) },
           ...(data !== undefined ? { body: multipart ? data : JSON.stringify(data) } : {}),
           signal,
         })
@@ -81,7 +82,8 @@ export class FeishuDriveClient {
   }
 
   async createFolder(name: string, signal?: AbortSignal): Promise<DeliveryFolder> {
-    const result = await this.request('创建交付文件夹', '/drive/v1/files/create_folder', 'POST', () => ({ name, folder_token: '' }), signal)
+    const folderName = requiredString(name, '交付文件夹名称')
+    const result = await this.request('创建交付文件夹', '/drive/v1/files/create_folder', 'POST', () => ({ name: folderName, folder_token: '' }), signal)
     return { token: requiredString(result?.token, '交付文件夹'), url: requireDriveUrl(result?.url) }
   }
 

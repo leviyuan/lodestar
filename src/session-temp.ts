@@ -88,7 +88,7 @@ const panelsBySession = new WeakMap<Session, Map<string, TempPanelState>>()
 const reservedTempChatNames = new Set<string>()
 
 function baseSessionName(s: Session): string {
-  return feishu.tempProjectName(s.sessionName) ?? s.sessionName
+  return feishu.mainSessionName(s.sessionName)
 }
 
 function reserveTempChatName(baseName: string): string {

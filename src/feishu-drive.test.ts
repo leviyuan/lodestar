@@ -270,6 +270,31 @@ describe('Feishu Drive delivery transport', () => {
     await expect(broken.createFolder('test')).rejects.toThrow('交付文件夹 MISS')
   })
 
+  test('sends the folder name as a JSON body accepted by the Drive gateway', async () => {
+    let body: unknown
+    let contentType: string | null = null
+    const client = new FeishuDriveClient(deps(async (_url, init) => {
+      contentType = new Headers(init.headers).get('content-type')
+      body = JSON.parse(String(init.body))
+      return Response.json({ code: 0, data: { token: 'created', url: 'https://example.feishu.cn/drive/folder/created' } })
+    }))
+    expect(await client.createFolder('BTW 项目群')).toEqual({
+      token: 'created', url: 'https://example.feishu.cn/drive/folder/created',
+    })
+    expect(contentType as string | null).toBe('application/json; charset=utf-8')
+    expect(body).toEqual({ name: 'BTW 项目群', folder_token: '' })
+  })
+
+  test('rejects an empty folder name before making a Drive request', async () => {
+    let requests = 0
+    const client = new FeishuDriveClient(deps(async () => {
+      requests++
+      return Response.json({ code: 0, data: folder })
+    }))
+    await expect(client.createFolder('  ')).rejects.toThrow('交付文件夹名称 MISS')
+    expect(requests).toBe(0)
+  })
+
   test('cancels an active request and prevents queued requests from reaching Feishu', async () => {
     const controller = new AbortController()
     let entered!: () => void

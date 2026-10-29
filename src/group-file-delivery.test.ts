@@ -14,8 +14,8 @@ function fixture() {
   const deps: GroupFileDeliveryDeps = {
     read: () => stored,
     write: value => { stored = JSON.stringify(value) },
-    getChatName: async chatId => {
-      const name = names.get(chatId)
+    getChatName: async context => {
+      const name = names.get(context.chatId)
       if (!name) throw new Error('群不存在')
       return name
     },
@@ -79,6 +79,24 @@ describe('automatic file delivery per-group folders', () => {
       ['chat-a', 'user'], ['chat-temp', 'second-user'], ['chat-temp', 'third-user'],
     ])
     expect(f.created).toHaveLength(2)
+  })
+
+  test('uses the main group name for BTW and WT delivery contexts', async () => {
+    const f = fixture()
+    const requested: string[] = []
+    f.deps.getChatName = async context => {
+      requested.push(context.projectName)
+      return '主群名称'
+    }
+    const btw = await f.registry.resolveFolder({
+      ...context, chatId: 'chat-btw', projectName: '项目群*1029-1828',
+    }, signal())
+    const wt = await f.registry.resolveFolder({
+      ...context, chatId: 'chat-wt', projectName: '项目群[feature]',
+    }, signal())
+    expect(requested).toEqual(['项目群*1029-1828', '项目群[feature]'])
+    expect(btw.name).toBe('主群名称')
+    expect(wt.name).toBe('主群名称')
   })
 
   for (const version of [1, 2]) {

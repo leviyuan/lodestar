@@ -11,7 +11,7 @@ import * as worktree from './worktree'
 import { messageOf, type WorktreeActionResult } from './session-util'
 
 export function worktreeProjectName(s: Session): string {
-  return worktree.projectNameFromSessionName(feishu.tempProjectName(s.sessionName) ?? s.sessionName)
+  return feishu.mainSessionName(s.sessionName)
 }
 
 export function worktreeProjectDir(s: Session): string {

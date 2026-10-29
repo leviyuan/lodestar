@@ -16,7 +16,11 @@ export const groupFileDelivery = new GroupFileDelivery({
     catch (error: any) { if (error?.code === 'ENOENT') return undefined; throw error }
   },
   write: value => writeJsonStateAtomic(FILE_DELIVERY_GROUPS_FILE, value),
-  getChatName: (chatId, signal) => feishuDrive.getChatName(chatId, signal),
+  getChatName: async (context, signal) => {
+    const chatId = feishu.mainChatIdForSession(context.projectName, context.chatId)
+    if (!chatId) throw new Error('无法找到主群，不能创建交付文件夹')
+    return feishuDrive.getChatName(chatId, signal)
+  },
   createFolder: (name, signal) => feishuDrive.createFolder(name, signal),
   getFolder: (folder, signal) => feishuDrive.getFolder(folder, signal),
   renameFolder: (folder, name, signal) => feishuDrive.renameFolder(folder, name, signal),

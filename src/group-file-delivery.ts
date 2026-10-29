@@ -12,7 +12,7 @@ export interface FileDeliveryGroupsState {
 export interface GroupFileDeliveryDeps {
   read(): string | undefined
   write(value: FileDeliveryGroupsState): void
-  getChatName(chatId: string, signal?: AbortSignal): Promise<string>
+  getChatName(context: Pick<FileDeliveryContext, 'chatId' | 'projectName'>, signal?: AbortSignal): Promise<string>
   createFolder(name: string, signal?: AbortSignal): Promise<DeliveryFolder>
   getFolder(folder: DeliveryFolder, signal?: AbortSignal): Promise<GroupDeliveryFolder>
   renameFolder(folder: DeliveryFolder, name: string, signal?: AbortSignal): Promise<GroupDeliveryFolder>
@@ -33,24 +33,29 @@ export class GroupFileDelivery {
 
   /** The first oversized file creates its chat's folder; later deliveries reuse it. */
   resolveFolder(context: FileDeliveryContext, signal: AbortSignal): Promise<GroupDeliveryFolder> {
-    return this.exclusive(`chat:${context.chatId}`, () => this.prepare(context.chatId, context.managerOpenId, true, signal))
+    return this.exclusive(`chat:${context.chatId}`, () => this.prepare(context, true, signal))
   }
 
   /** Explicit adoption for known existing deliverables; never searches or merges folders by name. */
-  bindExisting(chatId: string, managerOpenId: string, existing: DeliveryFolder): Promise<GroupDeliveryFolder> {
+  bindExisting(chatId: string, managerOpenId: string, existing: DeliveryFolder, projectName = chatId): Promise<GroupDeliveryFolder> {
     return this.exclusive(`chat:${chatId}`, async () => {
       const current = this.load().groups[chatId]
       if (current?.folder && current.folder.token !== existing.token) throw new Error('本群已经绑定其他文件夹')
       const folder = await this.deps.getFolder(existing)
       this.commitFolder(chatId, folder)
-      return this.prepare(chatId, managerOpenId, false)
+      return this.prepare({ chatId, managerOpenId, projectName }, false)
     })
   }
 
-  private async prepare(chatId: string, managerOpenId: string, create: boolean, signal?: AbortSignal): Promise<GroupDeliveryFolder> {
+  private async prepare(
+    context: Pick<FileDeliveryContext, 'chatId' | 'managerOpenId' | 'projectName'>,
+    create: boolean,
+    signal?: AbortSignal,
+  ): Promise<GroupDeliveryFolder> {
     signal?.throwIfAborted()
+    const { chatId, managerOpenId } = context
     if (!chatId.trim() || !managerOpenId.trim()) throw new Error('无法确认交付群或管理权限接收人')
-    const name = await this.deps.getChatName(chatId, signal)
+    const name = await this.deps.getChatName(context, signal)
     if (!name.trim()) throw new Error('群名称 MISS')
     let folder = this.load().groups[chatId]?.folder
     if (!folder) {

@@ -197,6 +197,14 @@ describe('session-temp Codex btw/fork', () => {
     expect(sentTexts.at(-1)).toContain('已创建')
   })
 
+  test('WT 中创建 BTW 仍使用主群项目名', async () => {
+    const h = makeHarness('project[feature]')
+
+    await runBtwCommand(h.session, 'ou_owner')
+
+    expect(h.createCalls[0].chatName).toBe('project*0000-0000')
+  })
+
   test('并发创建会同步预留临时群名，避免同分钟同名', async () => {
     const first = makeHarness()
     const second = makeHarness()

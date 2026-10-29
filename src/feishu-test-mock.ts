@@ -52,6 +52,7 @@ export const modelSelections = new Map<string, {
   tokenSourceId?: string | null
 }>()
 export const resumeRefs = new Map<string, { provider: 'codex' | 'claude' | 'dsh'; sessionId: string; cwd: string | null }>()
+export const preferredChatForSession = new Map<string, string>()
 /** [projects.<name>] 项目 profile 替身,测试往里 set 后 Session 构造时可查到。 */
 export const projectProfiles = new Map<string, ProjectProfile>()
 
@@ -66,6 +67,7 @@ export function resetFeishuMock(): void {
   chatTailMessages.clear()
   modelSelections.clear()
   resumeRefs.clear()
+  preferredChatForSession.clear()
   turnAnchorsBySession.clear()
   resumeWriteError = null
   turnAnchorWriteError = null
@@ -92,7 +94,7 @@ mock.module('./feishu', () => ({
   sendImage: async (chatId: string, key: string) => { sentImages.push([chatId, key]); return `om_image_${sentImages.length}` },
   MAX_UPLOAD_BYTES: 30 * 1024 * 1024,
   uploadAndSend: async (chatId: string, path: string) => { sentLocalFiles.push([chatId, path]); return true },
-  preferredChatForSession: new Map(),
+  preferredChatForSession,
   chatNameCache: new Map(),
   getChatTailMessageId: async (chatId: string) => chatTailMessages.get(chatId) ?? null,
   sendCard: async (chatId: string, card: object) => {
@@ -147,6 +149,19 @@ mock.module('./feishu', () => ({
   tempProjectName: (name: string) => /\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/.test(name)
     ? name.replace(/\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/, '')
     : null,
+  mainSessionName: (name: string) => {
+    const tempBase = /\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/.test(name)
+      ? name.replace(/\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/, '')
+      : name
+    return tempBase.match(/^(.+)\[[^\[\]]+\]$/)?.[1] ?? tempBase
+  },
+  mainChatIdForSession: (name: string, fallback?: string) => {
+    const tempBase = /\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/.test(name)
+      ? name.replace(/\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/, '')
+      : name
+    const main = tempBase.match(/^(.+)\[[^\[\]]+\]$/)?.[1] ?? tempBase
+    return preferredChatForSession.get(main) ?? (main === name ? fallback ?? null : null)
+  },
   tempChatName: (project: string, additionallyUsed: Iterable<string> = []) => {
     const used = new Set(additionallyUsed)
     let name = `${project}*0000-0000`
