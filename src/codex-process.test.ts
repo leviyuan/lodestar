@@ -2191,6 +2191,33 @@ describe('codex collab agent translation (ultra multi-agent)', () => {
     expect(results[0][1].content).toContain('agent-thread-2: running')
   })
 
+  test('a later spawn prompt upgrades the agentPath row title to the real task', () => {
+    const { proc, events } = makeProc()
+    // subAgentActivity arrives first and names the row by agentPath.
+    proc.handleNotification('item/started', {
+      item: { type: 'subAgentActivity', id: 'a1', kind: 'started',
+        agentThreadId: 'agent-thread-title', agentPath: '/root/sleep_agent' },
+      threadId: 'main-thread', turnId: 'turn-title',
+    })
+    expect(events.filter(([e]) => e === 'bg_task_started').at(-1)?.[1].description).toBe('sleep_agent')
+    // The spawn tool call carries the real task prompt; the row must switch to it.
+    proc.handleNotification('item/started', {
+      item: { type: 'collabAgentToolCall', id: 'spawn-title', tool: 'spawnAgent', status: 'inProgress',
+        prompt: '执行 240 秒 sleep 后汇报', agentsStates: { 'agent-thread-title': { status: 'running', message: null } } },
+      threadId: 'main-thread', turnId: 'turn-title',
+    })
+    expect(events.filter(([e]) => e === 'bg_task_started').at(-1)?.[1]).toMatchObject({
+      task_id: 'agent-thread-title', description: '执行 240 秒 sleep 后汇报', prompt: '执行 240 秒 sleep 后汇报',
+    })
+    // A later activity update must not put the codename back.
+    proc.handleNotification('item/started', {
+      item: { type: 'subAgentActivity', id: 'a2', kind: 'started',
+        agentThreadId: 'agent-thread-title', agentPath: '/root/sleep_agent' },
+      threadId: 'main-thread', turnId: 'turn-title',
+    })
+    expect(events.filter(([e]) => e === 'bg_task_started').at(-1)?.[1].description).toBe('执行 240 秒 sleep 后汇报')
+  })
+
   test('pure orchestration calls (wait/sendInput/closeAgent) emit no tool panels', () => {
     const { proc, events } = makeProc()
     for (const tool of ['wait', 'sendInput', 'resumeAgent', 'closeAgent']) {

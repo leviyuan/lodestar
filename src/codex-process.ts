@@ -1205,6 +1205,21 @@ export class CodexProcess extends EventEmitter {
   private translateAgentState(threadId: string, state: any, item: any): void {
     const status = state?.status
     if (typeof status !== 'string') return
+    // Task title from the spawn/followup prompt. subAgentActivity often arrives
+    // first and names the row by agentPath; this patch upgrades it to the task
+    // itself whenever the prompt is known.
+    const promptTitle = collabTaskTitle(item.prompt)
+    if (promptTitle && this.collabAgentTitles.get(threadId) !== promptTitle) {
+      this.collabAgentTitles.set(threadId, promptTitle)
+      if (!this.collabAgentSettled.has(threadId)) {
+        this.emit('bg_task_started', {
+          task_id: threadId,
+          task_type: 'local_agent',
+          description: promptTitle,
+          prompt: collabPromptText(item.prompt),
+        } satisfies BgTaskStartedEvent)
+      }
+    }
     // 已终态的 agent 又收到 running —— followup_task/interaction 重新激活:
     // 清 settled 标记并补 started+promote(bgStore 全终态沉降后可能已清空该
     // entry,updated 对未知 task 是 no-op —— 重新入池才能翻活)。其余情况
@@ -1244,9 +1259,7 @@ export class CodexProcess extends EventEmitter {
       // 先于 subAgentActivity 到达(spawn 的 inProgress item 先落)。v2 wire 不带
       // receiverAgents,这里没有 agentPath —— 先用 prompt 首行当任务标题(有就
       // 用它,没有才用中性占位名),subAgentActivity 到达时仍以任务标题优先。
-      const title = collabTaskTitle(item.prompt)
-      if (title) this.collabAgentTitles.set(threadId, title)
-      const name = title ?? '子 agent'
+      const name = promptTitle ?? '子 agent'
       this.collabAgentNames.set(threadId, name)
       const started: BgTaskStartedEvent = {
         task_id: threadId,
