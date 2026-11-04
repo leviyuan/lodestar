@@ -67,7 +67,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=18.15"
+    "node": ">=22.19"
   },
   "dependencies": {
     "@hono/node-server": "2.1.5",

@@ -4,9 +4,9 @@
 
 ## 安装与运行
 
-支持 Windows、macOS 和 Linux，需要 Node.js ≥ 18.15。Bun 用于源码开发和构建。
+支持 Windows、macOS 和 Linux，需要 Node.js 22.19+（22.x）或 Node 24+。Bun 用于源码开发和构建；发布包由 Node 运行。
 
-DeepSeek Harness 子进程另需 Node 22.19+（22.x）或 Node 24+；可通过其账号配置的 `bin` 指定 Node 可执行文件。
+DeepSeek Harness 子进程沿用同一 Node 要求（22.19+ 或 24+）；可通过其账号配置的 `bin` 指定 Node 可执行文件。源码用 Bun 运行时 Bun 会自动加载 `.env`/`.env.local`，npm 安装的 Node 入口不会自动加载，请通过 systemd、launchd 或 shell 显式设置环境变量。
 
 ```bash
 npm i -g @leviyuan/lodestar

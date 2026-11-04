@@ -16,7 +16,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 
 ## 开发规则
 
-- 源码运行使用 `bun daemon.ts` 或 `bun run start`；`bun run build` 生成 Node.js ≥ 18.15 的发布入口。
+- 源码运行使用 `bun daemon.ts` 或 `bun run start`；`bun run build` 生成 Node.js 22.19+（22.x）或 24+ 的发布入口；发布包由 Node 运行，Bun 自动加载的 `.env` 行为不适用于 npm 入口。
 - `config.ts` 在 import 时同步读取配置，缺失时报错。首次安装的延迟导入只放在 `cli.ts`。
 - 配置默认位于 `~/.config/lodestar/config.toml`，状态位于 `~/.local/share/lodestar/`。新增持久状态通过 `src/paths.ts` 定义，遵循 XDG 和 Windows 路径约定。
 - 凭据、本机配置、聊天成员、debug context 和 `~/.codex`、`~/.claude` 内容不得写入跟踪文件。
