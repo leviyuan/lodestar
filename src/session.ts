@@ -614,6 +614,12 @@ export class Session {
         || cards.hasActiveBgTask(this.backgroundTasks) || this.pendingBgTasks.length > 0 || this.backgroundSync
         || this.bgResumeCardless || this.bgResumePending)
   }
+  /** Running native subagents share this conversation's account quota, so account
+   *  scheduling counts each one as an extra load unit. */
+  activeSubagents(): number {
+    return [...this.backgroundTasks, ...this.pendingBgTasks]
+      .filter(task => task.type === 'subagent' && !cards.isBgTerminal(task)).length
+  }
   /** Running sessions normally revive after daemon restart. A process kept
    * only because the user's explicit stop could not yet be confirmed must not
    * undo that stop intent on the next boot. */

@@ -15,10 +15,11 @@ function fixture() {
   return { root, file, activity: new SessionActivityStore(file) }
 }
 const now = Date.parse('2030-01-02T03:04:05Z')
-function session(chatId: string, accountId: string | null = 'A', executing = false) {
+function session(chatId: string, accountId: string | null = 'A', executing = false, subagents = 0) {
   const proc = { provider: 'claude', tokenSourceId: 'claude-sub', isAlive: () => true } as AgentProcess
   if (accountId) bindProcessClaudeAccount(proc, accountId)
-  return { chatId, proc: proc as AgentProcess | null, hasActiveConversationWork: () => executing }
+  return { chatId, proc: proc as AgentProcess | null, hasActiveConversationWork: () => executing,
+    activeSubagents: () => subagents }
 }
 
 test('real user timestamps persist privately across restart, preserve event time and never move backwards', () => {
@@ -97,6 +98,19 @@ test('only actual live Claude subscription bindings reserve: absent, dead, unbou
   expect(control.proc).toBeDefined()
   expect([...countActiveClaudeSessions([absent, dead, unbound, thirdParty, codex], { activity, now })]).toEqual([])
   expect(existsSync(file)).toBe(false)
+})
+
+test('running native subagents add load units on the same account while terminal tasks do not', () => {
+  const { activity } = fixture()
+  const chat = session('chat', 'A', true, 2)
+  expect([...countActiveClaudeSessions([chat], { activity, now })]).toEqual([['A', 3]])
+  chat.activeSubagents = () => 0
+  expect([...countActiveClaudeSessions([chat], { activity, now })]).toEqual([['A', 1]])
+  const shared = session('shared', 'A', false, 1)
+  activity.recordUserMessage('shared', now - 1000, now)
+  expect([...countActiveClaudeSessions([chat, shared], { activity, now })]).toEqual([['A', 3]])
+  const bad = session('bad', 'A', true, -1)
+  expect(() => countActiveClaudeSessions([bad], { activity, now })).toThrow('子 Agent')
 })
 
 test('account replacement and daemon restart recompute one live binding rather than retaining old counts', () => {

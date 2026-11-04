@@ -55,6 +55,8 @@ interface ActiveClaudeSession {
   readonly chatId: string
   readonly proc: AgentProcess | null
   hasActiveConversationWork(): boolean
+  /** Running native subagents inside the conversation; they spend the same account. */
+  activeSubagents(): number
 }
 
 /** Actual live Session bindings only: control queries and absent/default guesses never reserve quota. */
@@ -73,8 +75,12 @@ export function countActiveClaudeSessions(
     if (!accountId) continue
     const lastMessage = activity.lastUserMessageAt(session.chatId)
     if (!session.hasActiveConversationWork() && (lastMessage === undefined || now - lastMessage > USER_ACTIVITY_WINDOW_MS)) continue
+    // A conversation plus each running subagent inside it is one load unit: they
+    // share the same account and run concurrently.
+    const subagents = session.activeSubagents()
+    if (!Number.isSafeInteger(subagents) || subagents < 0) throw new Error('活跃子 Agent 数量无效')
     counted.add(session.chatId)
-    counts.set(accountId, (counts.get(accountId) ?? 0) + 1)
+    counts.set(accountId, (counts.get(accountId) ?? 0) + 1 + subagents)
   }
   return counts
 }
