@@ -539,12 +539,25 @@ describe('plan and goal rendering', () => {
     expect(footerContextPercentLabel(null, 258_000)).toBeNull()
   })
 
-  test('formats compact footer token detail line', () => {
+  test('formats compact footer token detail line with one shared meaning', () => {
+    // Codex: input_tokens 已含缓存命中,入 = 新增输入(扣除缓存复读)。
     expect(footerTokenDetailLine({
       input_tokens: 4_900,
-        cache_read_input_tokens: 4_400,
+      cache_read_input_tokens: 4_400,
       output_tokens: 420,
-    })).toBe('└ 入 4.9k ｜ 缓 4.4k ｜ 出 420')
+    }, 'codex')).toBe('└ 入 500 ｜ 缓 4.4k ｜ 出 420')
+    // Claude/DSH: input_tokens 不含缓存命中,缓存写入并入入。
+    expect(footerTokenDetailLine({
+      input_tokens: 500,
+      cache_creation_input_tokens: 4_400,
+      output_tokens: 420,
+    }, 'claude')).toBe('└ 入 4.9k ｜ 缓 -- ｜ 出 420')
+    expect(footerTokenDetailLine({
+      input_tokens: 28,
+      cache_read_input_tokens: 16_448,
+      cache_creation_input_tokens: 3_000,
+      output_tokens: 91,
+    }, 'dsh')).toBe('└ 入 3k ｜ 缓 16k ｜ 出 91')
   })
 
   test('shows placeholders when footer token detail fields are missing', () => {

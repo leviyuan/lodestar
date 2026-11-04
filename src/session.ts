@@ -6243,7 +6243,7 @@ export class Session {
     if (modelLabel) line1Parts.push(modelLabel)
     const footerLine1 = line1Parts.join(' ｜ ')
     const footerLine2 = opts.hasFreshResult
-      ? cards.footerTokenDetailLine(snapshot.lastTurnUsage) + (turn.cardRotationFailed
+      ? cards.footerTokenDetailLine(snapshot.lastTurnUsage, turn.provider) + (turn.cardRotationFailed
         ? ''
         : await this.footerUsageSuffix(
             turn.provider,

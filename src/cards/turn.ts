@@ -134,11 +134,25 @@ export function footerContextPercentLabel(
   return pct ? `${pct.used}% · ${contextTokenRatioLabel(tokens, limit)}` : '--'
 }
 
-export function footerTokenDetailLine(usage: CodexUsage | null | undefined): string {
-  const input = compactFooterTokens(usage?.input_tokens ?? Number.NaN)
-  const cached = compactFooterTokens(usage?.cache_read_input_tokens ?? Number.NaN)
-  const output = compactFooterTokens(usage?.output_tokens ?? Number.NaN)
-  return `└ 入 ${input} ｜ 缓 ${cached} ｜ 出 ${output}`
+/** 统一口径:入 = 新增输入(未命中缓存的部分,含缓存写入)、缓 = 缓存命中、
+ *  出 = 输出;三项相加等于本轮总 token。Codex 的 input_tokens 已包含缓存命中,
+ *  需要减掉;Claude/DSH 的 input_tokens 不含缓存命中,缓存写入单独加上。 */
+export function footerTokenDetailLine(
+  usage: CodexUsage | null | undefined,
+  provider: 'codex' | 'claude' | 'dsh' = 'codex',
+): string {
+  const input = finiteOrUndefined(usage?.input_tokens)
+  const cached = finiteOrUndefined(usage?.cache_read_input_tokens)
+  const created = finiteOrUndefined(usage?.cache_creation_input_tokens)
+  const output = finiteOrUndefined(usage?.output_tokens)
+  const fresh = provider === 'codex'
+    ? input === undefined ? undefined : Math.max(0, input - (cached ?? 0))
+    : input === undefined && created === undefined ? undefined : (input ?? 0) + (created ?? 0)
+  return `└ 入 ${compactFooterTokens(fresh ?? Number.NaN)} ｜ 缓 ${compactFooterTokens(cached ?? Number.NaN)} ｜ 出 ${compactFooterTokens(output ?? Number.NaN)}`
+}
+
+function finiteOrUndefined(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
 export function contextCompactionElement(i: number, notice: ContextCompactionNotice, elementId: string): object {
