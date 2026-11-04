@@ -5628,20 +5628,79 @@ describe('Session background tasks in shared delegation cards', () => {
     await session.agentCards.closeChat('chat_id')
   })
 
-  test('a main message leaves running work in its original panel', async () => {
+  test('a new main card moves running work to the chat tail', async () => {
     const session = new Session('probe', 'chat_id') as any
     const proc = new FakeAgentProc('claude', 'claude-session-1')
     session.proc = proc
     session.backgroundTasks = [makeRunningTask('running')]
     await session.refreshBackgroundCardFull()
-    await feishu.sendCard('chat_id', { schema: '2.0', body: { elements: [] } })
-    session.backgroundTasks = [{ ...session.backgroundTasks[0], summary: '检查中' }]
-    await session.refreshBackgroundCardFull()
-    expect(sentCards).toHaveLength(2)
-    expect(updatedCards).toHaveLength(0)
-    expect(calls.some(call => call.method === 'PUT' && String(call.body.element).includes('检查中'))).toBe(true)
-    await session.resetBackgroundTasks()
-    await session.agentCards.closeChat('chat_id')
+    expect(sentCards).toHaveLength(1)
+    const panel = (sentCards[0] as any).body.elements[0].element_id as string
+    const converted = new Map<string, string>()
+    const convert = session.agentCards.deps.convertMessageToCard
+    session.agentCards.deps.convertMessageToCard = async (messageId: string) => {
+      const cardId = await convert(messageId)
+      converted.set(messageId, cardId)
+      return cardId
+    }
+    const owner = session.beginTurnOpen(proc, 0, true)
+    let turn: any = null
+    try {
+      turn = await session.openTurnCard(owner, '', 'user_message')
+      expect(turn).not.toBeNull()
+      // 委派卡 → 主卡 → 重建后的委派卡
+      expect(sentCards).toHaveLength(3)
+      expect((sentCards[2] as any).body.elements[0].element_id).toBe(panel)
+      expect(calls.some(call => call.method === 'DELETE' && call.path.includes(`/elements/${panel}`))).toBe(true)
+      const rebuiltCardId = converted.get('om_status_3')
+      expect(rebuiltCardId).toBeTruthy()
+      // 后续任务进度只能写重建后的群尾卡，不能回到旧卡。
+      session.backgroundTasks = [{ ...session.backgroundTasks[0], summary: '检查中' }]
+      await session.refreshBackgroundCardFull()
+      const write = calls.find(call => call.method === 'PUT' && String(call.body.element).includes('检查中'))
+      expect(write?.path).toContain(`/cards/${rebuiltCardId}`)
+    } finally {
+      session.agentCards.deps.convertMessageToCard = convert
+      if (turn) {
+        session.stopFooterStatus(turn)
+        await cardkit.dispose(turn.cardId)
+      }
+      session.releaseTurnOpen(owner)
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+    }
+  })
+
+  test('mid-turn rotation keeps running work behind the new card', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const turn = turnState('card_rotate_reanchor')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const order: string[] = []
+    const prepare = session.agentCards.prepareNewCard
+    const rebuild = session.agentCards.rebuildTailCard
+    session.agentCards.prepareNewCard = async (chatId: string) => {
+      order.push('prepare')
+      expect(sentCards).toHaveLength(0)
+      return prepare.call(session.agentCards, chatId)
+    }
+    session.agentCards.rebuildTailCard = async (chatId: string) => {
+      order.push('rebuild')
+      expect(sentCards).toHaveLength(1)
+      return rebuild.call(session.agentCards, chatId)
+    }
+    try {
+      session.startMidTurnRotate(turn)
+      await turn.rotating
+      expect(order.slice(0, 2)).toEqual(['prepare', 'rebuild'])
+    } finally {
+      session.agentCards.prepareNewCard = prepare
+      session.agentCards.rebuildTailCard = rebuild
+      if (turn.rotating) await turn.rotating
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+      session.dispose()
+    }
   })
 
   test('stop waits for an admitted open, settles it, and namespaces a later process', async () => {

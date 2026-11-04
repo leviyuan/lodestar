@@ -91,7 +91,17 @@ function shortIdHash(id: string): string {
 export const BG_ELEMENTS = {
   panel: (id: string) => `bg_${shortIdHash(id)}`,
   body: (id: string) => `bgb_${shortIdHash(id)}`,
+  migrated: 'bg_migrated',
 } as const
+
+/** 旧卡上的未完成项迁到群尾新卡后留下的说明，避免共享卡变成空消息。 */
+export function backgroundMigratedElement(): object {
+  return {
+    tag: 'markdown',
+    element_id: BG_ELEMENTS.migrated,
+    content: '↪ 未完成任务已迁至对话末尾的最新卡片',
+  }
+}
 
 // ── 归一化 / 判定 ────────────────────────────────────────────────────
 

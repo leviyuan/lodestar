@@ -141,7 +141,7 @@ describe('shared delegation card lifecycle', () => {
     expect([...h.elements.get('message-1')!.keys()].every(id => /^[A-Za-z][A-Za-z0-9_]{0,19}$/.test(id))).toBe(true)
   })
 
-  test('unchanged snapshots do not write; new messages leave existing native tasks in place', async () => {
+  test('unchanged snapshots do not write; new messages clear unfinished rows into a tail card', async () => {
     const h = harness()
     const child = background('child', 'subagent')
     const shell = background('shell')
@@ -152,11 +152,16 @@ describe('shared delegation card lifecycle', () => {
     h.deps.replaceElementResult = replace
     h.tails.set('chat', 'new-user-message')
     await h.cards.add(run('later-delegation'))
+    // 旧卡只剩一句迁移说明，两个运行中的任务随新委派一起落到新卡。
+    expect(h.sent).toHaveLength(2)
+    expect(h.elements.get('message-1')!.size).toBe(1)
+    expect(JSON.stringify([...h.elements.get('message-1')!.values()])).toContain('迁至')
+    expect(h.elements.get('message-2')!.size).toBe(3)
     const completed = [child, shell].map(task => ({ ...task, status: 'completed' as const }))
     await h.cards.syncBackground('chat', 'session', completed)
-    expect(h.sent).toHaveLength(2)
     expect(h.disposed.has('message-1')).toBe(true)
     expect(h.disposed.has('message-2')).toBe(false)
+    expect(h.elements.get('message-2')!.size).toBe(3)
     await h.cards.syncBackground('chat', 'session', completed)
     expect(h.sent).toHaveLength(2)
   })
@@ -410,22 +415,82 @@ describe('shared delegation card lifecycle', () => {
     expect(h.elements.get('message-1')!.size).toBe(3)
   })
 
-  test('new main cards and user messages end reuse while older tasks continue updating', async () => {
+  test('new main cards and user messages move unfinished work to the tail', async () => {
     const h = harness()
     const a = run('a'), b = run('b'), c = run('c')
     await h.cards.add(a)
     h.tails.set('chat', 'main-conversation-card')
     await h.cards.add(b)
     expect(h.sent).toHaveLength(2)
+    // a 从旧卡清走，和 b 一起落在末尾新卡；旧卡只留迁移说明。
+    expect(h.elements.get('message-1')!.size).toBe(1)
+    expect(h.elements.get('message-2')!.has(agentRunElementId('a'))).toBe(true)
+    expect(h.elements.get('message-2')!.has(agentRunElementId('b'))).toBe(true)
     terminal(a)
     await h.cards.update(a, true)
-    expect(h.elements.get('message-1')!.get(agentRunElementId('a')).header.title.content).toContain('完成')
+    expect(h.elements.get('message-2')!.get(agentRunElementId('a')).header.title.content).toContain('完成')
     expect(h.disposed.has('message-1')).toBe(true)
     expect(h.disposed.has('message-2')).toBe(false)
     h.tails.set('chat', 'user-message')
     await h.cards.add(c)
     expect(h.sent).toHaveLength(3)
     expect(c.cardMessageId).toBe('message-3')
+    // b 仍在运行，跟着 c 搬到最新卡；a 已完成，留在上一张卡作为历史。
+    expect(h.elements.get('message-3')!.has(agentRunElementId('b'))).toBe(true)
+    expect(h.elements.get('message-3')!.has(agentRunElementId('c'))).toBe(true)
+    expect(h.elements.get('message-2')!.has(agentRunElementId('a'))).toBe(true)
+    expect(h.elements.get('message-2')!.has(agentRunElementId('b'))).toBe(false)
+  })
+
+  test('prepareNewCard keeps completed history and rebuildTailCard restores unfinished rows at the tail', async () => {
+    const h = harness()
+    const done = background('done', 'subagent')
+    const running = background('running', 'subagent')
+    await h.cards.syncBackground('chat', 'session', [done, running])
+    await h.cards.syncBackground('chat', 'session', [
+      { ...done, status: 'completed' as const, summary: '子任务完成' }, running,
+    ])
+    await h.cards.prepareNewCard('chat')
+    expect(h.elements.get('message-1')!.size).toBe(1)
+    expect(JSON.stringify([...h.elements.get('message-1')!.values()])).toContain('子任务完成')
+    expect(JSON.stringify([...h.elements.get('message-1')!.values()])).not.toContain('检查 running')
+    expect(h.settings.get('message-1').config.streaming_mode).toBe(false)
+    h.tails.set('chat', 'main-card')
+    await h.cards.rebuildTailCard('chat')
+    expect(h.sent).toHaveLength(2)
+    expect(h.sent[1]!.card.body.elements).toHaveLength(1)
+    expect(JSON.stringify(h.sent[1]!.card)).toContain('检查 running')
+  })
+
+  test('a detached row keeps its newest progress until the tail card is rebuilt', async () => {
+    const h = harness()
+    await h.cards.add(run('moving'))
+    await h.cards.prepareNewCard('chat')
+    const latest = run('moving')
+    latest.workers[0]!.steps.push({ at: '2026-09-13T00:00:01Z', phase: 'started', tool: 'Read', detail: '读取新文件' })
+    await h.cards.update(latest)
+    h.tails.set('chat', 'main-card')
+    await h.cards.rebuildTailCard('chat')
+    expect(h.sent).toHaveLength(2)
+    expect(JSON.stringify(h.sent[1]!.card)).toContain('读取新文件')
+  })
+
+  test('a failed rebuild keeps unfinished rows pending for the next sync', async () => {
+    const h = harness()
+    await h.cards.add(run('pending'))
+    await h.cards.prepareNewCard('chat')
+    const send = h.deps.sendCard
+    h.deps.sendCard = async () => null
+    h.tails.set('chat', 'main-card')
+    await expect(h.cards.rebuildTailCard('chat')).rejects.toThrow('agent card creation failed')
+    expect(h.sent).toHaveLength(1)
+    h.deps.sendCard = send
+    await h.cards.syncBackground('chat', 'session', [background('new')])
+    expect(h.sent).toHaveLength(2)
+    expect(h.sent[1]!.card.body.elements).toHaveLength(1)
+    const rebuilt = JSON.stringify([...h.elements.get('message-2')!.values()])
+    expect(rebuilt).toContain('检查 pending')
+    expect(rebuilt).toContain('检查 new')
   })
 
   test('serializes main sends with the tail-read and append transaction', async () => {
@@ -787,7 +852,7 @@ test('each project invocation owns a card in both directions while session work 
   expect(h.sent).toHaveLength(4)
   expect(h.elements.get(a.cardMessageId!)!.size).toBe(1)
   expect(h.elements.get(b.cardMessageId!)!.size).toBe(1)
-  expect(h.elements.get(second.cardMessageId!)!.size).toBe(2)
+  expect(h.elements.get(second.cardMessageId!)!.size).toBe(3)
   terminal(a)
   await h.cards.update(a, true)
   expect(h.disposed.has(a.cardMessageId!)).toBe(true)

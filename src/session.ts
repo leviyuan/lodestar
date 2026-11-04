@@ -75,6 +75,7 @@ import {
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
+import { withChatMessageOrder } from './chat-message-order'
 import { formatFeishuError } from './feishu-errors'
 import { logError, logDiagnostic } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
@@ -4625,7 +4626,17 @@ export class Session {
       directStart: opts.directStart,
     })
     let sendFailure: unknown
-    const messageId = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
+    // 共享任务卡必须留在群尾：新主卡落地前，先把旧卡上的未完成项清走；
+    // 主卡发送成功后，再在末尾重建。两步与发送共用同一个群消息事务，
+    // 避免并发任务更新把行写回已经不在尾部的旧卡。
+    const messageId = await withChatMessageOrder(this.chatId, async () => {
+      try { await this.agentCards.prepareNewCard(this.chatId) }
+      catch (error) { await this.reportBackgroundWriteFailure(error) }
+      const id = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
+      try { await this.agentCards.rebuildTailCard(this.chatId) }
+      catch (error) { await this.reportBackgroundWriteFailure(error) }
+      return id
+    })
     if (!messageId) {
       if (!this.ownsTurnOpen(owner)) return null
       logDiagnostic('session: openTurnCard sendCard failed')
@@ -4866,7 +4877,15 @@ export class Session {
           userInputs: opts.userInputs ?? [],
         })
         let sendFailure: unknown
-        const newMessageId = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
+        // 中途换卡也会在群尾新增一条消息，同样要把运行中的任务行搬到新卡之后。
+        const newMessageId = await withChatMessageOrder(this.chatId, async () => {
+          try { await this.agentCards.prepareNewCard(this.chatId) }
+          catch (error) { await this.reportBackgroundWriteFailure(error) }
+          const id = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
+          try { await this.agentCards.rebuildTailCard(this.chatId) }
+          catch (error) { await this.reportBackgroundWriteFailure(error) }
+          return id
+        })
         if (!newMessageId) {
           logDiagnostic('session: mid-turn rotate sendCard failed')
           if (!forSteering && this.currentTurn === turn) {

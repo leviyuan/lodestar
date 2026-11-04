@@ -56,6 +56,9 @@ export class AgentCards {
   private readonly tails = new Map<string, CardGroup>()
   private readonly byTask = new Map<string, CardGroup>()
   private readonly background = new Map<string, Map<string, { task: BgTaskEntry; version: number; pendingSettings?: boolean }>>()
+  /** Rows cut out of a card that is no longer the chat tail. They own no card
+   * until `createDetached` rebuilds them together at the tail. */
+  private readonly detached = new Map<string, Map<string, TaskRow>>()
   private readonly failedSettings = new Map<CardGroup, { error: unknown }>()
 
   constructor(private readonly deps: AgentCardsDeps) {}
@@ -68,10 +71,42 @@ export class AgentCards {
     await this.updateRow(runRow(run), terminal, false, progressOnly)
   }
 
+  /** A new chat card is about to be sent. Cut every unfinished row out of the
+   * current shared card so it cannot stay behind the new card; completed rows
+   * remain as history. `rebuildTailCard` recreates the running rows at the tail
+   * once the new card has landed. Both steps share the chat message order, so
+   * the whole move is atomic against other sends and task updates. */
+  prepareNewCard(chatId: string): Promise<void> {
+    return withChatMessageOrder(chatId, async () => {
+      const groups = new Set<CardGroup>()
+      const tail = this.tails.get(chatId)
+      if (tail) groups.add(tail)
+      // A capacity split can leave running rows on an older card; those must
+      // move too, not only the rows of the current tail group.
+      for (const group of this.byTask.values()) if (group.chatId === chatId) groups.add(group)
+      const errors: unknown[] = []
+      for (const group of groups) {
+        const rows = [...group.rows.values()]
+        // Project cards are per-run and never join the shared tail card.
+        if (rows.length > 0 && rows.every(row => row.dedicated)) continue
+        if (group !== tail && rows.every(row => group.settled.has(row.key))) continue
+        await this.detachActive(group, errors)
+      }
+      if (errors.length) throw combinedError(errors)
+    })
+  }
+
+  /** Rebuild rows cut by `prepareNewCard` as the current chat-tail card. */
+  rebuildTailCard(chatId: string): Promise<void> {
+    return withChatMessageOrder(chatId, () => this.createDetached(chatId))
+  }
+
   /** Snapshots are immutable. Unchanged entries do not produce Card Kit writes.
    * Native follow-ups get a fresh row; late terminal corrections update the old row. */
   syncBackground(chatId: string, owner: string, tasks: BgTaskEntry[]): Promise<void> {
     return withChatMessageOrder(chatId, async () => {
+      // A detached row must get its card back before it is treated as history.
+      await this.createDetached(chatId)
       const pendingSettings = new Map(this.failedSettings)
       let entries = this.background.get(owner)
       if (!entries) this.background.set(owner, entries = new Map())
@@ -117,6 +152,14 @@ export class AgentCards {
 
   private addRow(row: TaskRow): Promise<void> {
     return withChatMessageOrder(row.chatId, async () => {
+      // The row was already cut out of an earlier card; its card is rebuilt here
+      // with the newest snapshot instead of a second copy being appended.
+      if (this.updateDetached(row)) {
+        await this.createDetached(row.chatId)
+        return
+      }
+      // Retry a rebuild that failed while this row was waiting for a card.
+      await this.createDetached(row.chatId)
       // A successful append followed by a settings failure still owns its row.
       const existing = this.byTask.get(row.key)
       if (existing) {
@@ -126,26 +169,46 @@ export class AgentCards {
       const group = row.dedicated ? undefined : this.tails.get(row.chatId)
       if (group) {
         const atTail = await this.deps.getChatTailMessageId(row.chatId) === group.messageId
-        if (atTail && this.deps.getElementCount(group.cardId) < CARD_ROW_SOFT_LIMIT) {
-          const result = await this.deps.addElementResult(group.cardId, row.element)
-          if (result.landed) {
-            this.attach(group, row)
-            // Appending to a completed card reopens the group for this run.
-            await this.settingsForRow(group, row)
-            return
+        if (atTail) {
+          if (this.deps.getElementCount(group.cardId) < CARD_ROW_SOFT_LIMIT) {
+            const result = await this.deps.addElementResult(group.cardId, row.element)
+            if (result.landed) {
+              this.attach(group, row)
+              // Appending to a completed card reopens the group for this run.
+              await this.settingsForRow(group, row)
+              return
+            }
+            if (!isCapacity(result)) throw writeError('agent card append', result)
           }
-          if (!isCapacity(result)) throw writeError('agent card append', result)
+          // A full card keeps its rows where they are; only the next main card
+          // moves them, because splitting the overflow again would not help.
+          await this.seal(group)
+          await this.create([row])
+          return
         }
-        await this.seal(group)
+        // The chat moved on. Completed rows stay as history; every unfinished
+        // row moves with this one to a fresh card at the tail.
+        const errors: unknown[] = []
+        await this.detachActive(group, errors)
+        this.detachedRows(row.chatId).set(row.key, row)
+        try { await this.createDetached(row.chatId) }
+        catch (error) { errors.push(error) }
+        if (errors.length) throw combinedError(errors)
+        return
       }
-      await this.create(row)
+      await this.create([row])
     })
   }
 
   private updateRow(row: TaskRow, terminal = false, allowTerminalCorrection = false, progressOnly = false): Promise<boolean> {
     return withChatMessageOrder(row.chatId, async () => {
       let group = this.byTask.get(row.key)
-      if (!group) return true // Durable history / a disposed, settled card.
+      if (!group) {
+        // Durable history, a disposed card, or a row waiting for its rebuilt
+        // tail card. Keep the newest state for the row that is still detached.
+        this.updateDetached(row)
+        return true
+      }
       if (group.settled.has(row.key) && !allowTerminalCorrection) {
         // A progress callback admitted before finalization must not reopen a
         // completed card; failed terminal settings may still be retried.
@@ -184,6 +247,9 @@ export class AgentCards {
     return withChatMessageOrder(chatId, async () => {
       const pendingSettings = new Map(this.failedSettings)
       const errors: unknown[] = []
+      // Shutdown still owes detached rows a card before closing their group.
+      try { await this.createDetached(chatId) }
+      catch (error) { errors.push(error) }
       const group = this.tails.get(chatId)
       if (group) {
         try { await this.seal(group) }
@@ -201,22 +267,92 @@ export class AgentCards {
     row.attach?.(group.messageId)
   }
 
-  private async create(row: TaskRow): Promise<CardGroup> {
+  private async create(rows: TaskRow[]): Promise<CardGroup> {
+    const row = rows[0]
+    if (!row) throw new Error('agent card creation rows MISS')
     let sendFailure: unknown
     const messageId = await this.deps.sendCard(row.chatId, {
       schema: '2.0',
-      config: { update_multi: true, streaming_mode: !row.terminal, summary: { content: row.summary } },
-      body: { elements: [row.element] },
+      config: {
+        update_multi: true,
+        streaming_mode: !rows.every(item => item.terminal),
+        summary: { content: cards.delegationCardSummary(rows) },
+      },
+      body: { elements: rows.map(item => item.element) },
     }, error => { sendFailure = error })
     if (!messageId) throw new Error(`agent card creation failed: ${formatFeishuError(sendFailure)}`)
     const cardId = await this.deps.convertMessageToCard(messageId)
-    this.deps.recordCardCreated(cardId, 1)
+    this.deps.recordCardCreated(cardId, rows.length)
     const group: CardGroup = {
       cardId, messageId, chatId: row.chatId, rows: new Map(), settled: new Set(), sealed: row.dedicated === true,
     }
-    this.attach(group, row)
+    for (const item of rows) this.attach(group, item)
     if (!row.dedicated) this.tails.set(row.chatId, group)
     return group
+  }
+
+  private detachedRows(chatId: string): Map<string, TaskRow> {
+    let rows = this.detached.get(chatId)
+    if (!rows) this.detached.set(chatId, rows = new Map())
+    return rows
+  }
+
+  /** A detached row owns no card; keep its newest state for the rebuild. */
+  private updateDetached(row: TaskRow): boolean {
+    const rows = this.detached.get(row.chatId)
+    if (!rows?.has(row.key)) return false
+    rows.set(row.key, row)
+    return true
+  }
+
+  /** Rebuild every detached row as one card at the current chat tail. A failed
+   * send keeps the rows detached so the next write retries instead of losing
+   * them. */
+  private async createDetached(chatId: string): Promise<void> {
+    const rows = this.detached.get(chatId)
+    if (!rows?.size) return
+    await this.create([...rows.values()])
+    rows.clear()
+    this.detached.delete(chatId)
+  }
+
+  /** Cut unfinished rows out of a card that must stop being the chat tail.
+   * Completed rows stay behind as history; a card left with nothing gets a
+   * short marker instead of an empty message. */
+  private async detachActive(group: CardGroup, errors: unknown[]): Promise<void> {
+    // Seal first so nothing can append while the rows are in flight.
+    this.markSealed(group)
+    const active = [...group.rows.values()].filter(row => !group.settled.has(row.key))
+    if (active.length === 0) {
+      try { await this.settings(group) }
+      catch (error) { errors.push(error) }
+      return
+    }
+    const detached = this.detachedRows(group.chatId)
+    for (const row of active) {
+      let failure: CardWriteFailure | undefined
+      try {
+        if (!await this.deps.deleteElementChecked(group.cardId, row.elementId, detail => { failure = detail })) {
+          throw writeError('agent card row detachment', { landed: false, failure })
+        }
+      } catch (error) {
+        // The row keeps living on the old card; never attach it to both.
+        errors.push(error)
+        continue
+      }
+      group.rows.delete(row.key)
+      group.settled.delete(row.key)
+      if (this.byTask.get(row.key) === group) this.byTask.delete(row.key)
+      detached.set(row.key, row)
+    }
+    if (group.rows.size === 0) {
+      try {
+        const result = await this.deps.addElementResult(group.cardId, cards.backgroundMigratedElement())
+        if (!result.landed) throw writeError('agent card migration marker', result)
+      } catch (error) { errors.push(error) }
+    }
+    try { await this.settings(group) }
+    catch (error) { errors.push(error) }
   }
 
   private markSealed(group: CardGroup): void {
@@ -239,7 +375,7 @@ export class AgentCards {
       catch (error) { errors.push(error) }
     }
     let group: CardGroup
-    try { group = await this.create(row) }
+    try { group = await this.create([row]) }
     catch (error) { throw combinedError([...errors, error]) }
     // Ownership transfers as soon as the new row exists. Even a failed
     // deletion must not leave a ghost task holding the old card open.
@@ -299,7 +435,11 @@ export class AgentCards {
     const settings = {
       config: {
         streaming_mode: !complete,
-        summary: { content: cards.delegationCardSummary([...group.rows.values()]) },
+        summary: {
+          content: group.rows.size === 0
+            ? '↪ 未完成任务已迁至对话末尾的最新卡片'
+            : cards.delegationCardSummary([...group.rows.values()]),
+        },
       },
     }
     const settingsJson = JSON.stringify(settings)

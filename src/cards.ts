@@ -132,6 +132,7 @@ export {
   backgroundTaskPanel,
   backgroundTaskSummary,
   backgroundTaskKind,
+  backgroundMigratedElement,
   elapsedBucket,
   liveElapsed,
   LIVE_ELAPSED_SECOND_FOOTER_TICK_MS,
