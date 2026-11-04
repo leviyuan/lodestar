@@ -1,11 +1,12 @@
 import { lstatSync, realpathSync, statSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import type { ProjectProfile } from './config'
+import { stripTempSuffix } from './session-name'
 import { expectedWorktreePath, projectNameFromSessionName } from './worktree'
 
 /** BTW/fork changes the conversation, never the workspace. WT keeps its suffix. */
 export function workspaceName(sessionName: string): string {
-  return sessionName.replace(/\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/, '')
+  return stripTempSuffix(sessionName)
 }
 
 export function resolveWorkspaceDir(sessionName: string, projectsRoot: string, projects: Record<string, ProjectProfile>): string {

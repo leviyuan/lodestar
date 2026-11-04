@@ -44,7 +44,7 @@ export const SESSION_CHAT_MAP_FILE = join(DATA_DIR, 'session-chat-map.json')
 export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
 /** Per-session branch baseline + backend-native turn checkpoints + durable pending Claude fork。
  *  fk/bk 用它列"用户输入前的分界点"；rs 历史由各 backend 自己发现。
- *  key = sessionName(主群名或 <project>*MMDD-HHMM 临时群名)。 */
+ *  key = sessionName(主群名或 <project>*MMDD-HHMM / <project>*备注 临时群名)。 */
 export const SESSION_TURNS_MAP_FILE = join(DATA_DIR, 'session-turns-map.json')
 export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
 /** Last real inbound user-message time per chat, used by Claude account reservations. */

@@ -2853,7 +2853,7 @@ export class Session {
   showForkList(userOpenId = ''): Promise<void> { return sessionTemp.showForkList(this, userOpenId) }
   showBackList(userOpenId = ''): Promise<void> { return sessionTemp.showBackList(this, userOpenId) }
   showResumeList(userOpenId = ''): Promise<void> { return sessionTemp.showResumeList(this, userOpenId) }
-  runBtwCommand(userOpenId: string): Promise<void> { return sessionTemp.runBtwCommand(this, userOpenId) }
+  runBtwCommand(userOpenId: string, role = ''): Promise<void> { return sessionTemp.runBtwCommand(this, userOpenId, role) }
   runByeCommand(): Promise<void> { return sessionTemp.runByeCommand(this) }
   onForkSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> {
     return sessionTemp.onForkSelect(this, panelId, choiceId, userOpenId)

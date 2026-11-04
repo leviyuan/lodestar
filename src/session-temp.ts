@@ -91,8 +91,8 @@ function baseSessionName(s: Session): string {
   return feishu.mainSessionName(s.sessionName)
 }
 
-function reserveTempChatName(baseName: string): string {
-  const name = feishu.tempChatName(baseName, reservedTempChatNames)
+function reserveTempChatName(baseName: string, role = ''): string {
+  const name = feishu.tempChatName(baseName, reservedTempChatNames, role)
   reservedTempChatNames.add(name)
   return name
 }
@@ -392,10 +392,15 @@ export async function showResumeList(s: Session, userOpenId: string): Promise<vo
 
 // ── btw / bye ────────────────────────────────────────────────────────
 
-export async function runBtwCommand(s: Session, userOpenId: string): Promise<void> {
+export async function runBtwCommand(s: Session, userOpenId: string, role = ''): Promise<void> {
   if (!userOpenId) { await feishu.sendText(s.chatId, '❌ 找不到发起人，无法建临时群。'); return }
   if (!s.opts.onCreateTempSession) { await feishu.sendText(s.chatId, '❌ 临时群能力未就绪（daemon 未注入回调）。'); return }
-  const chatName = reserveTempChatName(baseSessionName(s))
+  const normalizedRole = feishu.normalizeTempRole(role)
+  if (role.trim() && !normalizedRole) {
+    await feishu.sendText(s.chatId, '❌ btw 备注至少需要一个中文、字母或数字字符；空格等会写成 _。不带备注时使用时间后缀。')
+    return
+  }
+  const chatName = reserveTempChatName(baseSessionName(s), normalizedRole)
   await feishu.sendText(s.chatId, `🚀 正在创建 ${chatName} · ${s.backendLabel()} 新会话。它与当前群共享工作目录；当前会话不受影响。`)
   let result
   try {
@@ -420,7 +425,7 @@ export async function runBtwCommand(s: Session, userOpenId: string): Promise<voi
 
 export async function runByeCommand(s: Session): Promise<void> {
   if (!feishu.tempProjectName(s.sessionName)) {
-    await feishu.sendText(s.chatId, '❌ bye 只能在带 *MMDD-HHMM 后缀的临时会话群里使用。')
+    await feishu.sendText(s.chatId, '❌ bye 只能在带 *MMDD-HHMM 或 *备注 后缀的临时会话群里使用。')
     return
   }
   if (!s.opts.onDisbandTempSession) { await feishu.sendText(s.chatId, '❌ 解散能力未就绪（daemon 未注入回调）。'); return }

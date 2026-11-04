@@ -28,6 +28,7 @@ const {
   showResumeList,
   listClaudeSessions,
 } = await import('./session-temp')
+const { runCommand } = await import('./session-commands')
 
 interface TempHarnessState {
   routing: ConversationRouting
@@ -197,12 +198,48 @@ describe('session-temp Codex btw/fork', () => {
     expect(sentTexts.at(-1)).toContain('已创建')
   })
 
+  test('btw 备注代替时间后缀', async () => {
+    const h = makeHarness()
+
+    await runBtwCommand(h.session, 'ou_owner', '修复 登录')
+
+    expect(h.createCalls[0].chatName).toBe('project*修复_登录')
+    expect(sentTexts[0]).toContain('project*修复_登录')
+    expect(sentTexts.at(-1)).toContain('project*修复_登录')
+  })
+
+  test('btw 备注没有可用字符时不创建临时群', async () => {
+    const h = makeHarness()
+
+    await runBtwCommand(h.session, 'ou_owner', '🚀')
+
+    expect(h.createCalls).toHaveLength(0)
+    expect(sentTexts.at(-1)).toContain('备注至少需要')
+  })
+
   test('WT 中创建 BTW 仍使用主群项目名', async () => {
     const h = makeHarness('project[feature]')
 
     await runBtwCommand(h.session, 'ou_owner')
 
     expect(h.createCalls[0].chatName).toBe('project*0000-0000')
+
+    await runBtwCommand(h.session, 'ou_owner', 'review')
+
+    expect(h.createCalls[1].chatName).toBe('project*review')
+  })
+
+  test('btw 命令把备注原样传给临时群创建', async () => {
+    const calls: Array<[string, string]> = []
+    const fakeSession = {
+      runBtwCommand: async (userOpenId: string, role: string) => { calls.push([userOpenId, role]) },
+    }
+
+    expect(await runCommand(fakeSession as any, 'btw 修复 登录', 'ou_owner')).toBe(true)
+    expect(await runCommand(fakeSession as any, ' BTW ', 'ou_owner')).toBe(true)
+    expect(await runCommand(fakeSession as any, 'btw\nextra', 'ou_owner')).toBe(false)
+
+    expect(calls).toEqual([['ou_owner', '修复 登录'], ['ou_owner', '']])
   })
 
   test('并发创建会同步预留临时群名，避免同分钟同名', async () => {

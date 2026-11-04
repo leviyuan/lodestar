@@ -12,8 +12,12 @@ describe('directory configuration boundaries', () => {
     const projects = { main: { cwd: join(root, 'custom') } }
     expect(resolveWorkspaceDir('main', root, projects)).toBe(join(root, 'custom'))
     expect(resolveWorkspaceDir('main*0917-1234-2', root, projects)).toBe(join(root, 'custom'))
+    expect(resolveWorkspaceDir('main*修复登录', root, projects)).toBe(join(root, 'custom'))
+    expect(resolveWorkspaceDir('main*修复登录-2', root, projects)).toBe(join(root, 'custom'))
     expect(resolveWorkspaceDir('main[feature]*0917-1234', root, projects)).toBe(join(root, 'main[feature]'))
+    expect(resolveWorkspaceDir('main[feature]*修复登录', root, projects)).toBe(join(root, 'main[feature]'))
     expect(workspaceName('main[feature]*0917-1234')).toBe('main[feature]')
+    expect(workspaceName('main[feature]*修复登录-2')).toBe('main[feature]')
   })
 
   test('normalizes directory aliases, symlinks, trailing separators and paths not yet created', () => {

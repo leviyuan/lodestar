@@ -76,10 +76,12 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
     await s.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId)
     return true
   }
-  // btw = 开临时会话(同目录,自动启动);bye = 散临时群;fk/fork = 列当前会话 turn 分叉;
+  // btw = 开临时会话(同目录,自动启动);`btw 备注` 用备注代替时间后缀;
+  // bye = 散临时群;fk/fork = 列当前会话 turn 分叉;
   // bk/back = 列 turn；点选并通过 stale/owner 校验后才终止并切到新分支。
-  if (raw.trim().match(/^btw$/i)) {
-    await s.runBtwCommand(userOpenId)
+  const btw = raw.trim().match(/^btw(?:[ \t]+([^\r\n]+))?$/i)
+  if (btw) {
+    await s.runBtwCommand(userOpenId, (btw[1] ?? '').trim())
     return true
   }
   if (raw.trim().match(/^bye$/i)) {

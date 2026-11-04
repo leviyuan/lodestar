@@ -21,6 +21,8 @@ function runFresh(work: string, leases?: object) {
       mainChatIdForSession,
       mainSessionName,
       registerTempSessionLease,
+      tempChatName,
+      tempProjectName,
     } from ${JSON.stringify(feishuModule)}
     import { readFileSync } from 'node:fs'
     import { join } from 'node:path'
@@ -66,6 +68,50 @@ describe('temporary-session leases', () => {
       names: ['project', 'project', 'project', 'project'],
       chats: ['oc_main', 'oc_main', 'oc_main', 'oc_main'],
     })
+  })
+
+  test('resolves role-named BTW sessions back to their main project and group', () => {
+    const result = runFresh(`
+      bindSessionToChat('project', 'oc_main')
+      registerTempSessionLease('project*修复登录', 'oc_temp')
+      loadTempSessionLeases()
+      out({
+        projects: [
+          tempProjectName('project*修复登录'),
+          tempProjectName('project*修复登录-2'),
+          tempProjectName('project[feature]*修复登录'),
+        ],
+        names: [
+          mainSessionName('project*修复登录'),
+          mainSessionName('project*修复登录-2'),
+          mainSessionName('project[feature]*修复登录'),
+        ],
+        chats: [
+          mainChatIdForSession('project*修复登录', 'oc_temp'),
+          mainChatIdForSession('project[feature]*修复登录', 'oc_temp_worktree'),
+        ],
+        leased: hasTempSessionLease('project*修复登录', 'oc_temp'),
+      })
+    `)
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(result.value).toEqual({
+      projects: ['project', 'project', 'project[feature]'],
+      names: ['project', 'project', 'project'],
+      chats: ['oc_main', 'oc_main'],
+      leased: true,
+    })
+  })
+
+  test('builds role-based names and keeps time-stamped defaults', () => {
+    const result = runFresh(`
+      const first = tempChatName('project', [], '修复 登录')
+      const second = tempChatName('project', [first], '修复 登录')
+      out({ first, second, legacy: tempChatName('project') })
+    `)
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(result.value.first).toBe('project*修复_登录')
+    expect(result.value.second).toBe('project*修复_登录-2')
+    expect(result.value.legacy).toMatch(/^project\*\d{4}-\d{4}$/)
   })
 
   test('persists and reloads exact chat/name ownership', () => {

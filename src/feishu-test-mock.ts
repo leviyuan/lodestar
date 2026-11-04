@@ -15,6 +15,7 @@ import type { TurnAnchor } from './feishu'
 import type { ConversationBranchBase, PendingConversationLaunch } from './conversation'
 import type { ProjectProfile } from './config'
 import { profileForWorkspace, resolveWorkspaceDir } from './workspace'
+import { mainSessionName, normalizeTempRole, tempProjectName } from './session-name'
 
 export const sentCards: object[] = []
 export const chatTailMessages = new Map<string, string>()
@@ -146,26 +147,18 @@ mock.module('./feishu', () => ({
   provisionProject: () => {},
   projectProfile: (name: string) => projectProfiles.get(name),
   // 临时群 / fork / back / rs 恢复相关 stub。
-  tempProjectName: (name: string) => /\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/.test(name)
-    ? name.replace(/\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/, '')
-    : null,
-  mainSessionName: (name: string) => {
-    const tempBase = /\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/.test(name)
-      ? name.replace(/\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/, '')
-      : name
-    return tempBase.match(/^(.+)\[[^\[\]]+\]$/)?.[1] ?? tempBase
-  },
+  tempProjectName,
+  mainSessionName,
+  normalizeTempRole,
   mainChatIdForSession: (name: string, fallback?: string) => {
-    const tempBase = /\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/.test(name)
-      ? name.replace(/\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/, '')
-      : name
-    const main = tempBase.match(/^(.+)\[[^\[\]]+\]$/)?.[1] ?? tempBase
+    const main = mainSessionName(name)
     return preferredChatForSession.get(main) ?? (main === name ? fallback ?? null : null)
   },
-  tempChatName: (project: string, additionallyUsed: Iterable<string> = []) => {
+  tempChatName: (project: string, additionallyUsed: Iterable<string> = [], role = '') => {
     const used = new Set(additionallyUsed)
-    let name = `${project}*0000-0000`
-    for (let seq = 2; used.has(name); seq++) name = `${project}*0000-0000-${seq}`
+    const base = `${project}*${normalizeTempRole(role) || '0000-0000'}`
+    let name = base
+    for (let seq = 2; used.has(name); seq++) name = `${base}-${seq}`
     return name
   },
   appendTurnAnchorChecked: (sessionName: string, anchor: TurnAnchor) => {
