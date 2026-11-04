@@ -301,7 +301,8 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(proc.isAlive()).toBe(true)
     expect(store.active[0].status).toBe('completed')
     expect(store.active[0].steps.some(step => step.brief.includes('background-proof'))).toBe(true)
-    expect(store.active[0].description).toBe('DeepSeek Harness 子 Agent')
+    expect(store.active[0].description).toBe('Background child probe')
+    expect(store.active[0].title).toBe('Background child probe')
   }, 30_000)
 
   test('subagent descriptor names the child task instead of the bridge placeholder', async () => {

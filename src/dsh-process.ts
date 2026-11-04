@@ -76,6 +76,10 @@ export class DshProcess extends EventEmitter implements AgentProcess {
   /** Durable task label from the child's `subagent/descriptor`; the row header
    * must show this task instead of the generic bridge placeholder. */
   private childTitles = new Map<string, string>()
+  /** Parent `subagent` tool descriptions waiting for their child's
+   * `agent/created` signal (the descriptor event is log-only and may not be
+   * delivered to the bridge). */
+  private pendingSubagentTitles: string[] = []
   private earlyNotifications: DshNotification[] = []
   private pendingInputs = 0
   private terminalError: Error | null = null
@@ -254,7 +258,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         this.children.add(params.sessionId)
         this.emit('bg_task_started', {
           task_id: params.sessionId,
-          description: this.childTitles.get(params.sessionId) ?? 'DeepSeek Harness 子 Agent',
+          description: this.childTitles.get(params.sessionId) ?? this.pendingSubagentTitles.shift() ?? 'DeepSeek Harness 子 Agent',
           task_type: 'agent',
           tool_use_id: params.sessionId,
         })
@@ -349,6 +353,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
           const input = JSON.parse(data.arguments)
           const name = toolAliases[data.name] ?? data.name
           if (['read', 'write', 'edit'].includes(data.name) && input.path) input.file_path = input.path
+          if (!sub && data.name === 'subagent') this.rememberSubagentTitle(input)
           this.toolInputs.set(data.callId, { name, input })
           this.emit('tool_use', { id: data.callId, name, input, parentToolUseId: sub ? params.sessionId : null })
         } else if (e.type === 'tool/result') {
@@ -406,6 +411,18 @@ export class DshProcess extends EventEmitter implements AgentProcess {
       default: log('dsh.notification_unknown')
     }
   }
+  /** Queue the parent's subagent task description for the child that is about
+   * to be created; `agent/created` only carries session ids. */
+  private rememberSubagentTitle(input: any): void {
+    const description = typeof input?.description === 'string' ? input.description.trim() : ''
+    const promptLine = typeof input?.prompt === 'string'
+      ? input.prompt.split(/\r?\n/).map((part: string) => part.trim()).find(Boolean) ?? '' : ''
+    const title = description || promptLine
+    if (!title) return
+    this.pendingSubagentTitles.push(title)
+    if (this.pendingSubagentTitles.length > 32) this.pendingSubagentTitles.shift()
+  }
+
   private observeUsage(u: any): void {
     if (!Number.isFinite(u.inputTokens) || !Number.isFinite(u.outputTokens)) throw new Error('invalid DSH token usage')
     const usage: CodexUsage = { input_tokens: u.inputTokens, output_tokens: u.outputTokens,
