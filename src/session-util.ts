@@ -46,11 +46,16 @@ export function messageOf(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
-/** Compact diagnostic label that keeps both the UUIDv7 time prefix and random
- * tail. A longer timestamp-only prefix still collides for concurrently-created
- * threads, while first-8 + last-4 remains compact and disambiguates them. */
+/** Short, stable session label shared by every user-visible surface.
+ *
+ * Only the random tail is distinguishing: a UUIDv7's first 8 hex chars are the
+ * high bits of its millisecond timestamp, so sessions created within the same
+ * ~65s (a source and its fork, or two `rs` restarts) share them and the labels
+ * read as near-identical noise. Six trailing chars stay unique within a
+ * project's history (16.7M values) and can be matched across the rs picker,
+ * result cards and status texts. The leading ellipsis marks the truncation. */
 export function diagnosticIdLabel(id: string): string {
-  return id.length <= 16 ? id : `${id.slice(0, 8)}…${id.slice(-4)}`
+  return id.length <= 16 ? id : `…${id.slice(-6)}`
 }
 
 export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {

@@ -9,6 +9,8 @@
  * 按钮的 value.kind 在 daemon.ts handleCardAction 里 dispatch。
  */
 
+import { diagnosticIdLabel } from '../session-util'
+
 export interface TurnListEntry {
   /** 仅供当前 panel 解析的稳定、不透明 choice id。 */
   choiceId: string
@@ -35,7 +37,11 @@ export interface ResumeListEntry {
   choiceId: string
   /** 首条用户输入（会话主题）。 */
   preview: string
+  /** 最后一条用户输入；缺失（旧记录/其他后端）时省略。 */
+  lastPreview?: string
   ts: number
+  /** 仅展示：会话短标签（与状态卡/结果卡同一格式），不进入回调。 */
+  label?: string
 }
 
 export interface ResumeListCardOpts {
@@ -68,8 +74,11 @@ export interface ResumeSelectionResultCardOpts {
   projectName: string
   provider: 'claude' | 'codex' | 'dsh'
   selectedPreview: string
+  /** 所选会话最后一条用户输入；缺失时省略。 */
+  selectedLastPreview?: string | null
   selectedTs: number
   sourceSessionId: string
+  /** 后端返回的会话状态（仅 Codex）。 */
   sourceStatus?: string
   previousSessionId: string | null
   newSessionId: string | null
@@ -154,7 +163,11 @@ export function resumeListCard(opts: ResumeListCardOpts): object {
             weight: 5,
             elements: [{
               tag: 'markdown',
-              content: `**${fmtTime(e.ts)}**\n${inlineCode(e.preview.slice(0, 60) || '(无摘要)')}`,
+              content: [
+                `**${fmtTime(e.ts)}**${e.label ? ` · ${inlineCode(e.label)}` : ''}`,
+                `🚩 ${inlineCode(e.preview.slice(0, 60) || '(无摘要)')}`,
+                ...(e.lastPreview ? [`🏁 ${inlineCode(e.lastPreview.slice(0, 60))}`] : []),
+              ].join('\n'),
             }],
           },
           {
@@ -271,7 +284,7 @@ export function resumeSelectionResultCard(opts: ResumeSelectionResultCardOpts): 
     : opts.bindingState === 'prepared'
       ? [
         '**当前群**',
-        'Claude 独立分支已准备；发送下一条消息时生成并接入新会话。',
+        `Claude 独立分支已准备；发送下一条消息时生成并接入新会话。`,
         '',
         '源会话未修改；新分支与当前群共享 cwd 和磁盘文件。',
       ].join('\n')
@@ -314,7 +327,8 @@ export function resumeSelectionResultCard(opts: ResumeSelectionResultCardOpts): 
           content: [
             `**所选历史 · ${provider}**`,
             `**${fmtTime(opts.selectedTs)}**${sourceStatus}`,
-            inlineCode(preview),
+            `🚩 ${inlineCode(preview)}`,
+            ...(opts.selectedLastPreview ? [`🏁 ${inlineCode(opts.selectedLastPreview.slice(0, 80))}`] : []),
             `源会话 ${inlineCode(compactSessionId(opts.sourceSessionId))}`,
           ].join('\n'),
         },
@@ -336,8 +350,7 @@ function inlineCode(s: string): string {
 
 function compactSessionId(value: string | null): string {
   const id = value?.trim() ?? ''
-  if (!id) return 'MISS'
-  return id.length > 13 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id
+  return id ? diagnosticIdLabel(id) : 'MISS'
 }
 
 function escapeMarkdown(s: string): string {

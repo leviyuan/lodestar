@@ -661,3 +661,57 @@ describe('session-temp Codex stopped-session history', () => {
     expect(result.resumePresentation?.bindingState).toBe('unknown')
   })
 })
+
+describe('session-temp rs Claude account', () => {
+  test('rs 历史展示已记录的 Claude 账号，选择后把它留给耗尽回退', async () => {
+    const { claudeTranscriptDir } = await import('./claude-agent-process')
+    const { recordClaudeSessionAccount } = await import('./claude-session-accounts')
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-rs-account-'))
+    const workDir = join(root, 'project')
+    const configDir = join(root, 'claude')
+    const sessionId = '01a03100-0000-7000-8000-00000000beef'
+    mkdirSync(workDir, { recursive: true })
+    const transcriptDir = claudeTranscriptDir(workDir, { configDir })
+    mkdirSync(transcriptDir, { recursive: true })
+    const line = (value: unknown) => `${JSON.stringify(value)}\n`
+    writeFileSync(join(transcriptDir, `${sessionId}.jsonl`), [
+      line({ type: 'queue-operation', operation: 'enqueue', content: '第一句：排查导出失败' }),
+      line({ type: 'assistant', message: { content: [{ type: 'text', text: '## 结论\n已定位到超时逻辑。' }] } }),
+      line({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ok' }] } }),
+      line({ type: 'user', message: { content: [{ type: 'text', text: '顺便把重试日志也加上' }] } }),
+      line({ type: 'assistant', message: { content: [{ type: 'text', text: '已修复导出超时，回归测试全部通过。' }] } }),
+    ].join(''))
+    recordClaudeSessionAccount(sessionId, 'default')
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = configDir
+    const h = makeHarness('claude-account-rs')
+    h.session.selectedProvider = 'claude'
+    h.session.workDir = workDir
+    h.state.routing = { provider: 'claude', tokenSourceId: 'claude-sub', model: 'opus', effort: 'high' }
+    try {
+      await showResumeList(h.session, 'ou_owner')
+      const card = sentCards[sentCards.length - 1]
+      const row = JSON.stringify(card)
+      expect(row).toContain('🚩 `第一句：排查导出失败`')
+      // 末只取用户消息：最后一条用户输入，而不是它的回复。
+      expect(row).toContain('🏁 `顺便把重试日志也加上`')
+      expect(row).not.toContain('🏁 `已修复导出超时，回归测试全部通过。`')
+      const value = pickerValue(card, '第一句：排查导出失败')
+      const result = await onResumeSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+
+      expect(result.ok).toBe(true)
+      expect(result.resumePresentation).toMatchObject({
+        provider: 'claude',
+        sourceSessionId: sessionId,
+        selectedLastPreview: '顺便把重试日志也加上',
+        bindingState: 'prepared',
+      })
+      // 账号不再展示，但仍会留给“全部额度耗尽”时的原账号回退。
+      expect(h.session.claudeResumeAccountId).toBe('default')
+    } finally {
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})

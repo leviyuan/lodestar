@@ -13,7 +13,9 @@ import { captureClaudeSyncWarmup, waitForClaudeSyncWarmup } from './claude-sync-
 
 /** Startup selection only; this function neither queries upstream nor changes any running process. */
 export function selectClaudeAccount(options: { model?: string | null; effort?: AgentReasoningEffort | null;
-  preferred?: string | null; activeSessions?: ReadonlyMap<string, number> }): string {
+  preferred?: string | null; activeSessions?: ReadonlyMap<string, number>;
+  /** Conversation's original account; preferred only in the all-exhausted fallback. */
+  exhaustedFallbackAccountId?: string | null }): string {
   if (config.token_sources?.['claude-sub']?.enabled === false) throw new Error('Claude 订阅已禁用；发送 claude-sub on 启用')
   if (options.preferred) return claudeAccounts.assertReady(options.preferred).id
   const diagnostics: string[] = []
@@ -22,9 +24,15 @@ export function selectClaudeAccount(options: { model?: string | null; effort?: A
   let quotaEligibleAccounts = 0
   let quotaExhaustedAccounts = 0
   let selectionFailures = 0
+  let exhaustedFallback: string | null = null
+  const exhaustedIds = new Set<string>()
   const now = Date.now()
   for (const account of claudeAccounts.list()) {
     let quotaExhausted = false
+    // The native default account exists before anyone logs in; "not enrolled"
+    // is a normal state, not a selection failure that should block the
+    // exhausted fallback for users who only keep named subscriptions.
+    const unenrolledDefault = account.id === DEFAULT_CLAUDE_ACCOUNT && !account.identity
     try {
       const source = getTokenSourceForAccount('claude-sub', account.id)
       if (!source?.enabled || source.modelCatalogState?.status !== 'ready') {
@@ -41,26 +49,34 @@ export function selectClaudeAccount(options: { model?: string | null; effort?: A
       const rank = rankClaudeQuota(peekTokenSourceUsage(source), model, now, options.activeSessions?.get(account.id) ?? 0)
       if (rank.state !== 'ready') {
         quotaExhausted = rank.state === 'exhausted'
-        if (quotaExhausted) quotaExhaustedAccounts++
+        if (quotaExhausted) {
+          quotaExhaustedAccounts++
+          exhaustedIds.add(account.id)
+          exhaustedFallback ??= account.id
+        }
         throw new Error(rank.reason ?? '额度缓存 MISS')
       }
       if (identities.has(account.identity)) continue
       identities.add(account.identity)
       candidates.push({ id: account.id, ...rank })
     } catch (error) {
-      if (!quotaExhausted) selectionFailures++
+      if (!quotaExhausted && !unenrolledDefault) selectionFailures++
       diagnostics.push(`${account.name}：${error instanceof Error ? error.message : String(error)}`)
     }
   }
   candidates.sort(compareClaudeQuota)
   // An exhausted subscription should not make rs/restart lose the session.
-  // Keep the native default route when every account that passed model/effort
-  // validation is authoritatively out of quota. Other failures (catalog,
-  // authentication or a missing usage snapshot) remain visible to the caller.
+  // Keep the conversation's original account when it is one of the exhausted
+  // candidates (the user asked to continue on it, not on an arbitrary route);
+  // otherwise fall back to the default route, then the first exhausted account.
+  // Other failures (catalog, authentication or a missing usage snapshot) remain
+  // visible to the caller.
   if (!candidates.length && quotaEligibleAccounts > 0
     && quotaExhaustedAccounts === quotaEligibleAccounts && selectionFailures === 0) {
     logDiagnostic('claude_account_selection_fallback', { reason: 'rate_limit' })
-    return DEFAULT_CLAUDE_ACCOUNT
+    const original = options.exhaustedFallbackAccountId
+    if (original && exhaustedIds.has(original)) return original
+    return exhaustedFallback ?? DEFAULT_CLAUDE_ACCOUNT
   }
   if (!candidates.length) throw new Error(`Claude 自动选号 MISS：${diagnostics.join('；') || '尚无已收录账号'}`)
   return candidates[0]!.id

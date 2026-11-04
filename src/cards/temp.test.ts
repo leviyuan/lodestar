@@ -99,7 +99,9 @@ test('resumeListCard:按钮只带 panel/choice,并说明创建独立分支', () 
   const card = resumeListCard({
     projectName: 'p',
     panelId: 'panel-resume-1',
-    entries: [{ choiceId: 'choice-session-1', preview: '修bug', ts: 1 }],
+    entries: [{
+      choiceId: 'choice-session-1', preview: '修bug', lastPreview: '已经修好并跑通测试', ts: 1, label: '…c92e06',
+    }],
   }) as any
   const btn = card.body.elements.find((e: any) => e.tag === 'column_set')!.columns[1].elements[0]
   expect(btn.behaviors[0].value).toEqual({
@@ -108,6 +110,11 @@ test('resumeListCard:按钮只带 panel/choice,并说明创建独立分支', () 
     choice_id: 'choice-session-1',
   })
   expect(btn.text.content).toBe('分支')
+  // 相同主题的会话靠短标签区分；首句和末句都展示，标签不进回调。
+  const row = card.body.elements[1].columns[0].elements[0].content
+  expect(row).toContain('…c92e06')
+  expect(row).toContain('🚩 `修bug`')
+  expect(row).toContain('🏁 `已经修好并跑通测试`')
   expect(JSON.stringify(card)).toContain('创建独立对话分支')
   expect(JSON.stringify(card)).toContain('共享当前 cwd 和磁盘文件')
   expect(JSON.stringify(card)).not.toContain('sessionId')
@@ -126,6 +133,7 @@ test('resumeSelectionResultCard:Codex 成功态原位展示所选历史和新分
     projectName: 'project',
     provider: 'codex',
     selectedPreview: '修复 Codex rs 历史选择',
+    selectedLastPreview: '回归测试全部通过',
     selectedTs: new Date(2026, 7, 22, 14, 10).getTime(),
     sourceSessionId: '01a02552-0cd4-7a21-af8f-086262e9c892',
     sourceStatus: 'idle',
@@ -141,8 +149,12 @@ test('resumeSelectionResultCard:Codex 成功态原位展示所选历史和新分
   expect(card.header.title.content).toContain('rs 已接入 · project')
   expect(text).toContain('所选历史 · Codex')
   expect(text).toContain('修复 Codex rs 历史选择')
-  expect(text).toContain('01a02552…c892')
-  expect(text).toContain('01a026ef…2e06')
+  expect(text).toContain('…e9c892')
+  expect(text).toContain('…c92e06')
+  expect(text).toContain('🚩 `修复 Codex rs 历史选择`')
+  expect(text).toContain('🏁 `回归测试全部通过`')
+  expect(text).toContain('源会话 `…e9c892`')
+  expect(text).toContain('新会话 `…c92e06`')
   expect(text).toContain('状态 `idle`')
   expect(text).toContain('共享 cwd 和磁盘文件')
   expect(text).not.toContain('callback')
@@ -170,8 +182,9 @@ test('resumeSelectionResultCard:Claude 失败态保留所选快照、原因和�
   expect(card.header.title.content).toContain('rs 未切换 · project')
   expect(text).toContain('所选历史 · Claude')
   expect(text).toContain('&lt;旧会话&gt;')
-  expect(text).toContain('424f8d9e…370e')
-  expect(text).toContain('cbab31ed…7f84')
+  expect(text).toContain('…1e370e')
+  expect(text).toContain('本群原绑定 `…ca7f84`')
+  expect(text).toContain('…ca7f84')
   expect(outcome).toContain('历史分支创建失败；\\[伪链接\\]\\(https://example\\.com\\) 原会话绑定未改')
   expect(text).not.toContain('[伪链接](https://example.com)')
   expect(text).not.toContain('callback')

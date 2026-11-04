@@ -62,6 +62,7 @@ import { getTokenSource, getTokenSourceForAccount, listEnabledTokenSourcesByAgen
 import { boundCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT, processCodexAccount } from './codex-accounts'
 import { waitForLiveCodexUsage } from './codex-live-usage'
 import { claudeAccounts, DEFAULT_CLAUDE_ACCOUNT, processClaudeAccount } from './claude-accounts'
+import { recordClaudeSessionAccount } from './claude-session-accounts'
 import { enrollClaudeAccount } from './claude-account-selection'
 import { countActiveClaudeSessions } from './session-activity'
 import { codexAccountCard } from './cards/codex-account'
@@ -647,6 +648,11 @@ export class Session {
   /** Pending account selection takes effect only after the old process exits. */
   private codexStartAccountOverride: string | undefined
   private claudeStartAccountOverride: string | undefined
+  /** Original Claude account of the conversation being resumed. Consulted only
+   *  when every usable account is out of quota, so rs keeps the account the
+   *  session was running on instead of falling back to the default route.
+   *  Set by rs history selection or from the live process, cleared after spawn. */
+  claudeResumeAccountId: string | undefined
 
   codexAccountId(): string {
     return this.proc?.isAlive() && this.proc.provider === 'codex'
@@ -1024,6 +1030,7 @@ export class Session {
       ...(this.selectedProvider === 'codex' ? { codexAccountId: codexAccounts.selected(this.sessionName) } : {}),
       ...(codexPool ? { codexAccountPreference: this.codexStartAccountOverride ?? codexAccounts.preferred(this.sessionName) } : {}),
       ...(claudePool ? { claudeAccountPreference: this.claudeStartAccountOverride ?? null,
+        ...(launch.kind === 'fresh' ? {} : { claudeExhaustedFallbackAccountId: this.claudeResumeAccountId }),
         claudeActiveSessions: countActiveClaudeSessions(Session.all, { excludeChatId: this.chatId }) } : {}),
       model: ts ? (this.selectedModel ?? ts.defaultModel) : this.modelForSpawn(),
       effort: this.selectedProvider === 'dsh'
@@ -1037,6 +1044,7 @@ export class Session {
     })
     this.procSourceRevisions.set(created.process, created.sourceRevision)
     this.claudeStartAccountOverride = undefined
+    this.claudeResumeAccountId = undefined
     return created.process
   }
 
@@ -2127,6 +2135,13 @@ export class Session {
     const explicitLaunch = this.pendingConversationLaunch
       ?? (resume ? this.codexQuotaWaitLaunch : null)
       ?? this.pendingMaterializationLaunch()
+    // Keep the account the conversation was running on. It is only used when
+    // every usable Claude account is out of quota (never for a fresh start),
+    // so an rs restart resumes on the original account instead of another one.
+    if (this.selectedProvider === 'claude' && !this.claudeResumeAccountId
+      && (resume || explicitLaunch?.kind === 'resume' || explicitLaunch?.kind === 'fork')) {
+      this.claudeResumeAccountId = processClaudeAccount(this.proc) ?? undefined
+    }
     let prevSessionRef = this.lastSessionRef
     if (resume && !explicitLaunch && prevSessionRef?.cwd === null) {
       try {
@@ -3437,6 +3452,12 @@ export class Session {
       logError('session: fork checkpoint invalid', error)
       if (fatal) throw error
       return error.message
+    }
+    // Native history is account-shared; keep which subscription ran this
+    // conversation so rs can show it and keep it when every account is out of quota.
+    if (proc.provider === 'claude') {
+      const accountId = processClaudeAccount(proc)
+      if (accountId) recordClaudeSessionAccount(sessionId, accountId)
     }
     try {
       feishu.bindSessionResumeChecked(this.sessionName, ref)

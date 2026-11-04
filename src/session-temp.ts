@@ -22,6 +22,7 @@ import { closeSync, openSync, readSync, readdirSync, realpathSync, statSync } fr
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, join, resolve } from 'node:path'
 import { diagnosticIdLabel } from './session-util'
+import { claudeSessionAccount } from './claude-session-accounts'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const PANEL_TTL_MS = 30 * 60 * 1000
@@ -43,6 +44,8 @@ export interface ResumeSelectionPresentation {
   selectedPreview: string
   selectedTs: number
   sourceSessionId: string
+  /** 所选会话最后一条用户输入；缺失时省略。 */
+  selectedLastPreview?: string | null
   sourceStatus?: string
   previousSessionId: string | null
   newSessionId: string | null
@@ -63,8 +66,11 @@ interface ResumeChoice {
   kind: 'resume'
   launch: Extract<ConversationLaunch, { kind: 'fork' }>
   sourcePreview: string
+  sourceLastPreview?: string
   sourceTs: number
   sourceStatus?: string
+  /** Recorded Claude account of the source session; unknown for legacy sessions. */
+  sourceAccountId?: string | null
 }
 
 type TempPanelChoice = ForkChoice | ResumeChoice
@@ -212,7 +218,7 @@ export function listClaudeSessions(workDir: string, options?: { configDir?: stri
     if (error?.code === 'ENOENT') return []
     throw new Error(`读取 Claude 会话目录失败: ${error?.message ?? error}`)
   }
-  const all: ConversationSummary[] = []
+  const all: Array<{ summary: ConversationSummary; path: string }> = []
   for (const name of names) {
     if (!name.endsWith('.jsonl') || name.includes('.orphaned-') || name.includes('.superseded-')) continue
     const sessionId = name.slice(0, -6)
@@ -224,15 +230,78 @@ export function listClaudeSessions(workDir: string, options?: { configDir?: stri
     try { mtime = statSync(full).mtimeMs } catch (error: any) {
       throw new Error(`读取 Claude 会话元数据失败 (${name}): ${error?.message ?? error}`)
     }
-    all.push({
-      provider: 'claude',
-      sessionId,
-      cwd: workDir,
-      preview,
-      ts: mtime,
-    })
+    all.push({ summary: { provider: 'claude', sessionId, cwd: workDir, preview, ts: mtime }, path: full })
   }
-  return all.sort((a, b) => b.ts - a.ts)
+  all.sort((a, b) => b.summary.ts - a.summary.ts)
+  // The picker only ever renders the newest HISTORY_CARD_MAX rows, so the
+  // heavier tail read runs for those only instead of every transcript.
+  return all.map((row, index) => {
+    if (index >= HISTORY_CARD_MAX) return row.summary
+    const lastPreview = lastMessageSummary(row.path)
+    return lastPreview && lastPreview !== row.summary.preview
+      ? { ...row.summary, lastPreview }
+      : row.summary
+  })
+}
+
+/** Tail size for the last-input scan. Tool output can be large, so a small
+ *  tail can miss the closing prompt; 256 KiB keeps one rs open cheap. */
+const HISTORY_TAIL_BYTES = 256 * 1024
+
+/** Last *user* input of a Claude transcript, for the rs picker: the first
+ *  input tells you how a session started, the latest request tells you what
+ *  you were doing in it. Assistant prose, tool results and sidechains are
+ *  ignored. Reads only the file tail. */
+function lastMessageSummary(path: string): string | null {
+  let text = ''
+  let fd: number | null = null
+  try {
+    const size = statSync(path).size
+    const length = Math.min(size, HISTORY_TAIL_BYTES)
+    if (length <= 0) return null
+    fd = openSync(path, 'r')
+    const buffer = Buffer.alloc(length)
+    const n = readSync(fd, buffer, 0, length, size - length)
+    text = buffer.subarray(0, n).toString('utf8')
+    if (size > length) {
+      // Drop the partial first line created by slicing mid-file.
+      const newline = text.indexOf('\n')
+      text = newline >= 0 ? text.slice(newline + 1) : ''
+    }
+  } catch (error: any) {
+    throw new Error(`读取 Claude 会话结尾失败 (${path}): ${error?.message ?? error}`)
+  } finally {
+    if (fd !== null) closeSync(fd)
+  }
+  const lines = text.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim()
+    if (!line) continue
+    let data: any
+    try { data = JSON.parse(line) } catch { continue }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+    // Claude Code keeps the leaf prompt in its own near-EOF record; a big
+    // assistant turn can push the raw user message megabytes back, so this
+    // record is what makes a bounded tail read reliable. Assistant content,
+    // tool results and sidechains never count: "last" means the user's last
+    // input, matching the first-input preview.
+    const raw = data.type === 'last-prompt' && typeof data.lastPrompt === 'string'
+      ? data.lastPrompt
+      : data.type === 'user' && data.isSidechain !== true ? userMessageText(data.message) : ''
+    const preview = previewLine(raw)
+    if (preview) return preview.slice(0, 80)
+  }
+  return null
+}
+
+/** First meaningful line: skip blank lines, markdown headings and fences. */
+function previewLine(text: string): string {
+  const withoutFiles = text.replace(/^(?:\[file: [^\]]+\]\s*)+/, '')
+  for (const raw of withoutFiles.split(/\r?\n/)) {
+    const line = raw.replace(/^[\s>#*\-–—]+/, '').trim()
+    if (line) return line
+  }
+  return ''
 }
 
 function recentHistory(entries: ConversationSummary[]): ConversationSummary[] {
@@ -367,14 +436,23 @@ export async function showResumeList(s: Session, userOpenId: string): Promise<vo
   const choices = new Map<string, TempPanelChoice>()
   const entries = recentHistory(history).map(summary => {
     const choiceId = randomUUID()
+    const sourceAccountId = summary.provider === 'claude' ? claudeSessionAccount(summary.sessionId) : null
     choices.set(choiceId, {
       kind: 'resume',
       launch: { kind: 'fork', source: { provider: summary.provider, sessionId: summary.sessionId, cwd: summary.cwd } },
       sourcePreview: summary.preview,
+      ...(summary.lastPreview ? { sourceLastPreview: summary.lastPreview } : {}),
       sourceTs: summary.ts,
       sourceStatus: summary.status,
+      sourceAccountId,
     })
-    return { choiceId, preview: summary.preview, ts: summary.ts }
+    return {
+      choiceId,
+      preview: summary.preview,
+      ...(summary.lastPreview ? { lastPreview: summary.lastPreview } : {}),
+      ts: summary.ts,
+      label: diagnosticIdLabel(summary.sessionId),
+    }
   })
   const panel = createPanel(s, 'resume', userOpenId, choices)
   const card = cards.resumeListCard({ projectName: baseSessionName(s), panelId: panel.id, entries })
@@ -511,14 +589,16 @@ export async function onResumeSelect(s: Session, panelId: string, choiceId: stri
     throw new Error('resume panel contained a non-resume choice')
   }
   const sourceId = choice.launch.source.sessionId
+  const sourceProvider = choice.launch.source.provider
   const previousSessionId = s.lastSessionId
   const presentation = (
     newSessionId: string | null,
     bindingState: ResumeSelectionPresentation['bindingState'],
   ): ResumeSelectionPresentation => ({
     projectName: panel.baseName,
-    provider: choice.launch.source.provider,
+    provider: sourceProvider,
     selectedPreview: choice.sourcePreview,
+    ...(choice.sourceLastPreview ? { selectedLastPreview: choice.sourceLastPreview } : {}),
     selectedTs: choice.sourceTs,
     sourceSessionId: sourceId,
     ...(choice.sourceStatus ? { sourceStatus: choice.sourceStatus } : {}),
@@ -541,6 +621,10 @@ export async function onResumeSelect(s: Session, panelId: string, choiceId: stri
     if (choice.sourceStatus === 'active') {
       return finish(false, '所选 Codex 会话仍在运行；请先在原位置停止后再创建完整分支', 'unchanged')
     }
+    // Keep the account this history ran on. It is only used when every usable
+    // account is out of quota, so rs does not silently move the conversation
+    // to the default account just because all quotas are spent.
+    if (sourceProvider === 'claude') s.claudeResumeAccountId = choice.sourceAccountId ?? undefined
     const ok = await s.rollbackTo(choice.launch, {
       anchors: [],
       base: choice.launch,

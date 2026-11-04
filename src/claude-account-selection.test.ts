@@ -154,6 +154,13 @@ test('named-only authentication keeps one visible source, account-isolated quota
       const release = manager.acquireUse(named.id)
       try { assert.equal(await enrollClaudeAccount('second'), named.id) } finally { release() }
       assert.deepEqual(calls, before)
+      percentages[named.id] = 100
+      await refreshTokenSourceUsage(root)
+      // 默认账号尚未登录：全部已收录账号耗尽时必须回退到仍可启动的账号，
+      // 否则 rs/restart 会在启动前失败，把群留在停止状态并弄丢续跑入口。
+      assert.equal(selectClaudeAccount({ model: 'opus', effort: 'high' }), named.id)
+      percentages[named.id] = 40
+      await refreshTokenSourceUsage(root)
       defaultInfo = info('default@example.test')
       await root.refreshModels(); await refreshTokenSourceUsage(root)
       assert.equal(selectClaudeAccount({ model: 'opus', effort: 'high' }), 'default')
@@ -189,6 +196,9 @@ test('named-only authentication keeps one visible source, account-isolated quota
       percentages.default = 100; percentages[named.id] = 100
       await refreshTokenSourceUsage(root)
       assert.equal(selectClaudeAccount({ model: 'opus', effort: 'high', activeSessions }), 'default')
+      // 全部耗尽时优先沿用会话原账号，而不是列表里的第一个账号。
+      assert.equal(selectClaudeAccount({ model: 'opus', effort: 'high', exhaustedFallbackAccountId: named.id }), named.id)
+      assert.equal(selectClaudeAccount({ model: 'opus', effort: 'high', exhaustedFallbackAccountId: 'unknown' }), 'default')
       percentages.default = 40; percentages[named.id] = 40
       await refreshTokenSourceUsage(root)
       const old = root.forAccount('default')

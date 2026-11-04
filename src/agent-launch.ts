@@ -30,6 +30,8 @@ export interface AgentLaunchOptions {
   claudeAccountId?: string
   /** null = automatic at startup; an account id = this launch only. No mid-turn rotation. */
   claudeAccountPreference?: string | null
+  /** Conversation's original account; only consulted when every usable account is out of quota. */
+  claudeExhaustedFallbackAccountId?: string | null
   /** Existing active chats, excluding the Session whose prospective launch is being ranked. */
   claudeActiveSessions?: ReadonlyMap<string, number>
   model?: string
@@ -71,7 +73,8 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
   const accountId = claudeSubscription
     ? opts.claudeAccountPreference !== undefined
       ? selectClaudeAccount({ model: opts.model ?? '', effort: opts.effort, preferred: opts.claudeAccountPreference,
-        activeSessions: opts.claudeActiveSessions })
+        activeSessions: opts.claudeActiveSessions,
+        exhaustedFallbackAccountId: opts.claudeExhaustedFallbackAccountId })
       : opts.claudeAccountId ?? DEFAULT_CLAUDE_ACCOUNT
     : opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT
   const source = getTokenSourceForAccount(opts.tokenSourceId, accountId)

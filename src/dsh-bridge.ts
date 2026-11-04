@@ -263,15 +263,29 @@ export function apply(ctx: Context): void {
           if (header.origin === 'subagent' || header.cwd !== params.cwd) continue
           const stored = await ctx.sessionPersistence.open(header.id, 'read')
           let preview: string = header.id
+          let lastPreview: string | undefined
           try {
-            const { events } = await stored.read(0, 256)
-            const input = events.find(e => e.type === 'user/message' && e.data.source.kind === 'user')
-            if (input?.type === 'user/message') {
-              const text = input.data.content.filter(part => part.type === 'text').map(part => part.text).join(' ')
-              if (text.trim()) preview = text.replace(/\s+/g, ' ').slice(0, 120)
+            // The decoded log is memoized per unchanged session, so the full
+            // slice costs the same decode as the old first-256-events read.
+            const { events } = await stored.read()
+            const userText = (event: any): string => {
+              if (event?.type !== 'user/message' || event.data.source.kind !== 'user') return ''
+              return event.data.content.filter((part: any) => part.type === 'text')
+                .map((part: any) => part.text).join(' ').replace(/\s+/g, ' ').trim()
+            }
+            for (const event of events) {
+              const text = userText(event)
+              if (text) { preview = text.slice(0, 120); break }
+            }
+            // The rs row pairs the first user input with the newest one;
+            // assistant output never counts.
+            for (let i = events.length - 1; i >= 0; i--) {
+              const text = userText(events[i])
+              if (text) { lastPreview = text.slice(0, 120); break }
             }
           } finally { await stored.close() }
-          rows.push({ provider: 'dsh', sessionId: header.id, cwd: header.cwd, ts: header.createdAt, preview })
+          rows.push({ provider: 'dsh', sessionId: header.id, cwd: header.cwd, ts: header.createdAt, preview,
+            ...(lastPreview && lastPreview !== preview ? { lastPreview } : {}) })
         }
         return rows.sort((a, b) => b.ts - a.ts)
       }

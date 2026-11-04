@@ -75,6 +75,11 @@ export const CODEX_QUOTA_BLOCKS_FILE = join(DATA_DIR, 'codex-quota-blocks.json')
 export const CLAUDE_ACCOUNTS_DIR = join(HOME, '.claude-accounts')
 /** Private enrollment phases and identity revisions; never contains subscription credentials. */
 export const CLAUDE_ACCOUNTS_FILE = join(DATA_DIR, 'claude-accounts.json')
+/** Native session id → Claude subscription account id observed while that
+ *  conversation ran. rs history shows it and an all-exhausted restart keeps the
+ *  original account; names always come from the live account registry, so
+ *  deleted/re-added accounts never show a stale label. Bounded. */
+export const CLAUDE_SESSION_ACCOUNTS_FILE = join(DATA_DIR, 'claude-session-accounts.json')
 /** Automatically updated, immutable Agent runtime installations and status. */
 export const AGENT_RUNTIMES_DIR = join(DATA_DIR, 'agent-runtimes')
 /** 真实窗口观测缓存:key = `<sourceId>:<model>`(如 `glm:GLM-5.3`),value = 窗口

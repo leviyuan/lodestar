@@ -72,7 +72,10 @@ export interface ConversationSummary {
   sessionId: string
   /** Absolute working directory reported by the backend-native catalog. */
   cwd: string
+  /** First user input (the conversation's topic). */
   preview: string
+  /** Last user input, when the backend catalog can expose it. */
+  lastPreview?: string
   ts: number
   status?: string
 }

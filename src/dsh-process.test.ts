@@ -382,6 +382,9 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(history).toHaveLength(2)
     expect(history.every((row: any) => row.provider === 'dsh' && row.cwd === f.dir)).toBe(true)
     expect(history.find((row: any) => row.sessionId === sessionId).preview).toContain('blue lighthouse')
+    // rs pairs the first user input with the newest one; assistant replies never count.
+    expect(history.find((row: any) => row.sessionId === sessionId).lastPreview).toContain('after process restart')
+    expect(history.find((row: any) => row.sessionId !== sessionId).lastPreview).toContain('forked branch')
   }, 30_000)
 
   test('runs a real local shell tool and publishes its result', async () => {
