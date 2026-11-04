@@ -437,7 +437,7 @@ export class AgentCards {
         streaming_mode: !complete,
         summary: {
           content: group.rows.size === 0
-            ? '↪ 未完成任务已迁至对话末尾的最新卡片'
+            ? '↪ 已迁至末尾新卡'
             : cards.delegationCardSummary([...group.rows.values()]),
         },
       },

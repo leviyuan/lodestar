@@ -11,6 +11,7 @@ import {
   isBgTerminal,
   hasActiveBgTask,
   backgroundTaskPanel,
+  backgroundTaskSummary,
   emptyBgStore,
   BG_ELEMENTS,
   elapsedBucket,
@@ -183,6 +184,16 @@ describe('applyBgTaskProgress — active/pending 双池刷新', () => {
     const s: BgStore = { active: [mk({ id: 't1', status: 'running' })], pending: [] }
     expect(applyBgTaskProgress(s, { task_id: 'tX' })).toBe(s)
   })
+
+  test('进度刷新不改写行标题(最后一步不能顶掉任务说明)', () => {
+    let s = applyBgTaskStarted(emptyBgStore(), { task_id: 't1', task_type: 'subagent', description: '检查登录流程' }, 1000)
+    s = applyBgTaskProgress(s, { task_id: 't1', description: 'Bash sleep 240', summary: '正在执行 sleep' })
+    expect(s.active[0].title).toBe('检查登录流程')
+    expect(s.active[0].description).toBe('Bash sleep 240')
+    expect(s.active[0].summary).toBe('正在执行 sleep')
+    expect(backgroundTaskSummary(s.active[0])).toContain('检查登录流程')
+    expect(backgroundTaskSummary(s.active[0])).not.toContain('Bash sleep 240')
+  })
 })
 
 describe('applyBgTaskUpdated — is_backgrounded 提升 + 原池 patch', () => {
@@ -218,6 +229,13 @@ describe('applyBgTaskUpdated — is_backgrounded 提升 + 原池 patch', () => {
   test('未知 task_id no-op(不凭空造)', () => {
     const s: BgStore = { active: [], pending: [] }
     expect(applyBgTaskUpdated(s, { task_id: 'tX', patch: { is_backgrounded: true } })).toBe(s)
+  })
+
+  test('late patch 不能把任务标题改成操作步骤', () => {
+    let s = applyBgTaskStarted(emptyBgStore(), { task_id: 't1', task_type: 'subagent', description: '检查登录流程' }, 1000)
+    s = applyBgTaskUpdated(s, { task_id: 't1', patch: { description: 'Bash sleep 240' } })
+    expect(s.active[0].description).toBe('Bash sleep 240')
+    expect(backgroundTaskSummary(s.active[0])).toContain('检查登录流程')
   })
 })
 

@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises'
 import type { AgentModel, AgentProcess, AgentReasoningEffort, DshReasoningEffort } from './agent-process'
 import { isDshReasoningEffort, NothingToCompactError } from './agent-process'
 import type { CodexResultMeta, CodexUsage } from './codex-process'
+import type { BgTaskUpdatedEvent } from './claude-agent-process'
 import type { ConversationLaunch } from './conversation'
 import { validateConversationLaunch } from './conversation'
 import type { ProjectProfile } from './config'
@@ -72,6 +73,9 @@ export class DshProcess extends EventEmitter implements AgentProcess {
   private children = new Set<string>()
   private settledChildren = new Set<string>()
   private childText = new Map<string, string>()
+  /** Durable task label from the child's `subagent/descriptor`; the row header
+   * must show this task instead of the generic bridge placeholder. */
+  private childTitles = new Map<string, string>()
   private earlyNotifications: DshNotification[] = []
   private pendingInputs = 0
   private terminalError: Error | null = null
@@ -248,7 +252,12 @@ export class DshProcess extends EventEmitter implements AgentProcess {
       case 'agent.error': this.emit('error', new Error(params.message)); return
       case 'subagent.started':
         this.children.add(params.sessionId)
-        this.emit('bg_task_started', { task_id: params.sessionId, description: 'DeepSeek Harness 子 Agent', task_type: 'agent', tool_use_id: params.sessionId })
+        this.emit('bg_task_started', {
+          task_id: params.sessionId,
+          description: this.childTitles.get(params.sessionId) ?? 'DeepSeek Harness 子 Agent',
+          task_type: 'agent',
+          tool_use_id: params.sessionId,
+        })
         return
       case 'subagent.disposed':
         if (this.children.has(params.sessionId) && !this.settledChildren.has(params.sessionId)) {
@@ -257,6 +266,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         this.children.delete(params.sessionId)
         this.settledChildren.delete(params.sessionId)
         this.childText.delete(params.sessionId)
+        this.childTitles.delete(params.sessionId)
         for (const key of this.frames.keys()) if (key.startsWith(`${params.sessionId}:`)) this.frames.delete(key)
         return
       case 'session.status': return
@@ -306,14 +316,25 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         const e = params.event
         const data = e.data
         if (!e || !data || typeof e.type !== 'string') throw new Error('invalid DSH session event')
-        if (e.type === 'turn/start' && !sub) {
+        if (e.type === 'subagent/descriptor' && sub && typeof data.label === 'string' && data.label.trim()) {
+          // Durable child task label; patch the row that `subagent.started`
+          // created so its header names the task instead of the bridge default.
+          const label = data.label.trim()
+          this.childTitles.set(params.sessionId, label)
+          this.emit('bg_task_updated', { task_id: params.sessionId, patch: { title: label } } satisfies BgTaskUpdatedEvent)
+        } else if (e.type === 'turn/start' && !sub) {
           this.busy = true; this.startedAt = Date.now(); this.lastUsage = null
           this.activeTurnId = String(data.turn)
           this.lastResult = emptyResult()
           this.emit('scheduled_turn_input', { text: 'DeepSeek Harness 继续执行', promptId: `dsh-turn-${data.turn}` })
           this.emit('turn_started', { turn_id: String(data.turn), thread_id: this.sessionId })
         } else if (e.type === 'turn/start' && sub && this.settledChildren.delete(params.sessionId)) {
-          this.emit('bg_task_started', { task_id: params.sessionId, description: 'DeepSeek Harness 子 Agent', task_type: 'agent', tool_use_id: params.sessionId })
+          this.emit('bg_task_started', {
+            task_id: params.sessionId,
+            description: this.childTitles.get(params.sessionId) ?? 'DeepSeek Harness 子 Agent',
+            task_type: 'agent',
+            tool_use_id: params.sessionId,
+          })
         } else if (e.type === 'user/message' && !sub && typeof params.inputId === 'string') {
           if (this.steeringInputs.delete(params.inputId)) this.emit('user_input_consumed', { inputId: params.inputId })
         } else if (e.type === 'request/header' && !sub) {

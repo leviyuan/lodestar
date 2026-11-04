@@ -434,6 +434,9 @@ export class CodexProcess extends EventEmitter {
   // agentThreadId → 展示名(agentPath 末段,spawn 那刻从 subAgentActivity /
   // collabAgentToolCall 抓取)。仅用于 bg_task_* 事件的 description。
   private collabAgentNames = new Map<string, string>()
+  // agentThreadId → 任务自述(spawn/followup 的 prompt 首行)。行标题优先用它,
+  // agentPath 只是代号;两者都在时不能让代号盖掉任务说明。
+  private collabAgentTitles = new Map<string, string>()
   // agentThreadId → 已 emit 的终态,防同一 agent 的多次 wait item 重复结算。
   private collabAgentSettled = new Set<string>()
   // agentThreadId → 是否见过 active(thread/status/changed)。子线程首个 idle 是
@@ -1110,10 +1113,11 @@ export class CodexProcess extends EventEmitter {
       if (item.kind === 'started' && !this.collabAgentNames.has(threadId)) {
         const name = collabAgentDisplayName(item.agentPath, threadId)
         this.collabAgentNames.set(threadId, name)
+        // The row must name the task; agentPath is only a codename.
         this.emit('bg_task_started', {
           task_id: threadId,
           task_type: 'local_agent',
-          description: name,
+          description: this.collabAgentTitles.get(threadId) ?? name,
         } satisfies BgTaskStartedEvent)
         // Codex ultra 编排的子 agent 生而并行(主 agent spawn 后自己继续跑),
         // 直接后台化入卡 —— 不等主线程推进信号。
@@ -1133,7 +1137,7 @@ export class CodexProcess extends EventEmitter {
           this.emit('bg_task_started', {
             task_id: threadId,
             task_type: 'local_agent',
-            description: name,
+            description: this.collabAgentTitles.get(threadId) ?? name,
           } satisfies BgTaskStartedEvent)
         }
       } else if (item.kind === 'interrupted') {
@@ -1224,7 +1228,8 @@ export class CodexProcess extends EventEmitter {
         return
       }
       this.collabAgentSettled.delete(threadId)
-      const name = this.collabAgentNames.get(threadId) ?? collabAgentDisplayName(null, threadId)
+      const name = this.collabAgentTitles.get(threadId)
+        ?? this.collabAgentNames.get(threadId) ?? collabAgentDisplayName(null, threadId)
       this.emit('bg_task_started', {
         task_id: threadId,
         task_type: 'local_agent',
@@ -1237,9 +1242,11 @@ export class CodexProcess extends EventEmitter {
     }
     if (!this.collabAgentNames.has(threadId)) {
       // 先于 subAgentActivity 到达(spawn 的 inProgress item 先落)。v2 wire 不带
-      // receiverAgents,这里没有 agentPath —— 先用中性占位名入卡,subAgentActivity
-      // (带 agentPath)到达时经 applyBgTaskStarted 的已知 id patch 补真名。
-      const name = '子 agent'
+      // receiverAgents,这里没有 agentPath —— 先用 prompt 首行当任务标题(有就
+      // 用它,没有才用中性占位名),subAgentActivity 到达时仍以任务标题优先。
+      const title = collabTaskTitle(item.prompt)
+      if (title) this.collabAgentTitles.set(threadId, title)
+      const name = title ?? '子 agent'
       this.collabAgentNames.set(threadId, name)
       const started: BgTaskStartedEvent = {
         task_id: threadId,
@@ -2557,6 +2564,17 @@ function collabAgentDisplayName(agentPath: unknown, threadId: string): string {
     if (last) return last
   }
   return diagnosticIdLabel(threadId)
+}
+
+/** 子 agent 的任务标题:prompt 首行(去空白、限 60 字)。agentPath 只是代号,
+ *  行标题优先展示它,用户才能一眼看出子任务要做什么。密文任务书没有可读
+ *  任务名,交给 agentPath/占位名兜底。 */
+function collabTaskTitle(prompt: unknown): string | undefined {
+  if (typeof prompt !== 'string' || !prompt.trim()) return undefined
+  if (prompt.startsWith('gAAAA') && !/[一-鿿]/.test(prompt)) return undefined
+  const line = prompt.split(/\r?\n/).map(part => part.trim()).find(Boolean)
+  if (!line) return undefined
+  return line.length <= 60 ? line : `${line.slice(0, 59)}…`
 }
 
 /** spawn/followup 的 prompt 文本:fork_turns=all 时是服务端 Fernet 密文

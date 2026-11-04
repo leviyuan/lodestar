@@ -8854,3 +8854,90 @@ describe('Claude model selection across configured translation boundaries', () =
     })
   })
 })
+
+describe('Session task-end notifications', () => {
+  function task(status: 'running' | 'completed') {
+    return {
+      id: 't1', type: 'shell' as const, description: '后台命令', status,
+      startedAt: Date.now(), ...(status === 'completed' ? { endTime: Date.now() } : {}), steps: [],
+    }
+  }
+
+  test('a closed turn keeps the phone push until the background work ends', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    session.backgroundTasks = [task('running')]
+    session.currentTurn = turnState('card_bg_running')
+    cardkit.recordCardCreated('card_bg_running', 1)
+    try {
+      await session.closeTurnCard()
+      expect(urgentPushes).toHaveLength(0)
+
+      session.backgroundTasks = [task('completed')]
+      await session.notifyBackgroundEnd()
+      expect(urgentPushes).toEqual([['om_session_turn', ['ou_user']]])
+      await session.notifyBackgroundEnd()
+      expect(urgentPushes).toHaveLength(1)
+    } finally {
+      await cardkit.dispose('card_bg_running')
+      session.dispose()
+    }
+  })
+
+  test('an open turn takes over the task-end push and the resume turn does not repeat it', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    session.lastClosedTurnMessageId = 'om_previous_turn'
+    session.backgroundTasks = [task('completed')]
+    session.currentTurn = turnState('card_next_turn')
+    cardkit.recordCardCreated('card_next_turn', 1)
+    try {
+      // 后台已结束但新一轮正在进行：这一轮收尾负责推送。
+      await session.notifyBackgroundEnd()
+      expect(urgentPushes).toHaveLength(0)
+
+      session.currentTurn.trigger = 'bg_task_resume'
+      await session.closeTurnCard()
+      expect(urgentPushes).toHaveLength(1)
+    } finally {
+      await cardkit.dispose('card_next_turn')
+    }
+
+    // 任务结束通知已经发过；同一代际的迟到续跑轮不再重复推送。
+    urgentPushes.length = 0
+    session.backgroundWorkGeneration = 2
+    session.notifiedBackgroundWorkGeneration = 2
+    session.currentTurn = { ...turnState('card_late_resume'), trigger: 'bg_task_resume' }
+    cardkit.recordCardCreated('card_late_resume', 1)
+    try {
+      await session.closeTurnCard()
+      expect(urgentPushes).toHaveLength(0)
+    } finally {
+      await cardkit.dispose('card_late_resume')
+      session.dispose()
+    }
+  })
+
+  test('the task-end notice is skipped while the turn close is still in flight', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    session.lastClosedTurnMessageId = 'om_previous_turn'
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    session.backgroundTasks = [task('completed')]
+    session.currentTurn = turnState('card_closing')
+    cardkit.recordCardCreated('card_closing', 1)
+    const close = session.closeTurnCard()
+    session.turnCloseInflight.add(gate)
+    await session.notifyBackgroundEnd()
+    expect(urgentPushes).toHaveLength(0)
+    release()
+    session.turnCloseInflight.delete(gate)
+    await close
+    // closeTurnCard 结束时没有活跃后台任务，正常推送一次。
+    await waitUntil(() => urgentPushes.length === 1)
+    expect(urgentPushes).toEqual([['om_session_turn', ['ou_user']]])
+    await cardkit.dispose('card_closing')
+    session.dispose()
+  })
+})

@@ -29,6 +29,8 @@ export interface BgTaskEntry {
   toolUseId?: string
   type: BgTaskType
   description: string
+  /** 任务标题(启动那刻的说明),行标题只用它;进度只更新 description。 */
+  title?: string
   subagentType?: string
   workflowName?: string
   /** 子 agent 任务描述(task_started.prompt)。 */
@@ -158,6 +160,9 @@ export function applyBgTaskStarted(
       type: type === 'unknown' ? t.type : type,
       toolUseId: e.tool_use_id ?? t.toolUseId,
       description: e.description || t.description,
+      // started is the task's identity (including late 补名); progress never
+      // touches the title, so the row keeps naming the task.
+      title: e.description || t.title || t.description,
       subagentType: e.subagent_type ?? t.subagentType,
       workflowName: e.workflow_name ?? t.workflowName,
       prompt: e.prompt ?? t.prompt,
@@ -178,6 +183,7 @@ export function applyBgTaskStarted(
     toolUseId: e.tool_use_id,
     type,
     description: e.description,
+    title: e.description,
     subagentType: e.subagent_type,
     workflowName: e.workflow_name,
     prompt: e.prompt,
@@ -197,6 +203,8 @@ export function applyBgTaskProgress(store: BgStore, e: BgTaskProgressEvent): BgS
   if (!inActive && !inPending) return store
   const patchField = (t: BgTaskEntry): BgTaskEntry => ({
     ...t,
+    // `description` is the live detail; the row header reads `title`, captured
+    // when the task started, so progress cannot rename the task.
     description: e.description ?? t.description,
     subagentType: e.subagent_type ?? t.subagentType,
     usage: e.usage ?? t.usage,
@@ -223,6 +231,7 @@ export function applyBgTaskUpdated(store: BgStore, e: BgTaskUpdatedEvent): BgSto
       isBackgrounded: true,
       status: p.status ?? entry.status,
       description: p.description ?? entry.description,
+      title: p.title ?? entry.title,
       error: p.error ?? entry.error,
       endTime: p.end_time ?? entry.endTime,
     }
@@ -239,6 +248,7 @@ export function applyBgTaskUpdated(store: BgStore, e: BgTaskUpdatedEvent): BgSto
       ...t,
       status: p.status ?? t.status,
       description: p.description ?? t.description,
+      title: p.title ?? t.title,
       error: p.error ?? t.error,
       isBackgrounded: p.is_backgrounded ?? t.isBackgrounded,
       endTime: p.end_time ?? t.endTime,
@@ -539,7 +549,7 @@ export function backgroundTaskSummary(t: BgTaskEntry): string {
     running: `⏳ ${kindLabel}正在执行`, pending: `⏳ ${kindLabel}等待执行`, paused: `⏸️ ${kindLabel}已暂停`,
     completed: `✅ ${kindLabel}完成`, failed: `❌ ${kindLabel}失败`, killed: `🛑 ${kindLabel}已终止`,
   }[t.status]
-  const description = t.description.replace(/\s+/g, ' ').trim() || '说明 MISS'
+  const description = (t.title || t.description).replace(/\s+/g, ' ').trim() || '说明 MISS'
   return `${status} · ${description.length <= 40 ? description : `${description.slice(0, 39)}…`}`
 }
 

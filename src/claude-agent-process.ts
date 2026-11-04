@@ -604,6 +604,9 @@ export interface BgTaskUpdatedEvent {
   patch: {
     status?: BgTaskStatus
     description?: string
+    /** Durable task title learned after the row started (e.g. DSH's
+     * `subagent/descriptor` label); only ever fills/replaces the header. */
+    title?: string
     end_time?: number
     total_paused_ms?: number
     error?: string

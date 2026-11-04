@@ -301,7 +301,28 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(proc.isAlive()).toBe(true)
     expect(store.active[0].status).toBe('completed')
     expect(store.active[0].steps.some(step => step.brief.includes('background-proof'))).toBe(true)
+    expect(store.active[0].description).toBe('DeepSeek Harness 子 Agent')
   }, 30_000)
+
+  test('subagent descriptor names the child task instead of the bridge placeholder', async () => {
+    const f = await fixture(() => completion({ content: 'unused' }))
+    const proc = f.processFor()
+    await proc.initializationPromise()
+    const started: any[] = []
+    proc.on('bg_task_started', e => started.push(e))
+    const updated: any[] = []
+    proc.on('bg_task_updated', e => updated.push(e))
+    ;(proc as any).runtime.emit('notification', { method: 'session.event', params: {
+      sessionId: 'child-descriptor',
+      event: { type: 'subagent/descriptor', seq: 1, time: Date.now(),
+        data: { version: 3, mode: 'continuable', provider: 'spawn', label: '检查登录流程' } },
+    } })
+    expect(updated).toContainEqual(expect.objectContaining({
+      task_id: 'child-descriptor', patch: { title: '检查登录流程' },
+    }))
+    expect(started).toHaveLength(0)
+    await proc.kill()
+  }, 15_000)
 
   test('a fatal bridge error reports an unexpected exit even when shutdown succeeds', async () => {
     const f = await fixture(() => completion({ content: 'unused' }))

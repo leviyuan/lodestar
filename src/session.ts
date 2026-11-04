@@ -188,6 +188,10 @@ const CARD_ELEMENT_SOFT_LIMIT = 50
 
 const MAX_CONTEXT_COMPACTION_RECEIPTS = 256
 const ANONYMOUS_COMPACTION_DEDUPE_MS = 10_000
+/** A turn can close while subagents/background shells still run. Their last
+ * settlement gets this long to open the SDK's automatic resume turn before the
+ * session owes the user an explicit task-end push. */
+const BACKGROUND_END_NOTICE_GRACE_MS = 10_000
 /** Claude Agent SDK does not emit stream `init` until the first user input.
  * Still give synchronous/early startup failures a chance to surface before
  * presenting the session as ready. */
@@ -426,6 +430,15 @@ export class Session {
    * one turn, and "the most recent sender" is a defensible default for
    * the single-user private-bot scenario this product targets. */
   lastUserOpenId = ''
+  /** Newest closed main card. A background task that outlives its turn is
+   * announced against this card, because that is the message the user last
+   * saw for the task. */
+  lastClosedTurnMessageId = ''
+  /** Bumped whenever new background work starts. A task-end push covers one
+   * generation, so a late resume turn cannot announce it twice. */
+  private backgroundWorkGeneration = 0
+  private notifiedBackgroundWorkGeneration = -1
+  private backgroundEndNoticeTimer: ReturnType<typeof setTimeout> | null = null
   /** Feishu message_ids of user messages that arrived while the daemon
    * was busy (turn in flight or mid-open), mapped to the `reaction_id`
    * of the `OneSecond` reaction placed at arrival. The reaction_id is
@@ -1386,6 +1399,8 @@ export class Session {
         'same-process opens must wait for the current owner',
       )
     }
+    // A new visible turn takes over the task-end push decision.
+    this.clearBackgroundEndNotice()
     let resolveDone!: () => void
     const done = new Promise<void>(resolve => { resolveDone = resolve })
     const owner: TurnOpenOwner = {
@@ -2622,7 +2637,11 @@ export class Session {
 
   /** daemon 解散临时群(bye)时调:从 Session.all registry 移除,避免长期运行的 daemon
    *  因临时群不断建/散而累积孤立 Session 实例(sessions Map 已 delete,但 static all 不会)。 */
-  dispose(): void { this.modelPanelRefreshEpoch++; Session.all.delete(this) }
+  dispose(): void {
+    this.clearBackgroundEndNotice()
+    this.modelPanelRefreshEpoch++
+    Session.all.delete(this)
+  }
 
   /** Clean result 时记 backend-native checkpoint + 用户输入预览 + 文件变更记录。 */
   private recordTurnAnchor(checkpoint: ConversationCheckpoint | null | undefined): string | null {
@@ -3492,8 +3511,14 @@ export class Session {
   /** 把 BgStore 双池结果写回 backgroundTasks(active)+ pendingBgTasks。
    *  bg_task_* 事件与子 agent tool_use/tool_result 累积的统一落点。 */
   private applyBgStore(next: cards.BgStore): void {
+    const running = new Set(this.backgroundTasks.filter(task => !cards.isBgTerminal(task)).map(task => task.id))
     this.backgroundTasks = next.active
     this.pendingBgTasks = next.pending
+    // A restarted task (same id, terminal -> running) is new work again.
+    if (next.active.some(task => !cards.isBgTerminal(task) && !running.has(task.id))) {
+      this.backgroundWorkGeneration++
+      this.clearBackgroundEndNotice()
+    }
   }
 
   /** 主线程推进(新的主线程 tool_use / assistant 段定稿):pending 观察池里还没结算
@@ -3527,6 +3552,9 @@ export class Session {
     } else {
       this.scheduleBackgroundRefresh()
     }
+    // The turn may already be closed while this task kept running; the task
+    // itself now owns the task-end push.
+    this.scheduleBackgroundEndNotice()
   }
 
   private scheduleBackgroundRefresh(): void {
@@ -3535,6 +3563,42 @@ export class Session {
       this.backgroundRefreshTimer = null
       void this.refreshBackgroundCardFull().catch(error => this.reportBackgroundWriteFailure(error))
     }, 1500)
+  }
+
+  private hasActiveBackgroundWork(): boolean {
+    return this.backgroundTasks.some(task => !cards.isBgTerminal(task))
+  }
+
+  /** A turn is not the task: while subagents or background shells still run,
+   * the phone push belongs to the moment the last one ends. */
+  private scheduleBackgroundEndNotice(): void {
+    if (this.hasActiveBackgroundWork()) return
+    if (this.currentTurn || this.openingTurn || this.turnCloseInflight.size > 0) return
+    if (this.backgroundEndNoticeTimer) return
+    this.backgroundEndNoticeTimer = setTimeout(() => {
+      this.backgroundEndNoticeTimer = null
+      void this.notifyBackgroundEnd().catch(error => logError('session: background end notice failed', error))
+    }, BACKGROUND_END_NOTICE_GRACE_MS)
+  }
+
+  /** Claude normally opens its resume turn inside the grace window, and that
+   * turn's close pushes the result instead. Only a session that stays idle owes
+   * the user an explicit “tasks really finished” push. */
+  private async notifyBackgroundEnd(): Promise<void> {
+    if (this.hasActiveBackgroundWork()) return
+    if (this.currentTurn || this.openingTurn || this.turnCloseInflight.size > 0) return
+    const messageId = this.lastClosedTurnMessageId
+    const userOpenId = this.lastUserOpenId
+    if (!messageId || !userOpenId) return
+    if (this.notifiedBackgroundWorkGeneration === this.backgroundWorkGeneration) return
+    this.notifiedBackgroundWorkGeneration = this.backgroundWorkGeneration
+    await feishu.urgentApp(messageId, [userOpenId])
+  }
+
+  private clearBackgroundEndNotice(): void {
+    if (!this.backgroundEndNoticeTimer) return
+    clearTimeout(this.backgroundEndNoticeTimer)
+    this.backgroundEndNoticeTimer = null
   }
 
   private refreshBackgroundCardFull(): Promise<void> {
@@ -3569,6 +3633,7 @@ export class Session {
   private async resetBackgroundTasks(): Promise<void> {
     if (this.backgroundRefreshTimer) clearTimeout(this.backgroundRefreshTimer)
     this.backgroundRefreshTimer = null
+    this.clearBackgroundEndNotice()
     const now = Date.now()
     this.backgroundTasks = this.backgroundTasks.map(task => cards.isBgTerminal(task)
       ? task : { ...task, status: 'killed', endTime: task.endTime ?? now })
@@ -6032,6 +6097,8 @@ export class Session {
     // and finish below; stop/restart cancel them through the session registry.
     if (!suffix && turn.cardRotationFailed) this.maybeMidTurnRotate()
     this.currentTurn = null
+    // The task-end push targets the message the user last saw for this work.
+    if (turn.messageId) this.lastClosedTurnMessageId = turn.messageId
     this.stopFooterStatus(turn)
     const proc = this.proc
     const snapshot: TurnCloseSnapshot = {
@@ -6224,15 +6291,17 @@ export class Session {
       await this.sendAssistantTextFallback(text, 'CardKit 元素未落地')
     }
 
-    // Phone push on clean turn close so the user knows Codex is done
-    // even with the chat backgrounded. Skip on interrupts (no real
-    // completion), when we don't know who to ping, and when the turn
-    // wasn't kicked off by the user typing a message. `opts.forcePush`
-    // overrides the suffix-gate when the backend reports a failed turn.
+    // Phone push when the task really ends. A turn that closes while subagents
+    // or background shells still run leaves the push to the task-end notice,
+    // and a resume turn reporting work that notice already covered does not
+    // push a second time. `opts.forcePush` still overrides the suffix-gate.
     // Fire-and-forget; urgent_app failures are non-fatal and already
     // logged in feishu.ts.
     // 续卡仍未成功时已有失败提示，不推送旧卡的完成通知。
-    if ((opts.forcePush || !suffix) && turn.userOpenId && turn.messageId && !turn.cardRotationFailed) {
+    const announcedByTaskEnd = turn.trigger === 'bg_task_resume'
+      && this.notifiedBackgroundWorkGeneration === this.backgroundWorkGeneration
+    if ((opts.forcePush || !suffix) && turn.userOpenId && turn.messageId && !turn.cardRotationFailed
+      && !this.hasActiveBackgroundWork() && !announcedByTaskEnd) {
       void feishu.urgentApp(turn.messageId, [turn.userOpenId])
     }
 

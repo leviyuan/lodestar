@@ -5,7 +5,6 @@ import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
 import { formatDuration } from './duration'
 import {
   AGENT_CARD_TASK_KIND_ORDER,
-  agentCardTaskKindIcon,
   agentCardTaskKindLabel,
   type AgentCardTaskKind,
 } from './task-kind'
@@ -102,22 +101,54 @@ export function agentCardSummary(runs: AgentRunSnapshot[]): string {
   })))
 }
 
+/** Chat-list preview for the shared card. Feishu shows roughly 15 characters
+ * there, so the summary reports the live mix of running (or finished) task
+ * kinds — never the earlier “运行任务 · 已结束 0/2” sentence. */
 export function delegationCardSummary(tasks: Array<{
   summary: string
   status: string
   terminal: boolean
   kind?: AgentCardTaskKind
 }>): string {
-  if (tasks.length === 1) return tasks[0]!.summary
-  const done = tasks.filter(task => task.terminal).length
-  const failed = tasks.filter(task => task.status === 'failed').length
+  if (tasks.length === 0) return '✅ 任务结束'
+  // Project runs own a dedicated card; keep their descriptive summary.
+  if (tasks.length === 1 && tasks[0]!.kind === 'project') return tasks[0]!.summary
+  const active = tasks.filter(task => !task.terminal)
   const waiting = tasks.filter(task => task.status === 'needs_input' || task.status === 'paused').length
-  const kinds = new Set(tasks.map(task => task.kind ?? 'delegated'))
-  const kindList = AGENT_CARD_TASK_KIND_ORDER.filter(kind => kinds.has(kind))
-  const category = kindList.length === 1
-    ? `${agentCardTaskKindIcon(kindList[0]!)} ${agentCardTaskKindLabel(kindList[0]!)}`
-    : `🧩 运行任务 · ${kindList.map(kind => `${agentCardTaskKindLabel(kind)} ${tasks.filter(task => (task.kind ?? 'delegated') === kind).length}`).join(' · ')}`
-  return `${category} · 已结束 ${done}/${tasks.length}${failed ? ` · 失败 ${failed}` : ''}${waiting ? ` · 待处理 ${waiting}` : ''}`
+  const failed = tasks.filter(task => task.status === 'failed').length
+  if (waiting > 0) {
+    const rest = active.length - waiting
+    return `❓ 待回答${waiting}${rest > 0 ? `·${rest}项` : ''}`
+  }
+  if (active.length > 0) {
+    const counts = kindCounts(active)
+    return counts ? `⏳ ${counts}` : `⏳ ${active.length}项进行中`
+  }
+  if (failed > 0) return `❌ ${failed}失败·${tasks.length - failed}完成`
+  const done = kindCounts(tasks)
+  return done ? `✅ ${done}` : `✅ ${tasks.length}项已完成`
+}
+
+/** e.g. `后台1·子Agent1`; three or more kinds return null so the caller can
+ * collapse to a total that still fits the ~15 character preview. */
+function kindCounts(tasks: Array<{ kind?: AgentCardTaskKind }>): string | null {
+  const counts = new Map<AgentCardTaskKind, number>()
+  for (const task of tasks) {
+    const kind = task.kind ?? 'delegated'
+    counts.set(kind, (counts.get(kind) ?? 0) + 1)
+  }
+  const parts = AGENT_CARD_TASK_KIND_ORDER.filter(kind => counts.has(kind))
+    .map(kind => `${agentCardTaskKindShortLabel(kind)}${counts.get(kind)}`)
+  return parts.length > 2 ? null : parts.join('·')
+}
+
+function agentCardTaskKindShortLabel(kind: AgentCardTaskKind): string {
+  switch (kind) {
+    case 'project': return '项目'
+    case 'delegated': return '委派'
+    case 'subagent': return '子Agent'
+    case 'background': return '后台'
+  }
 }
 
 /** Render a bounded worker result; only the task prompt uses the shorter limit. */

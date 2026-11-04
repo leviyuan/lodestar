@@ -101,17 +101,17 @@ describe('shared delegation card lifecycle', () => {
     const rows = [...h.elements.get('message-1')!.values()]
     expect(rows).toHaveLength(3)
     expect(rows.every(row => row.tag === 'collapsible_panel' && row.expanded === false)).toBe(true)
-    expect(h.settings.get('message-1').config.summary.content).toBe('🧩 运行任务 · 委派任务 1 · 子 Agent 1 · 后台进程 1 · 已结束 0/3')
+    expect(h.settings.get('message-1').config.summary.content).toBe('⏳ 3项进行中')
     const completedChild = { ...child, status: 'completed' as const, summary: '子任务已完成', endTime: Date.now() }
     await h.cards.syncBackground('chat', 'session', [completedChild, shell])
     terminal(delegated)
     await h.cards.update(delegated, true)
     expect(h.settings.get('message-1').config.streaming_mode).toBe(true)
-    expect(h.settings.get('message-1').config.summary.content).toContain('2/3')
+    expect(h.settings.get('message-1').config.summary.content).toBe('⏳ 后台1')
     const failedShell = { ...shell, status: 'failed' as const, error: '构建失败', endTime: Date.now() }
     await h.cards.syncBackground('chat', 'session', [completedChild, failedShell])
     expect(h.settings.get('message-1').config.streaming_mode).toBe(false)
-    expect(h.settings.get('message-1').config.summary.content).toContain('失败 1')
+    expect(h.settings.get('message-1').config.summary.content).toBe('❌ 1失败·2完成')
     expect(JSON.stringify([...h.elements.get('message-1')!.values()])).toContain('构建失败')
   })
 

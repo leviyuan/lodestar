@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import type { AgentIdentity } from '../agent-identities'
 import type { AgentRunSnapshot } from '../agent-run-types'
-import { agentIdentityListCard, agentRunCard, agentRunSummary, agentRunElementId } from './agents'
+import { agentIdentityListCard, agentRunCard, agentRunSummary, agentRunElementId, delegationCardSummary } from './agents'
 
 const identity: AgentIdentity = {
   id: 'agent:a', displayName: 'GLM · 5.3', tokenSourceId: 'glm', tokenSourceDisplay: 'GLM',
@@ -153,5 +153,33 @@ describe('delegated Agent cards', () => {
     for (const text of ['Inspect API', 'Native result', 'Proceed?']) expect(disabled).toContain(text)
     expect(disabled).not.toContain('译文 MISS')
     expect(disabled).not.toContain('正在翻译任务说明')
+  })
+})
+
+describe('shared card chat-list summary', () => {
+  const task = (kind: 'delegated' | 'subagent' | 'background', status = 'running') => ({
+    summary: 'x', status, terminal: !['running', 'needs_input', 'paused'].includes(status), kind,
+  })
+
+  test('keeps the ~15 character preview focused on the running kinds', () => {
+    expect(delegationCardSummary([task('background')])).toBe('⏳ 后台1')
+    expect(delegationCardSummary([task('subagent'), task('background')])).toBe('⏳ 子Agent1·后台1')
+    expect(delegationCardSummary([task('delegated'), task('subagent'), task('background')])).toBe('⏳ 3项进行中')
+  })
+
+  test('marks the real end instead of reusing the running sentence', () => {
+    expect(delegationCardSummary([task('subagent', 'completed'), task('background', 'completed')]))
+      .toBe('✅ 子Agent1·后台1')
+    expect(delegationCardSummary([task('subagent', 'completed'), task('background', 'failed')]))
+      .toBe('❌ 1失败·1完成')
+  })
+
+  test('puts a pending question before the running counts', () => {
+    expect(delegationCardSummary([task('delegated', 'needs_input'), task('background')])).toBe('❓ 待回答1·1项')
+  })
+
+  test('lets a dedicated project card keep its descriptive summary', () => {
+    const project = { summary: '⏳ 项目任务正在执行 · 检查接口', status: 'running', terminal: false, kind: 'project' as const }
+    expect(delegationCardSummary([project])).toBe(project.summary)
   })
 })
