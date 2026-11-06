@@ -9,9 +9,9 @@ const window = (kind: string, percent: number | null, hours: number): UsageWindo
   kind, label: kind, percent, resetsAt: after(hours),
 })
 function quota(options: { shortUsed?: number; shortHours?: number; weekUsed?: number; weekHours?: number;
-  extra?: UsageWindowUnified[] } = {}): UsageSnapshotUnified {
+  extra?: UsageWindowUnified[]; weeklyOnly?: boolean } = {}): UsageSnapshotUnified {
   return { state: 'ok', fetchedAt: NOW, windows: [
-    window('fiveHour', options.shortUsed ?? 20, options.shortHours ?? 3),
+    ...(options.weeklyOnly ? [] : [window('fiveHour', options.shortUsed ?? 20, options.shortHours ?? 3)]),
     window('weekly', options.weekUsed ?? 30, options.weekHours ?? 24), ...(options.extra ?? []),
   ] }
 }
@@ -113,6 +113,50 @@ describe('Claude tasks spread by real headroom', () => {
   })
 })
 
+describe('accounts without a five-hour window', () => {
+  test('weekly-only quota is schedulable and carries the model weekly reset', () => {
+    const result = rank(quota({ weeklyOnly: true, weekUsed: 30, weekHours: 24 }))
+    expect(result).toMatchObject({ state: 'ready', hasFiveHour: false, remaining: 7, score: 7,
+      expiresAt: after(24).getTime() })
+    expect(result.fiveHourRemaining).toBeUndefined()
+  })
+
+  test('a usable five-hour window outranks every weekly-only account', () => {
+    // 5h 账号只剩很小的窗口余量，周额度几乎没动；无 5h 账号余额充足且更快到期。
+    const withShort = rank(quota({ shortUsed: 99, shortHours: 1, weekUsed: 0, weekHours: 168 }))
+    const weeklyOnly = rank(quota({ weeklyOnly: true, weekUsed: 0, weekHours: 2 }))
+    expect(withShort.hasFiveHour).toBe(true)
+    expect(compareClaudeQuota(withShort, weeklyOnly)).toBeLessThan(0)
+    expect(compareClaudeQuota(weeklyOnly, withShort)).toBeGreaterThan(0)
+  })
+
+  test('weekly-only accounts spend the weekly quota that resets unused first', () => {
+    const soon = rank(quota({ weeklyOnly: true, weekUsed: 80, weekHours: 8 }))
+    const later = rank(quota({ weeklyOnly: true, weekUsed: 0, weekHours: 120 }))
+    expect(compareClaudeQuota(soon, later)).toBeLessThan(0)
+    // 到期时间相同时仍按余量份额分摊。
+    const roomier = rank(quota({ weeklyOnly: true, weekUsed: 20, weekHours: 8 }))
+    const tighter = rank(quota({ weeklyOnly: true, weekUsed: 80, weekHours: 8 }))
+    expect(compareClaudeQuota(roomier, tighter)).toBeLessThan(0)
+  })
+
+  test('weekly-only exhaustion and missing values still exclude the account', () => {
+    expect(rank(quota({ weeklyOnly: true, weekUsed: 100 })).state).toBe('exhausted')
+    const noReset = quota({ weeklyOnly: true })
+    noReset.windows[0]!.resetsAt = null
+    expect(rank(noReset).state).toBe('miss')
+  })
+
+  test('five-hour accounts still spread by share before the window reset time', () => {
+    const earlier = rank(quota({ shortUsed: 50, shortHours: 1, weekUsed: 0, weekHours: 168 }))
+    const roomier = rank(quota({ shortUsed: 0, shortHours: 4.5, weekUsed: 0, weekHours: 168 }))
+    // 余量份额更大的账号先接，即使它的窗口更晚重置。
+    expect(compareClaudeQuota(roomier, earlier)).toBeLessThan(0)
+    // 份额相同时先花更快作废的窗口。
+    expect(compareClaudeQuota({ ...roomier, expiresAt: earlier.expiresAt! }, roomier)).toBeLessThan(0)
+  })
+})
+
 describe('Fable shared and dedicated weekly capacities', () => {
   test('Fable keeps five shared and ten dedicated units', () => {
     const snapshot = quota({ shortUsed: 0, weekUsed: 90, weekHours: 100,
@@ -161,15 +205,13 @@ describe('Claude actual quota errors remain excluded', () => {
     expect(rank(quota(), count)).toMatchObject({ state: 'miss', score: null, reason: '活跃会话数 MISS' })
   })
 
-  test('missing snapshots, failures and missing or repeated main windows cannot participate', () => {
+  test('missing snapshots, failures and missing or repeated weekly windows cannot participate', () => {
     expect(rank(undefined).state).toBe('miss')
     expect(rank({ state: 'network', windows: [], reason: 'offline' })).toMatchObject({ state: 'miss', reason: 'offline' })
     expect(rank({ state: 'ok', windows: [] }).state).toBe('miss')
-    for (const kind of ['fiveHour', 'weekly']) {
-      const snapshot = quota({ extra: [window('modelWeekly:Fable', 20, 2)] })
-      snapshot.windows = snapshot.windows.filter(item => item.kind !== kind)
-      expect(rank(snapshot, 0, 'fable').state).toBe('miss')
-    }
+    const noWeek = quota({ extra: [window('modelWeekly:Fable', 20, 2)] })
+    noWeek.windows = noWeek.windows.filter(item => item.kind !== 'weekly')
+    expect(rank(noWeek, 0, 'fable').state).toBe('miss')
     expect(rank(quota({ extra: [window('weekly', 0, 100)] })).state).toBe('miss')
   })
 

@@ -12,6 +12,10 @@ export interface ClaudeQuotaRank {
   /** Remaining units divided by active sessions including the one being launched. */
   score: number | null
   activeSessions: number
+  /** The account still reports a five-hour window; false means weekly quota only. */
+  hasFiveHour: boolean
+  /** Reset of the quota discarded first: the five-hour window when reported, otherwise the weekly window. */
+  expiresAt: number | null
   fiveHourRemaining?: number
   reason?: string
 }
@@ -23,7 +27,8 @@ export interface ClaudeQuotaRank {
  */
 export function rankClaudeQuota(snapshot: UsageSnapshotUnified | undefined, model: string,
   now = Date.now(), activeSessions = 0): ClaudeQuotaRank {
-  const out: ClaudeQuotaRank = { state: 'miss', remaining: null, score: null, activeSessions }
+  const out: ClaudeQuotaRank = { state: 'miss', remaining: null, score: null, activeSessions,
+    hasFiveHour: false, expiresAt: null }
   if (!Number.isFinite(now)) return { ...out, reason: '当前时间 MISS' }
   if (!Number.isSafeInteger(activeSessions) || activeSessions < 0) return { ...out, reason: '活跃会话数 MISS' }
   if (!snapshot || snapshot.state !== 'ok') return { ...out, reason: snapshot?.reason ?? '额度缓存 MISS' }
@@ -39,7 +44,8 @@ export function rankClaudeQuota(snapshot: UsageSnapshotUnified | undefined, mode
     || window.kind.startsWith('modelWeekly:') && claudeModelFamily(window.kind.slice('modelWeekly:'.length)) === family)
   const short = windows.find(window => window.kind === 'fiveHour')
   const totalWeek = windows.find(window => window.kind === 'weekly')
-  if (!short || !totalWeek) return { ...out, reason: '订阅主窗口额度 MISS' }
+  // 没有 5h 窗口的账号只受周额度约束，仍然可以接任务，不当作 MISS。
+  if (!totalWeek) return { ...out, reason: '订阅周额度 MISS' }
   if (new Set(windows.map(window => window.kind)).size !== windows.length) {
     return { ...out, reason: '额度窗口重复，归属 MISS' }
   }
@@ -65,15 +71,28 @@ export function rankClaudeQuota(snapshot: UsageSnapshotUnified | undefined, mode
       : family === 'fable' && window.kind === 'weekly' ? WEEKLY_ALLOWANCE / 2 : WEEKLY_ALLOWANCE
     return capacity * (100 - window.percent!) / 100
   }))
+  // 没有 5h 限额时以该模型实际生效的周额度重置时间为到期时间。
+  const expiresAt = (short ?? weekly).resetsAt!.getTime()
   return { state: 'ready', activeSessions, remaining,
-    score: remaining / (activeSessions + 1),
-    fiveHourRemaining: (100 - short.percent!) / 100 }
+    score: remaining / (activeSessions + 1), hasFiveHour: short !== undefined, expiresAt,
+    ...(short ? { fiveHourRemaining: (100 - short.percent!) / 100 } : {}) }
 }
 
-/** Equal per-session share is the goal; ties keep the launch on the least busy, roomiest account. */
+const expiryOf = (rank: ClaudeQuotaRank): number => rank.expiresAt ?? Number.POSITIVE_INFINITY
+
+/**
+ * 5h 窗口的速率额度不能结转：能安排任务的 5h 账号是更优先的状态，
+ * 只有在这里花掉窗口额度，该账号的周额度才用得完。
+ * 没有 5h 限额的账号只剩周额度，先接周额度最快到期作废的账号。
+ * 5h 组内仍按余量份额分摊，避免并发任务都压在同一个受限窗口上；
+ * 其余同分时也按到期时间兜底，5h 账号即先花快到重置的窗口。
+ */
 export function compareClaudeQuota(a: ClaudeQuotaRank, b: ClaudeQuotaRank): number {
-  return b.score! - a.score!
+  return Number(b.hasFiveHour) - Number(a.hasFiveHour)
+    || (a.hasFiveHour ? 0 : expiryOf(a) - expiryOf(b))
+    || b.score! - a.score!
     || a.activeSessions - b.activeSessions
     || b.remaining! - a.remaining!
-    || b.fiveHourRemaining! - a.fiveHourRemaining!
+    || (b.fiveHourRemaining ?? 0) - (a.fiveHourRemaining ?? 0)
+    || expiryOf(a) - expiryOf(b)
 }

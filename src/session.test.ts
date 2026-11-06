@@ -5542,6 +5542,15 @@ describe('Session usage cache cross-backend isolation', () => {
       snapshot.windows.find(window => window.kind === 'modelWeekly:Fable')!.percent = null
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'fable')).toBe('  |  4.1h·7%·[MISS]')
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, null)).toBe('  |  4.1h·7%·[MISS]')
+      // 账号取消 5 小时限额后只按周额度展示，不补 5h 的 MISS。
+      snapshot = claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
+        five_hour: null,
+        seven_day: { utilization: 17, resets_at: new Date(Date.now() + 6.9 * 86400_000).toISOString() },
+      } })
+      await session.patchConsoleUsage('quota-card')
+      expect((replaceSpy.mock.calls.at(-1)?.[2] as any).elements[0].content).toBe('**Claude 订阅**　周 17%/6.9d')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'opus')).toBe('  |  [6.9d·17%]')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'fable')).toBe('  |  [6.9d·17%]')
       snapshot = { state: 'network', windows: [], reason: 'query failed' }
       await session.patchConsoleUsage('quota-card')
       expect((replaceSpy.mock.calls.at(-1)?.[2] as any).elements[0].content).toContain('MISS · query failed')

@@ -6039,7 +6039,8 @@ export class Session {
         if (ts.kind === 'claude-subscription') {
           const weekly = claudeWeeklyUsageWindow(snap, model)
           const missing = { percent: null, resetsAt: null }
-          return this.fmtDualWindowSuffix(fiveHour ?? missing, weekly ?? missing)
+          // 没有 5h 窗口表示该账号已取消 5 小时限额：不补 MISS，只显示周额度。
+          return this.fmtDualWindowSuffix(fiveHour ?? null, weekly ?? missing)
         }
         const weekly = snap.windows.find(w => w.kind === 'weekly')
         if (fiveHour || weekly) return this.fmtDualWindowSuffix(fiveHour ?? null, weekly ?? null)

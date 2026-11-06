@@ -30,14 +30,31 @@ describe('Claude subscription usage response', () => {
     expect(snapshot.windows[1]?.resetsAt).toEqual(new Date(reset))
   })
 
-  test.each([undefined, null])('missing primary windows (%s) remain unknown even when model quota is available', five_hour => {
+  test.each([undefined, null])('a missing five-hour window (%s) means no short limit instead of MISS', five_hour => {
     const snapshot = claudeUsageSnapshot(response({
       five_hour,
+      seven_day: { utilization: 20, resets_at: reset },
       model_scoped: [{ display_name: 'Fable', utilization: 80, resets_at: reset }],
     }))
-    expect(snapshot.windows.map(window => window.percent)).toEqual([null, null, 80])
-    expect(snapshot.windows[1]?.kind).toBe('weekly')
-    expect(snapshot.windows[1]?.resetsAt).toBeNull()
+    expect(snapshot.windows.map(window => window.kind)).toEqual(['weekly', 'modelWeekly:Fable'])
+    expect(snapshot.windows.map(window => window.percent)).toEqual([20, 80])
+    expect(snapshot.windows.map(window => window.resetsAt)).toEqual([new Date(reset), new Date(reset)])
+  })
+
+  test('a null five-hour window stays MISS when the aggregated limits still report a session bucket', () => {
+    const conflict = claudeUsageSnapshot(response({
+      five_hour: null,
+      seven_day: { utilization: 20, resets_at: reset },
+      limits: [{ kind: 'session', percent: 15 }, { kind: 'weekly_all', percent: 20 }],
+    }))
+    expect(conflict.windows.map(window => window.kind)).toEqual(['fiveHour', 'weekly'])
+    expect(conflict.windows[0]).toEqual({ kind: 'fiveHour', label: '5h 窗口', percent: null, resetsAt: null })
+    const weeklyOnly = claudeUsageSnapshot(response({
+      five_hour: null,
+      seven_day: { utilization: 20, resets_at: reset },
+      limits: [{ kind: 'weekly_all', percent: 20 }, { kind: 'weekly_scoped', percent: 0 }],
+    }))
+    expect(weeklyOnly.windows.map(window => window.kind)).toEqual(['weekly'])
   })
 
   test('does not reset used, exhausted, expired or partially missing short windows to a full allowance', () => {
@@ -188,8 +205,8 @@ describe('legacy Claude model-specific weekly quota compatibility', () => {
       seven_day_opus: null,
       seven_day_sonnet: null,
     }))
-    expect(data.windows.map(window => window.kind)).toEqual(['fiveHour', 'weekly'])
-    expect(claudeWeeklyUsageWindow(data, 'opus')).toBe(data.windows[1])
-    expect(claudeWeeklyUsageWindow(data, 'sonnet')).toBe(data.windows[1])
+    expect(data.windows.map(window => window.kind)).toEqual(['weekly'])
+    expect(claudeWeeklyUsageWindow(data, 'opus')).toBe(data.windows[0])
+    expect(claudeWeeklyUsageWindow(data, 'sonnet')).toBe(data.windows[0])
   })
 })

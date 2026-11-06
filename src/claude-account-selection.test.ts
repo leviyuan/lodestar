@@ -84,6 +84,62 @@ test('an unobserved default warms an unstarted short window and remains selectab
   `)
 })
 
+test('weekly-only accounts stay selectable and yield to a usable five-hour window', () => {
+  isolated(`
+    import assert from 'node:assert/strict'
+    import { mock } from 'bun:test'
+    mock.module('./src/claude-agent-process', () => ({ ClaudeAgentProcess: class {} }))
+    const records = ['default', 'sam', 'tony', 'tonk'].map((id, index) => ({
+      id, name: id, state: 'ready', identity: 'identity-' + index,
+    }))
+    mock.module('./src/claude-accounts', () => ({ DEFAULT_CLAUDE_ACCOUNT: 'default',
+      claudeAccounts: {
+        list: () => records,
+        get: id => records.find(record => record.id === id),
+        assertReady: id => {
+          const record = records.find(item => item.id === id)
+          if (!record) throw new Error('未知账号')
+          return record
+        },
+      } }))
+    const sources = new Map(records.map(record => [record.id, { id: 'claude-sub', kind: 'claude-subscription',
+      agent: 'claude', enabled: true, accountId: record.id, defaultModel: 'opus',
+      modelCatalogState: { status: 'ready' } }]))
+    const registry = await import('./src/token-source')
+    mock.module('./src/token-source', () => ({ ...registry,
+      getTokenSourceForAccount: (sourceId, accountId) => sources.get(accountId),
+      scrubAnthropicEnv: base => base,
+      tokenSourceRuntimeModel: () => ({ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' }) }))
+    const cache = await import('./src/token-source-cache')
+    const snapshots = new Map()
+    mock.module('./src/token-source-cache', () => ({ ...cache,
+      peekTokenSourceUsage: source => snapshots.get(source.accountId),
+      refreshTokenSourceUsage: async () => {} }))
+    const { claudeUsageSnapshot } = await import('./src/claude-usage')
+    const iso = hours => new Date(Date.now() + hours * 3600_000).toISOString()
+    const quota = rate_limits => claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits })
+    const weekly = (used, reset) => ({ seven_day: { utilization: used, resets_at: reset } })
+    const day = iso(24), twoDays = iso(48), threeDays = iso(72)
+    const select = await import('./src/claude-account-selection')
+    const pick = (activeSessions, preferred) => select.selectClaudeAccount({ model: 'opus', effort: 'high',
+      ...(activeSessions ? { activeSessions } : {}), ...(preferred ? { preferred } : {}) })
+    snapshots.set('default', quota(weekly(60, day)))
+    snapshots.set('tony', quota(weekly(57, threeDays)))
+    snapshots.set('tonk', quota(weekly(5, threeDays)))
+    snapshots.set('sam', quota({ five_hour: { utilization: 15, resets_at: iso(3) }, ...weekly(46, twoDays) }))
+    // 能安排任务的 5h 账号优先，即使它更忙、周额度余量更少。
+    assert.equal(pick(), 'sam')
+    assert.equal(pick(new Map([['sam', 5]])), 'sam')
+    // 没有 5h 窗口的账号仍可参与选号，并按周额度最早到期优先。
+    snapshots.set('sam', quota({ five_hour: { utilization: 100, resets_at: iso(3) }, ...weekly(46, twoDays) }))
+    assert.equal(pick(), 'default')
+    snapshots.set('default', quota(weekly(100, day)))
+    // 到期时间相同时按余量份额分摊。
+    assert.equal(pick(), 'tonk')
+    assert.equal(pick(null, 'tony'), 'tony')
+  `)
+})
+
 test('named-only authentication keeps one visible source, account-isolated quota and cache-only startup selection', () => {
   isolated(`
     import assert from 'node:assert/strict'

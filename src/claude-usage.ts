@@ -64,6 +64,12 @@ export function claudeWeeklyUsageWindow(snapshot: UsageSnapshotUnified, model: s
   return snapshot.windows.find(window => window.kind === 'weekly') ?? null
 }
 
+/** 聚合 limits[] 明确列出 session 桶时，5h 限额仍然存在；老响应可能没有这个数组。 */
+function reportsSessionLimit(limits: JsonObject): boolean {
+  return Array.isArray(limits.limits)
+    && limits.limits.some(item => object(item) && item.kind === 'session')
+}
+
 /** /usage 的 utilization 已是 0–100 百分比，区别于流式事件中的 0–1 比例。 */
 export function claudeUsageSnapshot(data: unknown): UsageSnapshotUnified {
   if (!object(data) || typeof data.subscription_type !== 'string' || !data.subscription_type.trim()) {
@@ -73,19 +79,22 @@ export function claudeUsageSnapshot(data: unknown): UsageSnapshotUnified {
   if (!object(data.rate_limits)) throw new Error('Claude 原生额度接口未返回 rate_limits 数据')
   const limits = data.rate_limits
   const fetchedAt = Date.now()
-  const fiveHour = usageWindow(limits.five_hour, 'fiveHour', '5h 窗口')
+  // five_hour 为 null（或缺失）表示该账号已没有 5 小时限额：不补 0%、不补窗口时间，
+  // 展示与选号只按周额度处理。老响应没有 limits[]，仅在它明确列出 session 桶时
+  // 才把缺失的窗口当作数据缺失，保留 MISS，避免把仍有限额的账号当成无限制。
+  const fiveHour: UsageWindowUnified | null = limits.five_hour == null
+    ? reportsSessionLimit(limits) ? { kind: 'fiveHour', label: '5h 窗口', percent: null, resetsAt: null } : null
+    : usageWindow(limits.five_hour, 'fiveHour', '5h 窗口')
   // 未启动的短窗没有重置时间：按本次读取起的完整 5h 估算，供展示与选号共用。
   // 不把缺失窗口、已用额度或无效/过期时间当作未启动，缓存命中也不延后此时间。
-  if (limits.five_hour != null && fiveHour.resetsAt === null && (fiveHour.percent === 0 || fiveHour.percent === null)) {
+  if (fiveHour && limits.five_hour != null && fiveHour.resetsAt === null && (fiveHour.percent === 0 || fiveHour.percent === null)) {
     fiveHour.percent = 0
     fiveHour.resetsAt = new Date(fetchedAt + 5 * 3_600_000)
   }
-  // 主窗口缺失仍保留 MISS，不能用模型专属窗口冒充总周额度。
-  const windows = [
-    fiveHour,
-    usageWindow(limits.seven_day, 'weekly', '周额度'),
-  ]
-  let reported = limits.five_hour != null || limits.seven_day != null
+  // 主窗口缺失仍保留 MISS，不能用模型专属窗口冒充总周额度；没有 5h 限额的账号只返回周窗口。
+  const windows: UsageWindowUnified[] = fiveHour ? [fiveHour] : []
+  windows.push(usageWindow(limits.seven_day, 'weekly', '周额度'))
+  let reported = fiveHour !== null || limits.seven_day != null
   for (const [key, label] of [
     ['seven_day_oauth_apps', 'OAuth 应用周额度'],
     ['seven_day_opus', 'Opus 周额度'],
