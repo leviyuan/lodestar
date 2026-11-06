@@ -7,6 +7,8 @@
  * a note to `btw`. `*` is therefore reserved for this suffix; worktrees use a
  * `[...]` suffix instead.
  */
+/** 飞书群名/会话名的统一上限，和 `sanitizeSessionName` 的截断保持一致。 */
+export const SESSION_NAME_MAX = 64
 const TEMP_SUFFIX_RE = /\*[^*]+$/
 const WORKTREE_SUFFIX_RE = /^(.+)\[[^\[\]]+\]$/
 /** Keeps `project*role` within the 64-character session-name cap for normal project names. */
@@ -41,4 +43,20 @@ export function normalizeTempRole(raw: string): string {
     .replace(/^[_-]+|[_-]+$/g, '')
     .slice(0, TEMP_ROLE_MAX)
     .replace(/[_-]+$/, '')
+}
+
+/**
+ * 备注临时群名：`<基名>*<备注>`，不做 `-2` 去重 —— 同一个备注就是同一个群，
+ * 后到的成员加入既有群。基名可以是 `<项目>` 或 `<项目>[<分支>]`。
+ * 备注超过群名上限时报错，避免创建出会被 `sanitizeSessionName` 截断的群名。
+ */
+export function tempRoleChatName(projectName: string, role: string): string {
+  const suffix = normalizeTempRole(role)
+  if (!suffix) throw new Error('temporary role requires at least one letter, digit or CJK character')
+  const name = `${projectName}*${suffix}`
+  if (name.length > SESSION_NAME_MAX) {
+    const room = Math.max(SESSION_NAME_MAX - projectName.length - 1, 0)
+    throw new Error(`备注太长：${projectName} 之后最多 ${room} 个字符，当前 ${suffix.length} 个`)
+  }
+  return name
 }

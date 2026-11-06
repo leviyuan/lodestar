@@ -86,6 +86,8 @@ function harness(overrides: HarnessOverrides = {}) {
   const events: string[] = []
   const logs: string[] = []
   const stateClears: string[] = []
+  const modes: string[] = []
+  const leases: Array<[string, string]> = []
   const sessions = new Map<string, FakeSession>()
   const session = new FakeSession(events)
   const ensured = overrides.ensured ?? { chatId: 'chat-1', created: true, joined: true }
@@ -106,8 +108,9 @@ function harness(overrides: HarnessOverrides = {}) {
       events.push(`factory:${chatId}`)
       return session
     },
-    ensureChatForSession: async () => {
+    ensureChatForSession: async (_sessionName, _userOpenId, mode) => {
       events.push('ensure')
+      modes.push(mode)
       return ensured
     },
     disbandChatForSessionExact: overrides.disband ?? (async () => {
@@ -119,13 +122,15 @@ function harness(overrides: HarnessOverrides = {}) {
       events.push('state:clear')
       stateClears.push(sessionName)
     },
-    registerTempSessionLease: () => {},
+    registerTempSessionLease: (sessionName, chatId) => {
+      leases.push([sessionName, chatId])
+    },
     hasTempSessionLease: () => overrides.leased ?? true,
     replaceTurnAnchors: (_sessionName, _anchors, base) => { events.push(`anchors:${base?.kind ?? 'unknown'}`) },
     runExclusive: async (_chatId, task) => await task(),
     log: message => logs.push(message),
   })
-  return { runtime, session, sessions, events, logs, stateClears }
+  return { runtime, session, sessions, events, logs, stateClears, modes, leases }
 }
 
 describe('temporary session creation transaction', () => {
@@ -137,6 +142,7 @@ describe('temporary session creation transaction', () => {
       chatId: 'chat-1',
     })
     expect(h.session.appliedRouting).toEqual(routing)
+    expect(h.leases).toEqual([['project*0821-1200', 'chat-1']])
     expect(h.events).toEqual([
       'ensure',
       'factory:chat-1',
@@ -196,7 +202,7 @@ describe('temporary session creation transaction', () => {
     expect(h.sessions.size).toBe(0)
   })
 
-  test('never joins, starts, or deletes an existing group', async () => {
+  test('never joins, starts, or deletes an existing group in create mode', async () => {
     const h = harness({ ensured: { chatId: 'chat-1', created: false, joined: true } })
     h.session.startResult = false
 
@@ -210,6 +216,41 @@ describe('temporary session creation transaction', () => {
     expect(h.events).not.toContain('registry:delete:chat-1')
     expect(h.events).not.toContain('dispose')
     expect(h.stateClears).toEqual([])
+  })
+
+  test('reuse mode only adds the sender to an existing group and touches no session state', async () => {
+    const h = harness({ ensured: { chatId: 'chat-1', created: false, joined: true } })
+
+    const result = await h.runtime.createTempSession({ ...createOptions(), groupMode: 'reuse' })
+
+    expect(result).toEqual({ ok: true, chatId: 'chat-1', join: 'added' })
+    expect(h.modes).toEqual(['reuse'])
+    expect(h.sessions.size).toBe(0)
+    expect(h.events).toEqual(['ensure'])
+    expect(h.events).not.toContain('start:fresh')
+    expect(h.events).not.toContain('routing:codex')
+    expect(h.events).not.toContain('delete')
+    expect(h.stateClears).toEqual([])
+  })
+
+  test('reuse mode reports an already-present member without claiming a new join', async () => {
+    const h = harness({ ensured: { chatId: 'chat-1', created: false, joined: false } })
+
+    const result = await h.runtime.createTempSession({ ...createOptions(), groupMode: 'reuse' })
+
+    expect(result).toEqual({ ok: true, chatId: 'chat-1', join: 'present' })
+    expect(h.sessions.size).toBe(0)
+    expect(h.events).toEqual(['ensure'])
+  })
+
+  test('reuse mode still creates and starts a group when the name is free', async () => {
+    const h = harness()
+
+    const result = await h.runtime.createTempSession({ ...createOptions(), groupMode: 'reuse' })
+
+    expect(result).toEqual({ ok: true, chatId: 'chat-1' })
+    expect(h.modes).toEqual(['reuse'])
+    expect(h.events).toContain('start:fresh')
   })
 
   test('clears registry and state only after a newly-created group is confirmed deleted', async () => {

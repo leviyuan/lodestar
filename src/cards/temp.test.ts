@@ -7,6 +7,7 @@ import {
   selectionResultCard,
   writeLogCard,
   writeLogEntriesFromToolInput,
+  tempSessionNoticeCard,
 } from './temp'
 
 test('writeBodyFromToolInput:Write 取 content', () => {
@@ -256,4 +257,63 @@ test('writeLogCard:超长 body 截断', () => {
   const card = writeLogCard({ projectName: 'p', entries: [{ tool: 'Write', path: '/a', body: long }] }) as any
   const codeEl = card.body.elements.find((e: any) => String(e.content).includes('```'))!
   expect(codeEl.content).toContain('…(截断)')
+})
+
+test('tempSessionNoticeCard：创建 / 就绪 / 加入用不同配色并标出群名', () => {
+  const creating = tempSessionNoticeCard({
+    chatName: '项目*修复登录',
+    state: 'creating',
+    backendLabel: 'Codex',
+  }) as any
+  expect(creating.header.title.content).toBe('🚀 项目*修复登录')
+  expect(creating.header.template).toBe('blue')
+  const creatingText = JSON.stringify(creating)
+  expect(creatingText).toContain('正在创建或加入')
+  expect(creatingText).toContain('同备注的成员会进入同一个群')
+  expect(creatingText).toContain('Codex · ')
+
+  const created = tempSessionNoticeCard({ chatName: '项目*修复登录', state: 'created' }) as any
+  expect(created.header.template).toBe('green')
+  expect(JSON.stringify(created)).toContain('临时群已就绪')
+  expect(JSON.stringify(created)).toContain('创建者发送 bye 可停止并解散')
+
+  const joined = tempSessionNoticeCard({ chatName: '项目*修复登录', state: 'joined' }) as any
+  expect(joined.header.template).toBe('turquoise')
+  const joinedText = JSON.stringify(joined)
+  expect(joinedText).toContain('已加入这个临时群')
+  expect(joinedText).toContain('没有新建或重启会话')
+  expect(joinedText).not.toContain('Codex')
+
+  const present = tempSessionNoticeCard({ chatName: '项目*修复登录', state: 'present' }) as any
+  expect(present.header.template).toBe('blue')
+  expect(JSON.stringify(present)).toContain('你已经在这个临时群里')
+})
+
+test('tempSessionNoticeCard：退出与解散区分「离开」和「销毁群」', () => {
+  const leaving = tempSessionNoticeCard({ chatName: '项目*修复登录', state: 'leaving' }) as any
+  expect(leaving.header.template).toBe('grey')
+  const leavingText = JSON.stringify(leaving)
+  expect(leavingText).toContain('正在退出这个临时群')
+  expect(leavingText).toContain('仍由创建者管理')
+  expect(leavingText).not.toContain('解散')
+
+  const disbanding = tempSessionNoticeCard({ chatName: '项目*修复登录', state: 'disbanding' }) as any
+  expect(disbanding.header.template).toBe('orange')
+  expect(JSON.stringify(disbanding)).toContain('正在停止会话并解散')
+})
+
+test('tempSessionNoticeCard：错误态保留原因，缺失时不伪造成功', () => {
+  const withReason = tempSessionNoticeCard({
+    chatName: '项目*修复登录',
+    state: 'error',
+    body: '建临时会话失败: temporary group name already exists',
+  }) as any
+  expect(withReason.header.template).toBe('red')
+  const text = JSON.stringify(withReason)
+  expect(text).toContain('操作失败')
+  expect(text).toContain('temporary group name already exists')
+
+  const empty = tempSessionNoticeCard({ chatName: '项目*修复登录', state: 'error' }) as any
+  expect(JSON.stringify(empty)).toContain('未知错误')
+  expect(JSON.stringify(empty)).not.toContain('已就绪')
 })

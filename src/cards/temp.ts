@@ -338,6 +338,104 @@ export function resumeSelectionResultCard(opts: ResumeSelectionResultCardOpts): 
   }
 }
 
+/** btw / bye 的生命周期提示卡：创建、加入、退出、解散和失败都用同一套版式。 */
+export type TempSessionNoticeState =
+  | 'creating'
+  | 'created'
+  | 'joined'
+  | 'present'
+  | 'disbanding'
+  | 'leaving'
+  | 'error'
+
+export interface TempSessionNoticeCardOpts {
+  /** 目标临时群名（`<项目>*<备注>` 或 `<项目>*MMDD-HHMM`）。 */
+  chatName: string
+  state: TempSessionNoticeState
+  /** 本次会话的后端名（`Codex` / `Claude` / `DeepSeek Harness`），未知时省略。 */
+  backendLabel?: string
+  /** 失败原因或补充说明；错误态必填。 */
+  body?: string
+}
+
+interface TempSessionNoticeCopy {
+  emoji: string
+  status: string
+  template: string
+  detail: string
+}
+
+const TEMP_SESSION_NOTICE_COPY: Record<TempSessionNoticeState, TempSessionNoticeCopy> = {
+  creating: {
+    emoji: '🚀',
+    status: '正在创建或加入',
+    template: 'blue',
+    detail: '同备注的成员会进入同一个群；它与当前群共享工作目录，当前会话不受影响。',
+  },
+  created: {
+    emoji: '✅',
+    status: '临时群已就绪',
+    template: 'green',
+    detail: '其他成员发送同样的备注会被拉进这个群；创建者发送 bye 可停止并解散。',
+  },
+  joined: {
+    emoji: '👥',
+    status: '已加入这个临时群',
+    template: 'turquoise',
+    detail: '沿用群内既有的会话与模型/账号设置，本次没有新建或重启会话。',
+  },
+  present: {
+    emoji: '👤',
+    status: '你已经在这个临时群里',
+    template: 'blue',
+    detail: '沿用群内既有的会话与模型/账号设置，本次没有新建或重启会话。',
+  },
+  disbanding: {
+    emoji: '👋',
+    status: '正在停止会话并解散',
+    template: 'orange',
+    detail: '解散由创建者发起，群内其他成员会一并离开这个群。',
+  },
+  leaving: {
+    emoji: '🚪',
+    status: '正在退出这个临时群',
+    template: 'grey',
+    detail: '临时群和会话仍由创建者管理，其他成员不受影响。',
+  },
+  error: {
+    emoji: '❌',
+    status: '操作失败',
+    template: 'red',
+    detail: '',
+  },
+}
+
+export function tempSessionNoticeCard(opts: TempSessionNoticeCardOpts): object {
+  const copy = TEMP_SESSION_NOTICE_COPY[opts.state]
+  const detail = opts.state === 'error'
+    ? (opts.body ?? '未知错误')
+    : [opts.backendLabel ? `${opts.backendLabel} · ${copy.detail}` : copy.detail, ...(opts.body ? [opts.body] : [])].join('\n')
+  return {
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      title: { tag: 'plain_text', content: `${copy.emoji} ${opts.chatName}` },
+      template: copy.template,
+    },
+    body: {
+      elements: [
+        {
+          tag: 'markdown',
+          content: [
+            `**${copy.status}** ${inlineCode(opts.chatName)}`,
+            detail,
+          ].join('\n'),
+        },
+      ],
+    },
+  }
+}
+
 function fmtTime(ts: number): string {
   const d = new Date(ts)
   const pad = (n: number) => String(n).padStart(2, '0')

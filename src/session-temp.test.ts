@@ -8,11 +8,16 @@ import { resetAgentSessionRegistryForTest } from './agent-session-registry'
 import {
   clearedTurnAnchorSessions,
   branchBaseBySession,
+  leftChats,
+  projectProfiles,
   resetFeishuMock,
   seededTurnAnchors,
   sentCards,
   sentRawTexts,
   sentTexts,
+  setChatMembers,
+  setChatMembersError,
+  setLeaveChatError,
   turnAnchorsBySession,
 } from './feishu-test-mock'
 import * as feishu from './feishu'
@@ -23,6 +28,7 @@ const {
   onForkSelect,
   onResumeSelect,
   runBtwCommand,
+  runByeCommand,
   showBackList,
   showForkList,
   showResumeList,
@@ -43,9 +49,13 @@ interface TempHarness {
   createCalls: any[]
   rollbackCalls: ConversationLaunch[]
   rollbackStates: any[]
+  disbandCalls: Array<[string, string]>
 }
 
 function makeHarness(sessionName = 'project'): TempHarness {
+  // 临时群目录按群名解析(主项目目录),与 session.workDir 保持一致,
+  // 让备注 btw 的同目录校验不会误拒。
+  projectProfiles.set('project', { cwd: '/workspace/project' })
   const state: TempHarnessState = {
     routing: {
       provider: 'codex',
@@ -60,6 +70,7 @@ function makeHarness(sessionName = 'project'): TempHarness {
   const createCalls: any[] = []
   const rollbackCalls: ConversationLaunch[] = []
   const rollbackStates: any[] = []
+  const disbandCalls: Array<[string, string]> = []
   const session: any = {
     sessionName,
     chatId: `oc_${sessionName}`,
@@ -69,6 +80,10 @@ function makeHarness(sessionName = 'project'): TempHarness {
     opts: {
       onCreateTempSession: async (input: any) => {
         createCalls.push(input)
+        return { ok: true }
+      },
+      onDisbandTempSession: async (chatName: string, chatId: string) => {
+        disbandCalls.push([chatName, chatId])
         return { ok: true }
       },
     },
@@ -92,7 +107,7 @@ function makeHarness(sessionName = 'project'): TempHarness {
       return state.rollbackResult
     },
   }
-  return { session, state, createCalls, rollbackCalls, rollbackStates }
+  return { session, state, createCalls, rollbackCalls, rollbackStates, disbandCalls }
 }
 
 function codexAnchor(
@@ -113,6 +128,11 @@ function codexAnchor(
     ts,
     writes,
   }
+}
+
+/** 卡片正文断言用：模板是纯 JSON，直接查序列化文本。 */
+function cardJson(card: unknown): string {
+  return JSON.stringify(card ?? {})
 }
 
 function pickerValue(card: any, preview: string): {
@@ -194,8 +214,10 @@ describe('session-temp Codex btw/fork', () => {
       branchBase: { kind: 'fresh' },
       seedAnchors: [],
     }])
-    expect(sentTexts.some(text => text.includes('Codex'))).toBe(true)
-    expect(sentTexts.at(-1)).toContain('已创建')
+    // 创建过程先给「正在创建」卡，成功后换成「已就绪」卡，都是 Codex 会话。
+    expect(cardJson(sentCards[0])).toContain('正在创建或加入')
+    expect(cardJson(sentCards.at(-1))).toContain('临时群已就绪')
+    expect(cardJson(sentCards.at(-1))).toContain('Codex')
   })
 
   test('btw 备注代替时间后缀', async () => {
@@ -204,8 +226,151 @@ describe('session-temp Codex btw/fork', () => {
     await runBtwCommand(h.session, 'ou_owner', '修复 登录')
 
     expect(h.createCalls[0].chatName).toBe('project*修复_登录')
-    expect(sentTexts[0]).toContain('project*修复_登录')
-    expect(sentTexts.at(-1)).toContain('project*修复_登录')
+    expect(h.createCalls[0].groupMode).toBe('reuse')
+    expect(cardJson(sentCards[0])).toContain('project*修复_登录')
+    expect(cardJson(sentCards.at(-1))).toContain('project*修复_登录')
+  })
+
+  test('同备注的第二个成员复用同一个群名，不再追加 -2', async () => {
+    const first = makeHarness()
+    const second = makeHarness()
+
+    await runBtwCommand(first.session, 'ou_first', '修复登录')
+    await runBtwCommand(second.session, 'ou_second', '修复登录')
+
+    expect(first.createCalls[0].chatName).toBe('project*修复登录')
+    expect(second.createCalls[0].chatName).toBe('project*修复登录')
+    expect(second.createCalls[0].userOpenId).toBe('ou_second')
+    expect(second.createCalls[0].groupMode).toBe('reuse')
+  })
+
+  test('加入既有临时群时只回执已加入，不声称创建或重启会话', async () => {
+    const h = makeHarness()
+    h.session.opts.onCreateTempSession = async (input: any) => {
+      h.createCalls.push(input)
+      return { ok: true, chatId: 'oc_project*修复登录', join: 'added' }
+    }
+
+    await runBtwCommand(h.session, 'ou_guest', '修复登录')
+
+    const last = sentCards.at(-1) as any
+    expect(last.header.template).toBe('turquoise')
+    expect(cardJson(last)).toContain('已加入这个临时群')
+    expect(cardJson(last)).toContain('没有新建或重启会话')
+    expect(sentCards.some(card => cardJson(card).includes('临时群已就绪'))).toBe(false)
+  })
+
+  test('本来就在群里时回执「已在群内」，不谎报刚被拉进来', async () => {
+    const h = makeHarness()
+    h.session.opts.onCreateTempSession = async (input: any) => {
+      h.createCalls.push(input)
+      return { ok: true, chatId: 'oc_project*修复登录', join: 'present' }
+    }
+
+    await runBtwCommand(h.session, 'ou_owner', '修复登录')
+
+    const last = sentCards.at(-1) as any
+    expect(last.header.template).toBe('blue')
+    expect(cardJson(last)).toContain('你已经在这个临时群里')
+    expect(cardJson(last)).not.toContain('已加入这个临时群')
+  })
+
+  test('WT 里发 btw 备注落在该 worktree，群名带分支', async () => {
+    const h = makeHarness('project[feature]')
+    h.session.workDir = '/workspace/project[feature]'
+
+    await runBtwCommand(h.session, 'ou_owner', '评审')
+
+    expect(h.createCalls[0].chatName).toBe('project[feature]*评审')
+    expect(h.createCalls[0].groupMode).toBe('reuse')
+    expect(h.createCalls[0].workDir).toBe('/workspace/project[feature]')
+  })
+
+  test('基名很长导致备注放不下时明确拒绝，不创建会被截断的同名群', async () => {
+    const h = makeHarness('p'.repeat(40))
+    const longRole = '备'.repeat(40)
+
+    await runBtwCommand(h.session, 'ou_owner', longRole)
+
+    expect(h.createCalls).toHaveLength(0)
+    const last = sentCards.at(-1) as any
+    expect(last.header.template).toBe('red')
+    expect(cardJson(last)).toContain('备注太长')
+    expect(cardJson(last)).toContain('最多 23 个字符')
+  })
+
+  test('群里有别人时 bye 只是自己退出，不停会话也不解散群', async () => {
+    const h = makeHarness('project*修复登录')
+    setChatMembers(h.session.chatId, ['ou_guest', 'ou_owner'])
+
+    await runByeCommand(h.session, 'ou_guest')
+
+    expect(h.disbandCalls).toHaveLength(0)
+    expect(leftChats).toEqual([['oc_project*修复登录', 'ou_guest']])
+    expect(cardJson(sentCards.at(-1))).toContain('正在退出这个临时群')
+    expect(cardJson(sentCards.at(-1))).toContain('仍由创建者管理')
+  })
+
+  test('最后一个人 bye 时停止会话并解散，不看是谁创建的', async () => {
+    const h = makeHarness('project*修复登录')
+    setChatMembers(h.session.chatId, ['ou_guest'])
+
+    await runByeCommand(h.session, 'ou_guest')
+
+    expect(leftChats).toHaveLength(0)
+    expect(h.disbandCalls).toEqual([['project*修复登录', 'oc_project*修复登录']])
+    expect(cardJson(sentCards.at(-1))).toContain('正在停止会话并解散')
+  })
+
+  test('并发退群：退出后复查发现已空，最后一个走的负责解散', async () => {
+    const h = makeHarness('project*修复登录')
+    const members = spyOn(feishu, 'chatMemberOpenIds')
+      .mockResolvedValueOnce(['ou_guest', 'ou_other'])
+      .mockResolvedValueOnce([])
+    try {
+      await runByeCommand(h.session, 'ou_guest')
+    } finally { members.mockRestore() }
+
+    expect(leftChats).toEqual([['oc_project*修复登录', 'ou_guest']])
+    expect(h.disbandCalls).toEqual([['project*修复登录', 'oc_project*修复登录']])
+  })
+
+  test('读取群成员失败时既不退出也不解散', async () => {
+    const h = makeHarness('project*修复登录')
+    setChatMembersError(new Error('chatMembers.get failed: code=230002'))
+
+    await runByeCommand(h.session, 'ou_guest')
+
+    expect(leftChats).toHaveLength(0)
+    expect(h.disbandCalls).toHaveLength(0)
+    const last = sentCards.at(-1) as any
+    expect(last.header.template).toBe('red')
+    expect(cardJson(last)).toContain('读取群成员失败')
+    expect(cardJson(last)).toContain('230002')
+  })
+
+  test('自助退群失败时保留飞书原因并提示手动退出', async () => {
+    const h = makeHarness('project*修复登录')
+    setChatMembers(h.session.chatId, ['ou_guest', 'ou_owner'])
+    setLeaveChatError(new Error('chatMembers.delete failed: code=232008 no permission'))
+
+    await runByeCommand(h.session, 'ou_guest')
+
+    expect(h.disbandCalls).toHaveLength(0)
+    const last = sentCards.at(-1) as any
+    expect(last.header.template).toBe('red')
+    expect(cardJson(last)).toContain('退出失败')
+    expect(cardJson(last)).toContain('232008')
+    expect(cardJson(last)).toContain('手动退出')
+  })
+
+  test('群成员为空时按最后一人处理，解散而不是留空群', async () => {
+    const h = makeHarness('project*0821-1337')
+
+    await runByeCommand(h.session, 'ou_anyone')
+
+    expect(h.disbandCalls).toHaveLength(1)
+    expect(leftChats).toHaveLength(0)
   })
 
   test('btw 备注没有可用字符时不创建临时群', async () => {
@@ -214,19 +379,33 @@ describe('session-temp Codex btw/fork', () => {
     await runBtwCommand(h.session, 'ou_owner', '🚀')
 
     expect(h.createCalls).toHaveLength(0)
-    expect(sentTexts.at(-1)).toContain('备注至少需要')
+    expect(cardJson(sentCards.at(-1))).toContain('备注至少需要')
   })
 
-  test('WT 中创建 BTW 仍使用主群项目名', async () => {
+  test('卡片发送失败时回退原文并保留飞书诊断', async () => {
+    const h = makeHarness()
+    const send = spyOn(feishu, 'sendCard').mockImplementation(async (_chatId, _card, onFailure) => {
+      onFailure?.({ code: 230001, msg: 'invalid card content', log_id: 'btw-send-log' })
+      return null as unknown as string
+    })
+    try {
+      await runBtwCommand(h.session, 'ou_owner', '修复登录')
+    } finally { send.mockRestore() }
+
+    expect(sentRawTexts.length).toBeGreaterThan(0)
+    expect(sentRawTexts.every(text => text.includes('code=230001 message=invalid card content log_id=btw-send-log'))).toBe(true)
+  })
+
+  test('WT 中创建 BTW 使用该 worktree 基名', async () => {
     const h = makeHarness('project[feature]')
 
     await runBtwCommand(h.session, 'ou_owner')
 
-    expect(h.createCalls[0].chatName).toBe('project*0000-0000')
+    expect(h.createCalls[0].chatName).toBe('project[feature]*0000-0000')
 
     await runBtwCommand(h.session, 'ou_owner', 'review')
 
-    expect(h.createCalls[1].chatName).toBe('project*review')
+    expect(h.createCalls[1].chatName).toBe('project[feature]*review')
   })
 
   test('btw 命令把备注原样传给临时群创建', async () => {
@@ -242,7 +421,7 @@ describe('session-temp Codex btw/fork', () => {
     expect(calls).toEqual([['ou_owner', '修复 登录'], ['ou_owner', '']])
   })
 
-  test('并发创建会同步预留临时群名，避免同分钟同名', async () => {
+  test('时间后缀的并发创建仍同步预留群名，避免同分钟同名', async () => {
     const first = makeHarness()
     const second = makeHarness()
     let release!: () => void

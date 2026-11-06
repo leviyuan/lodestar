@@ -15,7 +15,7 @@ import type { TurnAnchor } from './feishu'
 import type { ConversationBranchBase, PendingConversationLaunch } from './conversation'
 import type { ProjectProfile } from './config'
 import { profileForWorkspace, resolveWorkspaceDir } from './workspace'
-import { mainSessionName, normalizeTempRole, tempProjectName } from './session-name'
+import { SESSION_NAME_MAX, mainSessionName, normalizeTempRole, stripTempSuffix, tempProjectName, tempRoleChatName } from './session-name'
 
 export const sentCards: object[] = []
 export const chatTailMessages = new Map<string, string>()
@@ -38,6 +38,20 @@ export const clearedTurnAnchorSessions: string[] = []
 export const seededTurnAnchors: Array<[string, TurnAnchor[]]> = []
 export const branchBaseBySession = new Map<string, ConversationBranchBase>()
 export const pendingConversationLaunchBySession = new Map<string, PendingConversationLaunch>()
+/** 群成员 open_id 替身(bye 按「最后一人」解散的判断依据)。 */
+export const chatMembersById = new Map<string, string[]>()
+export function setChatMembers(chatId: string, memberIds: string[]): void {
+  chatMembersById.set(chatId, memberIds.slice())
+}
+let chatMembersError: Error | null = null
+export function setChatMembersError(error: Error | null): void { chatMembersError = error }
+/** 群名 -> chat_id 列表（worktree 清理、按名解散用）。 */
+export const chatIdsByName = new Map<string, string[]>()
+export const disbandedChats: string[] = []
+/** 加入者 bye 的自助退群记录。 */
+export const leftChats: Array<[string, string]> = []
+let leaveChatError: Error | null = null
+export function setLeaveChatError(error: Error | null): void { leaveChatError = error }
 let resumeWriteError: Error | null = null
 export function setResumeWriteError(error: Error | null): void { resumeWriteError = error }
 let turnAnchorWriteError: Error | null = null
@@ -60,7 +74,7 @@ export const projectProfiles = new Map<string, ProjectProfile>()
 export function resetFeishuMock(): void {
   for (const arr of [
     sentCards, sentTexts, sentRawTexts, updatedCards, addedReactions, deletedReactions, boundResumes, clearedResumes, urgentPushes,
-    clearedTurnAnchorSessions, seededTurnAnchors, sentImages, uploadedImages, sentLocalFiles,
+    clearedTurnAnchorSessions, seededTurnAnchors, sentImages, uploadedImages, sentLocalFiles, leftChats,
   ]) {
     arr.length = 0
   }
@@ -74,8 +88,13 @@ export function resetFeishuMock(): void {
   turnAnchorWriteError = null
   updateCardHandler = null
   imageUploadHandler = null
+  leaveChatError = null
   branchBaseBySession.clear()
   pendingConversationLaunchBySession.clear()
+  chatMembersById.clear()
+  chatMembersError = null
+  chatIdsByName.clear()
+  disbandedChats.length = 0
 }
 
 mock.module('./feishu', () => ({
@@ -150,6 +169,7 @@ mock.module('./feishu', () => ({
   tempProjectName,
   mainSessionName,
   normalizeTempRole,
+  stripTempSuffix,
   mainChatIdForSession: (name: string, fallback?: string) => {
     const main = mainSessionName(name)
     return preferredChatForSession.get(main) ?? (main === name ? fallback ?? null : null)
@@ -161,6 +181,8 @@ mock.module('./feishu', () => ({
     for (let seq = 2; used.has(name); seq++) name = `${base}-${seq}`
     return name
   },
+  SESSION_NAME_MAX,
+  tempRoleChatName,
   appendTurnAnchorChecked: (sessionName: string, anchor: TurnAnchor) => {
     if (turnAnchorWriteError) throw turnAnchorWriteError
     const current = turnAnchorsBySession.get(sessionName) ?? []
@@ -192,7 +214,21 @@ mock.module('./feishu', () => ({
     }
   },
   ensureChatForSession: async (chatName: string) => ({ chatId: `oc_${chatName}`, created: true, joined: true }),
-  disbandChatForSession: async () => ({ chatId: null, disbanded: true }),
+  listNormalChatIdsByName: async () => new Map([...chatIdsByName].map(([name, ids]) => [name, ids.slice()])),
+  disbandChatForSession: async (sessionName: string) => {
+    disbandedChats.push(sessionName)
+    return { chatId: chatIdsByName.get(sessionName)?.[0] ?? null, disbanded: true }
+  },
+  chatMemberOpenIds: async (chatId: string) => {
+    if (chatMembersError) throw chatMembersError
+    return (chatMembersById.get(chatId) ?? []).slice()
+  },
+  leaveChatForMember: async (chatId: string, openId: string) => {
+    if (leaveChatError) throw leaveChatError
+    leftChats.push([chatId, openId])
+    chatMembersById.set(chatId, (chatMembersById.get(chatId) ?? []).filter(id => id !== openId))
+    return { left: true }
+  },
 }))
 
 // 随机顺序可能先加载 AgentService，令默认卡片依赖保存真实函数的副本。

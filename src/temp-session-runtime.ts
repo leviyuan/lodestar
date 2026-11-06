@@ -7,6 +7,9 @@ import {
 } from './conversation'
 import type { TurnAnchor } from './feishu'
 
+/** `create` 必须新建临时群;`reuse` 允许复用同名群(带备注的 btw)。*/
+export type TempSessionGroupMode = 'create' | 'reuse'
+
 export interface CreateTempSessionOptions {
   chatName: string
   userOpenId: string
@@ -15,12 +18,17 @@ export interface CreateTempSessionOptions {
   launch: ConversationLaunch
   branchBase: ConversationBranchBase
   seedAnchors?: TurnAnchor[]
+  /** 缺省 `create`:只有新建的群才启动会话,既有群一律拒绝。 */
+  groupMode?: TempSessionGroupMode
 }
 
 export interface CreateTempSessionResult {
   ok: boolean
   chatId?: string
   error?: string
+  /** `added` 表示刚被拉进既有临时群,`present` 表示本来就在群里；
+   * 两者都不新建、不启动、不改动会话。 */
+  join?: 'added' | 'present'
 }
 
 export interface DisbandTempSessionResult {
@@ -55,6 +63,7 @@ export interface TempSessionRuntimeDeps<TSession extends TempSessionHandle> {
   ensureChatForSession(
     sessionName: string,
     userOpenId: string,
+    mode: TempSessionGroupMode,
   ): Promise<{ chatId: string; created: boolean; joined: boolean }>
   disbandChatForSessionExact(
     sessionName: string,
@@ -117,14 +126,20 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
     opts: CreateTempSessionOptions,
   ): Promise<CreateTempSessionResult> => {
     let ensured: Awaited<ReturnType<typeof deps.ensureChatForSession>>
+    const mode = opts.groupMode ?? 'create'
     try {
       validateConversationLaunch(opts.launch, opts.routing.provider, opts.workDir)
       if (opts.launch.kind === 'resume') {
         throw new Error('temporary groups must start fresh or fork; resume is not allowed')
       }
-      ensured = await deps.ensureChatForSession(opts.chatName, opts.userOpenId)
+      ensured = await deps.ensureChatForSession(opts.chatName, opts.userOpenId, mode)
       if (!ensured.created) {
-        return { ok: false, chatId: ensured.chatId, error: '临时会话必须使用新群；既有群保留，未执行加入、启动或删除' }
+        if (mode !== 'reuse') {
+          return { ok: false, chatId: ensured.chatId, error: '临时会话必须使用新群；既有群保留，未执行加入、启动或删除' }
+        }
+        // 加入既有群:群里的会话、模型/账号和 lease 都归创建者,这里不改动任何状态。
+        deps.log('temp-session: reused existing group')
+        return { ok: true, chatId: ensured.chatId, join: ensured.joined ? 'added' : 'present' }
       }
     } catch (error) {
       const failure = messageOf(error)
@@ -166,7 +181,6 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
             }
           }
         }
-        if (!ensured.created) return { ok: false, error: `${failure}；既有群保留，未执行删除` }
 
         let deletedChatId: string
         try {

@@ -82,6 +82,22 @@ export function worktreeBranch(slug: string): string {
   return `${WORK_BRANCH_PREFIX}${slug}`
 }
 
+/**
+ * 属于该 worktree 的临时群名：`<项目>[<分支>]*<备注或时间后缀>`。
+ * 只匹配一层 `*` 后缀（btw/fk 的基名总会剥掉已有 `*`），按名字排序便于稳定处理。
+ */
+export function tempChatNamesUnderWorktree(chatNames: Iterable<string>, worktreeName: string): string[] {
+  const prefix = `${worktreeName}*`
+  const out: string[] = []
+  for (const name of chatNames) {
+    if (!name.startsWith(prefix)) continue
+    const suffix = name.slice(prefix.length)
+    if (!suffix || suffix.includes('*')) continue
+    out.push(name)
+  }
+  return out.sort()
+}
+
 export function expectedWorktreePath(projectDir: string, projectName: string, slug: string): string {
   return join(dirname(projectDir), worktreeChatName(projectName, slug))
 }

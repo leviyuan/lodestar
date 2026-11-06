@@ -9,6 +9,7 @@ import {
   listProjectWorktrees,
   readWorktreeInstructionsForManagedBranch,
   removeProjectWorktreeIfClean,
+  tempChatNamesUnderWorktree,
   withProjectWorktreeLock,
 } from './worktree'
 
@@ -17,6 +18,22 @@ let roots: string[] = []
 afterEach(() => {
   for (const root of roots) rmSync(root, { recursive: true, force: true })
   roots = []
+})
+
+describe('worktree temp groups', () => {
+  test('collects only the direct temp chats of one worktree', () => {
+    const names = [
+      'x[feature]*修复登录',
+      'x[feature]*0821-1337',
+      'x[feature]',
+      'x[feature]*a*b',
+      'x[other]*修复登录',
+      'x*修复登录',
+    ]
+    expect(tempChatNamesUnderWorktree(names, 'x[feature]')).toEqual(['x[feature]*0821-1337', 'x[feature]*修复登录'])
+    expect(tempChatNamesUnderWorktree(names, 'x')).toEqual(['x*修复登录'])
+    expect(tempChatNamesUnderWorktree([], 'x[feature]')).toEqual([])
+  })
 })
 
 describe('project worktrees', () => {

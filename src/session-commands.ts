@@ -85,7 +85,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
     return true
   }
   if (raw.trim().match(/^bye$/i)) {
-    await s.runByeCommand()
+    await s.runByeCommand(userOpenId)
     return true
   }
   if (raw.trim().match(/^(?:fk|fork)$/i)) {

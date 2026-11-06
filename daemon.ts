@@ -301,7 +301,7 @@ const tempSessionRuntime = createTempSessionRuntime<Session>({
     sessionRecovery.transferPending(session)
     return session
   },
-  ensureChatForSession: feishu.createTempChatForSession,
+  ensureChatForSession: feishu.ensureTempChatForSession,
   disbandChatForSessionExact: feishu.disbandChatForSessionExact,
   chatIdForSession: feishu.chatIdForSession,
   clearSessionConversationState: feishu.clearSessionConversationState,

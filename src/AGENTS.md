@@ -16,7 +16,7 @@
 
 - 本机环境变量 `LODESTAR_RESTART_CONTINUE_CHAT_ID` 可显式给一个精确群开启重启自动续接，默认关闭。只在原生会话成功恢复且空闲时，在同群 actor 内提交一次标明宿主来源的新续接请求；不重放旧输入、不启动新会话、不跨群。恢复或提交失败明确报告，不自动重试；不修改普通用户消息路径的默认行为。
 
-- `workspace.ts` 定义工作目录键与项目 profile：BTW/FK 去临时后缀并共享原目录，WT 保留独立目录；别名和软链接归一化，冲突报错。主会话与委派按实际执行目录查工具/MCP 配置。任务清单按主项目名持久化，主群、所有 WT 及其临时群共用。群文件夹/权限、模型/账号与会话历史各自保留原边界；临时会话模型/账号创建时继承，之后独立。
+- `workspace.ts` 定义工作目录键与项目 profile：BTW/FK 去临时后缀并共享原目录，WT 保留独立目录；别名和软链接归一化，冲突报错。主会话与委派按实际执行目录查工具/MCP 配置。任务清单按主项目名持久化，主群、所有 WT 及其临时群共用。群文件夹/权限、模型/账号与会话历史各自保留原边界；临时会话模型/账号创建时继承，之后独立。带备注的 `btw` 群名精确等于 `<基名>*<备注>`，基名跟随当前群（主群 `<项目>`、WT 群 `<项目>[分支]`），总长受 `SESSION_NAME_MAX` 限制且超长明确拒绝；同名群由 `ensureTempChatForSession` 加入并拉人，不追加 `-2`，只有新建群才启动会话；`bye` 不看创建者：群成员用 `leaveChatForMember` 把自己移出，退出前后按 `chatMemberOpenIds` 复核，最后一人退出时停止会话并解散群。`wt` 的「删」先用 `tempChatNamesUnderWorktree` 收集该分支下的临时群，逐群确认非运行且唯一后先解散它们，再删 worktree 群和目录。`btw`/`bye` 的状态提示统一用 `cards.tempSessionNoticeCard`，发送失败回退原文并带飞书诊断。
 - 命令、模型、权限、工具、临时会话、worktree、Agent 身份和任务清单放在对应 `session-*.ts` helper；这些模块可协作访问 Session 的内部字段。
 - 修改 `AgentProcess` 时检查 Codex、Claude、Session 消费方和卡片。单端能力用明确分支或 capability 表达。
 - Codex 通过 app-server JSON-RPC 管理 thread、turn、权限、提问、plan/goal、usage、compaction 和 collab 子 Agent。未知或畸形协议仅记录固定类别摘要并合并重复；已知未消费事件静默，不记录 payload、命令输出、diff、字段路径或关联 ID。

@@ -217,7 +217,37 @@ export async function onWorktreeDisband(s: Session, slugRaw: string): Promise<Wo
         const message = `❌ 解散 ${slug} 失败: Codex 正在运行，请先在 ${chatName} 群里 stop 或 kill。`
         return { ok: false, message, type: 'error' as const }
       }
+      // 该 worktree 名下的临时群（`<项目>[<分支>]*…`）和 worktree 同生共死：
+      // 目录删掉后它们的会话就无处落盘，先解散它们再删目录。
+      const chatIndex = await feishu.listNormalChatIdsByName()
+      const tempNames = worktree.tempChatNamesUnderWorktree(chatIndex.keys(), chatName)
+      const runningTemps = tempNames.filter(name => s.hasRunningPeerSession(name))
+      if (runningTemps.length > 0) {
+        const message = `❌ 解散 ${slug} 失败: 临时群还在运行（${runningTemps.join('、')}），请先在里面 stop 或 kill。`
+        return { ok: false, message, type: 'error' as const }
+      }
+      const ambiguous = tempNames.filter(name => (chatIndex.get(name) ?? []).length !== 1)
+      if (ambiguous.length > 0) {
+        const message = `❌ 解散 ${slug} 失败: 临时群重名（${ambiguous.join('、')}），请先人工确认要删除哪一个。`
+        return { ok: false, message, type: 'error' as const }
+      }
+      if (tempNames.length > 0 && !s.opts.onDisbandTempSession) {
+        const message = `❌ 解散 ${slug} 失败: 临时群能力未就绪（daemon 未注入回调），${tempNames.join('、')} 未处理。`
+        return { ok: false, message, type: 'error' as const }
+      }
       worktree.assertProjectWorktreeClean(projectDir, projectName, slug)
+      const disbandedTemps: string[] = []
+      for (const name of tempNames) {
+        const tempChatId = (chatIndex.get(name) ?? [])[0]
+        if (!tempChatId) continue
+        const result = await s.opts.onDisbandTempSession!(name, tempChatId)
+        if (!result.ok) {
+          const done = disbandedTemps.length ? `（已解散 ${disbandedTemps.join('、')}）` : ''
+          const message = `❌ 解散 ${slug} 失败: 临时群 ${name} 未解散${done}: ${result.error ?? '未知'}`
+          return { ok: false, message, type: 'error' as const }
+        }
+        disbandedTemps.push(name)
+      }
       const disbanded = await feishu.disbandChatForSession(chatName)
       const removed = worktree.removeProjectWorktreeIfClean(projectDir, projectName, slug)
       const message = [
@@ -225,6 +255,7 @@ export async function onWorktreeDisband(s: Session, slugRaw: string): Promise<Wo
         removed.removedWorktree ? 'dir removed' : 'dir missing',
         disbanded.disbanded ? 'group removed' : 'group missing',
         removed.branch,
+        disbandedTemps.length > 0 ? `临时群 ${disbandedTemps.length} 个已解散` : '无临时群',
       ].join('\n')
       return { ok: true, message, type: 'success' as const }
     })

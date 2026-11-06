@@ -41,7 +41,7 @@ import { sync as spawnSync } from 'cross-spawn'
 import { codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
 import { writeJsonStateAtomic } from './state-store'
 import { profileForWorkspace, resolveWorkspaceDir } from './workspace'
-import { mainSessionName, normalizeTempRole, tempProjectName } from './session-name'
+import { SESSION_NAME_MAX, mainSessionName, normalizeTempRole, stripTempSuffix, tempProjectName, tempRoleChatName } from './session-name'
 import { neutralizeMarkdownImagesInCard } from './cards/elements'
 import {
   validateConversationLaunch,
@@ -106,7 +106,7 @@ export function registerTempSessionLease(sessionName: string, chatId: string): v
     }
   }
   const previous = tempSessionLeaseByChat.get(chatId)
-  const lease = { sessionName, chatId, createdAt: Date.now() }
+  const lease: TempSessionLease = { sessionName, chatId, createdAt: Date.now() }
   tempSessionLeaseByChat.set(chatId, lease)
   try { saveTempSessionLeases() } catch (error) {
     if (previous) tempSessionLeaseByChat.set(chatId, previous)
@@ -848,7 +848,7 @@ export function replaceTurnAnchors(
   }
 }
 
-export { mainSessionName, normalizeTempRole, tempProjectName }
+export { SESSION_NAME_MAX, mainSessionName, normalizeTempRole, stripTempSuffix, tempProjectName, tempRoleChatName }
 
 // ── 临时群名(*后缀,同目录多会话) ───────────────────────────────────
 // 与 worktree 的 [slug](独立目录 + git 分支)区分:*后缀 = 同一项目目录、新群、
@@ -1184,6 +1184,44 @@ export async function createTempChatForSession(
   return { chatId, created: true, joined: true }
 }
 
+const chatNameTails = new Map<string, Promise<void>>()
+
+/**
+ * Serialize ensure/create/join for one exact Feishu group name. Two members
+ * sending the same `btw` note race on `im.chat.list` + `chat.create`, and
+ * Feishu does not enforce unique group names, so without this they can end up
+ * in two groups that every later lookup reports as ambiguous. Distinct names
+ * stay concurrent.
+ */
+export async function withChatNameLock<T>(name: string, run: () => Promise<T>): Promise<T> {
+  const previous = chatNameTails.get(name) ?? Promise.resolve()
+  let release!: () => void
+  const gate = new Promise<void>(resolveGate => { release = resolveGate })
+  const tail = previous.catch(() => {}).then(() => gate)
+  chatNameTails.set(name, tail)
+  await previous.catch(() => {})
+  try {
+    return await run()
+  } finally {
+    release()
+    if (chatNameTails.get(name) === tail) chatNameTails.delete(name)
+  }
+}
+
+/**
+ * 临时群入口。`create` 必须新建(时间后缀 btw / fk / bk);`reuse` 复用同名群并把
+ * 发起人拉进去(带备注的 btw 同名即同一个群)。
+ */
+export async function ensureTempChatForSession(
+  sessionName: string,
+  userOpenId: string,
+  mode: 'create' | 'reuse' = 'create',
+): Promise<{ chatId: string; created: boolean; joined: boolean }> {
+  if (mode === 'create') return await createTempChatForSession(sessionName, userOpenId)
+  if (!userOpenId) throw new Error('missing sender open_id; cannot join temporary group')
+  return await withChatNameLock(sessionName, () => ensureChatForSession(sessionName, userOpenId))
+}
+
 export async function disbandChatForSession(sessionName: string): Promise<{ chatId: string | null; disbanded: boolean }> {
   const chatId = await findNormalChatIdByName(sessionName)
   if (!chatId) {
@@ -1245,6 +1283,48 @@ async function ensureUserInChat(chatId: string, userOpenId: string): Promise<boo
     throw sdkApiError('feishu chatMembers.create', add)
   }
   return true
+}
+
+/**
+ * 群里的人类成员 open_id（不含机器人）；分页读完，失败直接抛出。
+ * 临时群的「最后一个人退出就解散」以此为准。
+ */
+export async function chatMemberOpenIds(chatId: string): Promise<string[]> {
+  if (!chatId) throw new Error('cannot list members without chat_id')
+  const ids: string[] = []
+  let pageToken: string | undefined
+  do {
+    const res = await client.im.chatMembers.get({
+      path: { chat_id: chatId },
+      params: { member_id_type: 'open_id', page_size: 100, ...(pageToken ? { page_token: pageToken } : {}) },
+    })
+    if (res.code && res.code !== 0) throw sdkApiError('feishu chatMembers.get', res)
+    for (const item of res.data?.items ?? []) if (item.member_id) ids.push(item.member_id)
+    pageToken = res.data?.page_token
+  } while (pageToken)
+  return ids
+}
+
+/**
+ * 把成员本人移出群聊：加入者在临时群发 bye 就是自己退出。
+ * 机器人移出其他成员需要群主/管理员或 `im:chat:operate_as_owner`，权限不足时
+ * 保留飞书的原始拒绝原因，由调用方提示用户手动退出。
+ */
+export async function leaveChatForMember(chatId: string, userOpenId: string): Promise<{ left: boolean }> {
+  if (!chatId) throw new Error('cannot leave a temporary group without chat_id')
+  if (!userOpenId) throw new Error('missing sender open_id; cannot leave temporary group')
+  const res = await client.im.chatMembers.delete({
+    path: { chat_id: chatId },
+    params: { member_id_type: 'open_id' },
+    data: { id_list: [userOpenId] },
+  })
+  if (res.code && res.code !== 0) {
+    throw sdkApiError('feishu chatMembers.delete', res)
+  }
+  if ((res.data?.invalid_id_list ?? []).includes(userOpenId)) {
+    throw new Error('飞书拒绝移出该成员：member_id 无效或不在群内')
+  }
+  return { left: true }
 }
 
 /** Resolve ONE chat's name by chat_id via `im.chat.get`, bypassing the
@@ -1666,5 +1746,5 @@ export function isOpenAIChatGPTAuthenticated(accountId = DEFAULT_CODEX_ACCOUNT):
 
 export function sanitizeSessionName(raw: string): string {
   // `*` 给临时群后缀(*MMDD-HHMM / *备注)用,和 worktree 的 `[]` 一样显式放行。
-  return raw.replace(/[^\w一-鿿\-\[\]\*]/g, '_').slice(0, 64)
+  return raw.replace(/[^\w一-鿿\-\[\]\*]/g, '_').slice(0, SESSION_NAME_MAX)
 }
