@@ -66,7 +66,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - 源码变更运行 `bun run typecheck` 和 `bun test`。构建入口、CLI、依赖或发布路径变更再运行 `bun run build`。
 - 共享 Session、Card Kit、飞书协议和持久状态变更最终跑全量测试。双后端接口变更覆盖 Codex、Claude、provider/source 切换和共享卡片。
 - 真实飞书、Agent 登录、Card action、建群/解散和 worktree smoke 需要明确目标群、账号及副作用；涉及 live daemon 仍按上节授权。
-- 发布前通过 `bun test` 与 `bun run build`。未指定 minor/major 时只升 patch；同一版本发布 npm 和 GitHub Packages，推送 `main` 和 tag，创建 GitHub Release。
+- 发布前通过 `bun test` 与 `bun run build`。未指定 minor/major 时只升 patch；同一版本发布 npm 和 GitHub Packages，推送 `main` 和 tag，创建 GitHub Release。发布只经 GitHub Actions 的 `发布版本` 工作流（本机无仓库令牌，不要本地 `npm publish`），完整步骤与常见坑见 `docs/release.md`。
 - `mathjax-full` 随包附带修复后的传递依赖。发布前实际安装 tarball 并运行 `npm audit --omit=dev`，不能只检查源码目录的 overrides 和 Bun 锁文件。
 - Agent 包仅为开发和类型测试依赖，发布运行时由自动更新器安装。DSH 根据每次获取的 latest 递归解析同版本包族，安装快照中的精确版本用于避免包族混装，不构成兼容限制。普通安全依赖用 `bun scripts/sync-security-deps.ts` 同步，Agent 运行目录也应用这些安全修复。tarball 验收实际安装 Agent 并查询原生目录，不断言其版本等于 Lodestar 构建时版本。
 - 没有 `gh` 时使用 GitHub REST，临时认证文件用后删除。Release 标题、功能说明和验证结果使用中文，模型名与代码标识符可保留原文；发布前检查没有整段英文说明。

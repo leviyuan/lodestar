@@ -10,6 +10,7 @@ README 保留项目哲学、项目介绍、最短快速开始、常用指令表�
 - `usage.md`：群内命令、会话、worktree、文件与生图、本机通知。
 - `models.md`：账号、模型与 effort、OpenRouter 默认列表、DSH 与 GLM 接入。
 - `claude-agent-backend.md`：后端实现、模型路由和会话行为。
+- `release.md`：发版步骤、工作流入口、凭据位置和常见坑（本机不 publish）。
 
 - 保留 Codex、Claude Code 订阅、GLM、DeepSeek、OpenRouter、通用中转站和 DeepSeek Harness 的支持说明。
 - 只写已实现的行为。删除失效接口、历史方案、重复规则和无法复现的验证结论；不另建产品规范或计划。
