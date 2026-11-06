@@ -24,4 +24,5 @@
 - 本机 npm 是 12.x，`npm pack` 会因 `bundleDependencies`（`mathjax-full`）与 `overrides`（含 `@xmldom/xmldom`）冲突报 `EBUNDLEOVERRIDE`。发布包由工作流的 Node 22 环境生成；需要本地验收制品时才用 `npx npm@11.6.2 pack --json`，不要改 `package.json` 去绕开。
 - 本机没有 `NODE_AUTH_TOKEN`，`gh` 的 OAuth 令牌也没有 `write:packages` 权限；本地 `npm publish` 和 `npm view --registry=https://npm.pkg.github.com` 都会 401，这不代表发布流程有问题。
 - 发布中断但制品已验收时，用 `续发已验收版本`（`resume-release.yml`）传 `tag`、`run_id`、`attempt` 复用已验收制品，不重新打包；同一版本续发只核对远端完整性。
+- 工作流里 `bun run ci` 偶发失败在 Linux 专用用例 `src/pid-guard.test.ts`（`/proc/<pid>/cmdline` 读到空行，报「命令行为空」）；这是既有的进程读取竞态，不是本次改动引起。确认日志只有这一条后 `gh run rerun <run-id> --failed` 重跑即可，不要为此改版本或移动已推送的 tag。
 - `scripts/publish-verified-package.mjs` 只接受 `npm pack --json` 生成的清单（含 `name`、`version`、`filename`、`integrity`），并在 `NODE_AUTH_TOKEN` 缺失时直接拒绝发布。
