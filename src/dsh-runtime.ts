@@ -47,6 +47,21 @@ export function dshProviderPatches(env: Record<string, string | undefined>): obj
   ]
 }
 
+/**
+ * The `sdk` profile may already provide the ask-user tool (0.2.2+). Inserting the
+ * same plugin again fails startup with a duplicate tool registration, so only add
+ * ours when the resolved profile does not ship it. Unknown or unreadable profiles
+ * keep the explicit insert, which is required by older releases.
+ */
+export function profileProvidesAskUser(runtimeRoot: string): boolean {
+  try {
+    const require = createRequire(join(runtimeRoot, 'package.json'))
+    const profile = dirname(require.resolve('@deepseek-ai/dsh-sdk-app/package.json'))
+    return /^\s*name:\s*['"]?@deepseek-ai\/dsh-tool-ask-user['"]?\s*$/m
+      .test(readFileSync(join(profile, 'cordis.patch.yml'), 'utf8'))
+  } catch { return false }
+}
+
 function projectMcpRows(cwd: string, profile?: ProjectProfile): object[] {
   if (profile?.loadProjectMcp === false) return []
   let raw: string
@@ -115,8 +130,12 @@ export class DshRuntime extends EventEmitter {
     publish(join(bridgeDir, 'package.json'), identity)
     if (sourceMode) publish(join(bridgeDir, 'dsh-protocol.ts'), protocol)
     publish(bridge, source)
+    const askUser = profileProvidesAskUser(runtimeRoot) ? []
+      : [{ id: 'lodestar-ask-user', name: '@deepseek-ai/dsh-tool-ask-user' }]
     const patch = [
-      ...['sdk-jsonrpc-server', 'session-title-llm', 'session-telemetry-otel', 'settings', 'credentials', 'llm-pi-ai'].map(id => ({ id, disabled: true })),
+      // 0.2.2 把模型接入选号/账号链，`connection` 等必需插件依赖 credentials 服务；
+      // 凭据仍由 Lodestar 通过 env 注入，这里只启用服务、不写入任何登录态。
+      ...['sdk-jsonrpc-server', 'session-title-llm', 'session-telemetry-otel', 'settings', 'llm-pi-ai'].map(id => ({ id, disabled: true })),
       { id: 'approval', config: { policy: 'ask' } },
       { id: 'permission', config: { defaultPreset: 'lodestar', presets: { lodestar: { sandbox: 'danger-full-access', approval: 'ask' } } } },
       // Keep native descendants able to delegate when DSH changes its default depth limit.
@@ -125,8 +144,7 @@ export class DshRuntime extends EventEmitter {
       // DSH supplies working-directory context; newer releases no longer register {{cwd}}.
       { id: 'system-prompt', config: { personaPrefix: 'You are a coding agent powered by {{model}}.', personaSuffix: '' } },
       { id: 'skill-filesystem', config: { includeDefaultRoots: true, ...(opts.managedSkillDir ? { customSkillDirs: [opts.managedSkillDir] } : {}) } },
-      { insert: [{ id: 'lodestar-bridge', name: bridge },
-        { id: 'lodestar-ask-user', name: '@deepseek-ai/dsh-tool-ask-user' }, ...mcp] },
+      { insert: [{ id: 'lodestar-bridge', name: bridge }, ...askUser, ...mcp] },
       ...providerPatches,
     ]
     const patchPath = join(this.launchDir, 'bridge.patch.yml')
