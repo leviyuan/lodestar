@@ -1,5 +1,6 @@
 import { test, expect } from 'bun:test'
 import {
+  btwListCard,
   writeBodyFromToolInput,
   turnListCard,
   resumeListCard,
@@ -317,3 +318,57 @@ test('tempSessionNoticeCard：错误态保留原因，缺失时不伪造成功',
   expect(JSON.stringify(empty)).toContain('未知错误')
   expect(JSON.stringify(empty)).not.toContain('已就绪')
 })
+
+test('btwListCard：汇总数量、当前群、模型与运行状态', () => {
+  const card = btwListCard({
+    entries: [
+      {
+        chatName: 'project*修复登录',
+        projectName: 'project',
+        createdAt: new Date(2026, 7, 22, 9, 5).getTime(),
+        isCurrent: true,
+        status: 'idle',
+        running: true,
+        provider: 'claude',
+        model: 'claude-opus-4-1',
+        effort: 'high',
+      },
+      {
+        chatName: 'project*0821-1337',
+        projectName: 'project',
+        createdAt: null,
+        isCurrent: false,
+        status: null,
+        running: false,
+        provider: null,
+        model: null,
+        effort: null,
+      },
+    ],
+  }) as any
+  const text = JSON.stringify(card)
+
+  expect(card.header.title.content).toBe('📋 bl · btw 列表')
+  expect(card.header.template).toBe('turquoise')
+  expect(text).toContain('共 **2** 个临时会话 · 已启动 **1** 个')
+  expect(text).toContain('project*修复登录')
+  expect(text).toContain('· 本群')
+  expect(text).toContain('创建 08-22 09:05')
+  expect(text).toContain('Claude')
+  expect(text).toContain('claude-opus-4-1')
+  expect(text).toContain('high')
+  expect(text).toContain('🟢 空闲')
+  expect(text).toContain('创建 MISS')
+  expect(text).toContain('模型 MISS')
+  expect(text).toContain('⚪ 未运行')
+  expect(text).not.toContain('callback')
+})
+
+test('btwListCard：空列表显示占位，不伪造条目', () => {
+  const card = btwListCard({ entries: [] }) as any
+  const text = JSON.stringify(card)
+  expect(text).toContain('还没有临时会话')
+  expect(text).toContain('btw')
+  expect(text).not.toContain('共 **')
+})
+

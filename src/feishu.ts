@@ -120,6 +120,14 @@ export function hasTempSessionLease(sessionName: string, chatId: string): boolea
   return lease?.sessionName === sessionName && lease.chatId === chatId
 }
 
+/** 本机登记的全部临时会话租约，按创建时间倒序（同刻按群名），供 `bl` 列表。
+ * 返回副本，调用方不能借此改动持久状态。 */
+export function listTempSessionLeases(): TempSessionLease[] {
+  return [...tempSessionLeaseByChat.values()]
+    .map(lease => ({ ...lease }))
+    .sort((a, b) => b.createdAt - a.createdAt || a.sessionName.localeCompare(b.sessionName))
+}
+
 /** Per-project launch profile for `sessionName`, or undefined when the
  * project runs with Lodestar defaults. Sourced from `[projects.<name>].*`
  * in config.toml. Lets an external project (e.g. evolving) override cwd,

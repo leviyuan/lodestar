@@ -9,6 +9,7 @@
  * 按钮的 value.kind 在 daemon.ts handleCardAction 里 dispatch。
  */
 
+import { agentProviderLabel, type AgentProvider } from '../agent-process'
 import { diagnosticIdLabel } from '../session-util'
 
 export interface TurnListEntry {
@@ -434,6 +435,89 @@ export function tempSessionNoticeCard(opts: TempSessionNoticeCardOpts): object {
       ],
     },
   }
+}
+
+/** `bl` 列表的一行：租约 + 当前 daemon 中已构造的会话状态。 */
+export interface BtwListEntry {
+  /** 临时群名 / 会话名（`<基名>*<备注或时间>`）。 */
+  chatName: string
+  /** 去掉 `*后缀` 的所属项目，WT 临时群保留 `[分支]`。 */
+  projectName: string
+  /** 租约创建时间；旧记录或未登记会话为 null。 */
+  createdAt: number | null
+  /** 是否为发送 `bl` 的当前群。 */
+  isCurrent: boolean
+  /** 已构造会话的实时状态；本 daemon 尚未构造时为 null。 */
+  status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped' | null
+  running: boolean
+  provider: AgentProvider | null
+  model: string | null
+  effort: string | null
+}
+
+export interface BtwListCardOpts {
+  entries: BtwListEntry[]
+}
+
+const BTW_LIST_STATUS: Record<string, { emoji: string; label: string }> = {
+  idle: { emoji: '🟢', label: '空闲' },
+  working: { emoji: '⚙️', label: '工作中' },
+  awaiting_permission: { emoji: '🔐', label: '等审批' },
+  starting: { emoji: '🚀', label: '启动中' },
+  stopped: { emoji: '⚪', label: '未运行' },
+}
+
+export function btwListCard(opts: BtwListCardOpts): object {
+  const elements: object[] = []
+  if (!opts.entries.length) {
+    elements.push({ tag: 'markdown', content: '_还没有临时会话。发送 `btw` 创建。_' })
+  } else {
+    const running = opts.entries.filter(entry => entry.running).length
+    elements.push({
+      tag: 'markdown',
+      content: [
+        `共 **${opts.entries.length}** 个临时会话${running ? ` · 已启动 **${running}** 个` : ''}`,
+        '_按创建时间倒序；`btw` 创建，`bye` 自己退出，最后一人退出时解散。_',
+      ].join('\n'),
+    })
+    const rows = opts.entries.map(btwListEntryMarkdown)
+    // 一个 markdown 元素最多放 20 条，避免群很多时单元素内容超限；卡片元素本身远低于上限。
+    for (let index = 0; index < rows.length; index += 20) {
+      elements.push({ tag: 'markdown', content: rows.slice(index, index + 20).join('\n\n') })
+    }
+  }
+  return {
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      title: { tag: 'plain_text', content: '📋 bl · btw 列表' },
+      template: 'turquoise',
+    },
+    body: { elements },
+  }
+}
+
+function btwListEntryMarkdown(entry: BtwListEntry): string {
+  const status = entry.status
+    ? BTW_LIST_STATUS[entry.status]
+    : { emoji: entry.running ? '🟢' : '⚪', label: entry.running ? '运行中' : '未运行' }
+  return [
+    `**${inlineCode(entry.chatName)}**${entry.isCurrent ? ' · 本群' : ''}`,
+    [
+      `项目 ${inlineCode(entry.projectName)}`,
+      entry.createdAt === null ? '创建 MISS' : `创建 ${fmtTime(entry.createdAt)}`,
+      btwListModelLabel(entry),
+      `${status.emoji} ${status.label}`,
+    ].join(' · '),
+  ].join('\n')
+}
+
+function btwListModelLabel(entry: BtwListEntry): string {
+  if (!entry.provider) return '模型 MISS'
+  const provider = agentProviderLabel(entry.provider)
+  if (!entry.model) return `${provider} · 默认模型`
+  const effort = entry.effort ? `/${inlineCode(entry.effort)}` : ''
+  return `${provider} · ${inlineCode(entry.model)}${effort}`
 }
 
 function fmtTime(ts: number): string {

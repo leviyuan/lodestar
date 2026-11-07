@@ -9,6 +9,7 @@ import {
   clearedTurnAnchorSessions,
   branchBaseBySession,
   leftChats,
+  modelSelections,
   projectProfiles,
   resetFeishuMock,
   seededTurnAnchors,
@@ -18,6 +19,7 @@ import {
   setChatMembers,
   setChatMembersError,
   setLeaveChatError,
+  tempSessionLeases,
   turnAnchorsBySession,
 } from './feishu-test-mock'
 import * as feishu from './feishu'
@@ -28,6 +30,7 @@ const {
   onForkSelect,
   onResumeSelect,
   runBtwCommand,
+  runBtwListCommand,
   runByeCommand,
   showBackList,
   showForkList,
@@ -36,11 +39,22 @@ const {
 } = await import('./session-temp')
 const { runCommand } = await import('./session-commands')
 
+interface TempPeer {
+  sessionName: string
+  chatId: string
+  status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
+  running: boolean
+  provider: 'claude' | 'codex' | 'dsh'
+  model: string | null
+  effort: string | null
+}
+
 interface TempHarnessState {
   routing: ConversationRouting
   running: boolean
   rollbackResult: boolean
   history: ConversationSummary[]
+  peers: TempPeer[]
 }
 
 interface TempHarness {
@@ -66,6 +80,7 @@ function makeHarness(sessionName = 'project'): TempHarness {
     running: false,
     rollbackResult: true,
     history: [],
+    peers: [],
   }
   const createCalls: any[] = []
   const rollbackCalls: ConversationLaunch[] = []
@@ -90,6 +105,8 @@ function makeHarness(sessionName = 'project'): TempHarness {
     backendLabel: () => 'Codex',
     conversationRouting: () => ({ ...state.routing }),
     isRunning: () => state.running,
+    tempSessionPeers: () => state.peers.map(peer => ({ ...peer })),
+    runBtwListCommand: () => runBtwListCommand(session),
     listCodexConversations: async () => state.history.slice(),
     claudeHistoryOptions: () => ({ configDir: process.env.CLAUDE_CONFIG_DIR }),
     rollbackTo: async (launch: ConversationLaunch, branchState?: { anchors: TurnAnchor[]; base: any }) => {
@@ -419,6 +436,88 @@ describe('session-temp Codex btw/fork', () => {
     expect(await runCommand(fakeSession as any, 'btw\nextra', 'ou_owner')).toBe(false)
 
     expect(calls).toEqual([['ou_owner', '修复 登录'], ['ou_owner', '']])
+  })
+
+  test('bl 列出全部临时租约并合并已加载会话状态', async () => {
+    const h = makeHarness('project*修复登录')
+    tempSessionLeases.push(
+      { sessionName: 'project*0821-1337', chatId: 'oc_old', createdAt: new Date(2026, 7, 21, 13, 37).getTime() },
+      { sessionName: 'project*修复登录', chatId: h.session.chatId, createdAt: new Date(2026, 7, 22, 9, 5).getTime() },
+    )
+    modelSelections.set('project*0821-1337', {
+      provider: 'codex', model: 'gpt-5.6-sol', effort: 'high', tokenSourceId: 'codex-sub',
+    })
+    h.state.peers.push({
+      sessionName: 'project*修复登录',
+      chatId: h.session.chatId,
+      status: 'working',
+      running: true,
+      provider: 'claude',
+      model: 'claude-opus-4-1',
+      effort: 'high',
+    })
+
+    expect(await runCommand(h.session, 'bl', 'ou_owner')).toBe(true)
+
+    const card = sentCards.at(-1) as any
+    expect(card.header.title.content).toBe('📋 bl · btw 列表')
+    expect(card.header.template).toBe('turquoise')
+    const text = cardJson(card)
+    expect(text).toContain('共 **2** 个临时会话 · 已启动 **1** 个')
+    expect(text.indexOf('project*修复登录')).toBeLessThan(text.indexOf('project*0821-1337'))
+    expect(text).toContain('· 本群')
+    expect(text).toContain('Claude')
+    expect(text).toContain('claude-opus-4-1')
+    expect(text).toContain('⚙️ 工作中')
+    expect(text).toContain('创建 08-22 09:05')
+    expect(text).toContain('Codex')
+    expect(text).toContain('gpt-5.6-sol')
+    expect(text).toContain('⚪ 未运行')
+  })
+
+  test('btwlist 别名同样列出；带参数不吞普通消息', async () => {
+    const h = makeHarness()
+
+    expect(await runCommand(h.session, ' btwlist ', 'ou_owner')).toBe(true)
+    expect(cardJson(sentCards.at(-1))).toContain('还没有临时会话')
+
+    const untouched = {}
+    expect(await runCommand(untouched as any, 'bl 项目', 'ou_owner')).toBe(false)
+    expect(await runCommand(untouched as any, 'btwlist\nmore', 'ou_owner')).toBe(false)
+  })
+
+  test('没有租约但已加载的临时群也列出，缺失创建时间显示 MISS', async () => {
+    const h = makeHarness()
+    h.state.peers.push({
+      sessionName: 'project*旧群',
+      chatId: 'oc_legacy',
+      status: 'idle',
+      running: true,
+      provider: 'codex',
+      model: null,
+      effort: null,
+    })
+
+    expect(await runCommand(h.session, 'bl', 'ou_owner')).toBe(true)
+
+    const text = cardJson(sentCards.at(-1))
+    expect(text).toContain('project*旧群')
+    expect(text).toContain('创建 MISS')
+    expect(text).toContain('默认模型')
+    expect(text).toContain('🟢 空闲')
+  })
+
+  test('bl 卡片发送失败时回退原文并保留飞书诊断', async () => {
+    const h = makeHarness()
+    const send = spyOn(feishu, 'sendCard').mockImplementation(async (_chatId, _card, onFailure) => {
+      onFailure?.({ code: 230001, msg: 'invalid card content', log_id: 'bl-send-log' })
+      return null as unknown as string
+    })
+    try { expect(await runCommand(h.session, 'bl')).toBe(true) } finally { send.mockRestore() }
+
+    expect(sentRawTexts).toHaveLength(1)
+    expect(sentRawTexts[0]).toContain('bl 列表发送失败')
+    expect(sentRawTexts[0]).toContain('code=230001 message=invalid card content log_id=bl-send-log')
   })
 
   test('时间后缀的并发创建仍同步预留群名，避免同分钟同名', async () => {

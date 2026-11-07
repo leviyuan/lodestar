@@ -847,6 +847,30 @@ export class Session {
     return [...Session.all].some(s => s.sessionName === sessionName && s.isRunning())
   }
 
+  /** 本 daemon 中已构造的临时群会话；`bl` 列表与 hi 的 peers 同源。
+   * 还没被任何消息唤醒的旧临时群不在里面，由持久化租约补全。 */
+  tempSessionPeers(): Array<{
+    sessionName: string
+    chatId: string
+    status: Status
+    running: boolean
+    provider: AgentProvider
+    model: string | null
+    effort: AgentReasoningEffort | null
+  }> {
+    return [...Session.all]
+      .filter(peer => feishu.tempProjectName(peer.sessionName) !== null)
+      .map(peer => ({
+        sessionName: peer.sessionName,
+        chatId: peer.chatId,
+        status: peer.status,
+        running: peer.isRunning(),
+        provider: peer.selectedProvider,
+        model: peer.selectedModel,
+        effort: peer.selectedEffort,
+      }))
+  }
+
   private modelForSpawn(): string | undefined {
     // 无 token source 的旧 Codex 路径不下发 model；Claude 用 selectedModel。
     if (this.selectedProvider === 'codex') return undefined
@@ -2875,6 +2899,7 @@ export class Session {
   showBackList(userOpenId = ''): Promise<void> { return sessionTemp.showBackList(this, userOpenId) }
   showResumeList(userOpenId = ''): Promise<void> { return sessionTemp.showResumeList(this, userOpenId) }
   runBtwCommand(userOpenId: string, role = ''): Promise<void> { return sessionTemp.runBtwCommand(this, userOpenId, role) }
+  runBtwListCommand(): Promise<void> { return sessionTemp.runBtwListCommand(this) }
   runByeCommand(userOpenId = ''): Promise<void> { return sessionTemp.runByeCommand(this, userOpenId) }
   onForkSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> {
     return sessionTemp.onForkSelect(this, panelId, choiceId, userOpenId)

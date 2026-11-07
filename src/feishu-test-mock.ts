@@ -68,6 +68,8 @@ export const modelSelections = new Map<string, {
 }>()
 export const resumeRefs = new Map<string, { provider: 'codex' | 'claude' | 'dsh'; sessionId: string; cwd: string | null }>()
 export const preferredChatForSession = new Map<string, string>()
+/** `bl` 列表读取的临时会话租约替身。 */
+export const tempSessionLeases: Array<{ sessionName: string; chatId: string; createdAt: number }> = []
 /** [projects.<name>] 项目 profile 替身,测试往里 set 后 Session 构造时可查到。 */
 export const projectProfiles = new Map<string, ProjectProfile>()
 
@@ -79,6 +81,7 @@ export function resetFeishuMock(): void {
     arr.length = 0
   }
   projectProfiles.clear()
+  tempSessionLeases.length = 0
   chatTailMessages.clear()
   modelSelections.clear()
   resumeRefs.clear()
@@ -183,6 +186,7 @@ mock.module('./feishu', () => ({
   },
   SESSION_NAME_MAX,
   tempRoleChatName,
+  listTempSessionLeases: () => tempSessionLeases.map(lease => ({ ...lease })),
   appendTurnAnchorChecked: (sessionName: string, anchor: TurnAnchor) => {
     if (turnAnchorWriteError) throw turnAnchorWriteError
     const current = turnAnchorsBySession.get(sessionName) ?? []

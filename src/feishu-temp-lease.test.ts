@@ -17,6 +17,7 @@ function runFresh(work: string, leases?: object) {
       bindSessionToChat,
       clearSessionConversationState,
       hasTempSessionLease,
+      listTempSessionLeases,
       loadTempSessionLeases,
       mainChatIdForSession,
       mainSessionName,
@@ -70,6 +71,29 @@ describe('temporary-session leases', () => {
       names: ['project', 'project', 'project', 'project'],
       chats: ['oc_main', 'oc_main', 'oc_main', 'oc_main'],
     })
+  })
+
+  test('lists leases newest first and cannot expose mutable state', () => {
+    const result = runFresh(`
+      const realNow = Date.now
+      Date.now = () => 1000
+      registerTempSessionLease('project*old', 'oc_old')
+      Date.now = () => 2000
+      registerTempSessionLease('project*new', 'oc_new')
+      Date.now = realNow
+      const listed = listTempSessionLeases()
+      listed[0].sessionName = 'tampered'
+      out({ listed, again: listTempSessionLeases() })
+    `)
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(result.value.listed).toEqual([
+      { sessionName: 'tampered', chatId: 'oc_new', createdAt: 2000 },
+      { sessionName: 'project*old', chatId: 'oc_old', createdAt: 1000 },
+    ])
+    expect(result.value.again).toEqual([
+      { sessionName: 'project*new', chatId: 'oc_new', createdAt: 2000 },
+      { sessionName: 'project*old', chatId: 'oc_old', createdAt: 1000 },
+    ])
   })
 
   test('resolves role-named BTW sessions back to their main project and group', () => {

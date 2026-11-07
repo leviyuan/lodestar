@@ -552,6 +552,55 @@ export async function runBtwCommand(s: Session, userOpenId: string, role = ''): 
   )
 }
 
+/** `bl` / `btwlist`：列出本机登记的全部临时会话（btw/fk 都算），
+ * 并合并本 daemon 已构造会话的实时状态；只读本地租约与内存，不发网络查询。 */
+export async function runBtwListCommand(s: Session): Promise<void> {
+  const peers = new Map(s.tempSessionPeers().map(peer => [peer.chatId, peer]))
+  const entries = new Map<string, cards.BtwListEntry>()
+  const entryFor = (
+    chatName: string,
+    chatId: string,
+    createdAt: number | null,
+    peer: ReturnType<Session['tempSessionPeers']>[number] | undefined,
+  ): cards.BtwListEntry => {
+    const selection = peer ? null : feishu.getSessionModelSelection(chatName)
+    return {
+      chatName,
+      projectName: feishu.tempProjectName(chatName) ?? chatName,
+      createdAt,
+      isCurrent: chatId === s.chatId,
+      status: peer?.status ?? null,
+      running: peer?.running ?? false,
+      provider: peer?.provider ?? selection?.provider ?? null,
+      model: peer ? peer.model : selection?.model ?? null,
+      effort: peer ? peer.effort : selection?.effort ?? null,
+    }
+  }
+  for (const lease of feishu.listTempSessionLeases()) {
+    entries.set(lease.chatId, entryFor(lease.sessionName, lease.chatId, lease.createdAt, peers.get(lease.chatId)))
+  }
+  // 兼容租约机制之前创建、但本 daemon 已加载的临时群：内存里仍在就同样列出。
+  for (const peer of peers.values()) {
+    if (!entries.has(peer.chatId)) entries.set(peer.chatId, entryFor(peer.sessionName, peer.chatId, null, peer))
+  }
+  const list = [...entries.values()].sort((a, b) => {
+    if (a.createdAt !== b.createdAt) {
+      if (a.createdAt === null) return 1
+      if (b.createdAt === null) return -1
+      return b.createdAt - a.createdAt
+    }
+    return a.chatName.localeCompare(b.chatName)
+  })
+  let messageId: string | null = null
+  let failure: unknown
+  try {
+    messageId = await feishu.sendCard(s.chatId, cards.btwListCard({ entries: list }), error => { failure = error })
+  } catch (error) {
+    failure = error
+  }
+  if (!messageId) await feishu.sendTextRaw(s.chatId, `❌ bl 列表发送失败\n${formatFeishuError(failure)}`)
+}
+
 export async function runByeCommand(s: Session, userOpenId = ''): Promise<void> {
   if (!feishu.tempProjectName(s.sessionName)) {
     await tempNoticeFailure(s, s.sessionName, 'bye 只能在带 *MMDD-HHMM 或 *备注 后缀的临时会话群里使用。')
