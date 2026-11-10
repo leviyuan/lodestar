@@ -140,6 +140,51 @@ test('weekly-only accounts stay selectable and yield to a usable five-hour windo
   `)
 })
 
+test('Fable and other models receive separate weekly allocations', () => {
+  isolated(`
+    import assert from 'node:assert/strict'
+    import { mock } from 'bun:test'
+    mock.module('./src/claude-agent-process', () => ({ ClaudeAgentProcess: class {} }))
+    const records = ['default', 'sam'].map((id, index) => ({ id, name: id, state: 'ready', identity: 'identity-' + index }))
+    mock.module('./src/claude-accounts', () => ({ DEFAULT_CLAUDE_ACCOUNT: 'default',
+      claudeAccounts: {
+        list: () => records,
+        get: id => records.find(record => record.id === id),
+        assertReady: id => {
+          const record = records.find(item => item.id === id)
+          if (!record) throw new Error('未知账号')
+          return record
+        },
+      } }))
+    const sources = new Map(records.map(record => [record.id, { id: 'claude-sub', kind: 'claude-subscription',
+      agent: 'claude', enabled: true, accountId: record.id, defaultModel: 'opus',
+      modelCatalogState: { status: 'ready' } }]))
+    const registry = await import('./src/token-source')
+    mock.module('./src/token-source', () => ({ ...registry,
+      getTokenSourceForAccount: (sourceId, accountId) => sources.get(accountId),
+      scrubAnthropicEnv: base => base,
+      tokenSourceRuntimeModel: (source, model) => ({ model, display: model, efforts: ['high'], defaultEffort: 'high' }) }))
+    const cache = await import('./src/token-source-cache')
+    const snapshots = new Map()
+    mock.module('./src/token-source-cache', () => ({ ...cache,
+      peekTokenSourceUsage: source => snapshots.get(source.accountId),
+      refreshTokenSourceUsage: async () => {} }))
+    const { claudeUsageSnapshot } = await import('./src/claude-usage')
+    const reset = new Date(Date.now() + 100 * 3600_000).toISOString()
+    const quota = (week, fable) => claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true,
+      rate_limits: {
+        seven_day: { utilization: week, resets_at: reset },
+        model_scoped: [{ display_name: 'Fable', utilization: fable, resets_at: reset }],
+      } })
+    // default 已被其他模型用掉 40%，Fable 已用 80%；sam 只用了 20%，Fable 未用。
+    snapshots.set('default', quota(40, 80))
+    snapshots.set('sam', quota(20, 0))
+    const { selectClaudeAccount } = await import('./src/claude-account-selection')
+    assert.equal(selectClaudeAccount({ model: 'opus', effort: 'high' }), 'default')
+    assert.equal(selectClaudeAccount({ model: 'fable', effort: 'high' }), 'sam')
+  `)
+})
+
 test('named-only authentication keeps one visible source, account-isolated quota and cache-only startup selection', () => {
   isolated(`
     import assert from 'node:assert/strict'

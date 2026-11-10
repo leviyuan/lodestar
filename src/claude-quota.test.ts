@@ -158,18 +158,25 @@ describe('accounts without a five-hour window', () => {
 })
 
 describe('Fable shared and dedicated weekly capacities', () => {
-  test('Fable keeps five shared and ten dedicated units', () => {
-    const snapshot = quota({ shortUsed: 0, weekUsed: 90, weekHours: 100,
-      extra: [window('modelWeekly:Fable', 20, 6)] })
-    expect(rank(snapshot)).toMatchObject({ state: 'ready', remaining: 1 })
-    expect(rank(snapshot, 0, 'fable')).toMatchObject({ state: 'ready', remaining: 0.5 })
-    expect(rank(snapshot, 1, 'fable').score).toBeCloseTo(0.25)
+  test('Fable keeps half a week in its own bucket', () => {
+    const fresh = quota({ weeklyOnly: true, weekUsed: 0, weekHours: 100,
+      extra: [window('modelWeekly:Fable', 0, 100)] })
+    expect(rank(fresh, 0, 'opus')).toMatchObject({ state: 'ready', remaining: 5 })
+    expect(rank(fresh, 0, 'fable')).toMatchObject({ state: 'ready', remaining: 5 })
+    // 已用 Fable 2 份时只剩 3 份专属余量；其他模型仍有自己的一半。
+    const used = quota({ weeklyOnly: true, weekUsed: 20, weekHours: 100,
+      extra: [window('modelWeekly:Fable', 40, 100)] })
+    expect(rank(used, 0, 'opus')).toMatchObject({ remaining: 5 })
+    expect(rank(used, 0, 'fable')).toMatchObject({ remaining: 3 })
+    expect(rank(used, 1, 'fable').score).toBeCloseTo(1.5)
   })
 
   test('the dedicated week can be the binding window', () => {
-    const snapshot = quota({ shortUsed: 0, weekUsed: 10, weekHours: 24,
+    const snapshot = quota({ weeklyOnly: true, weekUsed: 10, weekHours: 24,
       extra: [window('modelWeekly:Fable', 95, 24)] })
-    expect(rank(snapshot, 0, 'fable')).toMatchObject({ remaining: 0.5 })
+    expect(rank(snapshot, 0, 'fable')).toMatchObject({ remaining: 0.25 })
+    // 距重置 24 小时已释放预留，Opus 只看总周剩余。
+    expect(rank(snapshot)).toMatchObject({ remaining: 9 })
   })
 
   test.each(['pro', 'max', 'team', 'enterprise', 'unknown-plan'])(
@@ -194,6 +201,56 @@ describe('Fable shared and dedicated weekly capacities', () => {
     const snapshot = quota({ extra: [{ ...window('modelWeekly:Fable', 100, 4), resetsAt: null }] })
     expect(rank(snapshot).state).toBe('ready')
     expect(rank(snapshot, 0, 'fable').state).toBe('exhausted')
+    // 专属额度已用完时没有可预留的部分，其他模型可以用掉整周剩余。
+    const spent = quota({ weeklyOnly: true, weekUsed: 40, weekHours: 100,
+      extra: [window('modelWeekly:Fable', 100, 100)] })
+    expect(rank(spent, 0, 'opus')).toMatchObject({ state: 'ready', remaining: 6 })
+  })
+})
+
+describe('Fable reserve for other models', () => {
+  const weeklyOnly = (weekUsed: number, weekHours: number, fablePercent?: number) => quota({
+    weeklyOnly: true, weekUsed, weekHours,
+    ...(fablePercent === undefined ? {} : { extra: [window('modelWeekly:Fable', fablePercent, weekHours)] }),
+  })
+
+  test('other models keep the unused half week for Fable before the final two days', () => {
+    const fresh = weeklyOnly(0, 100, 0)
+    expect(rank(fresh, 0, 'opus')).toMatchObject({ state: 'ready', remaining: 5 })
+    expect(rank(fresh, 0, 'fable')).toMatchObject({ state: 'ready', remaining: 5 })
+    // 预留量随 Fable 已用额度减少，其他模型仍只多出自己的一半。
+    const spent = weeklyOnly(20, 100, 40)
+    expect(rank(spent, 0, 'opus')).toMatchObject({ remaining: 5 })
+    expect(rank(spent, 0, 'fable')).toMatchObject({ remaining: 3 })
+  })
+
+  test('the last two days release the reserve instead of losing the week', () => {
+    expect(rank(weeklyOnly(60, 100, 0), 0, 'opus')).toMatchObject({ state: 'exhausted',
+      reason: '周额度已为 Fable 预留' })
+    expect(rank(weeklyOnly(60, 48, 0), 0, 'opus')).toMatchObject({ state: 'ready', remaining: 4 })
+    expect(rank(weeklyOnly(60, 47.9, 0), 0, 'opus')).toMatchObject({ state: 'ready', remaining: 4 })
+  })
+
+  test('a missing Fable bucket never fabricates a reserve', () => {
+    expect(rank(weeklyOnly(60, 100), 0, 'opus')).toMatchObject({ state: 'ready', remaining: 4 })
+  })
+
+  test('an unusable Fable bucket blocks other models only while the reserve applies', () => {
+    const ambiguous = quota({ weeklyOnly: true, weekUsed: 40, weekHours: 100,
+      extra: [window('modelWeekly:Fable', 20, 100), window('modelWeekly:Fable 5', 20, 100)] })
+    expect(rank(ambiguous, 0, 'opus')).toMatchObject({ state: 'miss', reason: 'Fable 周额度归属 MISS' })
+    const late = quota({ weeklyOnly: true, weekUsed: 40, weekHours: 47,
+      extra: [window('modelWeekly:Fable', 20, 47), window('modelWeekly:Fable 5', 20, 47)] })
+    expect(rank(late, 0, 'opus')).toMatchObject({ state: 'ready', remaining: 6 })
+    const invalid = quota({ weeklyOnly: true, weekUsed: 40, weekHours: 100,
+      extra: [window('modelWeekly:Fable', null, 100)] })
+    expect(rank(invalid, 0, 'opus')).toMatchObject({ state: 'miss', reason: 'Fable 周额度 MISS' })
+  })
+
+  test('the five-hour window still constrains a reserved account', () => {
+    const snapshot = quota({ shortUsed: 90, weekUsed: 0, weekHours: 100,
+      extra: [window('modelWeekly:Fable', 0, 100)] })
+    expect(rank(snapshot, 0, 'opus')).toMatchObject({ state: 'ready', remaining: 0.1 })
   })
 })
 

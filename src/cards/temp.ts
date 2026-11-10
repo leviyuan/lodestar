@@ -256,7 +256,7 @@ export function selectionResultCard(opts: SelectionResultCardOpts): object {
  * trusted selection snapshot visible after the buttons are consumed, so the
  * user can verify which backend/history produced the current branch. */
 export function resumeSelectionResultCard(opts: ResumeSelectionResultCardOpts): object {
-  const provider = opts.provider === 'codex' ? 'Codex' : 'Claude'
+  const provider = agentProviderLabel(opts.provider)
   const stateLabel = opts.bindingState === 'changed'
     ? '已接入'
     : opts.bindingState === 'prepared'

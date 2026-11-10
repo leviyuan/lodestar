@@ -164,6 +164,27 @@ test('resumeSelectionResultCard:Codex 成功态原位展示所选历史和新分
   expect(text).not.toContain('/home/')
 })
 
+test('resumeSelectionResultCard:DSH 历史显示实际后端名', () => {
+  const card = resumeSelectionResultCard({
+    projectName: 'project',
+    provider: 'dsh',
+    selectedPreview: '继续 DSH 会话',
+    selectedTs: new Date(2026, 7, 22, 14, 12).getTime(),
+    sourceSessionId: 'dsh-source-session',
+    previousSessionId: null,
+    newSessionId: 'dsh-new-session',
+    bindingState: 'changed',
+    message: '已创建并接入独立分支',
+    ok: true,
+  }) as any
+  const text = JSON.stringify(card)
+
+  expect(card.header.title.content).toContain('rs 已接入 · project')
+  expect(text).toContain('所选历史 · DeepSeek Harness')
+  expect(text).not.toContain('所选历史 · Claude')
+  expect(text).not.toContain('所选历史 · Codex')
+})
+
 test('resumeSelectionResultCard:Claude 失败态保留所选快照、原因和原绑定', () => {
   const card = resumeSelectionResultCard({
     projectName: 'project',

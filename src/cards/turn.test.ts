@@ -200,7 +200,7 @@ describe('main conversation card rendering', () => {
     expect(md).toContain('https://res.mail.qq.com/x/test_pic_msg1.png')
   })
 
-  test('card-full continuation banner keeps Codex default and labels Claude only when requested', () => {
+  test('card-full continuation banner labels the actual backend', () => {
     const codexCard = mainConversationCard({
       sessionName: 'probe',
       turn: 2,
@@ -215,6 +215,15 @@ describe('main conversation card rendering', () => {
       kind: 'card_full',
     }) as any
     expect(claudeCard.body.elements[0].content).toContain('同一轮 Claude')
+
+    const dshCard = mainConversationCard({
+      sessionName: 'probe',
+      turn: 2,
+      provider: 'dsh',
+      kind: 'card_full',
+    }) as any
+    expect(dshCard.body.elements[0].content).toContain('同一轮 DeepSeek Harness')
+    expect(dshCard.body.elements[0].content).not.toContain('Codex')
   })
 
   test('status cards render one visible status line without a header', () => {
