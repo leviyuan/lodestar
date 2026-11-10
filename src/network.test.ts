@@ -218,3 +218,14 @@ test('Node DELETE preserves a streaming body of unknown length through HTTPS CON
   expect(origins[0]?.contentLength).toBeUndefined()
   expect(proxyRequests).toHaveLength(1)
 })
+
+test('Node sends a fixed-size JSON body with an exact content length instead of chunked framing', async () => {
+  const body = JSON.stringify({ name: '冒险天堂*effect', folder_token: '' })
+  const result = await run('node', { kind: 'network', url: 'https://network.invalid/create-folder', method: 'POST', body,
+    headers: { 'content-type': 'application/json; charset=utf-8' } }, { HTTPS_PROXY: proxyUrl })
+  expect(result.status).toBe(200)
+  expect(origins[0]?.body).toBe(body)
+  expect(origins[0]?.contentLength).toBe(String(Buffer.byteLength(body)))
+  expect(origins[0]?.transferEncoding).toBeUndefined()
+  expect(proxyRequests).toHaveLength(1)
+})

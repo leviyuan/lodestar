@@ -12,14 +12,17 @@ export interface FileDeliveryGroupsState {
 export interface GroupFileDeliveryDeps {
   read(): string | undefined
   write(value: FileDeliveryGroupsState): void
-  getChatName(context: Pick<FileDeliveryContext, 'chatId' | 'projectName'>, signal?: AbortSignal): Promise<string>
+  /** Chat that owns the cloud folder: the project's main group for WT and BTW/FK sessions. */
+  mainChatId(context: Pick<FileDeliveryContext, 'chatId' | 'projectName'>): string | null
+  getChatName(chatId: string, signal?: AbortSignal): Promise<string>
   createFolder(name: string, signal?: AbortSignal): Promise<DeliveryFolder>
   getFolder(folder: DeliveryFolder, signal?: AbortSignal): Promise<GroupDeliveryFolder>
   renameFolder(folder: DeliveryFolder, name: string, signal?: AbortSignal): Promise<GroupDeliveryFolder>
   grantFolderAccess(folder: DeliveryFolder, chatId: string, managerOpenId: string, signal?: AbortSignal): Promise<void>
 }
 
-/** Persistent remote folders and access remain per chat, independent of file routing. */
+/** One folder per project main group. WT and BTW/FK groups deliver into it, so a
+ * temporary group never creates a second folder named after its own chat. */
 export class GroupFileDelivery {
   private state?: FileDeliveryGroupsState
   private readonly locks = new Map<string, Promise<void>>()
@@ -31,45 +34,59 @@ export class GroupFileDelivery {
     return folder ? structuredClone(folder) : undefined
   }
 
-  /** The first oversized file creates its chat's folder; later deliveries reuse it. */
+  /** The first oversized file of a project creates its main group's folder. */
   resolveFolder(context: FileDeliveryContext, signal: AbortSignal): Promise<GroupDeliveryFolder> {
-    return this.exclusive(`chat:${context.chatId}`, () => this.prepare(context, true, signal))
+    let owner: string
+    try { owner = this.ownerChatId(context) } catch (error) { return Promise.reject(error) }
+    return this.exclusive(`chat:${owner}`, () => this.prepare(context, owner, true, signal))
   }
 
   /** Explicit adoption for known existing deliverables; never searches or merges folders by name. */
   bindExisting(chatId: string, managerOpenId: string, existing: DeliveryFolder, projectName = chatId): Promise<GroupDeliveryFolder> {
     return this.exclusive(`chat:${chatId}`, async () => {
-      const current = this.load().groups[chatId]
+      const owner = this.ownerChatId({ chatId, projectName })
+      if (owner !== chatId) throw new Error('临时群不单独绑定云空间文件夹')
+      const current = this.load().groups[owner]
       if (current?.folder && current.folder.token !== existing.token) throw new Error('本群已经绑定其他文件夹')
       const folder = await this.deps.getFolder(existing)
-      this.commitFolder(chatId, folder)
-      return this.prepare({ chatId, managerOpenId, projectName }, false)
+      this.commitFolder(owner, folder)
+      return this.prepare({ chatId, managerOpenId, projectName }, owner, false)
     })
+  }
+
+  private ownerChatId(context: Pick<FileDeliveryContext, 'chatId' | 'projectName'>): string {
+    const owner = this.deps.mainChatId(context)
+    if (typeof owner !== 'string' || !owner.trim()) throw new Error('无法找到主群，不能创建交付文件夹')
+    return owner
   }
 
   private async prepare(
     context: Pick<FileDeliveryContext, 'chatId' | 'managerOpenId' | 'projectName'>,
+    owner: string,
     create: boolean,
     signal?: AbortSignal,
   ): Promise<GroupDeliveryFolder> {
     signal?.throwIfAborted()
     const { chatId, managerOpenId } = context
     if (!chatId.trim() || !managerOpenId.trim()) throw new Error('无法确认交付群或管理权限接收人')
-    const name = await this.deps.getChatName(context, signal)
+    const name = await this.deps.getChatName(owner, signal)
     if (!name.trim()) throw new Error('群名称 MISS')
-    let folder = this.load().groups[chatId]?.folder
+    let folder = this.load().groups[owner]?.folder
     if (!folder) {
       if (!create) throw new Error('本群尚未绑定云空间文件夹')
       folder = { ...await this.deps.createFolder(name, signal), name }
       // Save the remote identity before granting access; a retry must reuse this exact folder.
-      this.commitFolder(chatId, folder)
+      this.commitFolder(owner, folder)
     }
     const remote = await this.deps.getFolder(folder, signal)
     if (remote.token !== folder.token) throw new Error('云空间返回的文件夹与本群绑定不一致')
     folder = remote.name === name ? remote : await this.deps.renameFolder(remote, name, signal)
     if (folder.name !== name) throw new Error('文件夹名称尚未与群名同步')
-    this.commitFolder(chatId, folder)
-    await this.deps.grantFolderAccess(folder, chatId, managerOpenId, signal)
+    this.commitFolder(owner, folder)
+    // The main group keeps access to its project folder; a temporary group that
+    // delivered here can view it too, without owning a folder of its own.
+    await this.deps.grantFolderAccess(folder, owner, managerOpenId, signal)
+    if (chatId !== owner) await this.deps.grantFolderAccess(folder, chatId, managerOpenId, signal)
     return folder
   }
 

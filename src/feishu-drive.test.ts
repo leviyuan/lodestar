@@ -285,6 +285,47 @@ describe('Feishu Drive delivery transport', () => {
     expect(body).toEqual({ name: 'BTW 项目群', folder_token: '' })
   })
 
+  test('retries a folder request whose body the gateway never received', async () => {
+    let attempts = 0
+    const client = new FeishuDriveClient(deps(async () => {
+      attempts++
+      if (attempts === 1) {
+        return Response.json({
+          code: 9499,
+          msg: 'Missing required parameter: name. Missing required parameter path: name, Please check and modify accordingly.',
+        }, { status: 400 })
+      }
+      return Response.json({ code: 0, data: { token: 'created', url: 'https://example.feishu.cn/drive/folder/created' } })
+    }))
+    expect(await client.createFolder('adventure_paradise')).toEqual({
+      token: 'created', url: 'https://example.feishu.cn/drive/folder/created',
+    })
+    expect(attempts).toBe(2)
+  })
+
+  test('does not retry other rejections of the folder request', async () => {
+    let attempts = 0
+    const client = new FeishuDriveClient(deps(async () => {
+      attempts++
+      return Response.json({ code: 99991672, msg: 'no permission' }, { status: 400 })
+    }))
+    await expect(client.createFolder('adventure_paradise')).rejects.toThrow('99991672')
+    expect(attempts).toBe(1)
+  })
+
+  test('gives up after three folder requests whose bodies never arrived', async () => {
+    let attempts = 0
+    const client = new FeishuDriveClient(deps(async () => {
+      attempts++
+      return Response.json({
+        code: 9499,
+        msg: 'Missing required parameter: name. Missing required parameter path: name, Please check and modify accordingly.',
+      }, { status: 400 })
+    }))
+    await expect(client.createFolder('adventure_paradise')).rejects.toThrow('9499')
+    expect(attempts).toBe(3)
+  })
+
   test('rejects an empty folder name before making a Drive request', async () => {
     let requests = 0
     const client = new FeishuDriveClient(deps(async () => {

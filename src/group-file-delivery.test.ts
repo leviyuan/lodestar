@@ -6,6 +6,7 @@ import type { FileDeliverySnapshot, GroupDeliveryFolder } from './file-delivery-
 function fixture() {
   let stored: string | undefined
   const names = new Map([['chat-a', '项目群'], ['chat-b', '项目群']])
+  const mains = new Map<string, string>()
   const remote = new Map<string, GroupDeliveryFolder>()
   const created: string[] = []
   const renamed: string[] = []
@@ -14,8 +15,9 @@ function fixture() {
   const deps: GroupFileDeliveryDeps = {
     read: () => stored,
     write: value => { stored = JSON.stringify(value) },
-    getChatName: async context => {
-      const name = names.get(context.chatId)
+    mainChatId: context => mains.get(context.chatId) ?? context.chatId,
+    getChatName: async chatId => {
+      const name = names.get(chatId)
       if (!name) throw new Error('群不存在')
       return name
     },
@@ -40,7 +42,7 @@ function fixture() {
     },
   }
   return {
-    registry: new GroupFileDelivery(deps), deps, names, remote, created, renamed, grants,
+    registry: new GroupFileDelivery(deps), deps, names, mains, remote, created, renamed, grants,
     restart: () => new GroupFileDelivery(deps),
     deny: (value: boolean) => { denyPermission = value },
     setStored: (value: string) => { stored = value },
@@ -66,37 +68,43 @@ describe('automatic file delivery per-group folders', () => {
     expect(f.stored()).toEqual({ version: 3, groups: { 'chat-a': { folder: first } } })
   })
 
-  test('temporary groups get separate folders and grant each delivery initiator access', async () => {
+  test('temporary groups deliver into the main group folder and never own one', async () => {
     const f = fixture()
-    f.names.set('chat-temp', '项目*0917-1234')
+    f.mains.set('chat-temp', 'chat-a')
     const main = await f.registry.resolveFolder(context, signal())
-    const first = await f.registry.resolveFolder({ ...context, chatId: 'chat-temp', managerOpenId: 'second-user' }, signal())
-    expect(first.token).not.toBe(main.token)
-    expect(first.name).toBe('项目*0917-1234')
-    const second = await f.registry.resolveFolder({ ...context, chatId: 'chat-temp', managerOpenId: 'third-user' }, signal())
-    expect(second.token).toBe(first.token)
+    const reused = await f.registry.resolveFolder({ ...context, chatId: 'chat-temp', managerOpenId: 'second-user' }, signal())
+    expect(reused.token).toBe(main.token)
+    expect(reused.name).toBe('项目群')
+    expect(f.created).toEqual(['项目群'])
+    expect(f.registry.get('chat-temp')).toBeUndefined()
     expect(f.grants.map(grant => [grant.chatId, grant.managerOpenId])).toEqual([
-      ['chat-a', 'user'], ['chat-temp', 'second-user'], ['chat-temp', 'third-user'],
+      ['chat-a', 'user'], ['chat-a', 'second-user'], ['chat-temp', 'second-user'],
     ])
-    expect(f.created).toHaveLength(2)
   })
 
-  test('uses the main group name for BTW and WT delivery contexts', async () => {
+  test('temporary deliveries without a resolvable main group fail instead of creating their own folder', async () => {
     const f = fixture()
-    const requested: string[] = []
-    f.deps.getChatName = async context => {
-      requested.push(context.projectName)
-      return '主群名称'
-    }
+    f.deps.mainChatId = () => null
+    await expect(f.registry.resolveFolder({ ...context, chatId: 'chat-temp' }, signal()))
+      .rejects.toThrow('无法找到主群')
+    expect(f.created).toEqual([])
+    expect(f.grants).toEqual([])
+  })
+
+  test('resolves the folder name from the main group of BTW and WT sessions', async () => {
+    const f = fixture()
+    f.mains.set('chat-btw', 'chat-a').set('chat-wt', 'chat-b')
+    f.names.set('chat-b', '主群名称')
     const btw = await f.registry.resolveFolder({
       ...context, chatId: 'chat-btw', projectName: '项目群*1029-1828',
     }, signal())
     const wt = await f.registry.resolveFolder({
       ...context, chatId: 'chat-wt', projectName: '项目群[feature]',
     }, signal())
-    expect(requested).toEqual(['项目群*1029-1828', '项目群[feature]'])
-    expect(btw.name).toBe('主群名称')
+    expect(btw.token).toBe(f.registry.get('chat-a')!.token)
     expect(wt.name).toBe('主群名称')
+    expect(wt.token).toBe(f.registry.get('chat-b')!.token)
+    expect(f.created).toEqual(['项目群', '主群名称'])
   })
 
   for (const version of [1, 2]) {
@@ -155,6 +163,18 @@ describe('automatic file delivery per-group folders', () => {
     expect(a.name).toBe('项目群')
     expect(b.name).toBe('项目群')
     expect(f.created).toHaveLength(2)
+  })
+
+  test('concurrent deliveries from two temporary groups create one main group folder', async () => {
+    const f = fixture()
+    f.mains.set('chat-temp-1', 'chat-a').set('chat-temp-2', 'chat-a')
+    const [a, b] = await Promise.all([
+      f.registry.resolveFolder({ ...context, chatId: 'chat-temp-1' }, signal()),
+      f.registry.resolveFolder({ ...context, chatId: 'chat-temp-2' }, signal()),
+    ])
+    expect(a.token).toBe(b.token)
+    expect(f.created).toEqual(['项目群'])
+    expect(f.stored()).toEqual({ version: 3, groups: { 'chat-a': { folder: a } } })
   })
 
   test('all turns share the group directory while each receipt lists only that turn’s files', async () => {

@@ -16,6 +16,17 @@ function requestAgent(url: URL, proxy?: string): HttpAgent {
   return url.protocol === 'https:' ? new HttpsProxyAgent(proxy) : new HttpProxyAgent(proxy)
 }
 
+/** Fixed-size payloads are sent with an exact Content-Length: chunked request bodies
+ * are what intermediaries most often truncate, and a truncated body reaches the API
+ * as an unparsable request rather than as a rejected value. */
+export function framingHeader(body: BodyInit | null | undefined): Record<string, string> {
+  const size = typeof body === 'string' ? Buffer.byteLength(body)
+    : body instanceof Uint8Array ? body.byteLength
+      : typeof Blob !== 'undefined' && body instanceof Blob ? body.size
+        : undefined
+  return size === undefined ? { 'transfer-encoding': 'chunked' } : { 'content-length': String(size) }
+}
+
 async function transport(url: URL, init: RequestInit, proxy?: string): Promise<Response> {
   if (typeof Bun !== 'undefined') {
     const key = url.protocol === 'https:' ? 'HTTPS_PROXY' : 'HTTP_PROXY'
@@ -33,11 +44,13 @@ async function transport(url: URL, init: RequestInit, proxy?: string): Promise<R
   // Node's native fetch only reads proxy env on newer, opt-in runtimes. Serialize native
   // FormData/Blob with Request, then use node-fetch's explicit agent on every supported Node.
   const request = new Request(url, { ...init, redirect: 'manual', duplex: 'half' } as RequestInit)
-  // Request exposes even fixed-size payloads as streams, so node-fetch cannot
-  // infer Content-Length. Node does not frame DELETE streams automatically;
-  // explicitly frame unknown-length bodies so the server receives their bytes.
+  // Request exposes even fixed-size payloads as streams, so node-fetch cannot infer
+  // Content-Length, and Node does not frame DELETE streams automatically. Declare the
+  // exact length when it is known: chunked request bodies are what intermediaries are
+  // most likely to truncate, and a truncated body reaches the API as "missing parameter".
+  // Only streamed multipart bodies fall back to chunked framing.
   if (request.body && !request.headers.has('content-length') && !request.headers.has('transfer-encoding')) {
-    request.headers.set('transfer-encoding', 'chunked')
+    for (const [name, value] of Object.entries(framingHeader(init.body))) request.headers.set(name, value)
   }
   const response = await nodeFetch(url, {
     method: request.method,

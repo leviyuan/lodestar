@@ -11,6 +11,7 @@ describe('temporary-session name suffixes', () => {
     expect(stripTempSuffix('project*修复登录-2')).toBe('project')
     expect(stripTempSuffix('project[feature]*修复登录')).toBe('project[feature]')
     expect(stripTempSuffix('project[feature]*0821-1337')).toBe('project[feature]')
+    expect(stripTempSuffix('project*a*b')).toBe('project')
     expect(stripTempSuffix('project*')).toBe('project*')
   })
 

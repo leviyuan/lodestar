@@ -10,13 +10,15 @@
 /** 飞书群名/会话名的统一上限，和 `sanitizeSessionName` 的截断保持一致。 */
 export const SESSION_NAME_MAX = 64
 const TEMP_SUFFIX_RE = /\*[^*]+$/
+/** A renamed or nested temporary group can carry more than one `*` suffix. */
+const REPEATED_TEMP_SUFFIX_RE = /(\*[^*]+)+$/
 const WORKTREE_SUFFIX_RE = /^(.+)\[[^\[\]]+\]$/
 /** Keeps `project*role` within the 64-character session-name cap for normal project names. */
 const TEMP_ROLE_MAX = 32
 
 /** Remove a `*<suffix>` temporary-session suffix when one is present. */
 export function stripTempSuffix(name: string): string {
-  return name.replace(TEMP_SUFFIX_RE, '')
+  return name.replace(REPEATED_TEMP_SUFFIX_RE, '')
 }
 
 /** Return the project name without its `*<suffix>`, or null for a non-temp session. */

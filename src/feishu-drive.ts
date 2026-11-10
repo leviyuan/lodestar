@@ -2,12 +2,15 @@ import { open } from 'node:fs/promises'
 import { basename } from 'node:path'
 import { networkFetch } from './network'
 import { getTenantToken } from './feishu'
+import { logDiagnostic } from './log'
 import { FeishuRequestError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
 import type { DeliveredFile, DeliveryFolder, GroupDeliveryFolder } from './file-delivery-types'
 
 const DRIVE_SINGLE_UPLOAD_BYTES = 20 * 1024 * 1024
 const MAX_CHUNK_BYTES = 20 * 1024 * 1024
 const REQUEST_TIMEOUT_MS = 60_000
+/** A folder is created once per project; a lost request body must not end the delivery. */
+const CREATE_FOLDER_ATTEMPTS = 3
 
 export function requireDriveUrl(value: unknown): string {
   if (typeof value !== 'string' || !value.trim()) throw new Error('云空间链接 MISS')
@@ -19,6 +22,13 @@ export function requireDriveUrl(value: unknown): string {
 function requiredString(value: unknown, label: string): string {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} MISS`)
   return value
+}
+
+/** The Drive gateway answers 9499 when it cannot parse the request body at all — an
+ * empty body reads as "Missing required parameter: name", a truncated body as "Bad
+ * Request". Both mean the bytes never arrived, not that a value was rejected. */
+function isRejectedUnparsedBody(error: unknown): boolean {
+  return error instanceof FeishuRequestError && String(error.code) === '9499'
 }
 
 export interface FeishuDriveDeps {
@@ -83,7 +93,21 @@ export class FeishuDriveClient {
 
   async createFolder(name: string, signal?: AbortSignal): Promise<DeliveryFolder> {
     const folderName = requiredString(name, '交付文件夹名称')
-    const result = await this.request('创建交付文件夹', '/drive/v1/files/create_folder', 'POST', () => ({ name: folderName, folder_token: '' }), signal)
+    const create = () => this.request('创建交付文件夹', '/drive/v1/files/create_folder', 'POST', () => ({ name: folderName, folder_token: '' }), signal)
+    let result: any
+    for (let attempt = 0; ; attempt++) {
+      try {
+        result = await create()
+        break
+      } catch (error) {
+        if (!isRejectedUnparsedBody(error) || attempt >= CREATE_FOLDER_ATTEMPTS - 1) throw error
+        // The gateway rejects such a request before anything is created, so resending
+        // the same body cannot produce a second folder for this delivery.
+        logDiagnostic('feishu folder request retried', { code: 9499 })
+        await this.deps.wait(attempt === 0 ? 1000 : 2000)
+        signal?.throwIfAborted()
+      }
+    }
     return { token: requiredString(result?.token, '交付文件夹'), url: requireDriveUrl(result?.url) }
   }
 
