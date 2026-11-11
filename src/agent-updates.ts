@@ -2,9 +2,11 @@ import { networkFetch } from './network'
 /** Explicit/opt-in Agent updates follow latest independently of Lodestar releases. */
 import { createHash, randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { existsSync, readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { join, isAbsolute } from 'node:path'
+import { promisify } from 'node:util'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { AGENT_RUNTIMES_DIR } from './paths'
 import { AgentInstallTerminationError, installAgentPackages } from './agent-install'
@@ -41,7 +43,14 @@ export interface AgentUpdateOptions {
   /** Injectable registry and installer for isolated, offline lifecycle tests. */
   metadata?: (name: string, version: string) => Promise<Manifest>
   install?: (directory: string, signal?: AbortSignal) => Promise<void>
+  /** Process table used to keep installations a live Agent still runs from. */
+  runningCommands?: () => Promise<string[] | null>
 }
+
+/** Older installs are disposable; the selected one and running ones are not. */
+const RUNTIME_KEEP = 3
+const RUNTIME_FINGERPRINT = /^[0-9a-f]{20}$/
+const execFileAsync = promisify(execFile)
 
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error)
 
@@ -158,12 +167,86 @@ async function writeState(agentDirectory: string, state: AgentRuntimeState): Pro
   }
 }
 
-async function validateInstalledPackages(directory: string, versions: Record<string, string>): Promise<void> {
+/** npm exits 0 when an optional platform package cannot be extracted (for
+ * example ENOSPC). The SDK only reports the missing CLI when a session starts,
+ * so a runtime without it must never be selected. */
+async function validateClaudeNativeBinary(directory: string): Promise<void> {
+  const sdk = join(directory, 'node_modules', '@anthropic-ai', 'claude-agent-sdk')
+  const installed = JSON.parse(await readFile(join(sdk, 'package.json'), 'utf8')) as Manifest
+  const suffix = `-${process.platform}-${process.arch}`
+  const candidates = Object.keys(installed.optionalDependencies ?? {})
+    .filter(name => name.endsWith(suffix) || (process.platform === 'linux' && name.endsWith(`${suffix}-musl`)))
+  // Packaging without a declared platform package needs no extra check.
+  if (candidates.length === 0) return
+  const binary = process.platform === 'win32' ? 'claude.exe' : 'claude'
+  if (candidates.some(name => existsSync(join(directory, 'node_modules', name, binary)))) return
+  throw new Error(`Invalid Agent runtime at ${directory}: @anthropic-ai/claude-agent-sdk@${installed.version} is missing its ${process.platform}-${process.arch} native CLI binary; reinstall with optional dependencies`)
+}
+
+async function validateInstalledPackages(agent: UpdatedAgent, directory: string, versions: Record<string, string>): Promise<void> {
   for (const [name, version] of Object.entries(versions)) {
     const installed = JSON.parse(await readFile(join(directory, 'node_modules', name, 'package.json'), 'utf8'))
     if (installed.name !== name || installed.version !== version) {
       throw new Error(`Invalid Agent runtime at ${directory}: expected ${name}@${version}, found ${installed.name}@${installed.version}`)
     }
+  }
+  if (agent === 'claude') await validateClaudeNativeBinary(directory)
+}
+
+/** Windows has no portable process table here; guessing could delete a directory
+ * a running Agent still uses, so pruning is skipped instead. */
+async function runningCommandLines(): Promise<string[] | null> {
+  if (process.platform === 'win32') return null
+  try {
+    const { stdout } = await execFileAsync('ps', ['-ww', '-a', '-x', '-o', 'command='], { timeout: 10_000, maxBuffer: 16 * 1024 * 1024 })
+    return stdout.split('\n')
+  } catch {
+    return null
+  }
+}
+
+function processUsesDirectory(commands: string[], directory: string): boolean {
+  const paths = new Set([directory])
+  try { paths.add(realpathSync(directory)) } catch {}
+  return commands.some(command => [...paths].some(path => command.includes(`${path}/`) || command.endsWith(path)))
+}
+
+/** Keep the selected install and the newest releases. A directory any live
+ * process still runs from is preserved: an update never breaks a running Agent.
+ * Cleanup is best-effort and must not turn a successful update into a failure. */
+async function pruneAgentRuntimes(agent: UpdatedAgent, directory: string, selected: string, options: AgentUpdateOptions): Promise<void> {
+  const report = (message: string) => { try { options.report?.(message) } catch {} }
+  try {
+    const versions: Array<{ path: string; mtimeMs: number }> = []
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !RUNTIME_FINGERPRINT.test(entry.name)) continue
+      const path = join(directory, entry.name)
+      try { versions.push({ path, mtimeMs: (await stat(path)).mtimeMs }) } catch {}
+    }
+    const keep = new Set([selected, ...versions.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, RUNTIME_KEEP).map(version => version.path)])
+    const expired = versions.filter(version => !keep.has(version.path))
+    if (expired.length === 0) return
+    let commands: string[] | null
+    try { commands = await (options.runningCommands ?? runningCommandLines)() } catch { commands = null }
+    if (!commands) {
+      report(`${agent}: 旧运行时清理跳过（无法确认占用）`)
+      return
+    }
+    let removed = 0
+    let failed = false
+    for (const version of expired) {
+      if (options.signal?.aborted) return
+      if (processUsesDirectory(commands, version.path)) continue
+      try {
+        await retryAgentFileOperation(() => rm(version.path, { recursive: true, force: true }))
+        removed++
+      } catch { failed = true }
+    }
+    if (removed > 0) report(`${agent}: 已清理 ${removed} 个旧运行时`)
+    if (failed) report(`${agent}: 旧运行时清理未完成，保留原目录`)
+  } catch {
+    // Cleanup runs after the update is committed; report it without failing the update.
+    report(`${agent}: 旧运行时清理未完成，保留原目录`)
   }
 }
 
@@ -235,7 +318,7 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
         dependencies: Object.fromEntries(PACKAGES[agent].map(name => [name, versions[name]])),
         overrides: { ...security, ...(agent === 'dsh' ? versions : {}) } }) + '\n', { mode: 0o600 })
       await (options.install ?? installAgentPackages)(staging, options.signal)
-      await validateInstalledPackages(staging, versions)
+      await validateInstalledPackages(agent, staging, versions)
       options.signal?.throwIfAborted()
       const completedInstall = staging
       await retryAgentFileOperation(() => rename(completedInstall, destination))
@@ -243,12 +326,13 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
     } else {
       // An existing fingerprint is not proof that its installation is intact.
       // Never activate a damaged directory or overwrite files a process may use.
-      await validateInstalledPackages(destination, versions)
+      await validateInstalledPackages(agent, destination, versions)
     }
     const state = { directory: destination, versions, checkedAt: Date.now() }
     const unchanged = previous?.directory === destination
     await writeState(directory, state)
     options.report?.(`${agent}: ${PACKAGES[agent][0]}@${versions[PACKAGES[agent][0]]}${unchanged ? ' 已是 latest' : ' 已更新，新进程使用新版'}`)
+    await pruneAgentRuntimes(agent, directory, destination, options)
     return state
   } catch (error) {
     // Failed updates leave the selected installation untouched. The updater

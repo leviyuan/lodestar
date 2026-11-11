@@ -324,6 +324,82 @@ test.each(['missing', 'version', 'name'])('a cached runtime with a %s package ca
   expect(existsSync(join(root, 'codex/update.lock'))).toBe(false)
 })
 
+test('a cached claude runtime without its native CLI binary cannot replace the current installation', async () => {
+  const root = await scratch()
+  const native = `@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}`
+  const binary = process.platform === 'win32' ? 'claude.exe' : 'claude'
+  const installWithNative = async (directory: string) => {
+    await install(directory)
+    await writeFile(join(directory, 'node_modules/@anthropic-ai/claude-agent-sdk/package.json'),
+      JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', version: '1.0.0', optionalDependencies: { [native]: '1.0.0' } }))
+    await mkdir(join(directory, 'node_modules', native), { recursive: true })
+    await writeFile(join(directory, 'node_modules', native, binary), '')
+  }
+  const options = { root, install: installWithNative, metadata: async (name: string) => ({ name, version: '1.0.0' }) }
+  const current = await updateAgentRuntime('claude', options)
+  expect(existsSync(join(current.directory!, 'node_modules', native, binary))).toBe(true)
+  // npm exits 0 when an optional platform package cannot be extracted (for example ENOSPC).
+  await rm(join(current.directory!, 'node_modules', native), { recursive: true })
+  const reports: string[] = []
+  await expect(updateAgentRuntime('claude', { ...options, report: message => reports.push(message) })).rejects.toThrow('native CLI binary')
+  expect(JSON.parse(await readFile(join(root, 'claude/current.json'), 'utf8'))).toEqual(current)
+  expect(reports.some(message => message.includes('已是 latest'))).toBe(false)
+  expect(existsSync(join(root, 'claude/update.lock'))).toBe(false)
+})
+
+test('successful updates keep only the newest three runtimes', async () => {
+  const root = await scratch()
+  let version = '1.0.0'
+  const options = { root, install, metadata: async (name: string) => ({ name, version }), runningCommands: async () => [] }
+  const states = []
+  for (let i = 0; i < 5; i++) {
+    states.push(await updateAgentRuntime('codex', options))
+    version = `1.0.${i + 2}`
+    await Bun.sleep(5)
+  }
+  const names = (await readdir(join(root, 'codex'))).filter(name => /^[0-9a-f]{20}$/.test(name))
+  expect(names.length).toBe(3)
+  expect(existsSync(states[0].directory!)).toBe(false)
+  expect(existsSync(states[1].directory!)).toBe(false)
+  for (const state of states.slice(2)) expect(existsSync(state.directory!)).toBe(true)
+  expect(JSON.parse(await readFile(join(root, 'codex/current.json'), 'utf8'))).toEqual(states[4])
+})
+
+test('pruning keeps a runtime a live process still runs from', async () => {
+  const root = await scratch()
+  let version = '1.0.0'
+  let running = ''
+  const options = { root, install, metadata: async (name: string) => ({ name, version }),
+    runningCommands: async () => [`codex ${running}/node_modules/.bin/codex`] }
+  const states = []
+  for (let i = 0; i < 5; i++) {
+    const state = await updateAgentRuntime('codex', options)
+    states.push(state)
+    if (i === 0) running = state.directory!
+    version = `1.0.${i + 2}`
+    await Bun.sleep(5)
+  }
+  expect(existsSync(states[0].directory!)).toBe(true)
+  expect(existsSync(states[1].directory!)).toBe(false)
+  const names = (await readdir(join(root, 'codex'))).filter(name => /^[0-9a-f]{20}$/.test(name))
+  expect(names.length).toBe(4)
+})
+
+test('pruning leaves old runtimes alone when the process table is unavailable', async () => {
+  const root = await scratch()
+  let version = '1.0.0'
+  const options = { root, install, metadata: async (name: string) => ({ name, version }), runningCommands: async () => null }
+  const reports: string[] = []
+  for (let i = 0; i < 5; i++) {
+    await updateAgentRuntime('codex', { ...options, report: message => reports.push(message) })
+    version = `1.0.${i + 2}`
+    await Bun.sleep(5)
+  }
+  const names = (await readdir(join(root, 'codex'))).filter(name => /^[0-9a-f]{20}$/.test(name))
+  expect(names.length).toBe(5)
+  expect(reports.some(message => message.includes('旧运行时清理跳过'))).toBe(true)
+})
+
 test.each(['checking', 'completed'])('a %s report failure preserves the last committed installation', async phase => {
   const root = await scratch()
   let version = '1.0.0'
