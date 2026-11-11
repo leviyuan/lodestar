@@ -474,24 +474,43 @@ export async function showResumeList(s: Session, userOpenId: string): Promise<vo
 // 交互提示统一用 `cards.tempSessionNoticeCard`：状态一眼可见，创建、加入、
 // 退出和解散共用同一版式；卡片发送失败时回退到原文并附带飞书诊断。
 
-/** 卡片发送失败必须回退原文并保留飞书诊断，不能静默丢掉回执。 */
+/** 卡片发送失败必须回退原文并保留飞书诊断，不能静默丢掉回执。
+ * 传入既有回执消息时用 message.patch 原地更新，同一次 btw/bye 只留一张卡。 */
 async function sendTempNotice(
   s: Session,
   opts: cards.TempSessionNoticeCardOpts,
   fallback: string,
-): Promise<void> {
+  messageId?: string | null,
+): Promise<string | null> {
+  const card = cards.tempSessionNoticeCard(opts)
+  if (messageId) {
+    try {
+      await feishu.updateCard(messageId, card)
+      return messageId
+    } catch (error) {
+      // 原地更新失败不再补发第二张卡：最终状态和诊断以原文回执发出。
+      await feishu.sendTextRaw(s.chatId, `${fallback}\n${formatFeishuError(error)}`)
+      return null
+    }
+  }
   let failure: unknown
-  let messageId: string | null = null
+  let sentId: string | null = null
   try {
-    messageId = await feishu.sendCard(s.chatId, cards.tempSessionNoticeCard(opts), error => { failure = error })
+    sentId = await feishu.sendCard(s.chatId, card, error => { failure = error })
   } catch (error) {
     failure = error
   }
-  if (!messageId) await feishu.sendTextRaw(s.chatId, `${fallback}\n${formatFeishuError(failure)}`)
+  if (!sentId) await feishu.sendTextRaw(s.chatId, `${fallback}\n${formatFeishuError(failure)}`)
+  return sentId
 }
 
-function tempNoticeFailure(s: Session, chatName: string, message: string): Promise<void> {
-  return sendTempNotice(s, { chatName, state: 'error', body: message }, `❌ ${message}`)
+function tempNoticeFailure(
+  s: Session,
+  chatName: string,
+  message: string,
+  messageId?: string | null,
+): Promise<string | null> {
+  return sendTempNotice(s, { chatName, state: 'error', body: message }, `❌ ${message}`, messageId)
 }
 
 export async function runBtwCommand(s: Session, userOpenId: string, role = ''): Promise<void> {
@@ -517,7 +536,8 @@ export async function runBtwCommand(s: Session, userOpenId: string, role = ''): 
     await tempNoticeFailure(s, chatName, `群名太长（${chatName.length} > ${feishu.SESSION_NAME_MAX}），请换一个更短的备注。`)
     return
   }
-  await sendTempNotice(
+  // 「创建中」和后续结果共用同一张卡：拿到 message id 后原地更新，不追加第二张。
+  const noticeId = await sendTempNotice(
     s,
     { chatName, state: 'creating', backendLabel: s.backendLabel() },
     reuse ? `🚀 正在创建或加入 ${chatName} · ${s.backendLabel()}` : `🚀 正在创建 ${chatName} · ${s.backendLabel()}`,
@@ -538,7 +558,7 @@ export async function runBtwCommand(s: Session, userOpenId: string, role = ''): 
     if (!reuse) releaseTempChatName(chatName)
   }
   if (!result.ok) {
-    await tempNoticeFailure(s, chatName, `建临时会话失败: ${result.error ?? '未知'}`)
+    await tempNoticeFailure(s, chatName, `建临时会话失败: ${result.error ?? '未知'}`, noticeId)
     return
   }
   await sendTempNotice(
@@ -549,6 +569,7 @@ export async function runBtwCommand(s: Session, userOpenId: string, role = ''): 
       backendLabel: s.backendLabel(),
     },
     result.join ? `✅ 已加入 ${chatName}` : `✅ 已创建 ${chatName}`,
+    noticeId,
   )
 }
 
@@ -610,33 +631,42 @@ export async function runByeCommand(s: Session, userOpenId = ''): Promise<void> 
   if (!userOpenId) { await tempNoticeFailure(s, s.sessionName, '找不到发起人，无法退出临时群。'); return }
 
   // bye 不看创建者：谁发谁退出；群里的最后一个人退出时连同会话一起解散。
+  // 退出和解散共用同一张卡，拿到 message id 后原地更新。
+  let noticeId: string | null = null
   const disband = async (): Promise<void> => {
-    await sendTempNotice(s, { chatName: s.sessionName, state: 'disbanding' }, `👋 正在停止会话并解散 ${s.sessionName}`)
+    noticeId = await sendTempNotice(
+      s,
+      { chatName: s.sessionName, state: 'disbanding' },
+      `👋 正在停止会话并解散 ${s.sessionName}`,
+      noticeId,
+    )
     const result = await s.opts.onDisbandTempSession!(s.sessionName, s.chatId)
-    if (!result.ok) await tempNoticeFailure(s, s.sessionName, `解散失败: ${result.error ?? '未知'}`)
+    if (!result.ok) {
+      await tempNoticeFailure(s, s.sessionName, `解散失败: ${result.error ?? '未知'}`, noticeId)
+    }
   }
 
   let others: string[]
   try {
     others = (await feishu.chatMemberOpenIds(s.chatId)).filter(id => id !== userOpenId)
   } catch (error) {
-    await tempNoticeFailure(s, s.sessionName, `读取群成员失败: ${messageOf(error)}；未执行退出或解散。`)
+    await tempNoticeFailure(s, s.sessionName, `读取群成员失败: ${messageOf(error)}；未执行退出或解散。`, noticeId)
     return
   }
   if (others.length === 0) { await disband(); return }
 
-  await sendTempNotice(s, { chatName: s.sessionName, state: 'leaving' }, `🚪 正在退出 ${s.sessionName}`)
+  noticeId = await sendTempNotice(s, { chatName: s.sessionName, state: 'leaving' }, `🚪 正在退出 ${s.sessionName}`)
   try {
     await feishu.leaveChatForMember(s.chatId, userOpenId)
   } catch (error) {
-    await tempNoticeFailure(s, s.sessionName, `退出失败: ${messageOf(error)}；可以在飞书群设置里手动退出。`)
+    await tempNoticeFailure(s, s.sessionName, `退出失败: ${messageOf(error)}；可以在飞书群设置里手动退出。`, noticeId)
     return
   }
   // 两个人同时退出时可能都看到还有人：退出后再数一次，最后一个走的负责解散。
   try {
     if ((await feishu.chatMemberOpenIds(s.chatId)).length > 0) return
   } catch (error) {
-    await tempNoticeFailure(s, s.sessionName, `已退出，但无法确认是否还有成员: ${messageOf(error)}；群未解散。`)
+    await tempNoticeFailure(s, s.sessionName, `已退出，但无法确认是否还有成员: ${messageOf(error)}；群未解散。`, noticeId)
     return
   }
   await disband()

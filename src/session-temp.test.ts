@@ -21,6 +21,7 @@ import {
   setLeaveChatError,
   tempSessionLeases,
   turnAnchorsBySession,
+  updatedCards,
 } from './feishu-test-mock'
 import * as feishu from './feishu'
 
@@ -152,6 +153,11 @@ function cardJson(card: unknown): string {
   return JSON.stringify(card ?? {})
 }
 
+/** btw/bye 的终态回执：发出后被原位更新的卡片优先，否则取最后发送的卡片。 */
+function finalCard(): any {
+  return updatedCards.length ? updatedCards.at(-1)![1] : sentCards.at(-1)
+}
+
 function pickerValue(card: any, preview: string): {
   panelId: string
   choiceId: string
@@ -231,10 +237,13 @@ describe('session-temp Codex btw/fork', () => {
       branchBase: { kind: 'fresh' },
       seedAnchors: [],
     }])
-    // 创建过程先给「正在创建」卡，成功后换成「已就绪」卡，都是 Codex 会话。
-    expect(cardJson(sentCards[0])).toContain('正在创建或加入')
-    expect(cardJson(sentCards.at(-1))).toContain('临时群已就绪')
-    expect(cardJson(sentCards.at(-1))).toContain('Codex')
+    // 创建和就绪共用同一张卡：只发一张，成功后就地更新成终态。
+    expect(sentCards).toHaveLength(1)
+    expect(cardJson(sentCards[0])).toContain('创建中…')
+    expect(updatedCards).toHaveLength(1)
+    expect(updatedCards[0]![0]).toMatch(/^om_status_/)
+    expect(cardJson(updatedCards[0]![1])).toContain('临时群已就绪')
+    expect(cardJson(updatedCards[0]![1])).toContain('Codex')
   })
 
   test('btw 备注代替时间后缀', async () => {
@@ -245,7 +254,7 @@ describe('session-temp Codex btw/fork', () => {
     expect(h.createCalls[0].chatName).toBe('project*修复_登录')
     expect(h.createCalls[0].groupMode).toBe('reuse')
     expect(cardJson(sentCards[0])).toContain('project*修复_登录')
-    expect(cardJson(sentCards.at(-1))).toContain('project*修复_登录')
+    expect(cardJson(finalCard())).toContain('project*修复_登录')
   })
 
   test('同备注的第二个成员复用同一个群名，不再追加 -2', async () => {
@@ -270,11 +279,12 @@ describe('session-temp Codex btw/fork', () => {
 
     await runBtwCommand(h.session, 'ou_guest', '修复登录')
 
-    const last = sentCards.at(-1) as any
+    const last = finalCard()
     expect(last.header.template).toBe('turquoise')
-    expect(cardJson(last)).toContain('已加入这个临时群')
-    expect(cardJson(last)).toContain('没有新建或重启会话')
-    expect(sentCards.some(card => cardJson(card).includes('临时群已就绪'))).toBe(false)
+    expect(cardJson(last)).toContain('**已加入**')
+    expect(cardJson(last)).toContain('沿用群内会话')
+    const shown = [...sentCards, ...updatedCards.map(([, card]) => card)].map(cardJson)
+    expect(shown.some(text => text.includes('临时群已就绪'))).toBe(false)
   })
 
   test('本来就在群里时回执「已在群内」，不谎报刚被拉进来', async () => {
@@ -286,10 +296,10 @@ describe('session-temp Codex btw/fork', () => {
 
     await runBtwCommand(h.session, 'ou_owner', '修复登录')
 
-    const last = sentCards.at(-1) as any
+    const last = finalCard()
     expect(last.header.template).toBe('blue')
-    expect(cardJson(last)).toContain('你已经在这个临时群里')
-    expect(cardJson(last)).not.toContain('已加入这个临时群')
+    expect(cardJson(last)).toContain('**已在群内**')
+    expect(cardJson(last)).not.toContain('**已加入**')
   })
 
   test('WT 里发 btw 备注落在该 worktree，群名带分支', async () => {
@@ -324,8 +334,8 @@ describe('session-temp Codex btw/fork', () => {
 
     expect(h.disbandCalls).toHaveLength(0)
     expect(leftChats).toEqual([['oc_project*修复登录', 'ou_guest']])
-    expect(cardJson(sentCards.at(-1))).toContain('正在退出这个临时群')
-    expect(cardJson(sentCards.at(-1))).toContain('仍由创建者管理')
+    expect(cardJson(finalCard())).toContain('**正在退出**')
+    expect(cardJson(finalCard())).toContain('群和会话保留')
   })
 
   test('最后一个人 bye 时停止会话并解散，不看是谁创建的', async () => {
@@ -336,7 +346,7 @@ describe('session-temp Codex btw/fork', () => {
 
     expect(leftChats).toHaveLength(0)
     expect(h.disbandCalls).toEqual([['project*修复登录', 'oc_project*修复登录']])
-    expect(cardJson(sentCards.at(-1))).toContain('正在停止会话并解散')
+    expect(cardJson(finalCard())).toContain('**正在解散**')
   })
 
   test('并发退群：退出后复查发现已空，最后一个走的负责解散', async () => {
@@ -374,7 +384,7 @@ describe('session-temp Codex btw/fork', () => {
     await runByeCommand(h.session, 'ou_guest')
 
     expect(h.disbandCalls).toHaveLength(0)
-    const last = sentCards.at(-1) as any
+    const last = finalCard()
     expect(last.header.template).toBe('red')
     expect(cardJson(last)).toContain('退出失败')
     expect(cardJson(last)).toContain('232008')

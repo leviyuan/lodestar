@@ -363,59 +363,29 @@ interface TempSessionNoticeCopy {
   emoji: string
   status: string
   template: string
-  detail: string
+  /** 一行以内的补充说明；群名已由标题承载，正文不重复。 */
+  hint: string
 }
 
 const TEMP_SESSION_NOTICE_COPY: Record<TempSessionNoticeState, TempSessionNoticeCopy> = {
-  creating: {
-    emoji: '🚀',
-    status: '正在创建或加入',
-    template: 'blue',
-    detail: '同备注的成员会进入同一个群；它与当前群共享工作目录，当前会话不受影响。',
-  },
-  created: {
-    emoji: '✅',
-    status: '临时群已就绪',
-    template: 'green',
-    detail: '其他成员发送同样的备注会被拉进这个群；创建者发送 bye 可停止并解散。',
-  },
-  joined: {
-    emoji: '👥',
-    status: '已加入这个临时群',
-    template: 'turquoise',
-    detail: '沿用群内既有的会话与模型/账号设置，本次没有新建或重启会话。',
-  },
-  present: {
-    emoji: '👤',
-    status: '你已经在这个临时群里',
-    template: 'blue',
-    detail: '沿用群内既有的会话与模型/账号设置，本次没有新建或重启会话。',
-  },
-  disbanding: {
-    emoji: '👋',
-    status: '正在停止会话并解散',
-    template: 'orange',
-    detail: '解散由创建者发起，群内其他成员会一并离开这个群。',
-  },
-  leaving: {
-    emoji: '🚪',
-    status: '正在退出这个临时群',
-    template: 'grey',
-    detail: '临时群和会话仍由创建者管理，其他成员不受影响。',
-  },
-  error: {
-    emoji: '❌',
-    status: '操作失败',
-    template: 'red',
-    detail: '',
-  },
+  creating: { emoji: '🚀', status: '创建中…', template: 'blue', hint: '' },
+  created: { emoji: '✅', status: '临时群已就绪', template: 'green', hint: 'bye 退出' },
+  joined: { emoji: '👥', status: '已加入', template: 'turquoise', hint: '沿用群内会话' },
+  present: { emoji: '👤', status: '已在群内', template: 'blue', hint: '沿用群内会话' },
+  disbanding: { emoji: '👋', status: '正在解散', template: 'orange', hint: '' },
+  leaving: { emoji: '🚪', status: '正在退出', template: 'grey', hint: '群和会话保留' },
+  error: { emoji: '❌', status: '操作失败', template: 'red', hint: '' },
 }
 
 export function tempSessionNoticeCard(opts: TempSessionNoticeCardOpts): object {
   const copy = TEMP_SESSION_NOTICE_COPY[opts.state]
-  const detail = opts.state === 'error'
-    ? (opts.body ?? '未知错误')
-    : [opts.backendLabel ? `${opts.backendLabel} · ${copy.detail}` : copy.detail, ...(opts.body ? [opts.body] : [])].join('\n')
+  const lines = [`**${copy.status}**${opts.backendLabel ? ` · ${opts.backendLabel}` : ''}`]
+  if (opts.state === 'error') {
+    lines.push(opts.body ?? '未知错误')
+  } else {
+    if (copy.hint) lines.push(copy.hint)
+    if (opts.body) lines.push(opts.body)
+  }
   return {
     schema: '2.0',
     config: { update_multi: true },
@@ -423,17 +393,7 @@ export function tempSessionNoticeCard(opts: TempSessionNoticeCardOpts): object {
       title: { tag: 'plain_text', content: `${copy.emoji} ${opts.chatName}` },
       template: copy.template,
     },
-    body: {
-      elements: [
-        {
-          tag: 'markdown',
-          content: [
-            `**${copy.status}** ${inlineCode(opts.chatName)}`,
-            detail,
-          ].join('\n'),
-        },
-      ],
-    },
+    body: { elements: [{ tag: 'markdown', content: lines.join('\n') }] },
   }
 }
 
