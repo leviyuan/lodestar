@@ -27,7 +27,7 @@ import { syncManagedSkill } from './managed-skills'
 export const NOTIFY_SKILL_NAME = 'feishu-notify'
 
 export function notifySkillBody(port: number): string {
-  const description = `Send a one-shot notification card to a project's bound Feishu (Lark) conversation through the local Lodestar daemon. Use for "通知飞书", "推送到飞书", "推送到对话", "飞书推送", "发到飞书", "脚本跑完通知我", "进程完成发个消息", "send to feishu", "feishu notify", "lodestar notify", "post to lark conversation", or notifications from scripts, cron jobs, and services. POST http://127.0.0.1:${port}/notify accepts {project, text, level}; project is a name resolved to a conversation ID (chat_id). Supports local images, interactive buttons: supply buttons, and free-text replies: set allow_reply:true for a fixed 回复 button. Receive results through a loopback callback or GET /notify/result/NOTIFY_ID.`
+  const description = `Send a one-shot notification card to a project's bound Feishu / Lark conversation through the local Lodestar daemon. Use for "通知飞书", "推送到飞书", "推送到对话", "飞书推送", "发到飞书", "脚本跑完通知我", "进程完成发个消息", "send to feishu", "feishu notify", "lark notify", "发到 Lark", "lodestar notify", "post to lark conversation", or notifications from scripts, cron jobs, and services. POST http://127.0.0.1:${port}/notify accepts {project, text, level}; project is a name resolved to a conversation ID (chat_id). Supports local images, interactive buttons: supply buttons, and free-text replies: set allow_reply:true for a fixed 回复 button. Receive results through a loopback callback or GET /notify/result/NOTIFY_ID.`
   return `---
 name: ${NOTIFY_SKILL_NAME}
 description: ${JSON.stringify(description)}
@@ -35,7 +35,7 @@ description: ${JSON.stringify(description)}
 
 # feishu-notify
 
-Push a one-shot card into a Feishu (Lark) conversation via the local lodestar
+Push a one-shot card into a Feishu / Lark conversation via the local lodestar
 daemon. The daemon resolves a project/session name to its bound conversation
 ID (\`chat_id\`); \`POST /notify\` with that project name routes a card to
 the conversation. The \`project\` request field remains a name, not a
@@ -67,17 +67,17 @@ Body (JSON):
 | field | required | meaning |
 |---|---|---|
 | \`project\` | ✅ | Project/session name used to resolve the bound conversation ID (\`chat_id\`); do not pass a \`chat_id\` here |
-| \`text\` | ✅ | Feishu schema-2.0 markdown — \`**bold**\`, \`\` \`code\` \`\`, \`[link](url)\`, \`<font color='red'>…</font>\` |
+| \`text\` | ✅ | Feishu / Lark Card JSON 2.0 markdown — \`**bold**\`, \`\` \`code\` \`\`, \`[link](url)\`, \`<font color='red'>…</font>\` |
 | \`title\` |   | Card header, defaults to \`project\` |
 | \`level\` |   | \`info\` (blue, default) / \`warn\` (yellow) / \`error\` (red) |
-| \`images\` |   | Array of local image paths \`["/abs/a.png"]\` — uploaded to Feishu and embedded above the text (failed uploads surface inline in red, never dropped silently) |
+| \`images\` |   | Array of local image paths \`["/abs/a.png"]\` — uploaded to the chat platform and embedded above the text (failed uploads surface inline in red, never dropped silently) |
 | \`buttons\` |   | Array of \`{id, text, type?}\` — renders one button per row (vertical stack, any count). \`id\`: \`^[A-Za-z0-9_-]{1,64}$\`, unique. \`text\`: ≤ 64 chars (a short phrase is fine — each button owns its full row). \`type\`: \`default\` / \`primary\` / \`danger\` (default \`default\`). |
 | \`allow_reply\` |   | Boolean, default false. Selects the custom text reply type; cannot be combined with nonempty \`buttons\`. Only this type has a fixed 「回复」 button at the bottom. Clicking sends a separate 「等待用户输入」 card; the clicker's next text in that conversation is returned to the caller. |
 | \`callback\` |   | Optional loopback HTTP URL (e.g. \`http://127.0.0.1:9999/hook\`) — **push mode**: the daemon POSTs the button choice or submitted text here. Must be \`http://\` on \`127.0.0.1\` / \`localhost\` / \`::1\`. Omit for **pull mode** (see below). |
 
 Response: \`200 {ok, chat_id, message_id, notify_id?}\` (notify_id returned
 when buttons are present or allow_reply is true) / \`400\` bad params / \`404\` project not
-bound to a conversation ID / \`413\` JSON body exceeds 4 MiB / \`502\` Feishu API rejected.
+bound to a conversation ID / \`413\` JSON body exceeds 4 MiB / \`502\` Feishu / Lark API rejected.
 
 \`GET /notify/result/<notify_id>\` — pull the verdict with no callback
 server: \`{notify_id, project, message_id, resolved, unknown, button?,
@@ -108,7 +108,7 @@ my-build-script.sh \\
 ## Usage — interactive buttons (push)
 
 Add \`buttons\` and pledge a loopback \`callback\` URL you listen on. When
-anyone taps a button in Feishu, the daemon POSTs the choice back to
+anyone taps a button, the daemon POSTs the choice back to
 that URL; the caller acks 2xx and the card freezes on the choice.
 
 \`\`\`bash
@@ -140,7 +140,7 @@ or the click surfaces a 回调失败 toast and stays retryable):
 The 2xx response body is OPTIONAL, but if you return one the daemon
 renders it on the final card as the caller's reply — turning the ack
 into a two-way channel. Return JSON \`{"text":"…"}\` (or \`{"reply"}\` /
-\`{"message"}\`) or plain text; capped at 500 chars; Feishu markdown
+\`{"message"}\`) or plain text; capped at 500 chars; Feishu / Lark Card JSON 2.0 markdown
 allowed. Empty body ⇒ just the standard "反馈已送达" marker.
 
 \`\`\`

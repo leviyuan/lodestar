@@ -12,7 +12,7 @@ const DELEGATION_INSTRUCTIONS = [
 
 const CALLER_OWNS_DELIVERY = [
   'Return task results and local artifact paths to the caller; the caller is responsible for delivering files to the user.',
-  'Do not emit file-delivery markers or upload, share, or send generated files to Feishu.',
+  'Do not emit file-delivery markers or upload, share, or send generated files to the chat platform (Feishu or Lark).',
   'These rules replace any earlier Lodestar file-delivery instructions, including those in a resumed conversation.',
 ]
 
