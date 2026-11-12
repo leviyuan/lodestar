@@ -2,7 +2,8 @@ import { networkFetch } from './network'
 /**
  * Feishu Card Kit v1 wrapper.
  *
- * Endpoints used (base = https://open.feishu.cn/open-apis/cardkit/v1):
+ * Endpoints used (base = <OPEN_API_BASE>/cardkit/v1; 飞书缺省 open.feishu.cn,
+ * Lark 为 open.larksuite.com，见 feishu-endpoint.ts):
  *   POST   /cards/id_convert                              message_id → card_id
  *   POST   /cards/:card_id/elements                       add element
  *   PUT    /cards/:card_id/elements/:element_id           replace element
@@ -16,11 +17,13 @@ import { networkFetch } from './network'
 
 import { createHash, randomUUID } from 'node:crypto'
 import { getTenantToken } from './feishu'
+import { config } from './config'
+import { openApiBaseFor } from './feishu-endpoint'
 import { FeishuRequestError, FeishuRecoveryWindow, isTransientFeishuError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
 import { log, logError, logDiagnostic } from './log'
 import { ELEMENTS, neutralizeMarkdownImagesInCard } from './cards/elements'
 
-const BASE = 'https://open.feishu.cn/open-apis/cardkit/v1'
+const BASE = `${openApiBaseFor(config.feishu.domain)}/cardkit/v1`
 const CARDKIT_FETCH_TIMEOUT_MS = 15_000
 // A consumed UUID/duplicate after an ambiguous response can arrive while the
 // upstream service is still recovering. Keep confirmation in the same queue

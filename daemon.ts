@@ -1450,6 +1450,8 @@ async function boot(): Promise<void> {
   const makeWs = (): lark.WSClient => new lark.WSClient({
     appId: config.feishu.app_id,
     appSecret: config.feishu.app_secret,
+    // 飞书为 Domain.Feishu（历史默认）；[feishu].domain = "lark" 走国际版。
+    domain: feishu.sdkDomain(),
     loggerLevel: lark.LoggerLevel.info,
     logger: wsLogger,
     // MUST be < the SDK's 120s pingInterval. The pong-watchdog is re-armed on

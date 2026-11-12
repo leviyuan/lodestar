@@ -68,6 +68,11 @@ Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`�
 运行日志按日保存，保留近 7 天。正常流程仅记录关键状态；不记录协议大包、工具输出、代码 diff、请求/响应正文或内部阶段流水。日志省略用户、群、项目和账号名称、路径、聊天/消息/会话/任务标识，以及人数和群数，不生成可关联的匿名编号。故障记录保留固定操作说明、错误类别、错误码和 HTTP 状态；相同摘要在 10 分钟内合并，不显示重复次数。用户收到的错误详情不因此省略。会话历史、任务结果和恢复绑定是功能状态，仍由相应模块保存。
 
 ```toml
+[feishu]
+app_id = "cli_..."
+app_secret = "..."
+# domain = "lark"            # 缺省为飞书；Lark 国际版填 "lark"，私有化填 https 源站
+
 [runtime]
 projects_root = "/abs/projects"
 live_elapsed = "bucket"      # bucket 按档位刷新耗时；second 按秒刷新
@@ -87,6 +92,8 @@ tools = "Read,Write,Edit,Bash,Glob,Grep"  # Claude / DSH 主会话
 [claude]
 bin = "/abs/path/to/claude-wrapper"  # 可选的 Claude 可执行文件
 ```
+
+`[feishu].domain` 选择开放平台区域：省略或 `"feishu"` 使用 `open.feishu.cn`（默认，与旧版本完全一致），`"lark"` 使用 `open.larksuite.com`，也可以填一个 https 源站用于私有化部署。两套云的应用互不通用，凭据校验失败时错误信息会提示域名不匹配；安装向导会先按所选版本探测，失败后再尝试另一侧并自动识别。修改后重启 daemon 生效。
 
 项目名用于定位工作目录；工具、MCP 等启动配置按实际目录匹配。同目录的 BTW/FK 与项目别名共享配置，别名配置冲突时明确报错。WT 的目录独立，不自动套用主目录的启动配置；需要配置某个 WT 时，可新增一个项目配置项，将 `cwd` 指向该 WT 的实际路径。工作目录内的 Agent 原生配置仍由相应后端读取。
 

@@ -10,13 +10,14 @@ interface FreshConfigResult {
   stderr: string
 }
 
-function loadFreshConfig(extraToml = ''): FreshConfigResult {
+function loadFreshConfig(extraToml = '', feishuExtra: string[] = []): FreshConfigResult {
   const root = mkdtempSync(join(tmpdir(), 'lodestar-config-fresh-'))
   const configFile = join(root, 'config.toml')
   const minimumConfig = [
     '[feishu]',
     'app_id = "cli_test"',
     'app_secret = "secret"',
+    ...feishuExtra,
   ].join('\n')
   writeFileSync(configFile, `${minimumConfig}${extraToml ? `\n\n${extraToml.trim()}\n` : '\n'}`)
 
@@ -55,6 +56,28 @@ describe('Claude subscription switch', () => {
   })
 })
 
+
+describe('[feishu].domain', () => {
+  test('omitted domain keeps the feishu default', () => {
+    const result = loadFreshConfig()
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout).feishu.domain).toBeUndefined()
+  })
+
+  test('accepts named regions and normalizes custom https origins', () => {
+    expect(JSON.parse(loadFreshConfig('', ['domain = "feishu"']).stdout).feishu.domain).toBe('feishu')
+    expect(JSON.parse(loadFreshConfig('', ['domain = "lark"']).stdout).feishu.domain).toBe('lark')
+    expect(JSON.parse(loadFreshConfig('', ['domain = "https://open.example.com/"']).stdout).feishu.domain)
+      .toBe('https://open.example.com')
+  })
+
+  test.each(['""', '"http://open.example.com"', '"https://open.example.com/api"', '"lark2"'])(
+    'rejects an invalid domain value: %s', value => {
+      const result = loadFreshConfig('', [`domain = ${value}`])
+      expect(result.exitCode).not.toBe(0)
+      expect(result.stderr).toContain('[feishu].domain')
+    })
+})
 
 describe('runtime live_elapsed', () => {
   test('defaults to bucket when omitted', () => {

@@ -1,6 +1,7 @@
 import { networkFetch } from './network'
 import { formatFeishuError } from './feishu-errors'
 import { readFeishuResponse } from './feishu-retry'
+import { apiBaseFor } from './feishu-endpoint'
 import { fetchGlmAnthropicModelIds, GLM_ANTHROPIC_BASE_URL } from './glm-models'
 /**
  * lodestar-setup 交互向导；cli.ts 首次启动且配置缺失时也可调用。
@@ -175,10 +176,14 @@ function openBrowser(url: string): void {
   }
 }
 
-// ── Feishu credential check ────────────────────────────────────────
-export async function testFeishuCreds(appId: string, appSecret: string): Promise<{ ok: true } | { ok: false; error: string }> {
+// ── Feishu / Lark credential check ─────────────────────────────────
+export type FeishuSetupRegion = 'feishu' | 'lark'
+
+async function requestTenantToken(
+  appId: string, appSecret: string, region: FeishuSetupRegion,
+): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
-    const res = await networkFetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+    const res = await networkFetch(`${apiBaseFor(region)}/open-apis/auth/v3/tenant_access_token/internal`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
@@ -190,6 +195,20 @@ export async function testFeishuCreds(appId: string, appSecret: string): Promise
   } catch (e: any) {
     return { ok: false, error: `飞书凭据校验失败：${formatFeishuError(e)}` }
   }
+}
+
+/** Probe the requested cloud first, then the other one. A working 飞书 app can
+ * never be switched away: the fallback only runs after the preferred host
+ * rejected the credentials. */
+export async function testFeishuCreds(
+  appId: string, appSecret: string, preferred: FeishuSetupRegion = 'feishu',
+): Promise<{ ok: true; domain: FeishuSetupRegion } | { ok: false; error: string }> {
+  const first = await requestTenantToken(appId, appSecret, preferred)
+  if (first.ok) return { ok: true, domain: preferred }
+  const other: FeishuSetupRegion = preferred === 'feishu' ? 'lark' : 'feishu'
+  const second = await requestTenantToken(appId, appSecret, other)
+  if (second.ok) return { ok: true, domain: other }
+  return first
 }
 
 // ── daemon auto-start ──────────────────────────────────────────────
@@ -313,9 +332,14 @@ export async function runSetup(): Promise<void> {
   }
 
   // ── Step 3/4 ──────────────────────────────────────────────────
-  step(3, 4, 'Feishu 自建应用')
-  const feishuUrl = 'https://open.feishu.cn/app'
-  console.log('打开飞书开放平台 (浏览器):')
+  step(3, 4, '飞书 / Lark 自建应用')
+  console.log(`${C.dim}飞书（中国版）用 open.feishu.cn；Lark（国际版）用 open.larksuite.com，是两套独立的云。${C.reset}`)
+  console.log(`${C.dim}两个版本的应用不通用；选错时下面的凭据校验会自动识别并纠正。${C.reset}`)
+  let region: FeishuSetupRegion =
+    (await ask('这个应用创建在 Lark 国际版 (open.larksuite.com)? (y/N)', { default: 'n' })).toLowerCase() === 'y'
+      ? 'lark' : 'feishu'
+  const feishuUrl = `${apiBaseFor(region)}/app`
+  console.log(`打开${region === 'lark' ? ' Lark 开放平台' : '飞书开放平台'} (浏览器):`)
   console.log(`  ${C.cyan}${feishuUrl}${C.reset}`)
   openBrowser(feishuUrl)
   console.log(`${C.dim}(如果浏览器没自动开, 复制上面 URL 粘到浏览器)${C.reset}`)
@@ -384,9 +408,13 @@ export async function runSetup(): Promise<void> {
     appId = await ask('App ID (以 cli_ 开头)', { required: true })
     appSecret = await ask('App Secret', { required: true })
     console.log(`${C.dim}测试中... (调 tenant_access_token endpoint)${C.reset}`)
-    const test = await testFeishuCreds(appId, appSecret)
+    const test = await testFeishuCreds(appId, appSecret, region)
     if (test.ok) {
-      console.log(`${C.green}✓ Feishu 凭据测试通过${C.reset}`)
+      if (test.domain !== region) {
+        region = test.domain
+        console.log(`${C.yellow}该应用属于${region === 'lark' ? ' Lark 国际版' : '飞书'}，已按 ${region} 写入配置。${C.reset}`)
+      }
+      console.log(`${C.green}✓ ${region === 'lark' ? 'Lark' : 'Feishu'} 凭据测试通过${C.reset}`)
       break
     }
     console.log(`${C.red}✗ 测试失败:${C.reset} ${(test as { ok: false; error: string }).error}`)
@@ -418,6 +446,7 @@ export async function runSetup(): Promise<void> {
     '[feishu]',
     `app_id = "${escapeTomlString(appId)}"`,
     `app_secret = "${escapeTomlString(appSecret)}"`,
+    ...(region === 'lark' ? ['domain = "lark"'] : []),
     '',
     '[runtime]',
     `projects_root = "${escapeTomlString(projectsRoot)}"`,

@@ -72,5 +72,10 @@ export function feishuErrorDetails(raw: unknown): FeishuErrorDetails {
 /** Every displayed API failure names all three fields, even if Feishu omitted one. */
 export function formatFeishuError(raw: unknown): string {
   const details = feishuErrorDetails(raw)
-  return `code=${details.code ?? 'MISS'} message=${details.message} log_id=${details.logId ?? 'MISS'}`
+  const base = `code=${details.code ?? 'MISS'} message=${details.message} log_id=${details.logId ?? 'MISS'}`
+  // 1000040351 = "Incorrect domain name": the app lives on the other cloud.
+  const mismatch = String(details.code ?? '') === '1000040351' || /incorrect domain name/i.test(details.message)
+  return mismatch
+    ? `${base}；应用与当前 [feishu].domain 不匹配（飞书 open.feishu.cn / Lark open.larksuite.com）`
+    : base
 }

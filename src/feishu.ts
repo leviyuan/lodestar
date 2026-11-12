@@ -20,6 +20,7 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, extname, isAbsolute, join } from 'node:path'
 import { config, type ProjectProfile } from './config'
+import { openApiBaseFor } from './feishu-endpoint'
 import { isCodexReasoningEffort, resolveCodexBin } from './codex-process'
 import {
   isClaudeReasoningEffort,
@@ -54,6 +55,15 @@ import {
 
 const APP_ID = config.feishu.app_id
 const APP_SECRET = config.feishu.app_secret
+/** 飞书缺省为 `https://open.feishu.cn/open-apis`；[feishu].domain 切换 Lark 或私有化源站。 */
+export const OPEN_API_BASE = openApiBaseFor(config.feishu.domain)
+/** SDK 与长连接使用的区域。飞书用 Domain.Feishu（与历史默认一致）。 */
+export function sdkDomain(): lark.Domain | string {
+  const domain = config.feishu.domain
+  if (domain === 'lark') return lark.Domain.Lark
+  if (domain && domain !== 'feishu') return domain
+  return lark.Domain.Feishu
+}
 export const PROJECTS_ROOT = config.runtime.projects_root
 
 export interface TempSessionLease {
@@ -189,7 +199,7 @@ const sdkHttp: SdkHttp = {
 }
 
 export const client = new lark.Client({
-  appId: APP_ID, appSecret: APP_SECRET, disableTokenCache: false,
+  appId: APP_ID, appSecret: APP_SECRET, domain: sdkDomain(), disableTokenCache: false,
   httpInstance: sdkHttp,
   // SDK defaults can print request bodies and credentials directly to console.
   logger: {
@@ -250,7 +260,7 @@ export async function getTenantToken(recovery?: FeishuRecoveryWindow): Promise<s
   recovery?.timeoutMs(RAW_FETCH_TIMEOUT_MS)
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken
   tokenInFlight ??= (async () => {
-    const data = await fetchFeishuJson('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+    const data = await fetchFeishuJson(`${OPEN_API_BASE}/auth/v3/tenant_access_token/internal`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ app_id: APP_ID, app_secret: APP_SECRET }),
     }, 'tenant token')
@@ -1348,7 +1358,7 @@ export async function leaveChatForMember(chatId: string, userOpenId: string): Pr
 export async function fetchChatName(chatId: string): Promise<string | null> {
   try {
     const token = await getTenantToken()
-    const res = await rawFetch(`https://open.feishu.cn/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, {
+    const res = await rawFetch(`${OPEN_API_BASE}/im/v1/chats/${encodeURIComponent(chatId)}`, {
       headers: { Authorization: `Bearer ${token}` },
     })
     const json = await readFeishuResponse(res, `fetchChatName ${chatId}`)
@@ -1467,7 +1477,7 @@ export async function sendTextRaw(chatId: string, text: string): Promise<string 
 async function sendTextRawOrdered(chatId: string, text: string): Promise<string | null> {
   try {
     const token = await getTenantToken()
-    const res = await rawFetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id', {
+    const res = await rawFetch(`${OPEN_API_BASE}/im/v1/messages?receive_id_type=chat_id`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1543,7 +1553,7 @@ export async function urgentApp(messageId: string, openIds: string[]): Promise<v
   if (!messageId) { log('feishu urgent delivery missing message'); return }
   if (openIds.length === 0) { log('feishu urgent delivery missing recipients'); return }
   const token = await getTenantToken()
-  const url = `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/urgent_app?user_id_type=open_id`
+  const url = `${OPEN_API_BASE}/im/v1/messages/${messageId}/urgent_app?user_id_type=open_id`
   try {
     const res = await rawFetch(url, {
       method: 'PATCH',
@@ -1562,7 +1572,7 @@ export async function downloadAttachment(
 ): Promise<string | undefined> {
   try {
     const token = await getTenantToken()
-    const url = `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/resources/${key}?type=${type}`
+    const url = `${OPEN_API_BASE}/im/v1/messages/${messageId}/resources/${key}?type=${type}`
     const res = await rawFetch(url, { headers: { Authorization: `Bearer ${token}` } })
     if (!res.ok) {
       await readFeishuResponse(res, `download ${type}`)
@@ -1623,7 +1633,7 @@ async function uploadMultipart(filePath: string, type: 'image' | 'file'): Promis
     // File transfers have their own longer deadline. Token acquisition, upload,
     // response reads and retry waits still consume the same recovery budget.
     const timeoutMs = recovery.timeoutMs(type === 'file' ? FILE_UPLOAD_TIMEOUT_MS : RAW_FETCH_TIMEOUT_MS)
-    const data = await fetchFeishuJson(`https://open.feishu.cn/open-apis/im/v1/${type}s`, {
+    const data = await fetchFeishuJson(`${OPEN_API_BASE}/im/v1/${type}s`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
       body: form,

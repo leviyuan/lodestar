@@ -26,6 +26,7 @@
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { CONFIG_FILE } from './paths'
+import { normalizeDomain } from './feishu-endpoint'
 
 /** 活跃 footer / 后台卡 header 耗时展示模式(config `[runtime].live_elapsed`)。 */
 export type LiveElapsedMode = 'bucket' | 'second'
@@ -34,6 +35,9 @@ export interface LodestarConfig {
   feishu: {
     app_id: string
     app_secret: string
+    /** 开放平台区域：缺省 feishu（open.feishu.cn）；lark 使用 open.larksuite.com；
+     *  私有化可写 https 源站。见 feishu-endpoint.ts。 */
+    domain?: string
   }
   runtime: {
     projects_root: string
@@ -228,6 +232,7 @@ export function loadConfig(): LodestarConfig {
   if (!appId || !appSecret) {
     throw new Error(`lodestar: ${CONFIG_FILE} is missing [feishu].app_id / [feishu].app_secret`)
   }
+  const feishuDomain = normalizeDomain(t.feishu?.domain)
   const projectsRoot = expandTilde(t.runtime?.projects_root ?? homedir())
   const agentAutoUpdate: LodestarConfig['runtime']['agent_auto_update'] = { codex: false, claude: false, dsh: false }
   const agentAutoUpdateSection = t['runtime.agent_auto_update']
@@ -376,7 +381,7 @@ export function loadConfig(): LodestarConfig {
   const claudeEnv = envSection('claude.env')
   const claudeBin = t.claude?.bin ? expandTilde(t.claude.bin) : undefined
   return {
-    feishu: { app_id: appId, app_secret: appSecret },
+    feishu: { app_id: appId, app_secret: appSecret, ...(feishuDomain ? { domain: feishuDomain } : {}) },
     runtime: { projects_root: projectsRoot, live_elapsed: liveElapsed, agent_auto_update: agentAutoUpdate },
     notify: { bind: notifyBind, port: notifyPort },
     codex: { env: codexEnv },

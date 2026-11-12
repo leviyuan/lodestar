@@ -2,6 +2,8 @@ import { open } from 'node:fs/promises'
 import { basename } from 'node:path'
 import { networkFetch } from './network'
 import { getTenantToken } from './feishu'
+import { config } from './config'
+import { openApiBaseFor } from './feishu-endpoint'
 import { logDiagnostic } from './log'
 import { FeishuRequestError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
 import type { DeliveredFile, DeliveryFolder, GroupDeliveryFolder } from './file-delivery-types'
@@ -70,7 +72,7 @@ export class FeishuDriveClient {
       cancelled?.addEventListener('abort', cancel, { once: true })
       const signal = controller.signal
       try {
-        const response = await this.deps.fetch(`https://open.feishu.cn/open-apis${path}`, {
+        const response = await this.deps.fetch(`${openApiBaseFor(config.feishu.domain)}${path}`, {
           method,
           // Match the media type required by Feishu's Drive endpoints exactly.
           headers: { Authorization: `Bearer ${token}`, ...(!multipart && data !== undefined ? { 'Content-Type': 'application/json; charset=utf-8' } : {}) },
