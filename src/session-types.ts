@@ -35,9 +35,6 @@ export interface TurnState {
     i: number
     name: string
     input: any
-    /** Presentation-only copies; native inputs/results remain untouched. */
-    displayInput?: any
-    displayOutput?: string
     resolvedNote?: string
     output?: string
     isError?: boolean
@@ -91,7 +88,7 @@ export interface TurnState {
    * batch at a new i. */
   toolBatches: Map<number, {
     kind: 'read' | 'edit'
-    items: Array<{ toolUseId: string; input: any; displayInput?: any; output: string | null; displayOutput?: string; isError: boolean }>
+    items: Array<{ toolUseId: string; input: any; output: string | null; isError: boolean }>
   }>
   openBatchI: number | null
   /** Task 工具按类型分两个合并槽(连续同类调用复用同一面板,切类则前一类定稿):

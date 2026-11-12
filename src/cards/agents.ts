@@ -154,23 +154,20 @@ function agentCardTaskKindShortLabel(kind: AgentCardTaskKind): string {
 /** Render a bounded worker result; only the task prompt uses the shorter limit. */
 export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars = WORKER_MAX_PREVIEW_CHARS, project = false) {
   const status = workerStatusLabel(worker)
-  const translated = worker.translationEnabled === true
-  const output = worker.displayOutput ?? (translated ? '' : worker.output)
-  const pendingInput = worker.displayPendingInput ?? (translated ? undefined : worker.pendingInput)
+  const output = worker.output
+  const pendingInput = worker.pendingInput
   const body: string[] = [`模型 ${inlineCode(worker.model)} · 推理 ${inlineCode(worker.effort)}`]
   if (worker.durationMs != null) body.push(`用时 ${formatDuration(worker.durationMs / 1000)}`)
   if (worker.status === 'queued' && worker.queuedReason) body.push('', escapeMarkdown(worker.queuedReason))
   if (worker.pendingInput) {
     body.push('', project ? '**项目任务不支持交互提问**' : '**等待主 Agent 回答**')
-    if (!pendingInput) body.push('问题译文 MISS')
     for (const question of pendingInput?.questions ?? []) {
       body.push(`- ${escapeMarkdown(question.question)}`)
       if (question.options.length) body.push(`  选项：${question.options.map(option => inlineCode(option.label)).join(' / ')}`)
     }
   }
-  if (worker.error) body.push('', worker.status === 'cancelled' ? '**停止原因**' : '**失败原因**', sanitizeMarkdownForCardKit(worker.displayError ?? worker.error))
+  if (worker.error) body.push('', worker.status === 'cancelled' ? '**停止原因**' : '**失败原因**', sanitizeMarkdownForCardKit(worker.error))
   if (output) body.push('', worker.status === 'failed' || worker.status === 'cancelled' ? '**已生成的内容**' : '**结果**', sanitizeMarkdownForCardKit(boundedResultContent(output, outputPreviewChars)))
-  if (translated && worker.output && worker.displayOutput === undefined) body.push('', '**结果译文 MISS**')
   if (!worker.output && !worker.error && !worker.pendingInput) {
     body.push('', worker.status === 'completed'
       ? '_任务已完成，没有正文输出。_'
@@ -183,7 +180,7 @@ export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars
     for (const step of worker.steps.slice(-3)) {
       const icon = step.tool === 'tool error' ? '❌' : step.phase === 'completed' ? '✓' : step.phase === 'started' ? '→' : '·'
       const label = step.tool === 'tool error' ? '工具执行失败' : step.tool === 'tool result' ? '工具执行完成' : step.tool
-      const detail = step.displayDetail ?? (translated && step.detail ? '动作说明译文 MISS' : step.detail)
+      const detail = step.detail
       body.push(`- ${icon} ${inlineCode(label)} ${escapeMarkdown(shortText(detail, 180))}`)
     }
   }
@@ -229,13 +226,7 @@ export function agentRunSummary(run: AgentRunSnapshot): string {
 }
 
 function runDisplayContext(run: AgentRunSnapshot): { description: string; prompt: string } {
-  const translatedWorker = run.workers.find(worker => worker.translationEnabled === true)
-  if (!translatedWorker) return { description: run.description ?? '说明 MISS', prompt: run.prompt }
-  const pending = isTerminal(run.status) ? '任务说明译文 MISS' : '正在翻译任务说明'
-  return {
-    description: translatedWorker.displayDescription ?? pending,
-    prompt: translatedWorker.displayPrompt ?? pending,
-  }
+  return { description: run.description ?? '说明 MISS', prompt: run.prompt }
 }
 
 function identityRow(identity: AgentIdentity): object {

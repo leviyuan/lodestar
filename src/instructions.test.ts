@@ -8,18 +8,5 @@ describe('channel instructions', () => {
 - 需要交付文件时，检查文件后独占一行输出 \`[[send: /实际绝对路径]]\`
 - Bash / shell 命令首行写 \`# desc: <一句中文说明>\`
 - 所有飞书 / Lark 相关的内容由通道插件处理，除了以上约定，你不需要做任何额外的事情`)
-    expect(channelInstructions()).toBe(channelInstructions('zh'))
-  })
-
-  test('the English version keeps the same channel contract without extra policies', () => {
-    const instructions = channelInstructions('en')
-    expect(instructions).not.toMatch(/\p{Script=Han}/u)
-    expect(instructions.split('\n')).toHaveLength(5)
-    expect(instructions).toContain('Feishu / Lark channel plugin')
-    expect(instructions).toContain('`[file: /abs/path]`')
-    expect(instructions).toContain('`[[send: /absolute/path]]`')
-    expect(instructions).toContain('# desc: <brief description>')
-    expect(instructions).toContain('Beyond these conventions, you do not need to do anything else.')
-    expect(instructions).not.toMatch(/Lodestar|30 MB|AskUserQuestion|request_user_input|ask_user_question|files on|image generation|permissions|credentials/)
   })
 })

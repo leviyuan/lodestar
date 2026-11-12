@@ -50,14 +50,14 @@ function fileToolBatchKind(name: string): 'read' | 'edit' | null {
   return null
 }
 
-function batchElement(kind: 'read' | 'edit', i: number, items: Array<{ input: any; displayInput?: any; output: string | null; displayOutput?: string; isError: boolean }>): object {
-  const shown = items.map(item => ({ ...item, input: item.displayInput ?? item.input, output: item.displayOutput ?? item.output }))
+function batchElement(kind: 'read' | 'edit', i: number, items: Array<{ input: any; output: string | null; isError: boolean }>): object {
+  const shown = items.map(item => ({ input: item.input, output: item.output, isError: item.isError }))
   return kind === 'read' ? cards.readBatchElement(i, shown) : cards.editBatchElement(i, shown)
 }
 
-export function addTool(s: Session, toolUseId: string, name: string, input: any, displayInput?: any): void {
+export function addTool(s: Session, toolUseId: string, name: string, input: any): void {
   if (!s.currentTurn) return
-  const shownInput = displayInput ?? input
+  const shownInput = input
   // 元素接近上限时 fire-and-forget kick off mid-turn rotation。check 是
   // O(1) 的(只查 cardkit 内部计数 Map),即使 in-batch 文件工具续走 replace
   // 路径不会 +1 element,也无害 —— maybeMidTurnRotate 看到 count 没到
@@ -83,8 +83,8 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any,
     const batch = s.currentTurn.toolBatches.get(batchI)
     if (batch && batch.kind === batchKind) {
       const slot = batch.items.length
-      batch.items.push({ toolUseId, input, displayInput, output: null, isError: false })
-      s.currentTurn.toolByUseId.set(toolUseId, { i: batchI, name, input, displayInput, batchSlot: slot })
+      batch.items.push({ toolUseId, input, output: null, isError: false })
+      s.currentTurn.toolByUseId.set(toolUseId, { i: batchI, name, input, batchSlot: slot })
       const el = batchElement(batchKind, batchI, batch.items)
       void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(batchI), el)
       toolSummaryToPreview(s.currentTurn, name, shownInput)
@@ -133,7 +133,7 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any,
       else turn.taskUpdateI = turn.toolCount++
     }
     const ti = (isCreate ? turn.taskCreateI : turn.taskUpdateI) as number
-    turn.toolByUseId.set(toolUseId, { i: ti, name, input, displayInput })
+    turn.toolByUseId.set(toolUseId, { i: ti, name, input })
     const el = cards.taskBoardElement(ti, s.taskBoard, { name: taskName, status: '⏳' })
     void (isFirst
       ? cardkit.addElement(turn.cardId, el, { type: 'insert_before', targetElementId: taskLiveAnchor(turn) })
@@ -150,9 +150,9 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any,
     // only, never source/diff bodies). Subsequent same-kind calls append
     // into the same batch via the openBatchI fast-path above.
     s.currentTurn.openBatchI = i
-    const items = [{ toolUseId, input, displayInput, output: null, isError: false }]
+    const items = [{ toolUseId, input, output: null, isError: false }]
     s.currentTurn.toolBatches.set(i, { kind: batchKind, items })
-    s.currentTurn.toolByUseId.set(toolUseId, { i, name, input, displayInput, batchSlot: 0 })
+    s.currentTurn.toolByUseId.set(toolUseId, { i, name, input, batchSlot: 0 })
     const el = batchElement(batchKind, i, items)
     void cardkit.addElement(s.currentTurn.cardId, el, {
       type: 'insert_before', targetElementId: taskLiveAnchor(s.currentTurn),
@@ -160,7 +160,7 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any,
     toolSummaryToPreview(s.currentTurn, name, shownInput)
     return
   }
-  s.currentTurn.toolByUseId.set(toolUseId, { i, name, input, displayInput })
+  s.currentTurn.toolByUseId.set(toolUseId, { i, name, input })
   // AskUserQuestion is a client-side tool — daemon renders the choice
   // UI in-line and supplies the tool_result itself once the user
   // clicks. Branch BEFORE the generic toolCallElement so we never
@@ -216,18 +216,14 @@ function toolResultText(content: any): string {
       : JSON.stringify(content)
 }
 
-export function completeTool(s: Session, toolUseId: string, content: any, isError: boolean, finalInput?: any, displayContent?: any, displayInput?: any): void {
+export function completeTool(s: Session, toolUseId: string, content: any, isError: boolean, finalInput?: any): void {
   if (!s.currentTurn) return
   const meta = s.currentTurn.toolByUseId.get(toolUseId)
   if (!meta) return
   if (finalInput && typeof finalInput === 'object') {
     meta.input = { ...meta.input, ...Object.fromEntries(Object.entries(finalInput).filter(([, value]) => value !== undefined)) }
   }
-  if (displayInput !== undefined) {
-    meta.displayInput = { ...(meta.displayInput ?? meta.input), ...displayInput }
-  }
   const output = toolResultText(content)
-  if (displayContent !== undefined) meta.displayOutput = toolResultText(displayContent)
   // Stash on the meta so rotation can rebuild unfinished or failed
   // panels after this result lands.
   meta.output = output
@@ -256,7 +252,7 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
     const batch = s.currentTurn.toolBatches.get(meta.i)
     if (batch) {
       const row = batch.items[meta.batchSlot]
-      if (row) { row.output = output; row.displayOutput = meta.displayOutput; row.displayInput = meta.displayInput; row.isError = isError }
+      if (row) { row.output = output; row.isError = isError }
       const el = batchElement(batch.kind, meta.i, batch.items)
       void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
     }
@@ -270,7 +266,7 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
     completeTaskTool(s, meta, taskName, output, isError)
     return
   }
-  const el = cards.toolCallElement(meta.i, meta.name, meta.displayInput ?? meta.input, meta.displayOutput ?? output, isError ? '❌' : '✅', meta.resolvedNote)
+  const el = cards.toolCallElement(meta.i, meta.name, meta.input, output, isError ? '❌' : '✅', meta.resolvedNote)
   void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
   startThinkingIfNoToolsRunning(s)
 }
@@ -285,7 +281,7 @@ function deliverGeneratedImage(s: Session, turn: TurnState, meta: TurnState['too
     s.sendOutboundPath(path, 'generated image')
     meta.resolvedNote = '图片超过 30 MB，上传结果见云空间交付卡。'
     void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i),
-      cards.toolCallElement(meta.i, meta.name, meta.displayInput ?? meta.input, meta.displayOutput ?? meta.output ?? null, '✅', meta.resolvedNote))
+      cards.toolCallElement(meta.i, meta.name, meta.input, meta.output ?? null, '✅', meta.resolvedNote))
     return
   }
   turn.outboundSeenPaths.add(path)
@@ -308,7 +304,7 @@ function deliverGeneratedImage(s: Session, turn: TurnState, meta: TurnState['too
       let landed = false
       try {
         landed = await cardkit.replaceElementChecked(cardId, elementId,
-          cards.toolCallElement(meta.i, meta.name, meta.displayInput ?? meta.input, meta.displayOutput ?? meta.output ?? null, '✅', meta.resolvedNote, imageKey),
+          cards.toolCallElement(meta.i, meta.name, meta.input, meta.output ?? null, '✅', meta.resolvedNote, imageKey),
           { notifyCardFailure: false, onFailure: failure => { failures.push(`图片嵌入：${formatFeishuError(failure)}`) } })
       } catch (error) {
         failures.push(`图片嵌入：${formatFeishuError(error)}`)
@@ -334,7 +330,7 @@ function deliverGeneratedImage(s: Session, turn: TurnState, meta: TurnState['too
     let noteLanded = false
     try {
       noteLanded = await cardkit.replaceElementChecked(cardId, elementId,
-        cards.toolCallElement(meta.i, meta.name, meta.displayInput ?? meta.input, meta.displayOutput ?? meta.output ?? null, sent ? '✅' : '❌', meta.resolvedNote),
+        cards.toolCallElement(meta.i, meta.name, meta.input, meta.output ?? null, sent ? '✅' : '❌', meta.resolvedNote),
         { notifyCardFailure: false, onFailure: failure => { noteFailure = failure } })
     } catch (error) {
       noteFailure = error
@@ -374,9 +370,7 @@ function completeTaskTool(s: Session, meta: TurnState['toolByUseId'] extends Map
     // Creation receipts provide machine IDs, including the native "Task #N"
     // syntax. Translate the input's human fields without changing that receipt.
     // List/Get presentation output retains its JSON schema and machine fields.
-    s.taskBoard = taskName === 'TaskCreate'
-      ? cards.applyTaskTool(s.taskBoard, taskName, meta.input, output, meta.displayInput)
-      : cards.applyTaskTool(s.taskBoard, taskName, meta.displayInput ?? meta.input, meta.displayOutput ?? output)
+    s.taskBoard = cards.applyTaskTool(s.taskBoard, taskName, meta.input, output)
   }
   const el = cards.taskBoardElement(meta.i, s.taskBoard, { name: taskName, status: isError ? '❌' : '✅' }, meta.resolvedNote)
   void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
@@ -430,16 +424,12 @@ export function rebuildToolsOnRotate(
     if (turn.toolByUseId.has(useId)) continue
     const batchSlot = meta.batchSlot ?? null
     let input = meta.input
-    let displayInput = meta.displayInput
-    let displayOutput = meta.displayOutput
     let output: string | null
     let isError: boolean
     if (batchSlot != null) {
       const item = oldBatches.get(meta.i)?.items[batchSlot]
       if (!item) continue
       input = item.input
-      displayInput = item.displayInput
-      displayOutput = item.displayOutput
       output = item.output
       isError = item.isError
     } else {
@@ -454,7 +444,7 @@ export function rebuildToolsOnRotate(
       const kind = oldBatches.get(meta.i)?.kind
       if (!kind) continue
       const ni = turn.toolCount++
-      const item = { toolUseId: useId, input, displayInput, output, displayOutput, isError }
+      const item = { toolUseId: useId, input, output, isError }
       turn.toolBatches.set(ni, { kind, items: [item] })
       turn.toolByUseId.set(useId, { ...meta, i: ni, batchSlot: 0 })
       void cardkit.addElement(newCardId, batchElement(kind, ni, [item]), {
@@ -486,7 +476,7 @@ export function rebuildToolsOnRotate(
     const ni = turn.toolCount++
     turn.toolByUseId.set(useId, { ...meta, i: ni })
     const status: '⏳' | '✅' | '❌' = !done ? '⏳' : (isError ? '❌' : '✅')
-    void cardkit.addElement(newCardId, cards.toolCallElement(ni, meta.name, displayInput ?? input, displayOutput ?? output, status, meta.resolvedNote, meta.imageKey), {
+    void cardkit.addElement(newCardId, cards.toolCallElement(ni, meta.name, input, output, status, meta.resolvedNote, meta.imageKey), {
       type: 'insert_before', targetElementId: taskLiveAnchor(turn),
     })
   }

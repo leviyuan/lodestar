@@ -1,16 +1,5 @@
-export type InstructionLanguage = 'zh' | 'en'
-
 /** The same channel contract applies to every backend and delivery mode. */
-export function channelInstructions(language: InstructionLanguage = 'zh'): string {
-  if (language === 'en') {
-    return [
-      'You are now collaborating with the user through the Feishu / Lark channel plugin. Follow these conventions:',
-      '- In received messages, `[file: /abs/path]` identifies an attachment. Read it directly when needed.',
-      '- When delivering a file, check it and output `[[send: /absolute/path]]` on its own line.',
-      '- Start each Bash / shell command with `# desc: <brief description>` on the first line.',
-      '- The channel plugin handles all Feishu / Lark-related matters. Beyond these conventions, you do not need to do anything else.',
-    ].join('\n')
-  }
+export function channelInstructions(): string {
   return [
     '你现在通过飞书 / Lark 通道插件与用户协作，需要遵守以下约定',
     '- 收到的消息中，`[file: /abs/path]` 表示附件，有需要可以直接读取',
