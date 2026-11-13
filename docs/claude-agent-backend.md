@@ -6,7 +6,7 @@ Lodestar 通过 `AgentProcess` 接口连接 Codex app-server、Claude Agent SDK 
 
 ## 进程与会话
 
-| 行为 | Codex | Claude Code（含 GLM、DeepSeek、OpenRouter） | DeepSeek Harness |
+| 行为 | Codex | Claude Code（含 reclaude、GLM、DeepSeek、OpenRouter、中转站） | DeepSeek Harness |
 | --- | --- | --- | --- |
 | 进程 | `codex app-server --listen stdio://`，通过 JSON-RPC 通信 | SDK `query()`，通过 `AsyncIterable<SDKUserMessage>` 连续输入 | Node 子进程，通过 Cordis stdio 桥接 |
 | 初始化 | 等待初始化和 thread 启动事务完成 | 首条输入才触发 `system/init`；启动时只检查早期错误 | `session/open` 完成原生会话创建或恢复并落盘 |
@@ -17,7 +17,7 @@ Lodestar 通过 `AgentProcess` 接口连接 Codex app-server、Claude Agent SDK 
 
 会话引用包含 provider、原生 session id 和 cwd。各后端分别保存恢复记录，切换后端不会共用同一段上下文。Claude fork 在首条输入前持久保存启动意图，获得新 session id 后才清除；历史会话通过原生 fork 接入新群，避免两个群写同一个会话。
 
-主动压缩没有固定完成时限，以完成事件为准，进程退出或报错时失败。Claude 明确返回 `Not enough messages to compact` 时视为无需压缩，普通 `result` 事件不能代替完成通知。
+主动压缩没有固定完成时限，以完成事件为准，进程退出或报错时失败。Claude 只有原生 `compact_boundary` 算压缩成功，普通 `result` 事件不能代替完成通知；其他原生结果都会结束等待：`Not enough messages to compact` 或 `No messages to compact` 视为无需压缩，原生返回的取消、跳过或失败文本按失败显示，等待期间的错误 `result` 和进程退出立即失败。压缩期间收到的 `stop`、`kill`、`restart`、`clear` 会先中断压缩，用户可见行为见[群内命令](usage.md#群内命令)。
 
 ## 账号和模型
 
@@ -27,6 +27,7 @@ Token Source 管理账号凭据、模型目录、启动环境、默认模型、e
 | --- | --- |
 | Codex subscription | 使用 Codex 登录态，模型来自 app-server `model/list` |
 | Claude Code 订阅 | `claude-sub` 复用本机原生订阅登录态；通过 SDK `accountInfo()` 确认账号，`supportedModels()` 读取模型和 effort，与第三方来源独立共存 |
+| reclaude | 本机找到 `reclaude` 命令即启用，`[token_source.reclaude]` 可选；登录与组织由 reclaude 管理，每次目录刷新经 reclaude 启动 control-only 进程，同时读取原生模型目录和 `/usage` 额度 |
 | GLM Coding Plan | `[token_source.glm]` 或本机 Claude settings；模型来自兼容端点，可补录已验证模型 |
 | DeepSeek | `[token_source.deepseek]` 或本机 Claude settings；模型来自兼容端点，可补录已验证模型 |
 | OpenRouter | `[token_source.openrouter]` 或本机 Claude settings；默认精选六个家族最新版（含 Gemini Flash、MiMo Pro），账号目录验证能力，MD 面板维护显隐 |
@@ -72,6 +73,18 @@ GLM、DeepSeek、OpenRouter 等来源先清除冲突的 Anthropic 环境变量�
 
 `[claude].bin` 可指定包装器，路径无效时启动失败；Windows `.cmd`/`.bat` 通过 shell shim 启动。未指定时使用独立运行目录中的 Claude Agent SDK 默认入口及其自带程序。
 
+### reclaude 启动器
+
+reclaude 来源（用户说明见[账号与模型](models.md#reclaude)）不直接启动 Claude Code，而是通过 SDK 的 `spawnClaudeCodeProcess` 改写启动命令（`src/claude-launcher.ts`），主会话、目录与额度查询共用同一启动器：
+
+- 命令为 `reclaude --org <组织 ID> cli <Claude Code 参数>`。组织 ID 取自最近一次目录刷新选定的绑定，显式传入，避免两次刷新之间切换默认组织导致进程与记录的目录不一致。
+- SDK 选定的 Claude Code 可执行文件所在目录被放在 `PATH` 最前，reclaude 因此启动的是 SDK 期望的那份受管运行时，而不是本机另一份安装。SDK 入口不是名为 `claude` 的可执行文件（例如 `[claude].bin` 指向脚本入口）时拒绝启动。
+- 环境先清除其他来源的 `ANTHROPIC_*` 变量，`CLAUDE_CONFIG_DIR` 设为 reclaude 数据目录中该组织绑定的配置目录，transcript、`rs` 历史、恢复和上下文用量都读取进程实际写入的位置。组织绑定（设备号）计入进程环境版本，绑定变化后空闲进程在下一轮前替换。
+- settings 来源与其他第三方来源相同，为 `project`、`local`，Lodestar 管理的 Skill 通过本地插件加载；目录与额度查询的 control-only 进程使用 `user`。
+- 启动器的 stderr 只保留以 `reclaude:` 开头的诊断行（最多 4 行），其余原生 stderr 丢弃，因为交接后它可能包含提示词、路径和账号信息。reclaude 在交给 Claude Code 之前失败时，SDK 只报退出码，Lodestar 把这些诊断行附在显示给用户的错误后面。
+- reclaude 与 `claude-sub` 一样按订阅使用处理，在 Agent 身份目录和委派新建/续跑入口中按来源类型排除（`src/agent-identities.ts`）。
+- 测试环境（`NODE_ENV=test`）不探测本机真实的 reclaude。
+
 Claude 使用 `permissionMode: default`：普通工具在 `canUseTool` 中放行，`AskUserQuestion` 等待用户回答。不能改成 `bypassPermissions`，否则 SDK 会绕开提问回调。
 
 Lodestar 每次启动 Claude SDK 子进程时自动设置 `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`，让新版 Claude 及第三方模型继续提供任务清单工具。安装或升级后无需手动修改配置，已有进程需重新启动后生效。任务创建和状态更新显示在会话卡片中，是否使用清单由 Agent 判断，项目 `tools` 限制仍生效。
@@ -95,10 +108,11 @@ Lodestar 每次启动 Claude SDK 子进程时自动设置 `CLAUDE_CODE_ENABLE_TO
 
 `DshProcess` 使用当前安装的运行目录启动 Node DSH 子进程，以 `sdk` profile 加载 `dsh-bridge` Cordis 插件，替换默认 SDK JSON-RPC server。启动补丁先读取所装 `@deepseek-ai/dsh-sdk-app/cordis.patch.yml`：profile 已自带 ask-user 工具时不再插入同插件（重复注册会让 DSH 启动失败），读取不到时保留插入以兼容旧版。0.2.2 起模型接入链需要的 credentials 服务保持启用，凭据仍只由 Lodestar 注入的环境变量提供，不写登录态。Lodestar 的 stdio 协议只承载控制和事件；Agent 循环、工具执行、持久化及子 Agent 由 DSH 管理。
 
-Agent 运行依赖由 `src/agent-updates.ts` 独立安装，daemon 启动时不检查或更新。自动更新默认关闭；手动运行 `lodestar-update --agents-only`，或在 `[runtime.agent_auto_update]` 中分别开启 `codex`、`claude`、`dsh` 后，各自每 6 小时检查 upstream latest。安装成功直接启用，旧任务继续使用各自目录。更新失败不修改当前安装记录，只记更新日志并向更新调用方返回失败；已有安装照常供新任务使用，已开启自动更新的 Agent 下个 6 小时周期再试。启动和版本查询不显示历史更新错误；没有可用安装记录或安装损坏仍报错。DSH 子包的 dist-tag 可能不同步，因此从主包最新版本递归读取 dependencies/peerDependencies/optionalDependencies，整族安装该次动态选中的版本。不存在兼容版本白名单；不兼容直接报告并后续适配。`dsh-bridge` 被放入选中运行目录，从同一依赖树加载，握手版本来自实际 package.json。开发依赖和 Bun 锁文件只是本地测试快照，不限制生产更新。普通安全 overrides 同时用于独立运行目录，tarball 验收真实执行更新器、包审计和原生查询。
+Agent 运行依赖由 `src/agent-updates.ts` 独立安装，更新命令、自动更新开关、版本目录和失败处理见[安装与配置](configuration.md#agent-更新)。DSH 子包的 dist-tag 可能不同步，因此从主包最新版本递归读取 dependencies/peerDependencies/optionalDependencies，整族安装该次动态选中的版本。不存在兼容版本白名单；不兼容直接报告并后续适配。`dsh-bridge` 被放入选中运行目录，从同一依赖树加载，握手版本来自实际 package.json。开发依赖和 Bun 锁文件只是本地测试快照，不限制生产更新。普通安全 overrides 同时用于独立运行目录，tarball 验收真实执行更新器、包审计和原生查询。
 
 - `session/open` 完成原生 create/resume/fork 并 flush 后才公布恢复点。`rs` 通过原生持久化服务列出同工作目录会话；`fk/bk` 使用 `turn/end` 的事件序号作为 checkpoint，原生日志验证并加载分叉历史。
 - 实时文本来自 `agent/assistant-stream`，工具和计划来自会话事件。进入 idle 后等待持久化完成，再用真实 `turn/end` 原因结算；认证失败、token 耗尽及驱动异常均向调用方报告。
+- 模型给出的工具参数不是合法 JSON 对象时不结束会话：工具输入按 `{ raw: <原文> }` 展示，由 DSH 返回自身的工具错误，本轮继续。启动失败时删除已创建的临时启动目录。
 - 子工具返回的内容块数组先转换为委派面板内的步骤摘要；不能按字符串直接处理。致命桥接错误会把未结束的子任务标记失败，并将进程退出作为异常向用户报告。
 - 提问通过 `user-questions/request` 停驻，复用飞书问答卡；回答按原始 question id 返回。主动和自动压缩使用 DSH compaction 服务与事件。
 - 模型与 effort 更新在下一轮应用，同一轮的工具续跑保持当前路由。`off` 是 DSH 原生推理选项。

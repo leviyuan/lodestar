@@ -10,7 +10,7 @@
 4. 打并推送标签：`git tag v0.21.31 && git push github v0.21.31`。标签必须与 `version` 一致，且指向要发布的提交（工作流会校验）。
 5. 触发工作流：`gh workflow run release.yml -f tag=v0.21.31`。
 6. 等待结果：`gh run watch`，或 `gh run list --workflow=release.yml --limit 1`。
-   工作流依次做：校验标签/版本 → 探测两个仓库身份 → `bun run ci` → `npm pack` → tarball 验收（`test-codex-plugin-upgrade`、`npm audit --omit=dev`、`check-installed-package`）→ 上传制品 → 发布 npm → 发布 GitHub Packages。
+   工作流依次做：校验标签/版本 → 探测两个仓库身份 → 安装锁定依赖并检查安全依赖声明 → `bun run ci` → `npm pack` → tarball 验收（`test-codex-plugin-upgrade`、`npm audit --omit=dev`、`check-installed-package`）→ 上传制品 → 发布 npm → 发布 GitHub Packages。
 7. 发布成功后建 GitHub Release（标题、功能说明和验证结果用中文）：
 
    ```bash

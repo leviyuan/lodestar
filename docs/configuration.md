@@ -26,24 +26,28 @@ lodestar-setup
 | `lodestar-setup` | 配置向导 |
 | `lodestar-daemon` | 启动 daemon |
 | `lodestar-stop` | 停止 daemon |
-| `lodestar-update` | 升级 Lodestar 及实际使用的 Codex、Claude Code/SDK、DSH；`--agents-only` 仅立即更新 Agent |
+| `lodestar-update` | 升级 Lodestar，再更新 Codex、Claude Code/SDK、DSH；`--agents-only` 只立即更新 Agent，详见 [Agent 更新](#agent-更新) |
 | `lodestar-version` | 查看 Lodestar、实际 Agent 版本及运行目录 |
 | `lodestar-claude <备注> [原生参数...]` | 用户终端入口，使用 Lodestar 管理的当前 Claude 安装和对应账号目录；例如 `lodestar-claude 工作号 auth login`，不自动收录账号或清理历史 |
 | `lodestar-agent` | 调用已配置模型执行任务；不支持 Claude 订阅，遵守 Claude 用户协议，中转站等第三方 Claude 模型仍可调用 |
 
-群内可用 `relay-setup <站点标识> <anthropic|openai> <base_url> <api_key>` 配置通用中转站。`anthropic` 提供 Claude Code 来源；`openai` 同时提供 Codex 和 DeepSeek Harness 来源。余额脚本可用 `relay-balance-setup <站点标识> <脚本路径>` 绑定，具体 JSON 接口见[模型与账号](models.md#通用中转站覆盖-packy)。
-
 启动和停止命令会核对 PID 对应的实际入口，读取进程信息失败时明确报错。无法识别的运行时选项、macOS 无法区分边界的含空格入口、Windows 相对入口也会拒绝操作，请通过对应服务管理器处理。旧式单行 PID 文件缺少入口标识，`lodestar-stop` 会拒绝发送信号；请先核对该 PID 的完整命令行，再通过服务管理器或精确 PID 停止。停止命令以进程退出为准，删除 PID 文件不会被当作停止成功。
+
+长期运行可交给 Linux `systemd --user`、macOS `launchd` 或 Windows 任务计划程序。daemon 重启后会恢复上次活跃的会话。
+
+## Agent 更新
+
+`lodestar-update` 先用 npm 全局安装最新的 Lodestar，再以子进程运行**新装版本**的 `lodestar-update --agents-only` 更新 Agent，因此新版本对安装逻辑的修改在这次更新中就会生效；`lodestar-update --agents-only` 直接在当前进程内更新。命令不会重启 daemon：检测到 daemon 仍在运行时会提示用对应服务管理器重启，旧进程重启前继续运行旧版 Lodestar。
 
 daemon 启动时不检查 Agent 版本，也不安装或更新 Agent。自动更新默认关闭；首次安装缺少运行文件或需要更新时，运行 `lodestar-update --agents-only`。手动更新和显式开启的自动更新都选择上游 `latest`，独立于 Lodestar 发版，不设置兼容版本白名单。
 
-Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`、`claude`、`dsh` 开关，未设置的项均为 `false`。设为 `true` 的 Agent 在 daemon 运行满 6 小时后首次检查，之后每 6 小时独立检查，启动阶段仍不检查；一个 Agent 更新较慢或失败不阻塞其他 Agent。旧版布尔总开关按原值兼容映射为三项并提示迁移，不可与新配置表混用。
+Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`、`claude`、`dsh` 开关，未设置的项均为 `false`。设为 `true` 的 Agent 在 daemon 运行满 6 小时后首次检查，之后每 6 小时独立检查，启动阶段仍不检查；一个 Agent 更新较慢或失败不阻塞其他 Agent。daemon 停止时在停机时限内等待进行中的自动更新结束。旧版布尔总开关按原值兼容映射为三项并提示迁移，不可与新配置表混用。
 
-运行文件放在 Lodestar 数据目录的 `agent-runtimes/` 下，每个版本使用独立目录；更新只切换新进程所用的目录，保留正在运行任务的程序和 SDK。Windows 下也不覆盖、重命名或删除正在使用的旧版 EXE/DLL。取消安装时按安装器 PID 终止其进程树，并等待退出；若无法确认终止，保留可能被占用的临时目录并报告错误。
+运行文件放在 Lodestar 数据目录的 `agent-runtimes/` 下，每个版本使用独立目录；更新只切换新进程所用的目录，保留正在运行任务的程序和 SDK。更新成功后保留当前版本及最近 3 个版本目录，更旧的目录在没有运行中进程使用时删除。Windows 下也不覆盖、重命名或删除正在使用的旧版 EXE/DLL。取消安装时按安装器 PID 终止其进程树，并等待退出；若无法确认终止，保留可能被占用的临时目录并报告错误。
+
+中断或取消的安装留下的临时目录（`.install-*`）和失效的更新锁，由该 Agent 下一次成功更新时一并清理，仍被运行中进程使用的目录保留；临时目录在安装进程确认退出后才删除，无法确认的满 24 小时后删除；无法读取进程列表的平台跳过清理。清理失败只在更新输出中提示，不影响更新结果。更新程序在创建锁后、写入 PID 前退出时，该锁 30 秒后可被回收，不会阻塞之后的更新。
 
 后台更新失败只记日志，继续使用当前安装；已开启自动更新的 Agent 会在下一个 6 小时检查周期再试。启动和 `lodestar-version` 不提示历史更新错误，版本查询只显示当前安装。手动更新命令仍如实返回本次更新结果。尚未安装或本地安装损坏时无法启动。旧版若已因失败清除了安装选择记录，需要一次成功的 `lodestar-update --agents-only` 恢复记录，不会自动猜测目录中的版本。文件占用只做有限重试，最终失败仍显示。显式配置的 `[claude].bin` 按该路径执行。
-
-长期运行可交给 Linux `systemd --user`、macOS `launchd` 或 Windows 任务计划程序。daemon 重启后会恢复上次活跃的会话。
 
 ## 飞书应用权限
 
@@ -63,7 +67,7 @@ Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`�
 
 ## 本机配置
 
-默认配置文件是 `~/.config/lodestar/config.toml`，可通过 `LODESTAR_CONFIG` 指定文件。日志和会话状态位于 `~/.local/share/lodestar/`；Windows 使用相应的应用数据目录。完整路径定义见 [src/paths.ts](../src/paths.ts)。
+默认配置文件是 `~/.config/lodestar/config.toml`，可通过 `LODESTAR_CONFIG` 指定文件。日志和会话状态位于 `~/.local/share/lodestar/`；Windows 使用相应的应用数据目录。完整路径定义见 [src/paths.ts](../src/paths.ts)。数据目录和 PID 目录由 Lodestar 新建时权限为 `0700`，已存在的目录不修改权限。
 
 运行日志按日保存，保留近 7 天。正常流程仅记录关键状态；不记录协议大包、工具输出、代码 diff、请求/响应正文或内部阶段流水。日志省略用户、群、项目和账号名称、路径、聊天/消息/会话/任务标识，以及人数和群数，不生成可关联的匿名编号。故障记录保留固定操作说明、错误类别、错误码和 HTTP 状态；相同摘要在 10 分钟内合并，不显示重复次数。用户收到的错误详情不因此省略。会话历史、任务结果和恢复绑定是功能状态，仍由相应模块保存。
 
@@ -100,6 +104,25 @@ bin = "/abs/path/to/claude-wrapper"  # 可选的 Claude 可执行文件
 Claude 后端启用项目 MCP 时，缺少 `.mcp.json` 表示未配置；文件存在但无法读取、JSON 损坏或缺少有效的 `mcpServers` 对象会阻止会话启动，并显示具体错误。修正配置后再启动会话。
 
 账号配置、OpenRouter 默认模型、通用中转站和 DSH 接入见[模型与账号](models.md)。手动修改配置后需重启 daemon；群内设置自行保存。
+
+### reclaude 配置
+
+[reclaude](models.md#reclaude) 无需配置：本机 `PATH` 或 `~/.local/bin` 中有 `reclaude` 命令即自动启用。需要调整时添加 `[token_source.reclaude]`，所有键均可省略，没有凭据字段：
+
+```toml
+[token_source.reclaude]
+# enabled = false              # 关闭该来源；省略或 true 时按是否找到命令自动启用
+# bin = "/abs/path/to/reclaude" # 命令不在 PATH 或 ~/.local/bin 时指定，路径须存在
+# org = "<组织 ID>"            # 固定组织；省略时跟随 reclaude org use 选定的组织
+# display = "reclaude"          # md、hi 中的显示名
+# model = "<模型 ID>"          # 默认模型，须在目录中或已补录；省略时选目录中的 Claude Opus
+# effort = "high"               # 默认模型的默认档位，须为该模型支持的档位
+# hidden_models = ""            # 逗号分隔：从目录中隐藏的模型
+# shown_models = ""             # 逗号分隔：显式显示的目录模型
+# custom_models = ""            # 逗号分隔：补录的目录外模型
+```
+
+`hidden_models`、`shown_models`、`custom_models` 一般通过 `md` 面板的「隐 / 显」与补录维护，不必手写。
 
 ## HTTP 代理
 

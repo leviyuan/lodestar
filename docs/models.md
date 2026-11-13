@@ -2,7 +2,7 @@
 
 [返回首页](../README.md) · [安装与配置](configuration.md) · [群内用法](usage.md)
 
-账号配置使用 `[token_source.glm]`、`[token_source.deepseek]` 等节。GLM、DeepSeek 和 OpenRouter 也可以从本机 Claude settings 中识别；识别后由对应 Token Source 注入凭据，避免不同账号的环境变量串用。项目的工具限制只作用于主会话，委派 Agent 使用完整工具集。
+账号配置使用 `[token_source.glm]`、`[token_source.deepseek]` 等节，通用中转站使用 `[relay.<site_id>]`。GLM、DeepSeek 和 OpenRouter 也可以从本机 Claude settings 中识别；识别后由对应 Token Source 注入凭据，避免不同账号的环境变量串用。项目的工具限制只作用于主会话，委派 Agent 使用完整工具集。
 
 ## 配置 API Key
 
@@ -27,7 +27,7 @@ GLM Key 可在首次安装时跳过，之后用群命令添加或更换。以下
 
 发送 `model`（`md`），在 Claude Code、Codex、DeepSeek Harness 分组下选择账号，再选择模型。首页直接使用缓存；手动点开账号模型列表时立即发起目录查询，卡片显示刷新状态，完成后呈现目录。有多个推理档位（effort）时继续选择档位，只有一个档位时直接应用。
 
-Codex 订阅的模型目录和额度主动轮询均为每 2 小时；其他来源仍为模型目录每 5 分钟、额度每 60 秒。daemon 启动时完成首次预热。`md` 首页、`hi`、账号列表、Agent 身份目录、自动选号和回复页脚都直接读取已提交缓存。手动进入账号模型列表会额外查询，但不会占住其他交互；翻页和显隐后的列表重绘复用快照。Codex 邮箱复用后台原生账号查询的结果。
+Codex 订阅的模型目录和额度主动轮询均为每 2 小时；[reclaude](#reclaude) 的额度随模型目录一起读取，均为每 5 分钟；其他来源为模型目录每 5 分钟、额度每 60 秒。daemon 启动时完成首次预热。`md` 首页、`hi`、账号列表、Agent 身份目录、自动选号和回复页脚都直接读取已提交缓存。手动进入账号模型列表会额外查询，但不会占住其他交互；翻页和显隐后的列表重绘复用快照。Codex 邮箱复用后台原生账号查询的结果。
 
 这些周期和主动查询流量预算仅约束 Lodestar 的定时轮询。常驻 Codex 自身刷新、用户手动拉取模型列表属于允许额外消耗的被动刷新，不受主动周期限制。同账号有运行中的 Codex 进程时，额度复用已有连接，每分钟兜底刷新，并在额度通知和回合结束时及时回读。无运行进程、也没有用户按需操作时，其他地方的消费变化可能到下次主动查询才显示。
 
@@ -48,11 +48,11 @@ OpenRouter 保持自己的精选和模型管理规则。通用中转站按站点
 
 ## 额度
 
-发送 `hi` 查看全部已配置账号的额度，一账号一行。Codex 按备注展示主额度窗口及“重置”次数，不展示 Spark、gpt-reserve；Claude 订阅保留主窗口和模型专属周额度，已取消 5 小时限额的账号只显示周额度；GLM 月工具仅显示已用百分比，DeepSeek、OpenRouter 显示余额。DeepSeek、GLM 的两个 Agent 入口各合并为一行。
+发送 `hi` 查看全部已配置账号的额度，一账号一行。Codex 按备注展示主额度窗口及“重置”次数，不展示 Spark、gpt-reserve；Claude 订阅和 reclaude 保留主窗口和模型专属周额度，已取消 5 小时限额的账号只显示周额度；GLM 月工具仅显示已用百分比，DeepSeek、OpenRouter 显示余额。DeepSeek、GLM 的两个 Agent 入口各合并为一行。
 
-所有群、Agent、`hi`、账号列表、页脚和自动选号共用账号级缓存。Codex 订阅模型目录和额度均每 2 小时主动刷新，其他来源仍为 5 分钟和 60 秒；普通交互只读已提交缓存，手动打开模型列表允许立即额外查询，同账号并发刷新合并。启动首次预热及显式首次收录账号可以等待查询完成。用户任务启动或真实耗尽换号若没有可选缓存，可立即按需回读一次；已知真实重置时间到达时可再确认一次，普通等待循环不额外冷查询。Codex 订阅主动查询失败后至少等待 2 小时；运行连接的被动额度刷新使用共享的 1、2、4、5 分钟失败冷却；其他来源失败后冷却 1 分钟，连续失败依次延长为 2、4、5 分钟。上游提供更长的 `Retry-After` 时遵守其等待时间。Codex 额度查询遇到瞬态连接错误时，在同一次共享查询内最多尝试 3 次，间隔 1 秒、4 秒；真实限频、认证失败及无效响应不立即重试，最终失败后进入冷却，冷却期间返回已有错误。重新登录、删除 Codex 账号或显式使用重置卡会使对应缓存失效；使用重置卡后重新查询实际额度。
+所有群、Agent、`hi`、账号列表、页脚和自动选号共用账号级缓存，刷新周期见[选择与管理模型](#选择与管理模型)。启动首次预热及显式首次收录账号可以等待查询完成。用户任务启动或真实耗尽换号若没有可选缓存，可立即按需回读一次；已知真实重置时间到达时可再确认一次，普通等待循环不额外冷查询。Codex 订阅主动查询失败后至少等待 2 小时；运行连接的被动额度刷新使用共享的 1、2、4、5 分钟失败冷却；其他来源失败后冷却 1 分钟，连续失败依次延长为 2、4、5 分钟。上游提供更长的 `Retry-After` 时遵守其等待时间。Codex 额度查询遇到瞬态连接错误时，在同一次共享查询内最多尝试 3 次，间隔 1 秒、4 秒；真实限频、认证失败及无效响应不立即重试，最终失败后进入冷却，冷却期间返回已有错误。重新登录、删除 Codex 账号或显式使用重置卡会使对应缓存失效；使用重置卡后重新查询实际额度。
 
-回复底部显示 `agent · 模型名/effort`，其中 Agent 为 `claude`、`codex` 或 `dsh`。窗口额度如 `4.1h·7%·[6.9d·17%]`，分别表示重置倒计时与已用百分比，方括号内为周窗口；Claude 订阅账号已取消 5 小时限额时省略 5h 段，只显示 `[6.9d·17%]`，不补 `MISS`。余额显示 `余额 $12.34` 或 `余额 ¥12.34`。Codex 刷新失败或进程已退出时，回复底部按原格式保留同账号上次成功的额度。没有成功缓存、登录认证失败或缓存已被重新登录、删除账号、额度重置操作清除时显示 `MISS`。Codex 的 `hi`、`codex-accounts` 额度区域在网络或限流导致刷新失败时也保留成功缓存，账号列表仍展示本次调度失败原因。
+回复底部显示 `agent · 模型名/effort`，其中 Agent 为 `claude`、`codex` 或 `dsh`。窗口额度如 `4.1h·7%·[6.9d·17%]`，分别表示重置倒计时与已用百分比，方括号内为周窗口；Claude 订阅或 reclaude 账号已取消 5 小时限额时省略 5h 段，只显示 `[6.9d·17%]`，不补 `MISS`。余额显示 `余额 $12.34` 或 `余额 ¥12.34`。Codex 刷新失败或进程已退出时，回复底部按原格式保留同账号上次成功的额度。没有成功缓存、登录认证失败或缓存已被重新登录、删除账号、额度重置操作清除时显示 `MISS`。Codex 的 `hi`、`codex-accounts` 额度区域在网络或限流导致刷新失败时也保留成功缓存，账号列表仍展示本次调度失败原因。
 
 Codex 启动和换号优先使用最近一次成功的额度缓存；能选出账号就直接启动，不等待其他账号刷新；没有可用缓存时明确显示 MISS，后台继续刷新。其他账号未参与选号的诊断保留在日志和 `codex-accounts` 中，不主动发送“部分账号 MISS”警告。只有无法启动或继续任务时，才主动展示相应失败或等待状态。
 
@@ -101,6 +101,25 @@ lodestar-claude 工作号 auth login
 
 旧版“Claude”本机配置入口已移除；使用该入口的用户升级后请通过 `md` 选择“Claude Code 订阅”及模型。
 
+## reclaude
+
+reclaude 是第三方的 Claude Code 启动器：登录、组织绑定和网络路由都由 reclaude 自己管理，Lodestar 只经它启动 Claude Code，不读取、不保存 reclaude 的任何凭据，配置里也没有凭据字段。来源 id 为 `reclaude`，在 `md` → Claude Code 下显示为 **reclaude**（可用 `display` 改名），可与 Claude Code 订阅及其他第三方来源同时使用。
+
+**启用**：无需群命令。Lodestar 在 `PATH` 和 `~/.local/bin` 中查找 `reclaude` 命令，找到即启用；装在别处时用 `[token_source.reclaude]` 的 `bin` 指定（路径不存在会报错），`enabled = false` 关闭该来源。配置项见[安装与配置](configuration.md#reclaude-配置)。每次目录刷新都会重新查找，Lodestar 运行后才安装或卸载 reclaude 无需重启，约 5 分钟内自动生效。随后在运行 Lodestar 的本机用 `reclaude login` 登录，并用 reclaude 绑定组织。
+
+**组织**：默认跟随 `reclaude org use <组织 ID>` 选定的当前组织；在配置中写 `org = "<组织 ID>"` 则固定使用该组织，该组织须已用 `reclaude org bind <组织 ID>` 绑定。切换组织在下一次目录刷新时生效：模型和额度改读新组织，绑定旧组织的空闲进程在下一轮开始前停止，按新组织重新启动。
+
+**会话记录**：reclaude 的会话记录保存在各组织自己的配置目录中，与其他 Claude 来源共用的会话目录相互独立。在 reclaude 与其他 Claude 来源之间切换，或切换组织后，原会话无法在新来源续接：续接时会说明原因，发送 `hi` 开始新会话，或用 `md` 切回原来源继续。`rs` 只列出当前来源目录下的历史会话。
+
+**状态**：
+
+- `md` 中显示“未配置”：本机找不到 reclaude 命令，或已被 `enabled = false` 关闭；点 **启** 会回复具体原因。
+- 模型目录显示 `MISS`：命令已找到，但 reclaude 未登录或登录失效、没有当前组织、`org` 指定的组织未绑定、绑定目录尚未初始化，或 reclaude 暂时无法确认登录状态（本机网络或 reclaude 后台服务异常，恢复后自动重试，无需重新登录）。原因中会给出要执行的命令（`reclaude login`、`reclaude org bind <id>`、`reclaude org use <id>`，或先运行一次 reclaude 完成初始化）。处理后等待下一次目录刷新（约 5 分钟），也可手动打开该来源的模型列表立即刷新。
+
+**模型与额度**：每次目录刷新（每 5 分钟，以及手动打开模型列表时）经 reclaude 启动一个 control-only Claude Code 进程，同时读取原生模型目录和原生 `/usage` 额度，因此 reclaude 的额度每 5 分钟更新一次，而不是每 60 秒。额度格式与 Claude Code 订阅相同：`hi` 显示 5 小时、周额度及模型专属周额度，回复底部显示本轮模型适用的窗口。额度读取失败只把额度显示为 `MISS`，模型目录照常可用。未配置 `model` 时默认选目录中的 Claude Opus；配置的 `model` 须在目录中或已补录，`effort` 须为该模型支持的档位，否则目录显示 `MISS` 和原因。
+
+**限制**：reclaude 使用组织的 Claude 订阅登录，与 Claude Code 订阅同样属于订阅使用，因此 Lodestar Agent 不调用 reclaude（遵守 Claude 用户协议），它不出现在 `agents` 身份目录中，也不能用于新建或续跑委派任务。主会话和原生委派工具不受影响。reclaude 只能启动原生 Claude Code 可执行文件，`[claude].bin` 指向脚本入口时该来源拒绝启动。启动方式见[后端说明](claude-agent-backend.md#reclaude-启动器)。
+
 ## OpenRouter
 
 OpenRouter 通过 Claude Agent SDK 运行。在群内发送 `openrouter-setup <api_key>`，再通过 `model` 面板选择模型和 effort；自建兼容端点用 `openrouter-setup <base_url> <api_key>`。也可在配置文件中添加：
@@ -140,13 +159,13 @@ effort 按上游声明提供。小米、MiniMax、字节等没有 effort 选择�
 
 OpenRouter 余额来自 `/api/v1/credits`，按 `total_credits - total_usage` 计算；接口权限和错误以实际响应为准。账号目录可见不代表所有工具和请求都能成功，上游拒绝或路由不可用会明确报错。兼容接口、模型与档位的处理见[后端说明](claude-agent-backend.md#openrouter)。
 
-## 通用中转站（覆盖 Packy）
+## 通用中转站
 
-中转站不绑定具体厂商，只配置站点标识、API Key、地址和协议类型。Packy 的旧 `[token_source.packy]`、`packy-secondary`、`packy-codex` 配置不再读取，需要按新格式重新配置。
+中转站不绑定具体厂商，每个站点一节 `[relay.<site_id>]`，只配置站点标识、API Key、地址和协议类型。PackyAPI 等中转服务都按这种方式接入；旧版 `[token_source.packy]`、`[token_source.packy-secondary]`、`[token_source.packy-codex]` 不再读取，升级后需按本节格式重新配置。
 
 ```toml
-[relay.packy]
-display = "Packy"
+[relay.my-relay]
+display = "我的中转站"
 api_key = "填写 API Key"
 base_url = "https://gateway.example"
 protocol = "anthropic"        # Claude Code；OpenAI 类型同时提供 Codex 和 DSH
@@ -163,7 +182,7 @@ protocol = "anthropic"        # Claude Code；OpenAI 类型同时提供 Codex �
 余额查询是可选的。发送 `relay-balance-setup <site_id> <script_path>` 绑定脚本。脚本通过 stdin 接收 JSON：
 
 ```json
-{"site_id":"packy","base_url":"https://gateway.example","protocol":"anthropic","api_key":"..."}
+{"site_id":"my-relay","base_url":"https://gateway.example","protocol":"anthropic","api_key":"..."}
 ```
 
 stdout 返回统一额度快照，例如：

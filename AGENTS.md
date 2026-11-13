@@ -2,7 +2,7 @@
 
 Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个群对应一个 `Session`，通过 Codex app-server、Claude Agent SDK 或 DeepSeek Harness 执行任务，以 Feishu Card Kit schema 2.0 展示结果。
 
-维护说明以 `AGENTS.md` 为入口。Codex、Claude Code 订阅、GLM、DeepSeek、OpenRouter、PackyAPI 和 DeepSeek Harness 都是受支持能力；文档清理、缺少本机凭据或维护工具选择不构成删除后端的理由。
+维护说明以 `AGENTS.md` 为入口。Codex、Claude Code 订阅、reclaude、GLM、DeepSeek、OpenRouter、通用中转站（relay）和 DeepSeek Harness 都是受支持能力；文档清理、缺少本机凭据或维护工具选择不构成删除后端的理由。
 
 ## 目录
 
@@ -17,8 +17,8 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 ## 开发规则
 
 - 源码运行使用 `bun daemon.ts` 或 `bun run start`；`bun run build` 生成 Node.js 22.19+（22.x）或 24+ 的发布入口；发布包由 Node 运行，Bun 自动加载的 `.env` 行为不适用于 npm 入口。
-- `config.ts` 在 import 时同步读取配置，缺失时报错。首次安装的延迟导入只放在 `cli.ts`。配置项校验失败抛 `ConfigError`，其消息只含配置键和非敏感取值，不含路径与凭据；启动入口把该消息原样写到 stderr，其余启动失败仍只输出安全摘要。`[notify].bind` 不能为空串（空串会监听全部网卡）。
-- 配置默认位于 `~/.config/lodestar/config.toml`，状态位于 `~/.local/share/lodestar/`。新增持久状态通过 `src/paths.ts` 定义，遵循 XDG 和 Windows 路径约定。
+- `config.ts` 在 import 时同步读取配置，缺失时报错。首次安装的延迟导入只放在 `cli.ts`。配置项校验失败抛 `ConfigError`（`src/config-error.ts`），其消息只含配置键和非敏感取值，不含路径与凭据；启动入口把该消息原样写到 stderr，其余启动失败仍只输出安全摘要。`[notify].bind` 不能为空串（空串会监听全部网卡）。
+- 配置默认位于 `~/.config/lodestar/config.toml`，状态位于 `~/.local/share/lodestar/`。新增持久状态通过 `src/paths.ts` 定义，遵循 XDG 和 Windows 路径约定。数据目录与 PID 目录创建时使用 0700（只作用于新建目录，不改已有目录权限）；状态文件经 `state-store.ts` 原子写入（0600），`debug-context.json` 同样如此。
 - 凭据、本机配置、聊天成员、debug context 和 `~/.codex`、`~/.claude` 内容不得写入跟踪文件。
 - 运行日志只保留关键状态和故障摘要，禁止正常协议 payload、命令输出、代码 diff、请求/响应正文及逐步调试流水。日志不能包含用户、群、项目名称、账号备注、路径、可关联的聊天/消息/会话/任务 ID、人数或群数；不使用哈希或匿名编号替代身份。事件说明使用固定字面量，错误通过 `logError` 提取安全类别、错误码及 HTTP 状态，重复诊断通过 `logDiagnostic` 合并且不输出次数；不得直接记录上游 message/stack/stderr。用户侧错误反馈和恢复所需持久状态保留原始信息，不属于普通日志。
 - API、模型目录、额度、上传和进程启动失败必须记录并向调用方显示；缺失数据用 `MISS`，不能伪造成功或偷偷更换来源。仅允许对已知瞬态错误有限重试。Codex 自动选号成功时，其他账号的缓存过期、模型不支持、查询或认证失败等诊断仅保留在日志和主动查询面板，不单独推送警告；无法启动或继续任务的失败仍须明确提示。
@@ -31,11 +31,40 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 
 - 一个群只有一个 Session 和一个当前主进程。Codex 使用 app-server JSON-RPC，Claude Code 及其第三方来源使用 Agent SDK streaming input，DSH 使用独立 Node 子进程和 Cordis stdio 桥接；不引入 tmux、JSONL 队列或旁路进程控制。
 - DSH 的 `deepseek-harness` 与 Claude 兼容的 `deepseek` 共用 DeepSeek 凭据和平台地址；`dsh-glm` 与 `glm` 共用 GLM Coding Plan 账号，前者通过原生 pi-ai 适配器接入。共享凭据只存一份，模型、effort 和可见性按 Agent 保留；旧配置冲突必须明确报错，任一 setup 入口均更新共享账号。运行时经更新器选择 latest，子进程需要 Node 22.19+（22.x）或 24+；`src/dsh-bridge.ts` 仅在该子进程加载。启动补丁按实际安装的 profile 判断是否已自带 ask-user 工具，避免重复注册；模型接入链需要的 credentials 服务保持启用，凭据仍只由环境变量注入。
-- `agent-updates.ts` 按 `[runtime.agent_auto_update]` 的 `codex`、`claude`、`dsh` 三个独立开关每 6 小时更新对应 Agent，首次检查也在 6 小时后；三项默认关闭，各自防止重叠执行，失败互不阻塞。旧布尔总开关按原值兼容转换并提示迁移，不与新表混用。`lodestar-update --agents-only` 可立即安装/更新。实际程序和 SDK 从独立版本目录加载；安装成功直接启用，新进程使用新版，已有进程保留其运行目录。更新成功后只保留当前与最近两个版本目录，仍被运行中进程使用的目录不删除，无法核对的平台跳过清理。Windows 不覆盖或删除使用中的 EXE/DLL；安装取消按精确 PID 终止安装器进程树，未确认退出不得清理其临时目录。文件占用有限重试，最终错误必须显示。安装或查询失败只记录更新日志并向手动更新调用方返回失败，不修改当前安装记录，不影响已有安装的启动和 `lodestar-version`；已开启自动更新的 Agent 在下一个 6 小时周期再试。旧状态中的更新错误不参与启动判断或版本展示。首次未安装、安装损坏或旧版已清掉选择记录时按实际安装状态报错，不扫描目录猜测版本。自动更新 Agent 不重启 daemon。
+- Agent 运行时更新（`agent-updates.ts`）：
+  - 按 `[runtime.agent_auto_update]` 的 `codex`、`claude`、`dsh` 三个独立开关每 6 小时更新对应 Agent，首次检查也在 6 小时后；三项默认关闭，各自防止重叠执行，失败互不阻塞。旧布尔总开关按原值兼容转换并提示迁移，不与新表混用。
+  - `lodestar-update --agents-only` 在当前进程立即安装/更新。不带参数的 `lodestar-update`（`update-run.ts`）先安装新版 Lodestar 包，再以子进程运行新装入口的 `--agents-only`，让新版自带的安装逻辑执行本次 Agent 更新。
+  - 实际程序和 SDK 从独立版本目录加载；安装成功直接启用，新进程使用新版，已有进程保留其运行目录。更新成功后只保留当前与最近两个版本目录，并清理中断或取消安装遗留的 `.install-*` 临时目录与过期锁目录；仍被运行中进程使用的目录不删除，无法核对进程的平台跳过清理，清理问题不使更新失败。遗留临时目录须同时满足没有进程引用、安装时记录的安装器 PID 已确认退出才删除，没有 PID 记录的满 24 小时才删除。
+  - 缺 PID 文件的锁目录超过 30 秒即回收，过期锁先改名再核对，避免两个等待者误删对方刚取得的锁。
+  - Windows 不覆盖或删除使用中的 EXE/DLL；安装取消按精确 PID 终止安装器进程树，未确认退出不得清理其临时目录。文件占用有限重试，最终错误必须显示。
+  - 安装或查询失败只记录更新日志并向手动更新调用方返回失败，不修改当前安装记录，不影响已有安装的启动和 `lodestar-version`；已开启自动更新的 Agent 在下一个 6 小时周期再试。旧状态中的更新错误不参与启动判断或版本展示。首次未安装、安装损坏或旧版已清掉选择记录时按实际安装状态报错，不扫描目录猜测版本。
+  - 自动更新 Agent 不重启 daemon；daemon 停机在 15 秒期限内等待进行中的更新结算。
 - 飞书与 Lark 是两套独立的开放平台云。`[feishu].domain` 缺省为飞书（`open.feishu.cn`，与历史行为逐字节一致），`lark` 切换 `open.larksuite.com`，也可填 https 源站；REST 基址、Card Kit、云空间、SDK `Client` 和 `WSClient` 全部经 `feishu-endpoint.ts` 与 `feishu.sdkDomain()` 解析，不得再硬编码 `open.feishu.cn`。安装向导先探测所选区域，失败后才尝试另一侧，保证可用的飞书应用不会被切走。
-- Token Source 统一管理账号、凭据、模型目录、启动环境和额度。Claude Code 订阅（`claude-sub`）独立复用本机原生登录态，可与第三方来源共存。模型与 Agent 身份动态读取该目录，沿用目录声明的 effort；来源禁用或刷新失败显示 `MISS`。新增来源通过 factory 注册。
-- MD 首页按 Claude Code、Codex、DeepSeek Harness 分组，底层 Agent id 仍为 `claude`、`codex`、`dsh`。模型行右侧窄按钮用单字（选、显、隐、删），补录模型、显示模型、返回和翻页等宽按钮保留完整文案；模型行之间加分隔线，文字和按钮垂直居中；只有一个 effort 档位（含原生 default）时直接应用，多个档位才进入选择；两个 DeepSeek 来源都显示为 DeepSeek。OpenRouter 默认从账号目录按腾讯 Hy、Gemini Flash、Meta Muse Spark、MiMo Pro、字节 Seed Turbo、美团 LongCat 六个家族筛选最新数字版本；Hy 沿用 preview 候选，同版本优先正式版；其他家族不自动纳入 preview，均排除 free、thinking、Flash Lite、ultraspeed 等变体；Packy Claude 入口默认从兼容目录按 MiniMax M、Claude Opus（含 5.5）、Claude Fable、Qwen Max 家族筛选最新数字版本，Codex 入口按 Kimi K、Grok 家族筛选，不自动纳入 preview/thinking 等变体。两来源均不猜测目录外 ID，默认精选随每 5 分钟目录刷新，显隐增量保存为 shown_models 与 hidden_models，自动精选项隐藏同时记录 family: 家族键与当前 ID，显式旧版仍按 ID 管理；已有 models 固定列表（含空串）、model 和 custom_models 保持显式配置，不自动切换运行模型。其他来源默认展示接口列表。Packy 主令牌为 `packy`，第二令牌为 `packy-secondary`，`packy-codex` 复用主令牌和平台地址；按接口协议筛选各 Agent 模型；已确认兼容但目录未声明该协议的模型可通过 custom_models 显式补录，不改写上游协议声明。Codex API 来源不参与订阅登录、自动选号或订阅额度查询。Packy 真实余额用独立系统访问令牌和用户 ID 查询管理端 `/api/user/self`，按站点单位换算；Codex 共用主账号余额，第二令牌可显式引用同一余额账号，推理 Key 保持独立。系统令牌不传入 Agent；hi 合并同一余额账号，footer 共用缓存，失败显示 MISS。接口项用隐藏/显示，列表外记录用补录/删除；所有来源支持 `custom_models`，补录后可选请求档位并直接使用，不能因目录未收录而清空 effort 或禁止选择。隐藏不改运行模型，删除补录项须保护正在选用的会话并清理悬空配置。footer 固定为 `agent · 模型名/effort`；`md` 首页、额度与身份面板等普通交互只读缓存；用户手动点开账号模型列表可立即按需刷新，翻页与显隐重绘复用快照；Codex 订阅模型目录和额度的主动轮询均为每 2 小时，主动失败重试不早于该间隔；同账号存在运行中的原生 Codex 进程时，额度优先复用其连接，每分钟兜底并在额度通知及回合结束时及时回读；同账号并发合并，原生通知仅作刷新信号，不直接写额度；运行连接失败不隐式退回冷启动；手动目录查询和常驻 Codex 自身刷新属于允许额外消耗的被动刷新，不受主动周期限制；其他来源仍按模型目录每 5 分钟、额度每 60 秒刷新，启动首次预热可等待；用户任务首次启动或真实耗尽换号在没有可选缓存时允许一次按需额度回读，已观测的真实重置时间到达时可按账号和时间去重确认一次；每分钟等待只读缓存，不能以兜底唤醒时间触发冷查询；额度按账号和平台共享缓存及并发请求；Codex 额度查询的瞬态连接错误先在同一共享请求内最多尝试 3 次（间隔 1s、4s），真实限频与认证失败不立即重试；主动查询最终失败后不早于对应正常间隔重试；运行连接的被动额度刷新沿用共享失败冷却，两者均遵守上游更长 Retry-After；回复 footer 最终刷新失败可按原格式直接展示同账号成功缓存，不加缓存或刷新失败标注，无缓存或认证失败仍 MISS；主动额度面板同样只读缓存，诊断保留在后台日志和账号状态；窗口额度保留原紧凑倒计时格式 `4.1h·7%·[6.9d·17%]`，Codex 有消费积分时追加 `积分 62.5k`，积分未知显示 MISS、确认没有则省略；订阅窗口耗尽且没有积分才判定额度用光。Codex 只展示接口实际返回的窗口，成功响应未返回短窗时不补造 5h、满额或重置时间；查询失败和已返回窗口缺值仍保留错误或 MISS。仅剩积分的账号排在有订阅余量的账号后，按积分余额降序；Plus 未返回短窗时按实际周额度评分，可参与 Ultra 自动选择，无需消费积分；返回短窗的 Plus 仍需本计量桶可用积分才能参与 Ultra，无积分排除、积分未知显示 MISS。有积分的 Pro 不受 Ultra 的 0.5 份周余量门槛限制，不据积分绕过模型权限或强制计费来源，`ordinaryUsageAllowed=false` 与 `rate_limit_reached` 仅表示套餐内额度不可用，有本计量桶积分时仍可选；工作区积分/用量限制、消费限制和真实请求耗尽仍有效。余额显示 `余额 $…` / `余额 ¥…`。OpenRouter 用 `/credits` 查账户余额，以实际响应判断权限。
-- Lodestar Agent 不支持调用 Claude 订阅，遵守 Claude 用户协议；中转站等第三方来源的 Claude 模型仍可调用。身份目录与新建/续跑入口仅按来源 ID 与类型排除 Claude 订阅，不按模型名称或显示名限制。此限制只作用于 Lodestar Agent，不影响主会话的 Claude 订阅能力或原生委派工具。
+- Token Source 统一管理账号、凭据、模型目录、启动环境和额度。内置来源通过 factory 注册（`token-source-builtins.ts`）；模型与 Agent 身份动态读取来源目录，沿用目录声明的 effort；来源禁用或刷新失败显示 `MISS`。
+  - Claude Code 订阅（`claude-sub`）独立复用本机原生登录态，可与第三方来源共存。
+  - reclaude（来源 id 与类型均为 `reclaude`，Agent 为 Claude Code）是第三方 Claude Code 启动器：登录态、组织绑定和网络路由归 reclaude 管理，Lodestar 只经它启动 Claude Code，不读取、不保存其凭据。PATH 或 `~/.local/bin` 中找到 `reclaude` 命令（或 `[token_source.reclaude].bin` 指定）即自动启用，`enabled = false` 关闭；`org` 固定组织，省略时跟随 `reclaude org use` 的当前组织。进程以 `reclaude --org <组织 ID> cli <Claude Code 参数>` 启动。reclaude 的会话记录保存在各组织自己的绑定目录，与其他 Claude 来源共用的原生目录相互独立：`rs` 只列当前来源的目录，跨目录续接明确报错，不交给原生报找不到会话。细节见 `src/AGENTS.md`。
+  - 通用中转站按 `[relay.<site_id>]` 配置，由 `token-source-relay.ts` 生成来源（id `relay:<site_id>:<agent>`）：`anthropic` 类型只提供 Claude Code，`openai` 类型同时生成 Codex 与 DeepSeek Harness 两个来源。站点只保存 API Key、地址、协议类型和可选余额脚本，不绑定具体厂商。旧 `packy`、`packy-secondary`、`packy-codex` 配置节不再参与生产 Token Source 注册，也不阻断启动。
+- MD 首页与模型目录：
+  - 首页按 Claude Code、Codex、DeepSeek Harness 分组，底层 Agent id 仍为 `claude`、`codex`、`dsh`；reclaude 列在 Claude Code 组；各组的中转站站点收在一行「中转站」下，点开后再选站点。两个 DeepSeek 来源都显示为 DeepSeek。
+  - 模型行右侧窄按钮用单字（选、显、隐、删），补录模型、显示模型、返回和翻页等宽按钮保留完整文案；模型行之间加分隔线，文字和按钮垂直居中。只有一个 effort 档位（含原生 default）时直接应用，多个档位才进入选择。
+  - OpenRouter 默认从账号目录按腾讯 Hy、Gemini Flash、Meta Muse Spark、MiMo Pro、字节 Seed Turbo、美团 LongCat 六个家族筛选最新数字版本；Hy 沿用 preview 候选，同版本优先正式版；其他家族不自动纳入 preview，均排除 free、thinking、Flash Lite、ultraspeed 等变体。不猜测目录外 ID；默认精选随每 5 分钟目录刷新，显隐增量保存为 `shown_models` 与 `hidden_models`，自动精选项隐藏同时记录 `family:` 家族键与当前 ID，显式旧版仍按 ID 管理；已有 `models` 固定列表（含空串）、`model` 和 `custom_models` 保持显式配置，不自动切换运行模型。
+  - 中转站模型目录读取站点 `/v1/models`，并追加配置中 `models`、`custom_models` 列出的 ID；不做厂商精选，MD 不提供显隐与补录。其他来源默认展示接口列表。
+  - 接口项用隐藏/显示，列表外记录用补录/删除；除中转站外所有来源支持 `custom_models`，补录后可选请求档位并直接使用，不能因目录未收录而清空 effort 或禁止选择。隐藏不改运行模型，删除补录项须保护正在选用的会话并清理悬空配置。
+  - Codex API 来源（中转站的 Codex 视图）不参与订阅登录、自动选号或订阅额度查询。
+- 缓存与刷新节奏：
+  - footer 固定为 `agent · 模型名/effort`。`md` 首页、额度与身份面板等普通交互只读缓存；用户手动点开账号模型列表可立即按需刷新，翻页与显隐重绘复用快照。
+  - Codex 订阅模型目录和额度的主动轮询均为每 2 小时，主动失败重试不早于该间隔。同账号存在运行中的原生 Codex 进程时，额度优先复用其连接，每分钟兜底并在额度通知及回合结束时及时回读；同账号并发合并，原生通知仅作刷新信号，不直接写额度；运行连接失败不隐式退回冷启动。手动目录查询和常驻 Codex 自身刷新属于允许额外消耗的被动刷新，不受主动周期限制。
+  - 其他来源按模型目录每 5 分钟、额度每 60 秒刷新，启动首次预热可等待。reclaude 例外：额度随每次目录刷新（每 5 分钟及手动刷新模型列表）与目录一并读取，不按 60 秒单独查询。
+  - 用户任务首次启动或真实耗尽换号在没有可选缓存时允许一次按需额度回读，已观测的真实重置时间到达时可按账号和时间去重确认一次；每分钟等待只读缓存，不能以兜底唤醒时间触发冷查询。额度按账号和平台共享缓存及并发请求。
+  - Codex 额度查询的瞬态连接错误先在同一共享请求内最多尝试 3 次（间隔 1s、4s），真实限频与认证失败不立即重试；主动查询最终失败后不早于对应正常间隔重试；运行连接的被动额度刷新沿用共享失败冷却，两者均遵守上游更长 Retry-After。
+  - 回复 footer 最终刷新失败可按原格式直接展示同账号成功缓存，不加缓存或刷新失败标注，无缓存或认证失败仍 MISS；主动额度面板同样只读缓存，诊断保留在后台日志和账号状态。
+- 额度展示与 Codex 选号：
+  - 窗口额度保留原紧凑倒计时格式 `4.1h·7%·[6.9d·17%]`，reclaude 与 Claude 订阅窗口格式相同；Codex 有消费积分时追加 `积分 62.5k`，积分未知显示 MISS、确认没有则省略；订阅窗口耗尽且没有积分才判定额度用光。余额显示 `余额 $…` / `余额 ¥…`。
+  - Codex 只展示接口实际返回的窗口，成功响应未返回短窗时不补造 5h、满额或重置时间；查询失败和已返回窗口缺值仍保留错误或 MISS。
+  - 仅剩积分的账号排在有订阅余量的账号后，按积分余额降序。Plus 未返回短窗时按实际周额度评分，可参与 Ultra 自动选择，无需消费积分；返回短窗的 Plus 仍需本计量桶可用积分才能参与 Ultra，无积分排除、积分未知显示 MISS。有积分的 Pro 不受 Ultra 的 0.5 份周余量门槛限制。
+  - 不据积分绕过模型权限或强制计费来源；`ordinaryUsageAllowed=false` 与 `rate_limit_reached` 仅表示套餐内额度不可用，有本计量桶积分时仍可选；工作区积分/用量限制、消费限制和真实请求耗尽仍有效。
+  - OpenRouter 用 `/credits` 查账户余额，以实际响应判断权限。中转站余额只来自可选 `balance_script`，同一站点的各 Agent 视图在 hi 合并为一个余额账号；未配置脚本时不适用，脚本失败显示 MISS。
+- Lodestar Agent 不支持调用 Claude 订阅，遵守 Claude 用户协议；中转站等第三方来源的 Claude 模型仍可调用。reclaude 运行在订阅登录上，与 Claude 订阅一样排除。身份目录与新建/续跑入口仅按来源 ID 与类型排除 Claude 订阅与 reclaude，不按模型名称或显示名限制。此限制只作用于 Lodestar Agent，不影响主会话的 Claude 订阅/reclaude 能力或原生委派工具。
 - `AgentService` 的委派进程与主会话共用启动入口。主 Agent、委派 Agent 和原生子 Agent 均可继续派工，不设置 Lodestar 委派层数上限，保留原生委派工具；独立服务/软件的项目调用不提供提问或回答接口，新建和续跑均须自主执行、验证直至完整完成目标，不能以索取输入、计划或部分工作结束；真实阻断和故障须如实报告；后续委派继承项目、对话 ID（`chat_id`）和交互约定，并纳入父任务的取消树。会话委派与 `--project` 项目调用都只返回结果和本地文件路径，由调用方处理交付；不注入主会话交付提示词，不执行结果中的交付标记，新建与续跑一致。具体生命周期约束见 `src/AGENTS.md`。
 - Agent 执行任务中的调用必须绑定会话，不得通过 `--project`、清除环境或借用项目凭据脱离会话；独立服务/软件调用必须显式 `--project`，每次在绑定对话 ID 下显示独立卡。对话 ID（`chat_id`）标识调用绑定对象；原生 `session_id` 是后端会话唯一 ID，与对话 ID 不同，`run_id` 仅标识一次调用。恢复限同一项目、同一对话 ID，允许会话/项目两种绑定之间续跑；未知归属、跨项目和跨对话 ID 均报错。会话委派与项目调用均不设置本地并发或任务数量上限，上游限制与启动失败按实际错误报告。
 - `managed-skills.ts` 同源生成 Codex/Claude standalone Skill 和 Claude 本地插件。GLM/DeepSeek 通过插件加载 Skill，不为此重新引入 user settings 和凭据。
@@ -44,16 +73,21 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - `cardkit.ts` 独占生产卡的队列、sequence、TTL 重开、元素计数和写入失败状态。正文按完整 block 插入静态元素，footer 用 replace；模板和 Session 不直调 Card Kit HTTP。
 - `workspace.ts` 统一按实际工作目录（含软链接归一化）解析目录配置；BTW/FK 与来源共享目录，WT 是独立目录。项目工具/MCP 配置按目录共享；任务清单属于项目级，主群、所有 WT 及其 BTW/FK 临时群共用同一清单。模型/账号仅创建临时会话时继承快照，后续各会话独立。配置别名冲突必须报错。
 - `worktree.ts` 管理 `work/*` 分支和同级 `<project>[name]` 工作区。飞书任务清单按主项目名绑定，所有 worktree 共用；只提供绑定与删除，不启动自动规划、执行、审核或合并 worker。
-- `[[send: /abs/path]]` 按每个文件的实际大小自动选择交付方式：不超过 30 MB（30 × 1024 × 1024 字节）走聊天附件，超过则上传云空间，同轮可混合。没有 `files` 命令或工作目录开关。主 Agent 使用统一的飞书通道插件提示词，仅保留附件读取、文件交付标记、shell 摘要和无需额外处理飞书事务四项约定；三后端及两种交付方式共用同一份中文原文。大小分流由交付层执行，不注入提示词；文件交付不提供独立 Skill。`group-file-delivery.ts` 按项目主群 chat_id 持久绑定唯一云空间目录，首次交付大文件时创建，目录名与主群实时群名一致，跨轮次和重启复用；WT 群与 BTW/FK 临时群一律进主群目录，临时群自己不建目录，解析不到主群时明确报错。忽略旧 v1/v2 的群和工作目录开关，保留已有文件夹绑定、管理者及远端文件。不同主群之间不能混用目录，失效绑定不得自动重建空目录。云空间卡只列本轮云空间文件，管理按钮打开本群全部历史云空间交付文件的原生飞书目录；交付发起人获 full_access、群获 view，不转移所有权或开放公网分享。超过 20 MB 分片上传，限额由上游判断，失败不自动切换通道。原附件/图片通道保留，旧聊天附件不删除、不自动迁移。不按轮次或进程固定交付模式，不追加提示词或重启进程；记录由 paths.ts 定义，远端文件不自动清理，模板不读取文件。
+- 文件交付（`[[send: /abs/path]]`）：
+  - 按每个文件的实际大小自动选择交付方式：不超过 30 MB（30 × 1024 × 1024 字节）走聊天附件，超过则上传云空间，同轮可混合。没有 `files` 命令或工作目录开关。不按轮次或进程固定交付模式，不追加提示词或重启进程。
+  - 主 Agent 使用统一的飞书通道插件提示词，仅保留附件读取、文件交付标记、shell 摘要和无需额外处理飞书事务四项约定；三后端及两种交付方式共用同一份中文原文。大小分流由交付层执行，不注入提示词；文件交付不提供独立 Skill。
+  - `group-file-delivery.ts` 按项目主群 chat_id 持久绑定唯一云空间目录，首次交付大文件时创建，目录名与主群实时群名一致，跨轮次和重启复用；WT 群与 BTW/FK 临时群一律进主群目录，临时群自己不建目录，解析不到主群时明确报错。不同主群之间不能混用目录，失效绑定不得自动重建空目录。忽略旧 v1/v2 的群和工作目录开关，保留已有文件夹绑定、管理者及远端文件。
+  - 云空间卡只列本轮云空间文件，管理按钮打开本群全部历史云空间交付文件的原生飞书目录；交付发起人获 full_access、群获 view，不转移所有权或开放公网分享。超过 20 MB 分片上传，限额由上游判断，失败不自动切换通道。
+  - 原附件/图片通道保留，旧聊天附件不删除、不自动迁移。记录由 `paths.ts` 定义，远端文件不自动清理，模板不读取文件。
 - Codex 生图超过 30 MB 时自动转云空间交付；其余图片与提示词默认放在同一个折叠面板，提示词包含完成事件补回的内容，不在折叠标题中展开。图片成功嵌入后不再单发；无法嵌入时按用户要求单独发图。关闭或换卡前等待所属图片上传和写入完成。
-- `hi` 展示 Codex 账号可用的重置卡次数，来源为 `account/rateLimits/read` 的 `rateLimitResetCredits.availableCount`；hi 展示全部已配置账号，一账号一行；DeepSeek、GLM 不按 Agent 重复展示。Codex 只显示主额度，不显示 Spark/gpt-reserve；重置卡简写为“重置”，GLM 月工具只显示百分比，无底部说明。这不是飞书换卡计数，也不加入回复 footer。
+- `hi` 展示全部已配置账号，一账号一行；DeepSeek、GLM 不按 Agent 重复展示。Codex 只显示主额度，不显示 Spark/gpt-reserve；Codex 账号可用的重置卡次数来自 `account/rateLimits/read` 的 `rateLimitResetCredits.availableCount`，简写为“重置”，这不是飞书换卡计数，也不加入回复 footer。GLM 月工具只显示百分比，无底部说明。
 - `codex-reset [备注]` 显式使用一次账号重置卡；省略备注只取当前运行账号，账号未知时要求指定。调用原生 `account/rateLimitResetCredit/consume`，同一消息及其网络重试复用幂等标识；按四种原生 outcome 展示结果，之后重新读额度，不能推算卡数或掩盖已扣卡后的刷新/关闭失败。
 
 ## 运行中的 daemon
 
-- 启动的第一次 await 前加载恢复名单；开放 WS/调试入口前，按群把恢复任务排入消息与卡片共用的 actor。停机先关闭入口并排空已接收命令，再冻结恢复名单；停止进程时的生命周期回调不得覆盖该名单。恢复失败保留恢复意图和错误，普通消息不得隐式新建会话。
+- 启动的第一次 await 前加载恢复名单；开放 WS/调试入口前，按群把恢复任务排入消息与卡片共用的 actor。停机先关闭入口并排空已接收命令，再冻结恢复名单；停止进程时的生命周期回调不得覆盖该名单。停机开头的同步步骤各自隔离失败（`daemon.shutdown.step_failed`），不能经未捕获异常处理器重入停机。恢复失败保留恢复意图和错误，普通消息不得隐式新建会话。
 - 接收时已晚到超过 30 秒的消息应丢弃，避免用户重发后重复执行；排队耗时不参与该判断。这是明确的产品规则。
-- WebSocket 恢复必须彻底关闭旧 client 并创建新的 `WSClient`，该方式已在实际环境反复验证；不能仅凭 SDK 显示 connected 就取消完整重建。
+- WebSocket 恢复必须彻底关闭旧 client 并创建新的 `WSClient`，该方式已在实际环境反复验证；不能仅凭 SDK 显示 connected 就取消完整重建。SDK 的 `close()` 取消不了进行中的建连，因此被替换的 client 由 `ws-retire.ts` 退役：立即关闭，约 10 分钟内每 30 秒再关一次，其自身生命周期回调触发时也立即再关。退役 client 不驱动重建或自愈；它仍送达的事件照常处理（消息处理已去重），不丢弃，但只有当前 client 送达的事件才算“事件通道存活”的证据。
 - 修改代码不授权 stop、restart、reload、切换服务或接管。只有当前用户消息明确要求对应操作时才能执行；授权不跨消息、中断恢复或上下文压缩继承。
 - “测试”“预览”“发张卡看看”不授权停止、重启、shadow、并行启动 daemon 或改 service 指向。不能无扰验证时说明影响，等待明确许可。
 - 重启前只读确认实际 unit，比较 `systemctl --user show <unit> -p ActiveEnterTimestamp` 与源码 mtime。运行代码不落后则不重启，不用 commit 时间代替启动时间。
