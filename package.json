@@ -70,7 +70,7 @@
     "node": ">=22.19"
   },
   "dependencies": {
-    "@hono/node-server": "2.1.5",
+    "@hono/node-server": "2.1.8",
     "@larksuiteoapi/node-sdk": "^1.73.0",
     "@modelcontextprotocol/sdk": "1.32.1",
     "@resvg/resvg-js": "^2.6.2",
@@ -81,7 +81,7 @@
     "fast-uri": "3.1.9",
     "fflate": "0.8.3",
     "follow-redirects": "1.16.2",
-    "hono": "4.13.12",
+    "hono": "4.13.18",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.6",
     "ip-address": "10.7.4",
@@ -97,13 +97,13 @@
     "mathjax-full"
   ],
   "overrides": {
-    "@hono/node-server": "2.1.5",
+    "@hono/node-server": "2.1.8",
     "@modelcontextprotocol/sdk": "1.32.1",
     "@xmldom/xmldom": "0.9.12",
     "axios": "1.20.0",
     "fast-uri": "3.1.9",
     "fflate": "0.8.3",
-    "hono": "4.13.12",
+    "hono": "4.13.18",
     "ip-address": "10.7.4",
     "protobufjs": "7.6.5",
     "proxy-addr": "2.0.8",
