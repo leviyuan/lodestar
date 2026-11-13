@@ -406,3 +406,76 @@ describe('temporary session disband transaction', () => {
     expect(h.stateClears).toEqual([])
   })
 })
+
+describe('sessionFor after a group rename', () => {
+  function renameHarness() {
+    const events: string[] = []
+    class NamedSession implements TempSessionHandle {
+      running = false
+      readonly workDir: string
+      constructor(readonly sessionName: string) { this.workDir = `/projects/${sessionName}` }
+      isRunning(): boolean { return this.running }
+      applyConversationRouting(): void {}
+      async start(): Promise<boolean> { return true }
+      async startForked(): Promise<boolean> { return true }
+      backendLabel(): string { return 'Codex' }
+      async stop(): Promise<void> {}
+      dispose(): void { events.push(`dispose:${this.sessionName}`) }
+    }
+    const sessions = new Map<string, NamedSession>()
+    const bindings = new Map<string, string>([['foo', 'chat-1']])
+    const runtime = createTempSessionRuntime({
+      registry: sessions,
+      createSession: (sessionName, chatId) => {
+        events.push(`create:${sessionName}@${chatId}`)
+        return new NamedSession(sessionName)
+      },
+      ensureChatForSession: async () => ({ chatId: 'chat-1', created: true, joined: true }),
+      disbandChatForSessionExact: async () => ({ chatId: 'chat-1', disbanded: true }),
+      chatIdForSession: name => bindings.get(name) ?? null,
+      unbindSessionChat: name => { events.push(`unbind:${name}`); bindings.delete(name) },
+      clearSessionConversationState: () => {},
+      registerTempSessionLease: () => {},
+      hasTempSessionLease: () => true,
+      replaceTurnAnchors: () => {},
+      log: () => {},
+    })
+    return { runtime, sessions, bindings, events }
+  }
+
+  test('a stopped session is retired so the new name maps to its own project', () => {
+    const { runtime, sessions, bindings, events } = renameHarness()
+    const original = runtime.sessionFor('chat-1', 'foo')
+    expect(runtime.sessionFor('chat-1', 'foo')).toBe(original)
+
+    const renamed = runtime.sessionFor('chat-1', 'bar')
+    expect(renamed).not.toBe(original)
+    expect(renamed.sessionName).toBe('bar')
+    expect(sessions.get('chat-1')).toBe(renamed)
+    // The old name no longer points notifications at the renamed group.
+    expect(bindings.has('foo')).toBe(false)
+    expect(events).toEqual(['create:foo@chat-1', 'dispose:foo', 'unbind:foo', 'create:bar@chat-1'])
+  })
+
+  test('running work keeps its project and the conflict is reported instead of stopping it', () => {
+    const { runtime, sessions, bindings, events } = renameHarness()
+    const original = runtime.sessionFor('chat-1', 'foo')
+    sessions.get('chat-1')!.running = true
+
+    expect(() => runtime.sessionFor('chat-1', 'bar')).toThrow('原群名「foo」的会话仍在运行')
+    expect(sessions.get('chat-1')).toBe(original)
+    expect(bindings.get('foo')).toBe('chat-1')
+    expect(events).toEqual(['create:foo@chat-1'])
+    // Renaming back reaches the same session again, so it can be stopped normally.
+    expect(runtime.sessionFor('chat-1', 'foo')).toBe(original)
+  })
+
+  test('a binding that already moved to another chat is left alone', () => {
+    const { runtime, bindings, events } = renameHarness()
+    runtime.sessionFor('chat-1', 'foo')
+    bindings.set('foo', 'chat-2')
+    runtime.sessionFor('chat-1', 'bar')
+    expect(bindings.get('foo')).toBe('chat-2')
+    expect(events).not.toContain('unbind:foo')
+  })
+})

@@ -384,6 +384,7 @@ export class CodexProcess extends EventEmitter {
   private inputPolicyAbort = new AbortController()
   private inputPolicyCatalog: CodexInputPolicyCatalog | null = null
   private stdoutBuf = ''
+  private stdoutDecoder: StringDecoder | undefined
   private requestCounter = 0
   private pending = new Map<string | number, PendingRequest>()
   private serverRequests = new Map<string | number, ServerRequestState>()
@@ -612,11 +613,17 @@ export class CodexProcess extends EventEmitter {
   }
 
   private onStdout(chunk: Buffer): void {
-    this.stdoutBuf += chunk.toString()
+    // A pipe read can end inside a multi-byte character. Decoding each chunk on its
+    // own turns both halves into U+FFFD, so the decoder keeps the partial bytes.
+    const text = (this.stdoutDecoder ??= new StringDecoder('utf8')).write(chunk)
+    // Only the new text can hold a delimiter: rescanning the retained partial record
+    // for every chunk is quadratic for a multi-megabyte thread/read response.
+    let start = 0
     let nl: number
-    while ((nl = this.stdoutBuf.indexOf('\n')) >= 0) {
-      const line = this.stdoutBuf.slice(0, nl).trim()
-      this.stdoutBuf = this.stdoutBuf.slice(nl + 1)
+    while ((nl = text.indexOf('\n', start)) >= 0) {
+      const line = (this.stdoutBuf + text.slice(start, nl)).trim()
+      this.stdoutBuf = ''
+      start = nl + 1
       if (!line) continue
       let msg: any
       try {
@@ -636,12 +643,15 @@ export class CodexProcess extends EventEmitter {
         logError('codex-process: dispatch error', e)
       }
     }
+    if (start < text.length) this.stdoutBuf += start ? text.slice(start) : text
   }
 
   /** Child `close` guarantees stdio has drained, but the final JSON record is
    * not required to end with a newline. Feed one synthetic delimiter so the
    * ordinary parser handles that last record before public exit/detach. */
   private flushStdoutTail(): void {
+    // Bytes of a character the stream never completed still belong to the last record.
+    this.stdoutBuf += this.stdoutDecoder?.end() ?? ''
     if (!this.stdoutBuf) return
     this.onStdout(Buffer.from('\n'))
   }

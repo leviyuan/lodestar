@@ -301,8 +301,8 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
     const versions = await resolveAgentPackages(agent, options.metadata ?? ((name, version) => metadata(name, version, options.signal)))
     options.signal?.throwIfAborted()
     const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
-    // Runtime-only fixes must not install a Node 20+ dependency into the
-    // Node 18-compatible daemon. DSH already owns a separate Node 22+ tree.
+    // Fixes for one Agent's runtime stay in that Agent's own dependency tree; they are
+    // not added to the daemon's dependencies.
     const security = { ...manifest.overrides, ...manifest.agentRuntimeOverrides?.[agent] }
     // Format 4 installs through a canonical npm root so security overrides also
     // apply when the state directory is reached through a filesystem alias.

@@ -36,7 +36,11 @@ interface AgentRunRecord {
   context: AgentExecutionContext | null
   handles: Map<string, AgentWorkerHandle>
   capabilityByIdentity: Map<string, string>
-  progressTimers: Map<string, ReturnType<typeof setTimeout>>
+  /** One pending and one in-flight progress write per run; see scheduleProgress. */
+  progressTimer: ReturnType<typeof setTimeout> | null
+  progressWrite: Promise<void> | null
+  /** Latest worker whose steps no row write has shown yet. */
+  progressWorker: AgentWorkerResult | null
   children: Set<string>
   pendingChildCreations: number
   cancelled: boolean
@@ -377,6 +381,8 @@ export class AgentService {
       if (identity.status !== 'ready') throw new Error(`${identity.displayName}: ${identity.reason ?? identity.status}`)
       return identity
     })
+    // No worker would ever report a state, so the run and its card would stay queued forever.
+    if (!identities.length) throw new Error('agent run requires at least one identity')
     const workers = identities.map(identity => workerSnapshot(
       identity,
       resolveEffort(identity, request.effort),
@@ -410,7 +416,9 @@ export class AgentService {
       context,
       handles: new Map(),
       capabilityByIdentity: new Map(),
-      progressTimers: new Map(),
+      progressTimer: null,
+      progressWrite: null,
+      progressWorker: null,
       children: new Set(),
       pendingChildCreations: 0,
       cancelled: false,
@@ -523,6 +531,7 @@ export class AgentService {
             this.refreshNonterminalStatus(run)
             this.persist(run)
             void this.updateWorkerCard(run, worker)
+              .catch(error => logError('agent-service: input request card update failed', error))
           },
           onProgress: step => this.recordStep(run, worker, step),
           onCodexAccount: accountId => {
@@ -540,7 +549,7 @@ export class AgentService {
       run.handles.set(identity.id, handle)
       const result = await handle.done
       if (run.cancelled) return
-      this.clearProgressTimer(run, identity.id)
+      this.dropPendingProgress(run, worker)
       worker.output = result.output
       worker.outputTruncated = result.outputTruncated
       worker.sessionId = result.sessionId
@@ -561,7 +570,7 @@ export class AgentService {
         this.persist(run)
       }
       if (!run.cancelled) {
-        this.clearProgressTimer(run, identity.id)
+        this.dropPendingProgress(run, worker)
         worker.status = 'failed'
         worker.error = messageOf(error)
         worker.finishedAt = new Date().toISOString()
@@ -584,18 +593,43 @@ export class AgentService {
     if (run.cancelled || run.finalizing || run.finalized || isWorkerTerminal(worker.status)) return
     worker.steps.push(step)
     if (worker.steps.length > MAX_WORKER_STEPS) worker.steps.splice(0, worker.steps.length - MAX_WORKER_STEPS)
-    if (run.progressTimers.has(worker.identityId)) return
-    const timer = setTimeout(() => {
-      run.progressTimers.delete(worker.identityId)
-      void this.updateWorkerCard(run, worker, 'progress')
-    }, 250)
-    run.progressTimers.set(worker.identityId, timer)
+    this.scheduleProgress(run, worker)
   }
 
-  private clearProgressTimer(run: AgentRunRecord, identityId: string): void {
-    const timer = run.progressTimers.get(identityId)
-    if (timer) clearTimeout(timer)
-    run.progressTimers.delete(identityId)
+  /** The row is rendered from the whole run, so a write queued for an older step shows
+   * nothing a newer one does not. Every worker used to queue its own write per interval;
+   * once a write took longer than the interval the queue only grew, and the terminal
+   * update and every other message of the chat waited behind it. Now at most one progress
+   * write is in flight and one is pending per run. */
+  private scheduleProgress(run: AgentRunRecord, worker: AgentWorkerResult): void {
+    run.progressWorker = worker
+    if (run.progressTimer || run.progressWrite) return
+    run.progressTimer = setTimeout(() => {
+      run.progressTimer = null
+      const pending = run.progressWorker
+      run.progressWorker = null
+      if (!pending || run.cancelled || run.finalizing || run.finalized) return
+      run.progressWrite = this.updateWorkerCard(run, pending, 'progress')
+        .catch(error => logError('agent-service: progress card update failed', error))
+        .finally(() => {
+          run.progressWrite = null
+          // Steps recorded during the write are shown by one follow-up write.
+          if (run.progressWorker && !run.cancelled && !run.finalizing && !run.finalized) {
+            this.scheduleProgress(run, run.progressWorker)
+          }
+        })
+    }, 250)
+  }
+
+  /** A worker's own state update shows its steps; its pending progress is redundant. */
+  private dropPendingProgress(run: AgentRunRecord, worker: AgentWorkerResult): void {
+    if (run.progressWorker === worker) run.progressWorker = null
+  }
+
+  private clearProgress(run: AgentRunRecord): void {
+    if (run.progressTimer) clearTimeout(run.progressTimer)
+    run.progressTimer = null
+    run.progressWorker = null
   }
 
   private refreshNonterminalStatus(run: AgentRunRecord): void {
@@ -633,7 +667,7 @@ export class AgentService {
     const failures: PromiseSettledResult<void>[] = []
     if (activeSelf) {
       run.cancelled = true
-      for (const identityId of [...run.progressTimers.keys()]) this.clearProgressTimer(run, identityId)
+      this.clearProgress(run)
       for (const capability of run.capabilityByIdentity.values()) this.capabilities.delete(capability)
       run.capabilityByIdentity.clear()
     }
@@ -680,7 +714,7 @@ export class AgentService {
   private async finalizeRun(run: AgentRunRecord, status: AgentRunStatus, error?: string): Promise<void> {
     if (run.finalized || run.finalizing) return
     run.finalizing = true
-    for (const identityId of [...run.progressTimers.keys()]) this.clearProgressTimer(run, identityId)
+    this.clearProgress(run)
     run.snapshot.status = status
     run.snapshot.finishedAt = new Date().toISOString()
     if (error) run.snapshot.error = error
@@ -860,7 +894,12 @@ export class AgentService {
 
   private loadDurableRuns(): void {
     for (const snapshot of this.deps.loadArtifacts()) {
-        if (!isTerminal(snapshot.status)) {
+      // Only a run this restart changes needs a new durable record: one that was still
+      // active, or one stored before prompts and outputs moved to separate artifacts.
+      // Rewriting every finished run is an fsynced write per run of the whole history.
+      const changed = !isTerminal(snapshot.status)
+        || !snapshot.promptArtifact || snapshot.workers.some(worker => !!worker.output && !worker.outputArtifact)
+      if (!isTerminal(snapshot.status)) {
         snapshot.status = 'failed'
         snapshot.error = 'daemon restarted before this Agent run reached a terminal state'
         snapshot.finishedAt = new Date().toISOString()
@@ -878,7 +917,9 @@ export class AgentService {
         context: null,
         handles: new Map(),
         capabilityByIdentity: new Map(),
-        progressTimers: new Map(),
+        progressTimer: null,
+        progressWrite: null,
+        progressWorker: null,
         children: new Set(),
         pendingChildCreations: 0,
         cancelled: snapshot.status === 'cancelled',
@@ -892,7 +933,7 @@ export class AgentService {
         ]),
       }
       this.runs.set(snapshot.runId, record)
-      this.persist(record)
+      if (changed) this.persist(record)
     }
     for (const run of this.runs.values()) {
       if (run.snapshot.parentRunId) this.runs.get(run.snapshot.parentRunId)?.children.add(run.snapshot.runId)

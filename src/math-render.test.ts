@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { existsSync } from 'node:fs'
+import { createRequire } from 'node:module'
 
 import {
   __test,
@@ -114,6 +115,27 @@ describe('renderTeXToPNG native CJK', () => {
     expect(renderTeXToPNG('S=\\sum_{i=1}^{n} w_i \\cdot \\frac{x_i-\\mu}{\\sigma}')).not.toBeNull()
     expect(renderTeXToPNG('\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}')).not.toBeNull()
     expect(renderTeXToPNG('\\begin{nope}')).toBeNull()
+  })
+
+  test('不含原生文字的公式不加载系统字体，输出与加载系统字体时逐字节一致', () => {
+    const { Resvg } = createRequire(import.meta.url)('@resvg/resvg-js') as typeof import('@resvg/resvg-js')
+    const withSystemFonts = (svg: string) => Buffer.from(new Resvg(svg, {
+      background: __test.constants.PAPER, fitTo: { mode: 'original' }, shapeRendering: 2, textRendering: 1,
+      font: { loadSystemFonts: true, serifFamily: __test.constants.CJK_FONT_FAMILY, sansSerifFamily: __test.constants.CJK_FONT_FAMILY },
+    }).render().asPng())
+    for (const tex of [
+      'E = mc^2', '\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}', '\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}',
+      '\\text{hello world} + \\mathrm{abc} + \\mathbf{X} + \\mathcal{L}', 'x \\in \\mathbb{R}^n, \\quad \\forall \\epsilon > 0',
+      '\\begin{aligned} a &= b + c \\\\ d &= e \\times f \\end{aligned}',
+    ]) {
+      const svg = renderTeXToSVG(tex)
+      expect(svg).not.toBeNull()
+      // MathJax 把自带字形输出为 path；没有 <text> 就不依赖任何系统字体。
+      expect(svg!.svg).not.toMatch(/<text\b/)
+      expect(Buffer.compare(Buffer.from(renderTeXToPNG(tex)!.png), withSystemFonts(svg!.svg))).toBe(0)
+    }
+    // 含 CJK 的公式仍以原生 <text> 输出，继续走系统字体。
+    expect(renderTeXToSVG('\\text{速度} = v')!.svg).toMatch(/<text\b/)
   })
 
   test('浅色不透明画布、padding 与 PNG 尺寸一致', () => {

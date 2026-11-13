@@ -207,5 +207,3 @@ async function requestGlmUsage(domain: string, token: string): Promise<GlmUsageS
     clearTimeout(timer)
   }
 }
-
-export const readGlmUsage = fetchGlmUsage

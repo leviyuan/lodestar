@@ -126,6 +126,15 @@ for (const runtime of ['bun', 'node']) describe(`${runtime} real outbound proxy 
     expect(origins.map(request => request.auth)).toEqual(['Bearer fixture-api-key', 'Bearer fixture-api-key'])
   })
 
+  // Bun's own fetch owns proxy pooling in source runs; the published Node entry uses our agents.
+  test.skipIf(runtime !== 'node')('requests to one HTTPS origin share a proxy tunnel instead of opening one each', async () => {
+    await run(runtime, { kind: 'openrouter' }, { HTTPS_PROXY: proxyUrl })
+    // Models and credits are two requests to the same origin: one CONNECT and one TLS
+    // handshake serve both.
+    expect(origins).toHaveLength(2)
+    expect(proxyRequests.map(request => request.url)).toEqual(['network.invalid:443'])
+  })
+
   test('discovered system proxy carries both HTTP and HTTPS without proxy environment variables', async () => {
     for (const scheme of ['http', 'https']) {
       const result = await run(runtime, { kind: 'system', proxy: proxyUrl, url: `${scheme}://network.invalid/system` })

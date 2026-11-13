@@ -6,7 +6,7 @@ import { Readable } from 'node:stream'
 // in real config.toml / tenant-token code (keeps this test hermetic).
 import './feishu-test-mock'
 
-import { buildNotifyCard, handleNotifyRequest, parseButtons, parseCallbackUrl, startNotifyServer } from './notify'
+import { buildNotifyCard, handleNotifyRequest, isCrossOriginBrowserRequest, parseButtons, parseCallbackUrl, startNotifyServer } from './notify'
 import { FeishuRequestError } from './feishu-retry'
 
 describe('notification HTTP input', () => {
@@ -105,6 +105,45 @@ describe('notification HTTP input', () => {
         expect(result).toEqual({ status: 500, body: expected })
       } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
     }
+  })
+
+  test('browser cross-origin requests are rejected before any route runs; local callers are unaffected', async () => {
+    expect(isCrossOriginBrowserRequest({})).toBe(false)
+    for (const origin of ['http://localhost:3000', 'http://127.0.0.1:8080', 'http://[::1]:9000']) {
+      expect(isCrossOriginBrowserRequest({ origin })).toBe(false)
+    }
+    for (const origin of ['https://evil.example', 'null', '', 'not a url', 'http://localhost.evil.example']) {
+      expect(isCrossOriginBrowserRequest({ origin })).toBe(true)
+    }
+    expect(isCrossOriginBrowserRequest({ origin: 'http://localhost:3000', 'sec-fetch-site': 'cross-site' })).toBe(true)
+    expect(isCrossOriginBrowserRequest({ origin: 'http://localhost:3000', 'sec-fetch-site': 'same-site' })).toBe(false)
+
+    let routed = 0
+    const server = startNotifyServer({ bind: '127.0.0.1', port: 0,
+      extraHandler: async (_req, res) => { routed++; res.end('handled'); return true },
+    })!
+    await once(server, 'listening')
+    const address = server.address() as import('node:net').AddressInfo
+    const send = (headers: Record<string, string>) => new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = request({ host: '127.0.0.1', port: address.port, path: '/notify', method: 'POST', headers }, res => {
+        let body = ''
+        res.setEncoding('utf8')
+        res.on('data', chunk => { body += chunk })
+        res.on('end', () => resolve({ status: res.statusCode!, body }))
+      })
+      req.on('error', reject)
+      req.end('{"project":"demo","text":"x"}')
+    })
+    try {
+      // What a web page's no-preflight fetch(url, { method: 'POST', mode: 'no-cors' }) sends.
+      expect(await send({ 'content-type': 'text/plain;charset=UTF-8', origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' }))
+        .toEqual({ status: 403, body: 'cross-origin requests are not accepted' })
+      expect(await send({ 'content-type': 'text/plain;charset=UTF-8', origin: 'null' })).toMatchObject({ status: 403 })
+      expect(routed).toBe(0)
+      expect(await send({ 'content-type': 'application/json' })).toEqual({ status: 200, body: 'handled' })
+      expect(await send({ 'content-type': 'application/json', origin: 'http://localhost:5173' })).toEqual({ status: 200, body: 'handled' })
+      expect(routed).toBe(2)
+    } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
   })
 
   test('a malformed Host cannot escape the listener error boundary', async () => {

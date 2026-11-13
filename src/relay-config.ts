@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { CONFIG_FILE } from './paths'
 import { writeStateFileAtomic } from './state-store'
-import { config, loadConfig, reloadTokenSources, type RelayConfig } from './config'
+import { loadConfig, reloadTokenSources, type RelayConfig } from './config'
 import { buildTokenSourcesFromConfig } from './token-source-builtins'
 import { fetchRelayModels, relayApiRoot } from './relay-api'
 import { listTokenSources, type TokenSource } from './token-source'
@@ -101,8 +101,4 @@ export function configureRelayBalance(id: string, script: string): void {
   saveRelayConfig(id, { ...relay, balance_script: script.trim() })
   reloadTokenSources()
   buildTokenSourcesFromConfig()
-}
-
-export function relayConfigs(): Record<string, RelayConfig> {
-  return config.relays ?? {}
 }

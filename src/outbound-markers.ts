@@ -1,4 +1,7 @@
-const SEND_MARKER_RE = /\[\[send:[ \t]*([^\n]*?)[ \t]*\]\]/g
+// The path is trimmed after matching. Optional-padding groups around the lazy capture
+// overlapped it, so an unterminated `[[send:` followed by blanks backtracked cubically
+// and stalled the event loop on every streamed delta.
+const SEND_MARKER_RE = /\[\[send:([^\n]*?)\]\]/g
 
 export function extractSendMarkerPaths(text: string): string[] {
   const paths: string[] = []

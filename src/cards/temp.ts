@@ -11,6 +11,7 @@
 
 import { agentProviderLabel, type AgentProvider } from '../agent-process'
 import { diagnosticIdLabel } from '../session-util'
+import { fencedCodeBlock, sliceWholeCharacters } from '../markdown-code'
 
 export interface TurnListEntry {
   /** 仅供当前 panel 解析的稳定、不透明 choice id。 */
@@ -89,6 +90,8 @@ export interface ResumeSelectionResultCardOpts {
 }
 
 const WRITE_BODY_MAX = 800
+/** Serialized size budget of the write-log code block, below the 30 KB card limit. */
+const WRITE_LOG_MAX_BYTES = 24_000
 
 export function turnListCard(opts: TurnListCardOpts): object {
   const isFork = opts.mode === 'fork'
@@ -205,14 +208,23 @@ export function resumeListCard(opts: ResumeListCardOpts): object {
 }
 
 export function writeLogCard(opts: WriteLogCardOpts): object {
+  // An interactive card is limited to about 30 KB of JSON. Past that the whole record
+  // failed to send; show what fits and say how much was left out.
+  const blocks: string[] = []
+  let bytes = 0
+  for (const e of opts.entries) {
+    const body = e.body.length > WRITE_BODY_MAX ? sliceWholeCharacters(e.body, WRITE_BODY_MAX) + '\n…(截断)' : e.body
+    const block = `${e.path}  (${e.tool})\n${body}`
+    const size = Buffer.byteLength(JSON.stringify(block)) + 4
+    if (bytes + size > WRITE_LOG_MAX_BYTES) break
+    bytes += size
+    blocks.push(block)
+  }
+  const omitted = opts.entries.length - blocks.length
+  if (omitted > 0) blocks.push(`…(另有 ${omitted} 处文件变更超出卡片大小上限，未显示)`)
   const code = opts.entries.length === 0
     ? '(回退范围内未观察到 Write/Edit/FileChange 类文件变更)'
-    : opts.entries
-      .map(e => {
-        const body = e.body.length > WRITE_BODY_MAX ? e.body.slice(0, WRITE_BODY_MAX) + '\n…(截断)' : e.body
-        return `${e.path}  (${e.tool})\n${body}`
-      })
-      .join('\n\n')
+    : blocks.join('\n\n')
   return {
     schema: '2.0',
     config: { update_multi: true },
@@ -226,7 +238,8 @@ export function writeLogCard(opts: WriteLogCardOpts): object {
           tag: 'markdown',
           content: '以下是回退范围内观察到的文件变更，可复制、编辑后交给新分支参考。bk 只回退对话历史，不会回滚磁盘文件；Shell/MCP 等工具造成的副作用可能未被记录。',
         },
-        { tag: 'markdown', content: '```\n' + code + '\n```' },
+        // File contents are literal: a fence they cannot close keeps them from becoming card markup.
+        { tag: 'markdown', content: fencedCodeBlock(code) },
       ],
     },
   }

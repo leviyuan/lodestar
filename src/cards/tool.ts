@@ -6,6 +6,7 @@
 import { isAbsolute, relative } from 'node:path'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
 import { shellCommandPresentation, shellCommandDescription } from './shell-command'
+import { closeOpenMarkdownFence, fencedCodeBlock, sliceWholeCharacters } from '../markdown-code'
 
 const BASH_OUTPUT_PREVIEW_CHARS = 300
 
@@ -173,10 +174,12 @@ function bashPresentation(input: any): { description: string; command: string } 
   return { description: info.description || explicit, command: info.command }
 }
 
-function fenceBlock(text: string, lang = ''): string {
-  let fence = '```'
-  while (text.includes(fence)) fence += '`'
-  return `${fence}${lang}\n${text}\n${fence}`
+const fenceBlock = fencedCodeBlock
+
+/** Markdown shown as prose but cut at a limit: never leave a code fence open behind it.
+ * Text that fits is passed through untouched, however its own fences are written. */
+function proseHead(text: string, max: number): string {
+  return text.length > max ? closeOpenMarkdownFence(sliceWholeCharacters(text, max)) : text
 }
 
 function outputPreviewBlock(text: string, max = BASH_OUTPUT_PREVIEW_CHARS, lang = ''): string {
@@ -723,7 +726,7 @@ function renderWebFetchBody(input: any, output: string | null, resolvedNote?: st
   if (input?.prompt) {
     lines.push('')
     lines.push('**问题**')
-    lines.push(String(input.prompt).slice(0, 1200))
+    lines.push(proseHead(String(input.prompt), 1200))
   }
   if (resolvedNote) {
     lines.push('')
@@ -764,7 +767,7 @@ function renderMcpBody(input: any, output: string | null, resolvedNote?: string)
       const texts = parsed.content
         .map((c: any) => typeof c?.text === 'string' ? c.text : '')
         .filter(Boolean)
-      if (texts.length > 0) lines.push(texts.join('\n').slice(0, 3000))
+      if (texts.length > 0) lines.push(proseHead(texts.join('\n'), 3000))
       if (parsed.structuredContent) {
         lines.push('')
         lines.push('**structuredContent**')
@@ -855,7 +858,7 @@ function renderAgentBody(input: any, output: string | null, resolvedNote?: strin
   if (input?.prompt) {
     if (lines.length > 0) lines.push('')
     lines.push('**prompt**')
-    lines.push(String(input.prompt).slice(0, 2000))
+    lines.push(proseHead(String(input.prompt), 2000))
   }
   if (resolvedNote) {
     lines.push('')
@@ -928,9 +931,9 @@ export function toolCallElement(
                                 ? renderAgentBody({ prompt: firstStringField(input) || '提交计划' }, output, resolvedNote)
                                 : isAgentTool(name)
                                   ? renderAgentBody(input, output, resolvedNote)
-                                  : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
+                                  : fenceBlock(JSON.stringify(input ?? {}, null, 2).slice(0, 2000))
                                     + noteBlock
-                                    + (output != null ? '\n---\n**output:**\n```\n' + output.slice(0, 3000) + '\n```' : '')
+                                    + (output != null ? '\n---\n**output:**\n' + fenceBlock(output.slice(0, 3000)) : '')
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.tool(i),
@@ -1067,7 +1070,7 @@ export function toolCallPermissionElement(
                               ? renderAgentBody({ prompt: firstStringField(input) || '提交计划' }, null)
                               : isAgentTool(name)
                                 ? renderAgentBody(input, null)
-                                : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
+                                : fenceBlock(JSON.stringify(input ?? {}, null, 2).slice(0, 2000))
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.tool(i),

@@ -334,6 +334,17 @@ test('expired token waiters stop output without cancelling the shared refresh or
   `)
 })
 
+test('urgent push logs a failed token refresh instead of rejecting its fire-and-forget callers', async () => {
+  await runIsolated(`
+    let tokenRequests = 0
+    globalThis.fetch = async () => { tokenRequests++; throw new Error('ECONNREFUSED simulated outage') }
+    // Turn completion and approval prompts call this without awaiting it; a rejection
+    // would reach the daemon's unhandledRejection handler and shut the daemon down.
+    await assert.doesNotReject(feishu.urgentApp('om_message', ['ou_user']))
+    assert.ok(tokenRequests > 0)
+  `)
+})
+
 test('interactive card replacement requires explicit API confirmation', async () => {
   await runIsolated(`
     const card = { schema: '2.0', body: { elements: [] } }

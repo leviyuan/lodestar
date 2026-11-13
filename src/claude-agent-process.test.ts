@@ -1534,6 +1534,55 @@ describe('Claude transcript context tokens', () => {
   test('readLastCallUsageFromTranscript returns null when file missing', () => {
     expect(readLastCallUsageFromTranscript(join(tmpdir(), 'lodestar-no-such.jsonl'))).toBeNull()
   })
+
+  test('readLastCallUsageFromTranscript reads backwards in blocks and matches a whole-file scan', () => {
+    // Reference: the former implementation, which loaded and split the entire transcript.
+    const reference = (content: string) => {
+      const lines = content.split('\n')
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const usage = JSON.parse(lines[i]!.trim())?.message?.usage
+          if (JSON.parse(lines[i]!.trim()).type !== 'assistant' || !usage) continue
+          if ((usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.output_tokens ?? 0) > 0) return usage
+        } catch { /* blank or malformed line */ }
+      }
+      return null
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-transcript-tail-'))
+    const file = join(dir, 'transcript.jsonl')
+    let seed = 20261113
+    const random = (limit: number) => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) % limit
+    const line = (): string => {
+      switch (random(6)) {
+        case 0: return JSON.stringify({ type: 'assistant', message: { usage: { input_tokens: 1 + random(900), cache_read_input_tokens: random(5000), output_tokens: random(40) } } })
+        case 1: return JSON.stringify({ type: 'assistant', message: { model: '<synthetic>', usage: { input_tokens: 0, output_tokens: 0 } } })
+        case 2: return JSON.stringify({ type: 'user', message: { role: 'user', content: '多字节内容🚀'.repeat(random(40)) } })
+        case 3: return '{"type":"assistant","message":{"usage":{"input_tokens":7' // torn write
+        case 4: return ''
+        default: return JSON.stringify({ type: 'last-prompt', lastPrompt: '结尾提示' })
+      }
+    }
+    try {
+      for (let round = 0; round < 60; round++) {
+        const content = Array.from({ length: random(14) }, line).join('\n') + (random(2) ? '\n' : '')
+        writeFileSync(file, content)
+        // Blocks smaller than a line, cutting through multi-byte characters, up to one read.
+        for (const block of [1, 2, 3, 7, 16, 64, 257, 4096, 256 * 1024]) {
+          expect(readLastCallUsageFromTranscript(file, block)).toEqual(reference(content))
+        }
+      }
+      // The match can lie far before the tail block, behind a line longer than a block.
+      const usage = { input_tokens: 5, cache_read_input_tokens: 9 }
+      writeFileSync(file, [
+        JSON.stringify({ type: 'assistant', message: { usage } }),
+        JSON.stringify({ type: 'user', message: { role: 'user', content: '结果'.repeat(300_000) } }),
+        JSON.stringify({ type: 'last-prompt', lastPrompt: 'x' }), '',
+      ].join('\n'))
+      expect(readLastCallUsageFromTranscript(file)).toEqual(usage)
+      writeFileSync(file, '')
+      expect(readLastCallUsageFromTranscript(file)).toBeNull()
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
 })
 
 describe('Claude project profile overrides', () => {

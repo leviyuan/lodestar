@@ -47,6 +47,26 @@ test('model edits migrate matching legacy credentials without replacing shared a
   expect(updated.deepseek.api_key).toBe('key')
 })
 
+test('model edits on a machine-detected account never persist a default endpoint or an empty credential', () => {
+  const detected = { glm: { auth_token: 'detected-token', base_url: 'https://api.z.ai/api/anthropic' } }
+  const updated = tokenSourceConfigUpdates({}, 'glm', { hidden_models: 'GLM-5.2' })
+  expect(updated).toEqual({ glm: { hidden_models: 'GLM-5.2' }, 'dsh-glm': {} })
+  // The detected account keeps working after the edit is reloaded, on its own host.
+  const reloaded = sharedTokenSourceConfigs(updated, detected)
+  expect(reloaded.glm).toMatchObject({ auth_token: 'detected-token', base_url: 'https://api.z.ai/api/anthropic', hidden_models: 'GLM-5.2' })
+  expect(reloaded['dsh-glm']).toMatchObject({ api_key: 'detected-token', base_url: 'https://api.z.ai/api/coding/paas/v4' })
+
+  // The same edit through the Harness view, and for the other shared accounts.
+  expect(tokenSourceConfigUpdates({}, 'dsh-glm', { custom_models: 'glm-x' })).toEqual({ glm: {}, 'dsh-glm': { custom_models: 'glm-x' } })
+  expect(tokenSourceConfigUpdates({}, 'deepseek', { model: 'deepseek-v4' })).toEqual({ deepseek: { model: 'deepseek-v4' }, 'deepseek-harness': {} })
+
+  // A stored endpoint or key is still written back in canonical form.
+  expect(tokenSourceConfigUpdates({ glm: { base_url: 'https://api.z.ai/api/anthropic' } }, 'glm', { hidden_models: 'a' }).glm)
+    .toEqual({ base_url: 'https://api.z.ai/api/anthropic', auth_token: '', hidden_models: 'a' })
+  expect(tokenSourceConfigUpdates({ glm: { auth_token: 'key' } }, 'glm', { hidden_models: 'a' }).glm)
+    .toEqual({ base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 'key', hidden_models: 'a' })
+})
+
 test('custom DeepSeek endpoints keep their supplied protocol path while explicit Anthropic suffixes share the API root', () => {
   const custom = sharedTokenSourceConfigs({ deepseek: { api_key: 'key', base_url: 'https://gateway.test/custom/api' } })
   expect(custom.deepseek.base_url).toBe('https://gateway.test/custom/api')

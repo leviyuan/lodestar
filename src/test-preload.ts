@@ -40,6 +40,16 @@ process.env.LODESTAR_DATA_DIR = dataDir
 process.env.CODEX_HOME = codexHome
 process.env.CLAUDE_CONFIG_DIR = claudeConfigDir
 
+// The machine's proxy must not choose the transport a test exercises. With a proxy in
+// the environment, loopback and bypassed requests leave `globalThis.fetch` for Bun's
+// direct dispatcher and skip fetch mocks; without one, non-loopback requests probe the
+// system proxy. Tests of proxy routing pass an explicit environment instead.
+for (const name of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']) {
+  delete process.env[name]
+  delete process.env[name.toLowerCase()]
+}
+process.env.NO_PROXY = process.env.no_proxy = '*'
+
 process.on('exit', () => {
   try { rmSync(testRoot, { recursive: true, force: true }) } catch {}
 })

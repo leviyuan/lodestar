@@ -16,11 +16,6 @@ export function relaySourceId(siteId: string, agent: RelayAgent): string {
   return `relay:${siteId}:${agent}`
 }
 
-export function relaySourceParts(id: string): { siteId: string; agent: RelayAgent } | null {
-  const match = /^relay:(.+):(claude|codex|dsh)$/.exec(id)
-  return match ? { siteId: match[1]!, agent: match[2] as RelayAgent } : null
-}
-
 function list(raw: string | undefined): string[] {
   return [...new Set((raw ?? '').split(',').map(value => value.trim()).filter(Boolean))]
 }

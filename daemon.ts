@@ -280,7 +280,14 @@ function enqueueMessage(data: any): boolean {
     log('daemon.inbound.admission_rejected')
     return false
   }
-  void admitted.completion.catch(e => { logError('daemon.inbound.failed', e) })
+  void admitted.completion.catch(e => {
+    logError('daemon.inbound.failed', e)
+    // A message that could not be handled must not vanish: its sender is told why.
+    const chatId = String(data?.message?.chat_id ?? '')
+    if (!chatId) return
+    void feishu.sendTextRaw(chatId, `❌ 消息处理出错：${e instanceof Error ? e.message : String(e)}`)
+      .catch(error => logError('daemon.inbound.failure_notice_failed', error))
+  })
   return true
 }
 
@@ -304,6 +311,7 @@ const tempSessionRuntime = createTempSessionRuntime<Session>({
   ensureChatForSession: feishu.ensureTempChatForSession,
   disbandChatForSessionExact: feishu.disbandChatForSessionExact,
   chatIdForSession: feishu.chatIdForSession,
+  unbindSessionChat: feishu.unbindSessionChat,
   clearSessionConversationState: feishu.clearSessionConversationState,
   registerTempSessionLease: feishu.registerTempSessionLease,
   hasTempSessionLease: feishu.hasTempSessionLease,
@@ -1368,7 +1376,8 @@ async function boot(): Promise<void> {
     }
     scheduledRebuildDueAt = dueAt
     scheduledRebuildReason = reason
-    scheduledRebuildVerifyAfter = verifyAfter
+    // An earlier rebuild replaces the pending one but still owes its verification.
+    scheduledRebuildVerifyAfter = scheduledRebuildTimer ? scheduledRebuildVerifyAfter || verifyAfter : verifyAfter
     scheduledRebuildTimer = setTimeout(() => {
       const scheduledReason = scheduledRebuildReason
       const scheduledVerifyAfter = scheduledRebuildVerifyAfter
@@ -1634,5 +1643,5 @@ async function boot(): Promise<void> {
 finishStartupLogging()
 boot().catch(e => {
   logError('daemon.boot.failed', e)
-  void requestShutdown('boot fatal', 1)
+  void requestShutdown('boot_fatal', 1)
 })

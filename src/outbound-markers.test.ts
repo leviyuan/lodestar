@@ -26,6 +26,22 @@ describe('outbound send markers', () => {
   test('does not match markers split across lines', () => {
     expect(extractSendMarkerPaths('[[send: /tmp/a.png\n]]')).toEqual([])
   })
+
+  test('trims tabs and spaces around the path and ignores empty markers', () => {
+    expect(extractSendMarkerPaths('[[send:\t /tmp/a b.png \t]] [[send:   ]] [[send:/tmp/c.png]]')).toEqual([
+      '/tmp/a b.png',
+      '/tmp/c.png',
+    ])
+  })
+
+  test('an unterminated marker followed by blanks is scanned in linear time', () => {
+    // Runs on the whole accumulated reply for every streamed delta. The former pattern
+    // needed over ten seconds for a few thousand blanks and froze the daemon.
+    const text = `x [[send:${' '.repeat(200_000)}\nrest [[send: /tmp/after.png]]`
+    const started = performance.now()
+    expect(extractSendMarkerPaths(text)).toEqual(['/tmp/after.png'])
+    expect(performance.now() - started).toBeLessThan(500)
+  })
 })
 
 describe('normalizeOutboundPath', () => {

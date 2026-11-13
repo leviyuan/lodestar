@@ -7,7 +7,6 @@ import { agentProviderLabel } from '../agent-process'
 
 import { SERVICE_LABEL, type SysInfo } from '../sysinfo'
 import type { UsageSnapshot } from '../usage'
-import type { GlmUsageSnapshot } from '../glm-usage'
 import type { UsageSnapshotUnified, TokenSourceModelCatalogState } from '../token-source'
 import type { AgentProvider } from '../agent-process'
 import { ELEMENTS } from './elements'
@@ -39,13 +38,7 @@ export interface ConsoleOpts {
     codexAccountName?: string
     claudeAccountName?: string
   }>
-  /** Subscription usage snapshot from Codex app-server. Undefined → omit row.
-   * 仅 codex 后端渲染;claude/GLM 后端走 glmUsage。 */
-  usage?: UsageSnapshot
-  /** GLM Coding Plan 用量快照(claude/GLM 后端)。Undefined → loading 占位。
-   * 仅 claude 后端渲染;codex 后端走 usage。按 provider 二选一(方案 C)。 */
-  glmUsage?: GlmUsageSnapshot
-  /** 统一用量快照(来自 tokenSource.readUsage)。设了优先用它(取代 usage/glmUsage 二元)。
+  /** 统一用量快照(来自 tokenSource.readUsage)。
    * 加新 token source 的额度自动支持 —— 只要 source.readUsage 返回 unified。 */
   unifiedUsage?: UsageSnapshotUnified
   /** Host snapshot: CPU 负载、内存、AI-managed systemd / launchd 服务。
@@ -218,52 +211,6 @@ export function consoleUsageContent(
   return lines.length === 1 ? '**📊 Codex 额度**　_无数据_' : lines.join('\n')
 }
 
-/** Render the GLM Coding Plan usage row for the console card. 数据源是
- * src/glm-usage.ts 打的 open.bigmodel.cn / api.z.ai quota/limit。结构与左侧
- * Codex 行对齐(标题挂套餐档 + 两个窗口行),失败态按 no_fallbacks 显式 MISS。
- *
- * `glmUsage === undefined` → 初始 loading 占位。 */
-export function consoleGlmUsageContent(glmUsage: GlmUsageSnapshot | undefined): string {
-  if (glmUsage === undefined) return '**📊 GLM 额度**　_加载中…_'
-  switch (glmUsage.state) {
-    case 'no_credentials':
-      return '**📊 GLM 额度**　未配置 `ANTHROPIC_AUTH_TOKEN` — 检查 ~/.claude/settings.json'
-    case 'not_glm':
-      return '**📊 GLM 额度**　非 GLM 后端 — ANTHROPIC_BASE_URL 不是 bigmodel / z.ai'
-    case 'rate_limited':
-      return '**📊 GLM 额度**　API 限流,稍后重试'
-    case 'network':
-      return `**📊 GLM 额度**　拉取失败${glmUsage.reason ? ' — `' + glmUsage.reason + '`' : ''}`
-  }
-  // level 是 GLM 原样返回的小写档位名(max/standard/lite…),首字母大写对齐观感。
-  const levelLabel = glmUsage.level
-    ? glmUsage.level.charAt(0).toUpperCase() + glmUsage.level.slice(1)
-    : ''
-  const head = levelLabel
-    ? `**📊 GLM 额度** · ${levelLabel} 套餐`
-    : '**📊 GLM 额度**'
-  const lines: string[] = [head]
-  if (glmUsage.fiveHour) {
-    const parts = [fmtUsagePercent(glmUsage.fiveHour.percent)]
-    if (glmUsage.fiveHour.resetsAt) parts.push(`重置 ${fmtResetIn(glmUsage.fiveHour.resetsAt)}`)
-    lines.push(`　· 5h 窗口　${parts.join(' · ')}`)
-  }
-  if (glmUsage.weekly) {
-    const parts = [fmtUsagePercent(glmUsage.weekly.percent)]
-    if (glmUsage.weekly.resetsAt) parts.push(`重置 ${fmtResetIn(glmUsage.weekly.resetsAt)}`)
-    lines.push(`　· 周额度　${parts.join(' · ')}`)
-  }
-  if (glmUsage.monthly) {
-    const parts = [fmtUsagePercent(glmUsage.monthly.percent)]
-    if (typeof glmUsage.monthly.used === 'number' && typeof glmUsage.monthly.total === 'number') {
-      parts.push(`${glmUsage.monthly.used}/${glmUsage.monthly.total}`)
-    }
-    if (glmUsage.monthly.resetsAt) parts.push(`重置 ${fmtResetIn(glmUsage.monthly.resetsAt)}`)
-    lines.push(`　· 月度工具　${parts.join(' · ')}`)
-  }
-  return lines.length === 1 ? '**📊 GLM 额度**　_无数据_' : lines.join('\n')
-}
-
 function fmtUsagePercent(percent: number | null | undefined): string {
   return typeof percent === 'number' && Number.isFinite(percent) ? `${Math.round(percent)}%` : 'MISS'
 }
@@ -420,8 +367,7 @@ export function consoleHostElement(sysinfo?: SysInfo, elementId = ELEMENTS.conso
 }
 
 /** 统一额度渲染:从 tokenSource.readUsage() 的 UsageSnapshotUnified 渲染。
- * 取代 consoleUsageContent/consoleGlmUsageContent 二元 —— 加新 token source 的额度
- * 自动支持(只要它的 readUsage 返回 unified)。失败态按 no_fallbacks 显式 MISS。 */
+ * 加新 token source 的额度自动支持(只要它的 readUsage 返回 unified)。失败态按 no_fallbacks 显式 MISS。 */
 export function unifiedUsageSummary(snap: UsageSnapshotUnified | undefined): string {
   const label = snap?.kind === 'balance' ? '余额' : '额度'
   if (!snap) return `${label} 加载中…`

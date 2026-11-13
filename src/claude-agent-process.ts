@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { spawn as crossSpawn } from 'cross-spawn'
 import { delimiter, join, resolve } from 'node:path'
@@ -278,14 +278,52 @@ export function claudeTranscriptPath(workDir: string, sessionId: string, options
  * call 的真实 per-call usage(transcript 是 claude CLI 写的,assistant 行带 finalize
  * 后的 usage;不像 stream-json 的 assistant event 恒 0/0)。= session 当前上下文快照,
  * 与 Claude Code 底栏(omc hud)的 context_window.current_usage 同口径。失败/空 → null。 */
-export function readLastCallUsageFromTranscript(path: string): CodexUsage | null {
-  let content: string
+export function readLastCallUsageFromTranscript(path: string, blockBytes = TRANSCRIPT_TAIL_BLOCK_BYTES): CodexUsage | null {
+  // Runs on the event loop for every turn result, and the answer sits at the end of a
+  // transcript that grows to tens of megabytes: read backwards one block at a time and
+  // stop at the first match instead of loading and splitting the whole file.
+  let fd: number | null = null
   try {
-    content = readFileSync(path, 'utf8')
+    fd = openSync(path, 'r')
+    let end = fstatSync(fd).size
+    // Later parts, in file order, of the line whose beginning lies in an earlier block.
+    let pending: Buffer[] = []
+    while (end > 0) {
+      const start = Math.max(0, end - blockBytes)
+      let chunk = Buffer.alloc(end - start)
+      let read = 0
+      while (read < chunk.length) {
+        const n = readSync(fd, chunk, read, chunk.length - read, start + read)
+        if (n <= 0) break
+        read += n
+      }
+      if (read === 0) return null
+      chunk = chunk.subarray(0, read)
+      // Unless the block begins the file, its first line started in an earlier block.
+      // Lines are cut at the newline byte, which never occurs inside a UTF-8 sequence.
+      const firstNewline = start === 0 ? -1 : chunk.indexOf(0x0a)
+      if (start !== 0 && firstNewline < 0) {
+        pending.unshift(chunk)
+        end = start
+        continue
+      }
+      const usage = lastCallUsageInLines(Buffer.concat([chunk.subarray(firstNewline + 1), ...pending]).toString('utf8'))
+      if (usage) return usage
+      pending = start === 0 ? [] : [chunk.subarray(0, firstNewline)]
+      end = start
+    }
+    return null
   } catch {
     return null
+  } finally {
+    if (fd !== null) try { closeSync(fd) } catch {}
   }
-  const lines = content.split('\n')
+}
+
+const TRANSCRIPT_TAIL_BLOCK_BYTES = 256 * 1024
+
+function lastCallUsageInLines(text: string): CodexUsage | null {
+  const lines = text.split('\n')
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim()
     if (!line) continue

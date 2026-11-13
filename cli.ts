@@ -22,6 +22,7 @@
 import { existsSync, unlinkSync } from 'node:fs'
 import { CONFIG_FILE, PID_FILE } from './src/paths'
 import { checkPidGuard } from './src/pid-guard'
+import { ConfigError } from './src/config-error'
 import { logError } from './src/log'
 
 const C = {
@@ -38,7 +39,13 @@ async function main(): Promise<void> {
       console.log()
       console.log(`${C.bold}${C.yellow}Lodestar: 未找到配置, 启动安装向导...${C.reset}`)
       const { runSetup } = await import('./src/setup')
-      await runSetup()
+      // This is the interactive first-run entry: show the operator the real failure, as
+      // `lodestar-setup` does, instead of the daemon's reduced startup summary.
+      try { await runSetup() }
+      catch (error) {
+        console.error(`\nlodestar-setup: ${error instanceof Error ? error.message : String(error)}`)
+        process.exit(1)
+      }
       // 向导写完 config + 拉起 detached daemon 就 rl.close, 进程从这里干净退出。
       return
     }
@@ -74,6 +81,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((e: any) => {
+  if (e instanceof ConfigError) process.stderr.write(`${e.message}\n`)
   logError('lodestar: startup failed', e)
   process.exit(1)
 })

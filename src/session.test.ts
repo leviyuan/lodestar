@@ -1586,6 +1586,73 @@ describe('Session compact command', () => {
   })
 })
 
+describe('Session whitespace-only assistant blocks', () => {
+  test('a block with no visible text is never written to the card, when it ends or when the turn closes', async () => {
+    const session = new Session('probe-ws-segment', 'chat_id') as any
+    const turn = turnState('card_ws_segment')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    session.appendAssistant('real paragraph')
+    session.finalizeCurrentAssistantSegment()
+    session.appendAssistant('\n\n')
+    session.finalizeCurrentAssistantSegment()
+    await session.closeTurnCard(undefined, { hasFreshResult: false })
+
+    const written = calls.filter(call => call.path.includes('/elements'))
+    const added = written.filter(call => call.method === 'POST')
+      .flatMap(call => JSON.parse(call.body.elements).map((element: any) => element.element_id as string))
+    const replaced = written.filter(call => call.method === 'PUT').map(call => call.path.split('/').pop())
+    expect(added.filter(id => id.startsWith('assistant_'))).toEqual(['assistant_0'])
+    expect(replaced).toContain('assistant_0')
+    // The second block never created `assistant_1`, so nothing may address it.
+    expect(replaced).not.toContain('assistant_1')
+    session.dispose()
+  })
+})
+
+describe('Session compact command process exit', () => {
+  test('a process exit during compaction is reported once without an unhandled rejection', async () => {
+    class ExitingProc extends EventEmitter {
+      provider = 'claude'
+      sessionId = 'claude-session-compact-exit'
+      isAlive(): boolean { return true }
+      // Like the Claude backend: pending for the whole compaction, rejected by the exit.
+      compactThread(): Promise<void> {
+        return new Promise((_, reject) => {
+          this.once('exit', () => reject(new Error('claude thread exited during /compact')))
+        })
+      }
+    }
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason) }
+    process.on('unhandledRejection', onUnhandled)
+    const session = new Session('compact-exit', 'chat_id') as any
+    const proc = new ExitingProc()
+    session.proc = proc
+    session.status = 'idle'
+    session.initCount = 1
+    try {
+      const command = session.runCommand('cm')
+      await new Promise(resolve => setTimeout(resolve, 20))
+      proc.emit('exit')
+      await expect(command).resolves.toBe(true)
+      await new Promise(resolve => setTimeout(resolve, 20))
+
+      expect(unhandled).toEqual([])
+      expect(session.manualContextCompactionPending).toBe(false)
+      const footerWrites = calls
+        .filter(call => call.method === 'PUT' && call.path.endsWith('/elements/footer'))
+        .map(call => JSON.parse(call.body.element).content as string)
+      expect(footerWrites.some(content => content.includes('❌ 上下文压缩失败') && content.includes('exited during /compact'))).toBe(true)
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+      session.dispose()
+    }
+  })
+})
+
 describe('Session automatic context compaction events', () => {
   test('deduplicates repeated completion for the same compaction item', async () => {
     const session = new Session('compact-dedupe', 'chat_id') as any
@@ -5093,6 +5160,53 @@ describe('Session SDK-initiated bg-task resume turns', () => {
     }
   })
 
+  test('a stop whose post-interrupt result never arrives cannot swallow the next process\'s first result', async () => {
+    const session = new Session('probe-stale-interrupt', 'chat_id') as any
+    const hung = new FakeAgentProc('claude', 'claude-session-hung')
+    session.proc = hung
+    session.selectedProvider = 'claude'
+    session.wireProc(hung)
+    session.initCount = 1
+    session.currentTurn = turnState('card_hung')
+    cardkit.recordCardCreated('card_hung', 1)
+
+    // `stop` interrupts the turn; the hung backend never reports the interrupted result,
+    // so the user escalates to `kill`.
+    expect(await session.runCommand('stop', 'ou_user')).toBe(true)
+    expect(session.userInterrupted).toBe(true)
+    await session.stop('已终止', { announce: false })
+    expect(session.userInterrupted).toBe(false)
+
+    const next = new FakeAgentProc('claude', 'claude-session-next')
+    session.proc = next
+    session.wireProc(next)
+    session.initCount = 1
+    const turn = turnState('card_next')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated('card_next', 1)
+    session.status = 'working'
+    try {
+      emitClaudeResult(next)
+      await new Promise(resolve => setTimeout(resolve, 30))
+      // The completed turn is settled instead of being left open in streaming mode.
+      expect(session.currentTurn).toBeNull()
+      expect(cardkit.isDisposed('card_next')).toBe(true)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose('card_next')
+      session.dispose()
+    }
+  })
+
+  test('an interrupt with no backend leaves no pending post-interrupt result to skip', () => {
+    const session = new Session('probe-interrupt-no-proc', 'chat_id') as any
+    session.userInterrupted = true
+    session.interrupt()
+    expect(session.userInterrupted).toBe(false)
+    session.dispose()
+  })
+
   test('result 抢在 bg-resume 开卡 await 窗口内到达:不重复兜底,卡片正常收尾,不卡在 working', async () => {
     const { session, proc } = wiredClaudeSession()
 
@@ -8286,6 +8400,49 @@ describe('Session task-end notifications', () => {
       startedAt: Date.now(), ...(status === 'completed' ? { endTime: Date.now() } : {}), steps: [],
     }
   }
+
+  test('switching source while idle settles the killed process\'s background tasks', async () => {
+    const session = new Session('probe-bg-idle-switch', 'chat_bg_idle_switch') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1', 'glm') as any
+    session.proc = proc
+    session.wireProc(proc)
+    session.initCount = 1
+    session.status = 'idle'
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'
+    session.selectedEffort = 'max'
+    // A native subagent that outlives its already closed turn.
+    proc.emit('bg_task_started', { task_id: 'native-id', tool_use_id: 'agent-tool', description: '长任务', task_type: 'local_agent' })
+    await session.backgroundSync
+    expect(session.hasActiveConversationWork()).toBe(true)
+    session.modelPanels.set('panel-ds', { models: [{
+      provider: 'claude', sourceId: 'deepseek', model: 'deepseek-v4-pro', displayName: 'DeepSeek V4 Pro',
+      efforts: [{ effort: 'high', isDefault: true }],
+    }] })
+
+    const result = await session.onModelEffortSelect('deepseek-v4-pro', 'high', 'panel-ds', 'ou_user', 'claude')
+    expect(result.ok).toBe(true)
+    expect(proc.killCalls).toBe(1)
+    expect(session.proc).toBeNull()
+    // The subagent died with its process: nothing may keep counting as running work.
+    expect(session.backgroundTasks.filter((entry: any) => entry.status === 'running')).toHaveLength(0)
+    expect(session.hasActiveConversationWork()).toBe(false)
+    expect(session.activeSubagents()).toBe(0)
+
+    const turn = turnState('card_after_idle_switch')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    try {
+      await session.closeTurnCard()
+      // A later clean turn pushes its completion again.
+      expect(urgentPushes).toEqual([['om_session_turn', ['ou_user']]])
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+      session.dispose()
+    }
+  })
 
   test('a closed turn keeps the phone push until the background work ends', async () => {
     const session = new Session('probe', 'chat_id') as any

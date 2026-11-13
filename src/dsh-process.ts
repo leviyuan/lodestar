@@ -69,7 +69,6 @@ export class DshProcess extends EventEmitter implements AgentProcess {
   private startedAt = 0
   private questionInputs = new Map<string, any[]>()
   private frames = new Map<string, { revision: number; nextIndex: number }>()
-  private toolInputs = new Map<string, { name: string; input: any }>()
   private children = new Set<string>()
   private settledChildren = new Set<string>()
   private childText = new Map<string, string>()
@@ -275,7 +274,6 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         return
       case 'session.status': return
       case 'question': {
-        this.questionInputs.set(params.id, params.questions)
         const input = { questions: params.questions.map((q: any) => ({ ...q, question: q.detail ? `${q.question}\n\n${q.detail}` : q.question })) }
         // Keep the exact displayed question as the answer key used by Session.
         this.questionInputs.set(params.id, input.questions)
@@ -354,7 +352,6 @@ export class DshProcess extends EventEmitter implements AgentProcess {
           const name = toolAliases[data.name] ?? data.name
           if (['read', 'write', 'edit'].includes(data.name) && input.path) input.file_path = input.path
           if (!sub && data.name === 'subagent') this.rememberSubagentTitle(input)
-          this.toolInputs.set(data.callId, { name, input })
           this.emit('tool_use', { id: data.callId, name, input, parentToolUseId: sub ? params.sessionId : null })
         } else if (e.type === 'tool/result') {
           const message = data.message
@@ -370,7 +367,6 @@ export class DshProcess extends EventEmitter implements AgentProcess {
           }
           this.emit('tool_result', { tool_use_id: result.toolCallId, content: result.content,
             is_error: result.isError === true, parentToolUseId: sub ? params.sessionId : null })
-          this.toolInputs.delete(result.toolCallId)
         } else if (e.type === 'todo/write' && !sub) {
           this.emit('turn_plan_updated', { threadId: this.sessionId, explanation: null,
             plan: data.todos.map((item: any) => ({ step: item.content, status: item.status === 'in_progress' ? 'inProgress' : item.status })) })

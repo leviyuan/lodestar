@@ -224,3 +224,71 @@ describe('activation response and model selection', () => {
     expect(isUnusedMainWeek(fresh)).toBe(false)
   })
 })
+
+describe('post-activation quota refresh', () => {
+  const window = (used: number) => ({ usedPercent: used, windowDurationMins: 10080, resetsAt: Math.floor(Date.now() / 1000) + 86400 })
+  const raw = (used: number) => ({ accountId: upstreamId, rateLimits: { limitId: 'codex', planType: 'pro', primary: window(used) } })
+  const weekly = (snapshot: unknown) => (snapshot as any)?.weekly?.percent
+
+  test('a failed re-read keeps the last successful snapshot instead of leaving the account without usage', async () => {
+    const { refreshActivatedCodexUsage } = await import('./codex-activation-request')
+    const { peekSuccessfulUsage, peekUsage, refreshUsageFromConnection } = await import('./usage')
+    const account = 'activation-refresh-probe'
+    const primed = await refreshUsageFromConnection(async () => rawUsage(), account)
+    expect(primed?.state).toBe('ok')
+    expect(peekSuccessfulUsage(account)?.accountFingerprint).toBe(identity)
+
+    let reads = 0
+    const client = {
+      async initialize() {},
+      async request(method: string) {
+        expect(method).toBe('account/rateLimits/read')
+        reads++
+        throw new Error('post-activation quota read failed')
+      },
+      async close() {},
+    }
+    const refreshed = await refreshActivatedCodexUsage(client as never, account)
+    // The cached success TTL is bypassed: the read is really attempted.
+    expect(reads).toBeGreaterThan(0)
+    expect(refreshed?.state).not.toBe('ok')
+    // Selection, hi and the activation scan still see the account's last real quota.
+    expect(peekSuccessfulUsage(account)?.state).toBe('ok')
+    expect(peekSuccessfulUsage(account)?.accountFingerprint).toBe(identity)
+    expect(peekUsage(account)?.state).toBe('ok')
+  })
+
+  test('the re-read is a real request even during a failure cooldown', async () => {
+    const { refreshActivatedCodexUsage } = await import('./codex-activation-request')
+    const { peekSuccessfulUsage, refreshUsageFromConnection } = await import('./usage')
+    const account = 'activation-refresh-cooldown'
+    expect((await refreshUsageFromConnection(async () => raw(0), account))?.state).toBe('ok')
+    // An earlier shared read failed: the account's reads are cooling down.
+    expect(await refreshUsageFromConnection(async () => { throw new Error('boom') }, account, { force: true })).toBeNull()
+
+    let reads = 0
+    const refreshed = await refreshActivatedCodexUsage({ async request() { reads++; return raw(7) } } as never, account)
+    expect(reads).toBe(1)
+    expect(refreshed?.state).toBe('ok')
+    expect(weekly(peekSuccessfulUsage(account))).toBe(7)
+  })
+
+  test('a read that began before the activation cannot stand in for, or overwrite, the re-read', async () => {
+    const { refreshActivatedCodexUsage } = await import('./codex-activation-request')
+    const { peekSuccessfulUsage, refreshUsageFromConnection } = await import('./usage')
+    const account = 'activation-refresh-pending'
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const earlier = refreshUsageFromConnection(async () => { await gate; return raw(0) }, account)
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    let reads = 0
+    const refreshed = await refreshActivatedCodexUsage({ async request() { reads++; return raw(7) } } as never, account)
+    expect(reads).toBe(1)
+    expect(weekly(refreshed)).toBe(7)
+    // The pre-activation result arrives late and is discarded.
+    release()
+    expect(await earlier).toBeNull()
+    expect(weekly(peekSuccessfulUsage(account))).toBe(7)
+  })
+})

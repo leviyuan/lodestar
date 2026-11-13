@@ -13,12 +13,3 @@ export function agentCardTaskKindLabel(kind: AgentCardTaskKind): string {
     case 'background': return '后台进程'
   }
 }
-
-export function agentCardTaskKindIcon(kind: AgentCardTaskKind): string {
-  switch (kind) {
-    case 'project': return '📂'
-    case 'delegated': return '🧠'
-    case 'subagent': return '🤖'
-    case 'background': return '⚙️'
-  }
-}

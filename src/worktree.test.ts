@@ -258,6 +258,16 @@ describe('project worktrees', () => {
     expect(readWorktreeInstructionsForManagedBranch(result.worktreePath, repo, 'feishu')).toBeNull()
   })
 
+  test('ordinary checkouts on user branches under work/ have no managed instructions', () => {
+    const { repo } = initRepo()
+    // A branch Lodestar could not have created must not make the optional lookup throw:
+    // it runs on every session start and delegation.
+    for (const branch of ['work/feature/login', 'work/修复登录', 'work/plain']) {
+      git(repo, ['checkout', '-q', '-b', branch])
+      expect(readWorktreeInstructionsForManagedBranch(repo, repo, 'feishu')).toBeNull()
+    }
+  })
+
   test('skips slug-specific AGENTS files outside managed worktree branches', () => {
     const { repo } = initRepo()
     writeFileSync(join(repo, 'agents.main.md'), '# extra rules\n')

@@ -53,7 +53,7 @@ jobs:
       - name: Set up minimum supported Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18.15.0
+          node-version: 22.19.0
       - name: Smoke-check Node.js bundles
         run: |
           node --check dist/lodestar.js

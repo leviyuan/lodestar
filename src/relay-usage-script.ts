@@ -20,7 +20,12 @@ export async function readRelayUsage(siteId: string, cfg: RelayConfig, protocol:
     const child = spawn(script, [], { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'], shell: false,
       env: { ...process.env, LODESTAR_RELAY_USAGE: '1' } })
     const finish = (value: UsageSnapshotUnified) => { if (!settled) { settled = true; clearTimeout(timer); resolve(value) } }
-    const timer = setTimeout(() => { child.kill('SIGTERM'); finish({ state: 'network', windows: [], reason: '余额脚本超时' }) }, SCRIPT_TIMEOUT_MS)
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM')
+      // A grandchild that inherited the pipes can outlive the script; release our ends now.
+      child.stdout.destroy(); child.stderr.destroy()
+      finish({ state: 'network', windows: [], reason: '余额脚本超时' })
+    }, SCRIPT_TIMEOUT_MS)
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8')
     child.stdout.on('data', chunk => { stdout += chunk; if (stdout.length > 1_000_000) child.kill('SIGTERM') })
     child.stderr.on('data', chunk => { stderr += chunk; if (stderr.length > 16_384) stderr = stderr.slice(-16_384) })
@@ -42,6 +47,10 @@ export async function readRelayUsage(siteId: string, cfg: RelayConfig, protocol:
         finish({ state: 'network', windows: [], reason: error instanceof Error ? error.message : String(error) })
       }
     })
+    // A script that never reads its input may exit first. That write failure must stay
+    // here: the exit code and output decide the result, and an unhandled stream error
+    // would otherwise take the daemon down.
+    child.stdin.on('error', () => {})
     child.stdin.end(input + '\n')
   })
 }

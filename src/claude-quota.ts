@@ -69,12 +69,15 @@ export function rankClaudeQuota(snapshot: UsageSnapshotUnified | undefined, mode
   if (new Set(windows.map(window => window.kind)).size !== windows.length) {
     return { ...out, reason: '额度窗口重复，归属 MISS' }
   }
+  // Every window is validated before any is judged: an account with an unreadable window
+  // is MISS, and must not pass as "clearly exhausted" because an earlier window was full.
   for (const window of windows) {
     if (typeof window.percent !== 'number' || !Number.isFinite(window.percent) || window.percent < 0 || window.percent > 100) {
       return { ...out, reason: `${window.label} MISS` }
     }
-    if (window.percent >= 100) return { ...out, state: 'exhausted', reason: `${window.label} 已耗尽` }
   }
+  const spent = windows.find(window => window.percent! >= 100)
+  if (spent) return { ...out, state: 'exhausted', reason: `${spent.label} 已耗尽` }
   for (const window of windows) {
     const reset = window.resetsAt instanceof Date ? window.resetsAt.getTime() : NaN
     if (!Number.isFinite(reset) || reset <= now) return { ...out, reason: `${window.label} 重置时间 MISS 或已过期` }

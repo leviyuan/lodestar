@@ -70,6 +70,8 @@ export interface TempSessionRuntimeDeps<TSession extends TempSessionHandle> {
     chatId: string,
   ): Promise<{ chatId: string | null; disbanded: boolean }>
   chatIdForSession(sessionName: string): string | null
+  /** Drops a name → chat binding that a group rename left pointing at this chat. */
+  unbindSessionChat?(sessionName: string): void
   clearSessionConversationState(sessionName: string): void
   registerTempSessionLease(sessionName: string, chatId: string): void
   hasTempSessionLease(sessionName: string, chatId: string): boolean
@@ -113,7 +115,18 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
   const sessionFor = (chatId: string, sessionName: string): TSession => {
     let session = deps.registry.get(chatId)
     if (session && session.sessionName !== sessionName) {
-      throw new Error(`chat ${chatId} is already owned by session "${session.sessionName}", not "${sessionName}"`)
+      // The group was renamed. Work that is still running stays with its project and is
+      // never stopped implicitly; the caller reports this to the chat.
+      if (session.isRunning()) {
+        throw new Error(`本群已改名为「${sessionName}」，但原群名「${session.sessionName}」的会话仍在运行，本条消息未执行。`
+          + `请把群名改回「${session.sessionName}」并发送 kill 结束该会话，再改为新群名`)
+      }
+      // A stopped session holds no process: retire it so the new name maps to its own project.
+      const previousName = session.sessionName
+      session.dispose()
+      deps.registry.delete(chatId)
+      if (deps.chatIdForSession(previousName) === chatId) deps.unbindSessionChat?.(previousName)
+      session = undefined
     }
     if (!session) {
       session = deps.createSession(sessionName, chatId)

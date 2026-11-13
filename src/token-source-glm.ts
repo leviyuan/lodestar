@@ -172,7 +172,7 @@ registerTokenSourceFactory({
         return verifyModelExists(baseUrl, { Authorization: `Bearer ${token}` }, model)
       },
       async readUsage(): Promise<UsageSnapshotUnified> {
-        // 额度用本 source 的 baseUrl/token 查(不经全局 readGlmUsage 的 settings.json,避免凭据不一致)
+        // 额度用本 source 的 baseUrl/token 查,避免与其他来源的凭据不一致。
         return glmUsageToUnified(await fetchGlmUsage(baseUrl, token))
       },
     }

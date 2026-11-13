@@ -6,8 +6,8 @@ import { CODEX_REASONING_EFFORTS, type CodexReasoningEffort } from './codex-proc
 import { codexQuotaMeter, rankCodexQuota, unusedCodexWeek } from './codex-quota'
 import { networkFetch } from './network'
 import type { TokenSource } from './token-source'
-import { AppServerOnce, invalidateCodexUsage, refreshUsageFromConnection, requestCodexControlWithRetry,
-  snapshotFromReadResponse, type UsageSnapshot } from './usage'
+import { AppServerOnce, refreshUsageFromConnection, requestCodexControlWithRetry,
+  snapshotFromReadResponse, supersedeCodexUsageReads, type UsageSnapshot } from './usage'
 
 // Standard-speed credit rates: https://learn.chatgpt.com/docs/pricing#token-rates (2026-09-27).
 // Require the cheapest model explicitly; never silently substitute a more expensive model.
@@ -151,10 +151,16 @@ const defaults: ActivationRequestDeps = {
     client.once('exit', () => { if (ownedClients.get(id) === client) ownedClients.delete(id) })
     return client
   }, credentials: credentialsFromNativeFile, fetch: networkFetch,
-  refresh: (client, id) => {
-    invalidateCodexUsage(id)
-    return refreshUsageFromConnection((method, params) => client.request(method, params), id)
-  },
+  refresh: refreshActivatedCodexUsage,
+}
+
+/** Re-reads the quota an activation just consumed. The read must be a real one, so an
+ * earlier in-flight read and a failure cooldown are superseded; the last successful
+ * snapshot is kept, because dropping it left the account without usage when this read
+ * failed and its diagnostic was then pruned on the next scan. */
+export function refreshActivatedCodexUsage(client: Client, accountId: string): Promise<UsageSnapshot | null> {
+  supersedeCodexUsageReads(accountId)
+  return refreshUsageFromConnection((method, params) => client.request(method, params), accountId)
 }
 
 /** One bounded request using native-refreshed subscription auth. No thread/turn is created. */

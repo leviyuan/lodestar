@@ -177,7 +177,10 @@ export function renderTeXToPNG(
       shapeRendering: 2,
       textRendering: 1,
       font: {
-        loadSystemFonts: true,
+        // MathJax draws its own glyphs as paths; only native <text> (CJK and other
+        // characters outside its fonts) needs a system font. Scanning the system fonts
+        // costs hundreds of milliseconds of blocked event loop per formula.
+        loadSystemFonts: /<text\b/.test(renderedSvg.svg),
         serifFamily: CJK_FONT_FAMILY,
         sansSerifFamily: CJK_FONT_FAMILY,
       },

@@ -128,9 +128,15 @@ export function tokenSourceConfigUpdates(configs: Configs, id: string, update: T
     next[group.other] = withoutCredentials(next[group.other] ?? {})
   } else {
     const { key, base } = accountCredentials(group, next)
-    next[group.id] = { ...withoutCredentials(next[group.id] ?? {}), base_url: base,
-      ...(group.id === 'glm' ? { auth_token: key ?? '' } : { api_key: key ?? '' }) }
-    next[group.other] = withoutCredentials(next[group.other] ?? {})
+    const primary = next[group.id] ?? {}, other = next[group.other] ?? {}
+    // An account that stores neither key nor endpoint may be the one detected on this
+    // machine, possibly on another host. Persisting the default endpoint for a model or
+    // visibility edit would contradict that account on every later load.
+    const stored = !!key || !!primary.base_url?.trim() || !!other.base_url?.trim()
+    next[group.id] = stored
+      ? { ...withoutCredentials(primary), base_url: base, ...(group.id === 'glm' ? { auth_token: key ?? '' } : { api_key: key ?? '' }) }
+      : withoutCredentials(primary)
+    next[group.other] = withoutCredentials(other)
   }
   return { [group.id]: next[group.id], [group.other]: next[group.other] }
 }

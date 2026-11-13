@@ -67,6 +67,10 @@ function watchManualCompaction(proc: AgentProcess): ManualCompactionWatch {
     resolvePromise = resolve
     rejectPromise = reject
   })
+  // The process can exit while the caller still awaits compactThread(); that failure is
+  // reported there, and this watch must not surface as an unhandled rejection, which
+  // would shut the daemon down.
+  promise.catch(() => {})
   // 大上下文压缩不设固定时限；等待完成通知，进程退出或报错时失败。
   proc.on('context_compacted', onCompacted)
   proc.once('exit', onExit)

@@ -653,6 +653,38 @@ describe('session conversation state cleanup', () => {
     })
   })
 
+  test('clearing one provider keeps a DSH-only remainder in memory and on disk', () => {
+    const result = runFreshState(`
+      loadSessionResumeMap()
+      clearSessionResumeChecked('target', 'codex')
+      const afterCodex = getSessionResumeRef('target', 'dsh')
+      const persistedAfterCodex = __read('session-resume-map.json')
+      clearSessionResumeChecked('target', 'dsh')
+      __out({
+        afterCodex,
+        persistedAfterCodex,
+        afterDsh: getSessionResumeRef('target', 'dsh'),
+        persistedAfterDsh: __read('session-resume-map.json'),
+      })
+    `, {
+      'session-resume-map.json': {
+        target: {
+          codex: { provider: 'codex', sessionId: 'target-thread', cwd: '/srv/target' },
+          dsh: { provider: 'dsh', sessionId: 'target-dsh', cwd: '/srv/target' },
+        },
+      },
+    })
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    const dsh = { provider: 'dsh', sessionId: 'target-dsh', cwd: '/srv/target' }
+    expect(extract(result)).toEqual({
+      afterCodex: dsh,
+      persistedAfterCodex: { target: { dsh } },
+      afterDsh: null,
+      persistedAfterDsh: {},
+    })
+  })
+
   test('checked resume cleanup restores the full ref when persistence fails', () => {
     const result = runFreshState(`
       loadSessionResumeMap()

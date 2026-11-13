@@ -196,7 +196,13 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
         try {
           await s.stop('已取消额度恢复', { announce: !card, onStatus: value => s.setStatusCard(card, value) })
           await s.closeStatusCard(card, '🛑 已取消额度恢复')
-        } catch (error) { await s.closeStatusCard(card, `❌ ${messageOf(error)}`); throw error }
+        } catch (error) {
+          await s.closeStatusCard(card, `❌ ${messageOf(error)}`)
+          // Without a card nothing has told the user yet; with one, rethrowing would have
+          // the inbound failure notice report the same error a second time.
+          if (!card) throw error
+          logError('session-commands: quota wait stop failed', error)
+        }
         return true
       }
       // Soft barge-out: interrupt the current turn (if any) AND drop

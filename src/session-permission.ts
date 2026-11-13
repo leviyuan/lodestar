@@ -154,6 +154,6 @@ export function renderPermission(s: Session, req: CanUseToolRequest): void {
       cardkit.cancelSummary(turn.cardId)
       await cardkit.patchSettings(turn.cardId, { config: { summary: { content: summary } } })
       await feishu.urgentApp(turn.messageId, [turn.userOpenId])
-    })()
+    })().catch(error => logError('session-permission: approval notification failed', error))
   }
 }

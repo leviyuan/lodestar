@@ -1,3 +1,5 @@
+import { closeOpenMarkdownFence, sliceWholeCharacters } from '../markdown-code'
+
 const DEFAULT_TASK_CONTENT_CHARS = 360
 export const DEFAULT_RESULT_CONTENT_CHARS = 8_000
 
@@ -16,5 +18,6 @@ export function boundedResultContent(value: string, maxChars = DEFAULT_RESULT_CO
   if (value.length <= maxChars) return value
   const receipt = '_结果超过卡片安全上限，已截断。_'
   const available = Math.max(1, maxChars - receipt.length - 2)
-  return `${value.slice(0, available)}…\n\n${receipt}`
+  // A cut inside a code fence would turn the notice and every later section into code.
+  return `${closeOpenMarkdownFence(`${sliceWholeCharacters(value, available)}…`)}\n\n${receipt}`
 }

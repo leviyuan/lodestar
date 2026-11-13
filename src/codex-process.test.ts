@@ -1010,6 +1010,55 @@ describe('codex JSON-RPC lifecycle reliability', () => {
     expect(proc.isAlive()).toBe(false)
   })
 
+  test('stdout records survive chunk boundaries inside multi-byte characters and across lines', async () => {
+    let requestId = 0
+    const proc = makeCodexLifecycleHarness({
+      write: (chunk: string) => {
+        requestId = JSON.parse(chunk).id
+        return true
+      },
+    })
+    const first = proc.request('thread/read', {}, 100)
+    const firstId = requestId
+    const second = proc.request('thread/read', {}, 100)
+    const text = '中文输出，含 emoji 🚀 与标点'
+    const stream = Buffer.from([
+      JSON.stringify({ id: firstId, result: { text } }),
+      JSON.stringify({ id: requestId, result: { text: text.repeat(3) } }),
+    ].join('\n'))
+
+    // One byte per read puts a boundary inside every multi-byte character and both records.
+    for (const byte of stream) proc.onStdout(Buffer.from([byte]))
+    await expect(first).resolves.toEqual({ text })
+    expect(proc.pending.size).toBe(1)
+
+    // The last record has no trailing newline; close drains it like any other tail.
+    proc.handleChildClose(0, null)
+    await expect(second).resolves.toEqual({ text: text.repeat(3) })
+  })
+
+  test('a record split after its delimiter keeps the following partial record intact', async () => {
+    let requestId = 0
+    const proc = makeCodexLifecycleHarness({
+      write: (chunk: string) => {
+        requestId = JSON.parse(chunk).id
+        return true
+      },
+    })
+    const first = proc.request('thread/read', {}, 100)
+    const firstId = requestId
+    const second = proc.request('thread/read', {}, 100)
+    const one = JSON.stringify({ id: firstId, result: { n: 1 } })
+    const two = JSON.stringify({ id: requestId, result: { n: 2 } })
+
+    proc.onStdout(Buffer.from(`\n${one}\n${two.slice(0, 5)}`))
+    await expect(first).resolves.toEqual({ n: 1 })
+    expect(proc.stdoutBuf).toBe(two.slice(0, 5))
+    proc.onStdout(Buffer.from(`${two.slice(5)}\n`))
+    await expect(second).resolves.toEqual({ n: 2 })
+    expect(proc.stdoutBuf).toBe('')
+  })
+
   test('stdin EPIPE does not reject an already-sent RPC whose response is in the stdout tail', async () => {
     let requestId = 0
     const proc = makeCodexLifecycleHarness({

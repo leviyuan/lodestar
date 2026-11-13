@@ -280,6 +280,15 @@ describe('Claude actual quota errors remain excluded', () => {
       expect(rank(snapshot, 100, 'fable')).toMatchObject({ state: 'exhausted', score: null })
     })
 
+  test('an unreadable window keeps the account MISS even when an earlier window is exhausted', () => {
+    // Only accounts whose every window is known may count as clearly exhausted for the
+    // all-exhausted fallback.
+    const snapshot = quota({ shortUsed: 100 })
+    snapshot.windows.find(item => item.kind === 'weekly')!.percent = null
+    expect(rank(snapshot)).toMatchObject({ state: 'miss', score: null })
+    expect(rank(quota({ shortUsed: 100 }))).toMatchObject({ state: 'exhausted', score: null })
+  })
+
   test.each(['fiveHour', 'weekly', 'seven_day_oauth_apps', 'modelWeekly:Fable'])(
     'invalid %s percentages and reset times stay MISS rather than becoming headroom', kind => {
       for (const percent of [null, NaN, Infinity, -1, 101]) {

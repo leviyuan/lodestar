@@ -17,12 +17,20 @@ const fixture = `
   let command = 'bun\\0/project/daemon.ts\\0'
   let cwd = '/project'
   let fileError, commandError, probeError
+  let stat = '12345 (bun) S 1 12345 12345 0 -1 4194304 0 0'
+  let emptyCommandReads = 0
+  let commandReads = 0
   const executions = []
   const originalRead = fs.readFileSync
   mock.module('node:fs', () => ({ ...fs,
     readFileSync(path, ...args) {
       if (path === '/test/pid') { if (fileError) throw fileError; return raw }
-      if (String(path).startsWith('/proc/')) { if (commandError) throw commandError; return command }
+      if (String(path).startsWith('/proc/')) {
+        if (commandError) throw commandError
+        if (String(path).endsWith('/stat')) return stat
+        commandReads++
+        return emptyCommandReads-- > 0 ? '' : command
+      }
       return originalRead(path, ...args)
     },
     readlinkSync() { return cwd },
@@ -51,10 +59,19 @@ test('PID guard distinguishes absence from unreadable records and process inspec
     probeError = Object.assign(new Error('gone'), { code: 'ESRCH' })
     assert.deepEqual(checkPidGuard('/test/pid'), { state: 'continue' })
     commandError = undefined
+    // 另一用户的进程：探测被拒绝只说明进程存在，仍按命令行判断是否为 daemon。
     probeError = Object.assign(new Error('probe denied'), { code: 'EPERM' })
-    assert.throws(() => checkPidGuard('/test/pid'), /probe denied/)
+    assert.deepEqual(checkPidGuard('/test/pid'), { state: 'exit', pid: 12345 })
+    command = '/usr/sbin/sshd\\0-D\\0'
+    assert.deepEqual(checkPidGuard('/test/pid'), { state: 'continue' })
+    commandError = Object.assign(new Error('cmdline permission denied'), { code: 'EACCES' })
+    assert.throws(() => checkPidGuard('/test/pid'), /cmdline permission denied/)
+    commandError = undefined
+    command = 'bun\\0/project/daemon.ts\\0'
     raw = '12345'
-    assert.throws(() => checkPidGuard('/test/pid'), /probe denied/)
+    assert.deepEqual(checkPidGuard('/test/pid'), { state: 'exit', pid: 12345 })
+    probeError = Object.assign(new Error('probe failed'), { code: 'EINVAL' })
+    assert.throws(() => checkPidGuard('/test/pid'), /probe failed/)
     probeError = undefined
     assert.deepEqual(checkPidGuard('/test/pid'), { state: 'exit', pid: 12345 })
     for (const invalid of ['', '12345junk', '123.5', '-1', '0', '2147483648']) {
@@ -62,6 +79,31 @@ test('PID guard distinguishes absence from unreadable records and process inspec
       assert.equal(parseDaemonPid(invalid), null)
       assert.throws(() => checkPidGuard('/test/pid'), /PID 文件格式坏/)
     }
+  `)
+})
+
+test('Linux PID guard treats zombies and kernel threads as absent and rereads a command line caught mid-exec', () => {
+  runScript(fixture + `
+    // 僵尸进程与内核线程没有命令行，不可能是 daemon，也不应阻止启动或让停止流程报错。
+    emptyCommandReads = Infinity
+    stat = '12345 (node) Z 1 12345 12345 0 -1 4228100 0 0'
+    assert.equal(isOurDaemon(12345, '/project/daemon.ts'), false)
+    assert.deepEqual(checkPidGuard('/test/pid'), { state: 'continue' })
+    stat = '12345 (kworker/0:1 (x)) I 2 0 0 0 -1 69238880 0 0'
+    assert.deepEqual(checkPidGuard('/test/pid'), { state: 'continue' })
+
+    // exec 切换瞬间读到的空值在重读后恢复，按真实入口判断。
+    stat = '12345 (bun) R 1 12345 12345 0 -1 4194304 0 0'
+    emptyCommandReads = 2
+    commandReads = 0
+    assert.deepEqual(checkPidGuard('/test/pid'), { state: 'exit', pid: 12345 })
+    assert.equal(commandReads, 3)
+
+    // 始终读不到命令行的普通进程仍无法核对身份，必须报错而不是放行。
+    emptyCommandReads = Infinity
+    commandReads = 0
+    assert.throws(() => checkPidGuard('/test/pid'), /命令行为空/)
+    assert.equal(commandReads, 5)
   `)
 })
 

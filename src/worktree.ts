@@ -261,9 +261,9 @@ function managedWorktreeInstructionContext(
   const branch = currentGitBranchForOptionalInstructions(workDir)
   if (!branch?.startsWith(WORK_BRANCH_PREFIX)) return null
   const slug = branch.slice(WORK_BRANCH_PREFIX.length)
-  if (!normalizeWorktreeSlug(slug)) {
-    throw new Error(`invalid worktree branch "${branch}"`)
-  }
+  // Managed branches are only ever created from a validated slug. Any other work/…
+  // branch (work/feature/login, work/修复登录) is the user's own and has no instructions.
+  if (!normalizeWorktreeSlug(slug)) return null
   const expectedPath = expectedWorktreePath(projectDir, projectName, slug)
   if (!sameWorktreePath(workDir, expectedPath)) return null
   const instructionsPath = worktreeInstructionsPath(workDir, worktreeInstructionSlugKey(slug))

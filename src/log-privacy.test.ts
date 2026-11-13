@@ -103,3 +103,41 @@ test('source startup catches import failures before the runtime can print privat
     rmSync(directory, { recursive: true, force: true })
   }
 })
+
+test('startup shows which configuration key to fix without exposing paths or secrets', () => {
+  const root = fileURLToPath(new URL('../', import.meta.url))
+  const directory = mkdtempSync(join(tmpdir(), 'lodestar-startup-config-'))
+  const start = (lines: string[]) => {
+    const script = join(directory, 'startup.ts')
+    writeFileSync(script, `
+      import ${JSON.stringify(join(root, 'src/daemon-startup-logging.ts'))};
+      import ${JSON.stringify(join(root, 'src/config.ts'))};
+    `)
+    writeFileSync(join(directory, 'private-owner.toml'), ['[feishu]', 'app_id = "cli_test"', 'app_secret = "private-app-secret"', ...lines].join('\n'))
+    const result = Bun.spawnSync([process.execPath, script], {
+      env: { ...process.env, NODE_ENV: 'test', LODESTAR_DATA_DIR: directory,
+        LODESTAR_CONFIG: join(directory, 'private-owner.toml') },
+      stdout: 'pipe', stderr: 'pipe',
+    })
+    return { exitCode: result.exitCode, stderr: result.stderr.toString(), stdout: result.stdout.toString() }
+  }
+  try {
+    for (const [lines, expected] of [
+      [['', '[runtime]', 'live_elapsed = "seconds"'], '[runtime].live_elapsed must be "bucket" or "second", got "seconds"'],
+      [['', '[notify]', 'bind = ""'], '[notify].bind must not be empty'],
+      [['', '[notify]', 'port = "http"'], '[notify].port must be an integer'],
+      [['domain = "https://owner:private-domain-password@open.example.com"'], '[feishu].domain must be "feishu", "lark" or an https origin'],
+    ] as const) {
+      const result = start([...lines])
+      expect(result.exitCode).toBe(1)
+      expect(result.stderr).toContain(expected)
+      expect(result.stderr).toContain('daemon: startup failed')
+      for (const secret of [directory, root, 'private-owner', 'private-app-secret', 'private-domain-password']) {
+        expect(result.stderr).not.toContain(secret)
+      }
+      expect(result.stdout).toBe('')
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})

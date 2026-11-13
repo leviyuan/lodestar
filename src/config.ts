@@ -26,6 +26,7 @@
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { CONFIG_FILE } from './paths'
+import { ConfigError } from './config-error'
 import { normalizeDomain } from './feishu-endpoint'
 
 /** 活跃 footer / 后台卡 header 耗时展示模式(config `[runtime].live_elapsed`)。 */
@@ -230,19 +231,27 @@ export function loadConfig(): LodestarConfig {
   const appId = t.feishu?.app_id
   const appSecret = t.feishu?.app_secret
   if (!appId || !appSecret) {
-    throw new Error(`lodestar: ${CONFIG_FILE} is missing [feishu].app_id / [feishu].app_secret`)
+    throw new ConfigError('lodestar: configuration is missing [feishu].app_id / [feishu].app_secret')
   }
-  const feishuDomain = normalizeDomain(t.feishu?.domain)
+  let feishuDomain: string | undefined
+  try { feishuDomain = normalizeDomain(t.feishu?.domain) }
+  catch (error) {
+    // The rejected value can be a URL with credentials; name the key and accepted forms only.
+    throw new ConfigError(
+      'lodestar: [feishu].domain must be "feishu", "lark" or an https origin such as "https://open.feishu.cn"',
+      { cause: error },
+    )
+  }
   const projectsRoot = expandTilde(t.runtime?.projects_root ?? homedir())
   const agentAutoUpdate: LodestarConfig['runtime']['agent_auto_update'] = { codex: false, claude: false, dsh: false }
   const agentAutoUpdateSection = t['runtime.agent_auto_update']
   const legacyAgentAutoUpdate = t.runtime?.agent_auto_update
   if (legacyAgentAutoUpdate !== undefined) {
     if (agentAutoUpdateSection) {
-      throw new Error('lodestar: legacy [runtime].agent_auto_update cannot be combined with [runtime.agent_auto_update]')
+      throw new ConfigError('lodestar: legacy [runtime].agent_auto_update cannot be combined with [runtime.agent_auto_update]')
     }
     if (legacyAgentAutoUpdate !== 'true' && legacyAgentAutoUpdate !== 'false') {
-      throw new Error(`lodestar: [runtime].agent_auto_update must be true or false, got "${legacyAgentAutoUpdate}"`)
+      throw new ConfigError(`lodestar: [runtime].agent_auto_update must be true or false, got "${legacyAgentAutoUpdate}"`)
     }
     // Migrate the previous boolean without changing an explicit update choice.
     for (const agent of ['codex', 'claude', 'dsh'] as const) agentAutoUpdate[agent] = legacyAgentAutoUpdate === 'true'
@@ -250,29 +259,33 @@ export function loadConfig(): LodestarConfig {
   } else if (agentAutoUpdateSection) {
     for (const [agent, value] of Object.entries(agentAutoUpdateSection)) {
       if (agent !== 'codex' && agent !== 'claude' && agent !== 'dsh') {
-        throw new Error(`lodestar: unknown [runtime.agent_auto_update] Agent "${agent}"`)
+        throw new ConfigError(`lodestar: unknown [runtime.agent_auto_update] Agent "${agent}"`)
       }
       if (value !== 'true' && value !== 'false') {
-        throw new Error(`lodestar: [runtime.agent_auto_update].${agent} must be true or false, got "${value}"`)
+        throw new ConfigError(`lodestar: [runtime.agent_auto_update].${agent} must be true or false, got "${value}"`)
       }
       agentAutoUpdate[agent] = value === 'true'
     }
   }
   const liveElapsedRaw = (t.runtime?.live_elapsed ?? 'bucket').trim().toLowerCase()
   if (liveElapsedRaw !== 'bucket' && liveElapsedRaw !== 'second') {
-    throw new Error(
+    throw new ConfigError(
       `lodestar: [runtime].live_elapsed must be "bucket" or "second", got "${t.runtime?.live_elapsed}"`,
     )
   }
   const liveElapsed: LiveElapsedMode = liveElapsedRaw
-  const notifyBind = t.notify?.bind ?? '127.0.0.1'
+  const notifyBind = (t.notify?.bind ?? '127.0.0.1').trim()
+  if (!notifyBind) {
+    // An empty host makes the HTTP server listen on every interface.
+    throw new ConfigError('lodestar: [notify].bind must not be empty; use "127.0.0.1" for loopback or an explicit address such as "0.0.0.0"')
+  }
   const notifyPortRaw = t.notify?.port ?? '9876'
   if (!/^\d+$/.test(notifyPortRaw.trim())) {
-    throw new Error(`lodestar: [notify].port must be an integer, got "${notifyPortRaw}"`)
+    throw new ConfigError(`lodestar: [notify].port must be an integer, got "${notifyPortRaw}"`)
   }
   const notifyPort = Number.parseInt(notifyPortRaw, 10)
   if (!Number.isFinite(notifyPort) || notifyPort <= 0 || notifyPort > 65535) {
-    throw new Error(`lodestar: [notify].port must be 1..65535, got "${notifyPortRaw}"`)
+    throw new ConfigError(`lodestar: [notify].port must be 1..65535, got "${notifyPortRaw}"`)
   }
   const envSection = (name: string): Record<string, string> => {
     const section = t[name] ?? {}
@@ -334,7 +347,7 @@ export function loadConfig(): LodestarConfig {
         if (typeof value !== 'string') continue
         const field = rawKey.trim()
         if (field === 'enabled') {
-          if (value !== 'true' && value !== 'false') throw new Error(`[${sectionName}].enabled 必须为 true 或 false`)
+          if (value !== 'true' && value !== 'false') throw new ConfigError(`[${sectionName}].enabled 必须为 true 或 false`)
           cfg.enabled = value === 'true'
         } else if (field === 'default') {
           cfg.default = value === 'true'
@@ -364,7 +377,7 @@ export function loadConfig(): LodestarConfig {
         if (typeof value !== 'string') continue
         const field = rawKey.trim()
         if (field === 'enabled') {
-          if (value !== 'true' && value !== 'false') throw new Error(`[${sectionName}].enabled 必须为 true 或 false`)
+          if (value !== 'true' && value !== 'false') throw new ConfigError(`[${sectionName}].enabled 必须为 true 或 false`)
           relay.enabled = value === 'true'
         } else if (field === 'display' || field === 'api_key' || field === 'base_url'
           || field === 'protocol' || field === 'balance_script' || field === 'models'

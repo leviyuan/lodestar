@@ -79,9 +79,8 @@ import { formatFeishuError } from './feishu-errors'
 import { logError, logDiagnostic } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { readSysInfo } from './sysinfo'
-import { captureCodexUsageCache, type UsageSnapshot } from './usage'
+import { captureCodexUsageCache } from './usage'
 import { codexCreditsSummary } from './cards/usage'
-import type { GlmUsageSnapshot } from './glm-usage'
 import { readAllAccountUsage } from './account-usage'
 import { claudeWeeklyUsageWindow } from './claude-usage'
 import {
@@ -176,6 +175,8 @@ function mergeCompactionNotices(
 const FOOTER_THINKING_PREFIX = 'Thinking...'
 const FOOTER_WRITING = 'Writing...'
 const FOOTER_WORKING = 'Working...'
+/** Raw characters fed to the sanitizer for the 40-character chat-list preview. */
+const SUMMARY_SOURCE_CHARS = 512
 /** Final transaction guard: two 30s control RPCs plus a materialization read
  * of up to 10 minutes. Leave a minute for local lifecycle work so the exact
  * method timeout can surface before this outer guard. */
@@ -536,7 +537,6 @@ export class Session {
     public opts: SessionOpts = {},
   ) {
     this.agentCards = opts.agentCards ?? createAgentCards()
-    Session.all.add(this)
     const selection = feishu.getSessionModelSelection(sessionName)
     this.selectedProvider = selection?.provider ?? 'claude'
     this.selectedModel = selection?.model ?? null
@@ -579,6 +579,9 @@ export class Session {
         this.pendingConversationMaterialization = pendingLaunch
       }
     }
+    // Registered last: a constructor that throws above must not leave a half-built
+    // session in the registry that peers and account scheduling scan.
+    Session.all.add(this)
   }
 
   /** Minimal cross-chat snapshot for the `hi` peer-list section.
@@ -1235,50 +1238,25 @@ export class Session {
     try { await proc.kill() }
     catch (e) { killError = e }
     resumableStateError = await this.settleProcResumableState(proc)
+    // Subagents and background shells die with their process. Left "running", their rows
+    // suppress every later completion push and keep counting as active Claude load.
+    let backgroundError: unknown = null
+    try { await this.resetBackgroundTasks() }
+    catch (e) {
+      backgroundError = e
+      logError('session: idle stop background cleanup failed', e)
+    }
     const confirmed = this.finishProcStop(proc, killError)
     this.opts.onLifecycleChange?.()
     const failures = [
       ...(killError ? [killError] : !confirmed ? [new Error(this.blockedProcReason ?? 'process stop unconfirmed')] : []),
       ...(resumableStateError ? [new Error(resumableStateError)] : []),
+      ...(backgroundError ? [backgroundError] : []),
     ]
     if (failures.length === 1) throw failures[0]
     if (failures.length > 1) {
       throw new AggregateError(failures, `idle process stop failed: ${failures.map(messageOf).join('; ')}`)
     }
-  }
-
-  async stopIdleCurrentProcess(reason: string): Promise<boolean> {
-    return await this.runLifecycle('stop-idle-current', () => this.stopIdleCurrentProcessUnlocked(reason))
-  }
-
-  private async stopIdleCurrentProcessUnlocked(_reason: string): Promise<boolean> {
-    if (!this.proc?.isAlive()) return false
-    if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return false
-    const proc = this.proc
-    this.beginProcStop(proc)
-    this.initCount = 0
-    this.bgResumePending = false
-    this.discardOrphanAssistant()
-    this.currentTurnUsageBaseline = null
-    this.currentTurnUsageBaselineKnown = false
-    this.usageTotalsSeedUnknown = false
-    this.status = 'stopped'
-    let resumableStateError = await this.settleProcResumableState(proc)
-    let killError: unknown = null
-    try { await proc.kill() }
-    catch (e) { killError = e }
-    resumableStateError = await this.settleProcResumableState(proc)
-    const confirmed = this.finishProcStop(proc, killError)
-    this.opts.onLifecycleChange?.()
-    const failures = [
-      ...(killError ? [killError] : !confirmed ? [new Error(this.blockedProcReason ?? 'process stop unconfirmed')] : []),
-      ...(resumableStateError ? [new Error(resumableStateError)] : []),
-    ]
-    if (failures.length === 1) throw failures[0]
-    if (failures.length > 1) {
-      throw new AggregateError(failures, `idle process stop failed: ${failures.map(messageOf).join('; ')}`)
-    }
-    return true
   }
 
   private startFooterTimer(
@@ -1530,6 +1508,9 @@ export class Session {
     }
     this.stoppingProc = proc
     this.agentCapability = null
+    // The pending post-interrupt result belongs to this process, whose ordinary events
+    // are ignored from here on. Left set, it would swallow the next process's first result.
+    this.userInterrupted = false
   }
 
   acceptsAgentCapability(value: string): boolean {
@@ -1681,7 +1662,7 @@ export class Session {
       }
     }
     if (this.selectedProvider === 'codex') report?.(this.currentTokenSource()?.codexApiProvider ? '🔎 检查 Codex API 来源' : '🔎 检查 Codex 登录')
-    else report?.('🔎 检查 Claude Code')
+    else report?.(this.selectedProvider === 'dsh' ? `🔎 检查 ${this.backendLabel()}` : '🔎 检查 Claude Code')
     if (this.selectedProvider === 'codex' && this.selectedTokenSourceId !== 'codex-sub'
       && !this.currentTokenSource()?.codexApiProvider
       && !feishu.isOpenAIChatGPTAuthenticated(this.codexAccountId())) {
@@ -1921,7 +1902,10 @@ export class Session {
       const timer = setTimeout(() => finish('ready'), graceMs)
       const onInit = () => finish('init')
       const onError = (e: unknown) => finish('error', e)
-      const onExit = (e: unknown) => finish('exit', e)
+      // The exit event carries `{ code, signal, expected }`, not an Error; reported as is
+      // it reads 「启动失败: [object Object]」.
+      const onExit = (e: { code?: number | null; signal?: string | null } | undefined) =>
+        finish('exit', new Error(`进程已退出 (code=${e?.code ?? 'null'}, signal=${e?.signal ?? 'null'})`))
       proc.once('init', onInit)
       proc.once('error', onError)
       proc.once('exit', onExit)
@@ -2912,14 +2896,8 @@ export class Session {
     return sessionCommands.runCommand(this, raw, userOpenId, messageId)
   }
 
-  /** Build the hi-panel data snapshot for this session.
-   *
-   * Passing `usage=undefined` paints the `_加载中…_` placeholder — the
-   * caller is responsible for the async patch if the panel was sent. */
-  async buildConsoleOpts(
-    usage: UsageSnapshot | undefined,
-    glmUsage?: GlmUsageSnapshot,
-  ): Promise<cards.ConsoleOpts> {
+  /** Build the hi-panel data snapshot for this session, including the cached account usage. */
+  async buildConsoleOpts(): Promise<cards.ConsoleOpts> {
     const sysinfo = await readSysInfo()
     const runtime = this.runtimeModelSelection()
     return {
@@ -2935,19 +2913,15 @@ export class Session {
           ...s.peerSnapshot(),
           isCurrent: s === this,
         })),
-      usage,
-      glmUsage,
       accountUsages: await readAllAccountUsage(),
       sysinfo,
     }
   }
 
-  async buildConsoleCard(usage: UsageSnapshot | undefined): Promise<object> {
-    return cards.consoleCard(await this.buildConsoleOpts(usage))
-  }
-
   private async patchConsoleUsage(cardId: string): Promise<void> {
-    const opts = await this.buildConsoleOpts(undefined)
+    // The usage panel reads nothing but the account rows: rebuilding the whole console
+    // snapshot here collected host information and usage a second time for every `hi`.
+    const opts: cards.ConsoleOpts = { sessionName: this.sessionName, status: this.status }
     try { opts.accountUsages = await readAllAccountUsage() }
     catch (error) {
       const reason = messageOf(error)
@@ -3010,7 +2984,7 @@ export class Session {
   async replaceStatusCardWithConsole(handle: StatusCardHandle, finalStatus: string): Promise<void> {
     handle.timer.stop()
     const elapsed = handle.timer.elapsedSec()
-    const consoleOpts = await this.buildConsoleOpts(undefined)
+    const consoleOpts = await this.buildConsoleOpts()
     await cardkit.flush(handle.cardId)
     const failures: cardkit.CardWriteFailure[] = []
     const onFailure = (failure: cardkit.CardWriteFailure) => { failures.push(failure) }
@@ -3051,7 +3025,7 @@ export class Session {
 
   async showConsole(): Promise<void> {
     // The first card already contains the current cached account snapshots.
-    const opts = await this.buildConsoleOpts(undefined)
+    const opts = await this.buildConsoleOpts()
     await feishu.sendCard(this.chatId, cards.consoleCard(opts))
   }
 
@@ -3060,7 +3034,11 @@ export class Session {
     this.submittedSteering.clear()
     this.steeringBoundary?.start()
     this.steeringBoundary = null
-    if (!this.proc) return
+    if (!this.proc) {
+      // No backend will answer this interrupt, so no result may be skipped for it.
+      this.userInterrupted = false
+      return
+    }
     this.proc.sendInterrupt()
   }
 
@@ -5727,11 +5705,12 @@ export class Session {
     if (!segId) return
     turn.segmentTexts.set(segId, turn.currentAssistantText)
     this.processOutboundMarkers(turn.currentAssistantText)
-    const displayText = this.cleanAssistantTextForDisplay(turn.currentAssistantText)
     // Chat-list preview: head of the latest assistant text (~40 chars —
     // 开头即主题,流式期间稳定不闪;尾部截断会把 markdown 语法尾巴糊进列表行)。
     // Feishu truncates anyway. patchSummaryThrottled is rate-limited on its own.
-    const head = displayText.slice(0, 40)
+    // Only the head is shown, so only a bounded head is sanitized: cleaning the whole
+    // segment for every delta is quadratic and blocks the loop on long replies.
+    const head = this.cleanAssistantTextForDisplay(turn.currentAssistantText.slice(0, SUMMARY_SOURCE_CHARS)).slice(0, 40)
     cardkit.patchSummaryThrottled(turn.cardId, head)
   }
 
@@ -6235,6 +6214,9 @@ export class Session {
     // 隔离:本卡的段才跳过(rotation 重编号后新卡同名段不受旧卡标记影响)。
     const renderedHere = turn.mathRendered?.get(cardId)
     for (const [segId, fullText] of segmentTexts) {
+      // A whitespace-only block (common just before a tool call) never became an element;
+      // replacing it would be a write to an id the card does not have.
+      if (!fullText.trim()) continue
       if (cardkit.isDeadElement(cardId, segId)) {
         fallbackSegments.set(segId, fullText)
         continue

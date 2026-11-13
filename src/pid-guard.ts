@@ -20,8 +20,27 @@ function processExists(pid: number): boolean {
     process.kill(pid, 0)
     return true
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ESRCH') return false
+    // 进程存在但属于其他用户（PID 被系统进程回收时常见）；是否为 daemon 仍由命令行核对决定。
+    if (code === 'EPERM') return true
     throw error
+  }
+}
+
+const PF_KTHREAD = 0x00200000
+
+/** Linux 上僵尸进程与内核线程的命令行恒为空，它们不可能是 daemon；exec 切换瞬间也会短暂读到空值，需要重读。 */
+function linuxCommandLine(pid: number): string | null {
+  for (let attempt = 0; ; attempt++) {
+    const command = readFileSync(`/proc/${pid}/cmdline`, 'utf8')
+    if (command.trim()) return command
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    // comm 可含空格与括号，状态字段从最后一个右括号之后开始：state ppid pgrp session tty tpgid flags。
+    const fields = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)
+    if (fields[0] === 'Z' || (Number(fields[6]) & PF_KTHREAD) !== 0) return null
+    if (attempt >= 4) return command
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)
   }
 }
 
@@ -30,7 +49,9 @@ function commandLine(pid: number): string | null {
   try {
     let command: string
     if (process.platform === 'linux') {
-      command = readFileSync(`/proc/${pid}/cmdline`, 'utf8')
+      const linux = linuxCommandLine(pid)
+      if (linux === null) return null
+      command = linux
     } else if (process.platform === 'darwin') {
       command = execFileSync('ps', ['-p', String(pid), '-o', 'args='], { encoding: 'utf8', timeout: 2000 })
     } else if (process.platform === 'win32') {

@@ -105,7 +105,9 @@ const ENUM_VALUES: Record<string, ReadonlySet<string>> = {
   method: new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
   reason: new Set([...ERROR_CODES, 'cancelled', 'timeout', 'authentication', 'permission', 'rate_limit',
     'capacity', 'network', 'not_found', 'conflict', 'invalid_data', 'unavailable', 'server_error', 'unknown',
-    'not_logged_in', 'not_available', 'no_data', 'SIGINT', 'SIGTERM']),
+    'not_logged_in', 'not_available', 'no_data', 'SIGINT', 'SIGTERM', 'SIGBREAK',
+    // Shutdowns the daemon starts itself: without these the log shows no cause at all.
+    'unhandledRejection', 'uncaughtException', 'boot_fatal']),
   phase: new Set(['start', 'end', 'retry', 'recovered', 'failed']),
 }
 const recentDiagnostics = new Map<string, number>()

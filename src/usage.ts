@@ -16,7 +16,7 @@ import { StringDecoder } from 'node:string_decoder'
 import { createHash } from 'node:crypto'
 import { config } from './config'
 import { bindProcessCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT, liveCodexQuotaReaders } from './codex-accounts'
-import { UsageReadCache, UsageReadSupersededError, USAGE_FRESH_MS, isUsageAuthError, isUsageRateLimitError, type UsageReadOptions } from './usage-cache'
+import { UsageReadCache, UsageReadSupersededError, isUsageAuthError, isUsageRateLimitError, type UsageReadOptions } from './usage-cache'
 import { observeCodexAccountEmail } from './codex-account-info'
 import { parseCodexCredits, type CodexCredits } from './codex-credits'
 
@@ -410,7 +410,10 @@ async function fetchUsage(accountId: string): Promise<UsageSnapshot> {
  * 桶 map 整体替换(OpenAI 加/删桶自动跟上)。 */
 export function snapshotFromReadResponse(limitsRes: any, planType?: string | null, readStartedAt?: number): UsageSnapshot {
   const { buckets, defaultLimitId } = bucketsFromReadResponse(limitsRes)
-  const def = buckets.find(b => b.limitId === defaultLimitId) ?? buckets[0]
+  // Without a default pointer a single bucket is the main quota. Otherwise the main bucket
+  // must be the one the server names: an additional model bucket never stands in for it.
+  const def = buckets.find(b => b.limitId === defaultLimitId)
+    ?? (defaultLimitId === undefined && buckets.length === 1 ? buckets[0] : undefined)
   if (!def) return { state: 'network', reason: 'empty rate limit response' }
   const quotaPlanType = limitsRes?.rateLimits?.planType
   const subscriptionType = quotaPlanType ?? planType ?? undefined
@@ -442,11 +445,6 @@ export function peekUsage(accountId = DEFAULT_CODEX_ACCOUNT): UsageSnapshot | nu
 /** Last successful read for startup scheduling and footer displays. */
 export function peekSuccessfulUsage(accountId = DEFAULT_CODEX_ACCOUNT): Extract<UsageSnapshot, { state: 'ok' }> | null {
   return successfulCaches.get(accountId) ?? null
-}
-
-export function peekFreshUsage(accountId = DEFAULT_CODEX_ACCOUNT): Extract<UsageSnapshot, { state: 'ok' }> | null {
-  const snapshot = peekSuccessfulUsage(accountId)
-  return snapshot && Date.now() >= snapshot.fetchedAt && Date.now() - snapshot.fetchedAt < USAGE_FRESH_MS ? snapshot : null
 }
 
 /** Bind a closing footer to its account; login, deletion or quota reset invalidates the reader. */
@@ -558,6 +556,16 @@ export function invalidateCodexUsage(accountId: string): void {
   usageGenerations.set(accountId, (usageGenerations.get(accountId) ?? 0) + 1)
   caches.delete(accountId)
   successfulCaches.delete(accountId)
+  usageReads.invalidate(accountId)
+}
+
+/** The account's quota was just changed by a request of ours. Reads that began before it
+ * are superseded and their freshness and failure cooldown are dropped, so the next read
+ * is a real one. Unlike invalidation, the last successful snapshot stays: if that read
+ * fails, selection, `hi` and the activation scan still see the account's quota. */
+export function supersedeCodexUsageReads(accountId: string): void {
+  usageRevision++
+  usageGenerations.set(accountId, (usageGenerations.get(accountId) ?? 0) + 1)
   usageReads.invalidate(accountId)
 }
 

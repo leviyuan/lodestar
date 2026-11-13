@@ -213,6 +213,13 @@ test('Claude subscription coexists with other accounts and refreshes authoritati
     await source.refreshModels()
     assert.equal(source.modelCatalogState.status, 'ready')
     assert.equal(source.defaultModel, 'opus')
+    // Removing a custom default leaves model = "" behind: an unset default, never MISS.
+    const cleared = registry.tokenSourceFactories().find(def => def.kind === 'claude-subscription')
+      .build({ model: '', effort: '' }).forAccount('default')
+    await cleared.refreshModels()
+    assert.equal(cleared.defaultModel, 'opus')
+    assert.equal(cleared.modelCatalogState.status, 'ready')
+    assert.equal(cleared.modelCatalogState.error, undefined)
     assert.deepEqual(source.models[0].efforts, ['high', 'low'])
     assert.equal(source.models[0].defaultEffort, 'high')
     await (await import('./src/token-source-cache')).refreshTokenSourceUsage(source)

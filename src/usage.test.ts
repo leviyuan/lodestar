@@ -153,6 +153,23 @@ describe('quota account isolation', () => {
     expect(snapshot?.state === 'ok' && unusedCodexWeek(snapshot, 'model')).toBe(true)
     invalidateCodexUsage(account)
   })
+  test('an additional model bucket never stands in for a missing main quota', () => {
+    const window = { usedPercent: 5, windowDurationMins: 10080, resetsAt: Math.floor(quotaNow / 1000) + 86400 }
+    const spark = { limitId: 'codex_spark', limitName: 'GPT-5.3-Codex-Spark', primary: window }
+    // The named main bucket has no window: the Spark bucket must not be shown as the main quota.
+    expect(snapshotFromReadResponse({ rateLimits: { limitId: 'codex', planType: 'pro' },
+      rateLimitsByLimitId: { codex: { limitId: 'codex' }, codex_spark: spark } }).state).toBe('network')
+    // Several buckets and no pointer to the main one: ownership is unknown.
+    expect(snapshotFromReadResponse({ rateLimitsByLimitId: { codex_other: { ...spark, limitId: 'codex_other' }, codex_spark: spark } }).state)
+      .toBe('network')
+    // A single bucket without a pointer is the main quota, as before.
+    const single = snapshotFromReadResponse({ rateLimitsByLimitId: { codex: { limitId: 'codex', primary: window } } })
+    expect(single.state === 'ok' && single.weekly?.percent).toBe(5)
+    const named = snapshotFromReadResponse({ rateLimits: { limitId: 'codex', planType: 'pro', primary: window },
+      rateLimitsByLimitId: { codex: { limitId: 'codex', primary: window }, codex_spark: { ...spark, primary: { ...window, usedPercent: 90 } } } })
+    expect(named.state === 'ok' && named.weekly?.percent).toBe(5)
+  })
+
   test('invalid native percentages cannot become an apparently untouched week', () => {
     for (const usedPercent of [-1, 101, NaN, Infinity]) {
       const snapshot = snapshotFromReadResponse({ rateLimits: { planType: 'pro', primary: {

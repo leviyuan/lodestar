@@ -11,9 +11,27 @@ const directHttp = new HttpAgent({ keepAlive: true })
 const directHttps = new HttpsAgent({ keepAlive: true })
 let bunDirect: import('undici').Agent | undefined
 
+// A fresh proxy agent per request opens a new proxy connection (and, for HTTPS, a new
+// CONNECT tunnel and TLS handshake) every time. One keep-alive agent per proxy and scheme
+// reuses them like the direct agents above. Proxy settings rarely change; a few entries
+// cover a switch between proxies without holding stale agents forever.
+const MAX_PROXY_AGENTS = 4
+const proxyAgents = new Map<string, HttpAgent>()
+
 function requestAgent(url: URL, proxy?: string): HttpAgent {
   if (!proxy) return url.protocol === 'https:' ? directHttps : directHttp
-  return url.protocol === 'https:' ? new HttpsProxyAgent(proxy) : new HttpProxyAgent(proxy)
+  const key = `${url.protocol} ${proxy}`
+  let agent = proxyAgents.get(key)
+  if (!agent) {
+    agent = url.protocol === 'https:' ? new HttpsProxyAgent(proxy, { keepAlive: true }) : new HttpProxyAgent(proxy, { keepAlive: true })
+    proxyAgents.set(key, agent)
+    if (proxyAgents.size > MAX_PROXY_AGENTS) {
+      const [oldest, stale] = proxyAgents.entries().next().value!
+      proxyAgents.delete(oldest)
+      stale.destroy()
+    }
+  }
+  return agent
 }
 
 /** Fixed-size payloads are sent with an exact Content-Length: chunked request bodies
@@ -33,8 +51,8 @@ async function transport(url: URL, init: RequestInit, proxy?: string): Promise<R
     if (!proxy && (process.env[key.toLowerCase()] || process.env[key])) {
       // Bun 1.3.x ignores an empty proxy option and still reads the environment.
       // A direct dispatcher is required for bypasses; it never retries a failed proxy.
-      // This optional Bun-only dependency requires Node 18.17, so Node 18.15 uses
-      // the node-fetch transport below without loading it.
+      // The dependency is optional and only ever loaded here: Node uses the node-fetch
+      // transport below, and the Node CLI bundles keep it external for that reason.
       const undici = await import('undici')
       bunDirect ??= new undici.Agent()
       return await undici.fetch(url, { ...init, redirect: 'manual', dispatcher: bunDirect } as Parameters<typeof undici.fetch>[1]) as unknown as Response

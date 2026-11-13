@@ -62,3 +62,42 @@ export function transformMarkdownProse(text: string, transform: (prose: string) 
   if (last < text.length) out += transform(text.slice(last))
   return out
 }
+
+/** Wrap literal text in a fence longer than any backtick run inside it, so the text can
+ * never close the block early and continue as live card markup. */
+export function fencedCodeBlock(text: string, lang = ''): string {
+  let fence = '```'
+  while (text.includes(fence)) fence += '`'
+  return `${fence}${lang}\n${text}\n${fence}`
+}
+
+/** Close a fenced block that `text` leaves open, as happens when Markdown is cut at a
+ * character limit. Otherwise everything appended after it renders as part of the code. */
+export function closeOpenMarkdownFence(text: string): string {
+  // As in CommonMark, a backtick fence's info string holds no backtick: "```js``` text"
+  // is inline code, and closing it as a fence would open a block instead.
+  const opener = /^(?: {0,3})(?:(`{3,})[^`\n]*|(~{3,})[^\n]*)(?:\n|$)/gm
+  let cursor = 0
+  while (cursor < text.length) {
+    opener.lastIndex = cursor
+    const match = opener.exec(text)
+    if (!match) break
+    const marker = (match[1] ?? match[2])!
+    const close = new RegExp(
+      `^(?: {0,3})${regexEscape(marker[0]!)}{${marker.length},}[ \\t]*(?:\\n|$)`,
+      'gm',
+    )
+    close.lastIndex = match.index + match[0].length
+    const closing = close.exec(text)
+    if (!closing) return `${text}${text.endsWith('\n') ? '' : '\n'}${marker}`
+    cursor = closing.index + closing[0].length
+  }
+  return text
+}
+
+/** `text.slice(0, max)` that never ends between the two halves of a surrogate pair. */
+export function sliceWholeCharacters(text: string, max: number): string {
+  if (text.length <= max) return text
+  const last = text.charCodeAt(max - 1)
+  return text.slice(0, last >= 0xd800 && last <= 0xdbff ? max - 1 : max)
+}

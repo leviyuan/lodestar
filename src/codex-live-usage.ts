@@ -192,5 +192,4 @@ export class CodexLiveUsageRefresh {
 const refreshes = new CodexLiveUsageRefresh()
 export function startCodexLiveUsageRefresh(): void { refreshes.start() }
 export function stopCodexLiveUsageRefresh(): void { refreshes.stop() }
-export function refreshLiveCodexUsage(accountId: string): Promise<Result> { return refreshes.refresh(accountId) }
 export function waitForLiveCodexUsage(accountId: string, timeoutMs = 5_000): Promise<void> { return refreshes.wait(accountId, timeoutMs) }
