@@ -100,6 +100,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - Agent 功能的真实调用、续跑和 smoke 测试默认选 GLM Flash；每次先查询实时身份目录，选择 `ready` 项并沿用目录默认 effort。用户明确指定其他模型时按该次要求；GLM Flash 不可用时报告问题，不自动换模型。
 - 源码变更运行 `bun run typecheck` 和 `bun test`。构建入口、CLI、依赖或发布路径变更再运行 `bun run build`。
 - 共享 Session、Card Kit、飞书协议和持久状态变更最终跑全量测试。双后端接口变更覆盖 Codex、Claude、provider/source 切换和共享卡片。
+- CI 的 Windows 任务（`.github/workflows/ci.yml` 中列出的测试文件）里，不要用 `expect(promise).rejects` / `.resolves` 去等一个已经挂在定时器上的 promise：Windows 上 Bun 会在其中满 CPU 空转、定时器不再触发，测试进程卡到任务超时，也不会报单个用例超时。先 `await promise.then(() => undefined, error => error)` 取结果再断言。
 - 真实飞书、Agent 登录、Card action、建群/解散和 worktree smoke 需要明确目标群、账号及副作用；涉及 live daemon 仍按上节授权。
 - 发布前通过 `bun test` 与 `bun run build`。未指定 minor/major 时只升 patch；同一版本发布 npm 和 GitHub Packages，推送 `main` 和 tag，创建 GitHub Release。发布只经 GitHub Actions 的 `发布版本` 工作流（本机无仓库令牌，不要本地 `npm publish`），完整步骤与常见坑见 `docs/release.md`。
 - `mathjax-full` 随包附带修复后的传递依赖。发布前实际安装 tarball 并运行 `npm audit --omit=dev`，不能只检查源码目录的 overrides 和 Bun 锁文件。

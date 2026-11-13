@@ -691,7 +691,11 @@ test('a lock whose updater died before publishing its PID is reclaimed after the
   await Bun.sleep(300)
   expect(existsSync(join(root, 'codex/current.json'))).toBe(false)
   controller.abort(new Error('stopped waiting'))
-  await expect(waiting).rejects.toThrow('stopped waiting')
+  // 等锁循环此刻挂在 200ms 定时器上。Windows 上 Bun 的 expect(...).rejects 等这种 promise 时会满 CPU
+  // 空转、定时器不再触发，整个测试进程卡到 CI 超时（实测 12 次卡 11 次）；先 await 取结果再断言。
+  const stopped = await waiting.then(() => undefined, (error: unknown) => error)
+  expect(stopped).toBeInstanceOf(Error)
+  expect((stopped as Error).message).toBe('stopped waiting')
   expect(existsSync(lockPath)).toBe(true)
   const old = new Date(Date.now() - 60_000)
   await utimes(lockPath, old, old)
