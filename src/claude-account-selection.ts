@@ -24,7 +24,7 @@ export function selectClaudeAccount(options: { model?: string | null; effort?: A
   let quotaEligibleAccounts = 0
   let quotaExhaustedAccounts = 0
   let selectionFailures = 0
-  let exhaustedFallback: string | null = null
+  let exhaustedFallback: { id: string; recoversAt: number } | null = null
   const exhaustedIds = new Set<string>()
   const now = Date.now()
   for (const account of claudeAccounts.list()) {
@@ -52,7 +52,9 @@ export function selectClaudeAccount(options: { model?: string | null; effort?: A
         if (quotaExhausted) {
           quotaExhaustedAccounts++
           exhaustedIds.add(account.id)
-          exhaustedFallback ??= account.id
+          // The account that recovers first; unknown recovery ranks last and ties keep list order.
+          const recoversAt = rank.recoversAt ?? Number.POSITIVE_INFINITY
+          if (!exhaustedFallback || recoversAt < exhaustedFallback.recoversAt) exhaustedFallback = { id: account.id, recoversAt }
         }
         throw new Error(rank.reason ?? '额度缓存 MISS')
       }
@@ -66,9 +68,10 @@ export function selectClaudeAccount(options: { model?: string | null; effort?: A
   }
   candidates.sort(compareClaudeQuota)
   // An exhausted subscription should not make rs/restart lose the session.
-  // Keep the conversation's original account when it is one of the exhausted
-  // candidates (the user asked to continue on it, not on an arbitrary route);
-  // otherwise fall back to the default route, then the first exhausted account.
+  // Only spent windows count here: an account left with Fable's reserve is a
+  // ranked candidate, not a fallback. Keep the conversation's original account
+  // when it is one of the exhausted accounts (the user asked to continue on it);
+  // otherwise start on the exhausted account that recovers first.
   // Other failures (catalog, authentication or a missing usage snapshot) remain
   // visible to the caller.
   if (!candidates.length && quotaEligibleAccounts > 0
@@ -76,7 +79,7 @@ export function selectClaudeAccount(options: { model?: string | null; effort?: A
     logDiagnostic('claude_account_selection_fallback', { reason: 'rate_limit' })
     const original = options.exhaustedFallbackAccountId
     if (original && exhaustedIds.has(original)) return original
-    return exhaustedFallback ?? DEFAULT_CLAUDE_ACCOUNT
+    return exhaustedFallback?.id ?? DEFAULT_CLAUDE_ACCOUNT
   }
   if (!candidates.length) throw new Error(`Claude 自动选号 MISS：${diagnostics.join('；') || '尚无已收录账号'}`)
   return candidates[0]!.id

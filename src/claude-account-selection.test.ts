@@ -7,6 +7,49 @@ function isolated(script: string): void {
   expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
 }
 
+/**
+ * Startup selection over logged-in accounts with ready catalogs. The script sets each account's
+ * cached usage with snapshots.set(id, quota(rate_limits)), using iso(hours) for reset times, and
+ * selects an Opus launch with pick(options).
+ */
+function selection(ids: string[], script: string): void {
+  isolated(`
+    import assert from 'node:assert/strict'
+    import { mock } from 'bun:test'
+    mock.module('./src/claude-agent-process', () => ({ ClaudeAgentProcess: class {} }))
+    const records = ${JSON.stringify(ids)}.map((id, index) => ({ id, name: id, state: 'ready', identity: 'identity-' + index }))
+    mock.module('./src/claude-accounts', () => ({ DEFAULT_CLAUDE_ACCOUNT: 'default',
+      claudeAccounts: {
+        list: () => records,
+        get: id => records.find(record => record.id === id),
+        assertReady: id => {
+          const record = records.find(item => item.id === id)
+          if (!record) throw new Error('未知账号')
+          return record
+        },
+      } }))
+    const sources = new Map(records.map(record => [record.id, { id: 'claude-sub', kind: 'claude-subscription',
+      agent: 'claude', enabled: true, accountId: record.id, defaultModel: 'opus',
+      modelCatalogState: { status: 'ready' } }]))
+    const registry = await import('./src/token-source')
+    mock.module('./src/token-source', () => ({ ...registry,
+      getTokenSourceForAccount: (sourceId, accountId) => sources.get(accountId),
+      scrubAnthropicEnv: base => base,
+      tokenSourceRuntimeModel: (source, model) => ({ model, display: model, efforts: ['high'], defaultEffort: 'high' }) }))
+    const cache = await import('./src/token-source-cache')
+    const snapshots = new Map()
+    mock.module('./src/token-source-cache', () => ({ ...cache,
+      peekTokenSourceUsage: source => snapshots.get(source.accountId),
+      refreshTokenSourceUsage: async () => {} }))
+    const { claudeUsageSnapshot } = await import('./src/claude-usage')
+    const iso = hours => new Date(Date.now() + hours * 3600_000).toISOString()
+    const quota = rate_limits => claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits })
+    const { selectClaudeAccount } = await import('./src/claude-account-selection')
+    const pick = (options = {}) => selectClaudeAccount({ model: 'opus', effort: 'high', ...options })
+    ${script}
+  `)
+}
+
 test('an unobserved default warms an unstarted short window and remains selectable without I/O', () => {
   isolated(`
     import assert from 'node:assert/strict'
@@ -84,7 +127,7 @@ test('an unobserved default warms an unstarted short window and remains selectab
   `)
 })
 
-test('weekly-only accounts stay selectable and yield to a usable five-hour window', () => {
+test('weekly-only accounts stay selectable and compete with five-hour accounts by per-session pace', () => {
   isolated(`
     import assert from 'node:assert/strict'
     import { mock } from 'bun:test'
@@ -127,14 +170,19 @@ test('weekly-only accounts stay selectable and yield to a usable five-hour windo
     snapshots.set('tony', quota(weekly(57, threeDays)))
     snapshots.set('tonk', quota(weekly(5, threeDays)))
     snapshots.set('sam', quota({ five_hour: { utilization: 15, resets_at: iso(3) }, ...weekly(46, twoDays) }))
-    // 能安排任务的 5h 账号优先，即使它更忙、周额度余量更少。
+    // 跟得上节奏的 5h 窗口按每 5 小时 1 份（0.2 份/小时）计，高于各无 5h 账号到周重置为止的节奏
+    // （default 4/24、tonk 9.5/72、tony 4.3/72 份/小时）。
     assert.equal(pick(), 'sam')
-    assert.equal(pick(new Map([['sam', 5]])), 'sam')
-    // 没有 5h 窗口的账号仍可参与选号，并按周额度最早到期优先。
+    // 5h 账号不再整组优先：sam 已有 5 个活跃会话时每会话只剩 0.2/6，让给 default。
+    assert.equal(pick(new Map([['sam', 5]])), 'default')
+    // 没有 5h 窗口的账号仍可参与选号，按到周重置为止的节奏比较：default 剩 4 份、24 小时后作废，节奏最高。
     snapshots.set('sam', quota({ five_hour: { utilization: 100, resets_at: iso(3) }, ...weekly(46, twoDays) }))
     assert.equal(pick(), 'default')
+    // 不再只看谁先重置：default 只剩 0.5 份时节奏 0.5/24，低于 tonk 的 9.5/72。
+    snapshots.set('default', quota(weekly(95, day)))
+    assert.equal(pick(), 'tonk')
     snapshots.set('default', quota(weekly(100, day)))
-    // 到期时间相同时按余量份额分摊。
+    // 重置时间相同时余量大的节奏高。
     assert.equal(pick(), 'tonk')
     assert.equal(pick(null, 'tony'), 'tony')
   `)
@@ -182,6 +230,61 @@ test('Fable and other models receive separate weekly allocations', () => {
     const { selectClaudeAccount } = await import('./src/claude-account-selection')
     assert.equal(selectClaudeAccount({ model: 'opus', effort: 'high' }), 'default')
     assert.equal(selectClaudeAccount({ model: 'fable', effort: 'high' }), 'sam')
+  `)
+})
+
+test('an account left with only Fable\'s reserve is a discounted candidate, not an exhausted fallback', () => {
+  selection(['default', 'sam', 'tony'], `
+    const fiveHour = { utilization: 0, resets_at: iso(5) }
+    const fable = { model_scoped: [{ display_name: 'Fable', utilization: 0, resets_at: iso(120) }] }
+    // default 和 tony 的周额度真用光；sam 周额度只用了 60%，剩下的都是留给 Fable 的预留。
+    snapshots.set('default', quota({ five_hour: fiveHour, seven_day: { utilization: 100, resets_at: iso(120) } }))
+    snapshots.set('sam', quota({ five_hour: fiveHour, seven_day: { utilization: 60, resets_at: iso(120) }, ...fable }))
+    snapshots.set('tony', quota({ five_hour: fiveHour, seven_day: { utilization: 100, resets_at: iso(120) } }))
+    // 旧规则把 sam 也判成耗尽，全部耗尽后回退到列表第一的 default；现在预留按 1/4 计入，sam 是可启动的候选，
+    // 不走耗尽回退，会话原账号 default 已耗尽也不例外。
+    assert.equal(pick(), 'sam')
+    assert.equal(pick({ exhaustedFallbackAccountId: 'default' }), 'sam')
+    // 预留不再整组排在最后：自有额度只剩 0.1 份的账号、5h 窗口已用 99% 的账号都排在 sam 之后。
+    snapshots.set('tony', quota({ seven_day: { utilization: 49, resets_at: iso(120) }, ...fable }))
+    assert.equal(pick(), 'sam')
+    snapshots.set('tony', quota({ five_hour: { utilization: 99, resets_at: iso(4.9) }, seven_day: { utilization: 0, resets_at: iso(100) } }))
+    assert.equal(pick(), 'sam')
+    // 全新的未预留账号仍排在前面。
+    snapshots.set('tony', quota({ five_hour: fiveHour, seven_day: { utilization: 0, resets_at: iso(120) } }))
+    assert.equal(pick(), 'tony')
+  `)
+})
+
+test('when every account is spent the fallback keeps the conversation\'s own account, otherwise the one that recovers first', () => {
+  selection(['default', 'sam', 'tony'], `
+    const account = (fiveHour, week) => quota({ five_hour: fiveHour, seven_day: week })
+    const spentAt = resets_at => ({ utilization: 100, resets_at })
+    // default 的周额度 120 小时后才恢复；sam 的 5h 窗口 2 小时后恢复；
+    // tony 的 5h 窗口 1 小时后就重置，但周额度也用光了，要 30 小时后才恢复。
+    snapshots.set('default', account({ utilization: 0, resets_at: iso(5) }, spentAt(iso(120))))
+    snapshots.set('sam', account(spentAt(iso(2)), { utilization: 50, resets_at: iso(100) }))
+    snapshots.set('tony', account(spentAt(iso(1)), spentAt(iso(30))))
+    // 不再取列表第一个（原生默认账号），也不看单个窗口谁先重置，而是整个账号最先恢复的 sam。
+    assert.equal(pick(), 'sam')
+    // 会话原账号也在耗尽账号中时仍沿用原账号；不在其中时按恢复时间选。
+    assert.equal(pick({ exhaustedFallbackAccountId: 'tony' }), 'tony')
+    assert.equal(pick({ exhaustedFallbackAccountId: 'default' }), 'default')
+    assert.equal(pick({ exhaustedFallbackAccountId: 'unknown' }), 'sam')
+    // 用光的窗口缺重置时间时恢复时间未知，排在最后。
+    snapshots.set('sam', account(spentAt(null), { utilization: 50, resets_at: iso(100) }))
+    assert.equal(pick(), 'tony')
+    // 恢复时间相同时保持列表顺序，原生默认账号在最前。
+    const tie = iso(30)
+    snapshots.set('default', account({ utilization: 0, resets_at: iso(5) }, spentAt(tie)))
+    snapshots.set('tony', account(spentAt(iso(1)), spentAt(tie)))
+    assert.equal(pick(), 'default')
+    snapshots.set('default', account(spentAt(null), spentAt(tie)))
+    snapshots.set('sam', account(spentAt(iso(1)), spentAt(tie)))
+    assert.equal(pick(), 'sam')
+    // 触发条件不变：还有账号因额度缓存缺失而无法判断时不回退，照常报错。
+    snapshots.delete('tony')
+    assert.throws(() => pick(), /Claude 自动选号 MISS/)
   `)
 })
 

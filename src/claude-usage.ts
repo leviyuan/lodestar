@@ -6,6 +6,8 @@ import { resolveClaudeSdkModel } from './claude-models'
 import { UsageReadCache, isUsageRateLimitError } from './usage-cache'
 
 const TIMEOUT_MS = 30_000
+/** An unstarted five-hour window is estimated to reset one full window after the read. */
+const UNSTARTED_FIVE_HOUR_MS = 5 * 3_600_000
 const usageReads = new UsageReadCache<UsageSnapshotUnified>()
 const usageKeys = new Map<string, Set<string>>()
 
@@ -64,6 +66,15 @@ export function claudeWeeklyUsageWindow(snapshot: UsageSnapshotUnified, model: s
   return snapshot.windows.find(window => window.kind === 'weekly') ?? null
 }
 
+/**
+ * 该 5h 窗口在读取时尚未启动，重置时间只是读取时的估算（见 claudeUsageSnapshot）。
+ * 未启动的窗口不会作废，被使用时才开始计时；选号不能因快照变旧就把它当成快到期的窗口。
+ */
+export function claudeFiveHourUnstarted(snapshot: UsageSnapshotUnified, window: UsageWindowUnified): boolean {
+  return window.kind === 'fiveHour' && window.percent === 0 && window.resetsAt instanceof Date
+    && typeof snapshot.fetchedAt === 'number' && window.resetsAt.getTime() === snapshot.fetchedAt + UNSTARTED_FIVE_HOUR_MS
+}
+
 /** 聚合 limits[] 明确列出 session 桶时，5h 限额仍然存在；老响应可能没有这个数组。 */
 function reportsSessionLimit(limits: JsonObject): boolean {
   return Array.isArray(limits.limits)
@@ -89,7 +100,7 @@ export function claudeUsageSnapshot(data: unknown): UsageSnapshotUnified {
   // 不把缺失窗口、已用额度或无效/过期时间当作未启动，缓存命中也不延后此时间。
   if (fiveHour && limits.five_hour != null && fiveHour.resetsAt === null && (fiveHour.percent === 0 || fiveHour.percent === null)) {
     fiveHour.percent = 0
-    fiveHour.resetsAt = new Date(fetchedAt + 5 * 3_600_000)
+    fiveHour.resetsAt = new Date(fetchedAt + UNSTARTED_FIVE_HOUR_MS)
   }
   // 主窗口缺失仍保留 MISS，不能用模型专属窗口冒充总周额度；没有 5h 限额的账号只返回周窗口。
   const windows: UsageWindowUnified[] = fiveHour ? [fiveHour] : []
