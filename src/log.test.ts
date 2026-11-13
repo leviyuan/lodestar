@@ -1,8 +1,8 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, test } from 'bun:test'
-import { fileLoggingEnabled, formatLogDiagnostic, formatLogError, localDayKey, log, logFileForDate, parseLogFileDate, pruneOldLogs } from './log'
+import { ensureDataDir, fileLoggingEnabled, formatLogDiagnostic, formatLogError, localDayKey, log, logFileForDate, parseLogFileDate, pruneOldLogs } from './log'
 
 describe('log day key', () => {
   test('localDayKey formats local date as YYYY-MM-DD', () => {
@@ -164,6 +164,19 @@ describe('operational log privacy', () => {
       expect(readFileSync(join(directory, file), 'utf8')).toBe(stderr)
     } finally {
       rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('ensureDataDir', () => {
+  test('creates missing directories private to the owner', () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-log-dir-'))
+    try {
+      const dir = join(root, 'a', 'b')
+      ensureDataDir(dir)
+      if (process.platform !== 'win32') expect(statSync(dir).mode & 0o777).toBe(0o700)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
     }
   })
 })

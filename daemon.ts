@@ -23,8 +23,8 @@ import { startBackgroundRefresh, stopBackgroundRefresh } from './src/background-
 import { startCodexLiveUsageRefresh, stopCodexLiveUsageRefresh } from './src/codex-live-usage'
 import { codexActivation } from './src/codex-activation'
 import { refreshTokenSourceUsage } from './src/token-source-cache'
-import { pendingSourceCommands } from './src/session-commands'
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { cancelCompactionOnArrival, pendingSourceCommands } from './src/session-commands'
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { Session } from './src/session'
 import { sessionActivity } from './src/session-activity'
@@ -66,6 +66,8 @@ import { config } from './src/config'
 import { log, logError, logDiagnostic } from './src/log'
 import { startAgentAutoUpdates } from './src/agent-updates'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
+import { writeJsonStateAtomic } from './src/state-store'
+import { clientEventDispatcher, createWsRetirement } from './src/ws-retire'
 import { checkPidGuard, writePidFile } from './src/pid-guard'
 import {
   inboundMessageResource,
@@ -102,14 +104,14 @@ import {
   if (existsSync(PID_FILE)) { try { unlinkSync(PID_FILE) } catch {} }
 }
 
-mkdirSync(dirname(PID_FILE), { recursive: true })
+mkdirSync(dirname(PID_FILE), { recursive: true, mode: 0o700 })
 writePidFile(PID_FILE)
 
 let cleanupDone = false
 let shutdownRequested = false
 let shutdownPromise: Promise<void> | null = null
 let shutdownExitCode = 0
-let stopAgentAutoUpdates: (() => void) | undefined
+let stopAgentAutoUpdates: (() => Promise<void>) | undefined
 let stopFeishuWs: (() => void) | undefined
 const SHUTDOWN_DEADLINE_MS = 15_000
 const cleanup = () => {
@@ -129,16 +131,30 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
   shutdownExitCode = Math.max(shutdownExitCode, exitCode)
   if (shutdownPromise) return shutdownPromise
   shutdownRequested = true
-  stopBackgroundRefresh()
-  stopCodexLiveUsageRefresh()
-  const activationStopped = codexActivation.stop().then(
+  // The drain promise does not exist yet: a throw here would come back through
+  // uncaughtException and run these steps again, so each one is contained.
+  const step = <T>(run: () => T): T | undefined => {
+    try { return run() }
+    catch (error) {
+      shutdownExitCode = 1
+      logError('daemon.shutdown.step_failed', error)
+      return undefined
+    }
+  }
+  step(stopBackgroundRefresh)
+  step(stopCodexLiveUsageRefresh)
+  const activationStopped = (step(() => codexActivation.stop()) ?? Promise.resolve(undefined)).then(
     value => ({ status: 'fulfilled' as const, value }), reason => ({ status: 'rejected' as const, reason }),
   )
-  stopAgentAutoUpdates?.()
+  // Cancels an in-flight Agent install; its settlement is awaited with the sessions below.
+  // Settled here: the drain or the deadline may finish before anything else observes it.
+  const agentUpdatesStopped = (step(() => stopAgentAutoUpdates?.()) ?? Promise.resolve()).then(
+    () => ({ status: 'fulfilled' as const, value: undefined }), reason => ({ status: 'rejected' as const, reason }),
+  )
   // Seal both message and action admission synchronously before taking the
   // dynamic work snapshot. Already-admitted tails remain drainable.
-  chatActor.close()
-  for (const session of sessions.values()) session.closeModelSettingsChanges()
+  step(() => chatActor.close())
+  step(() => { for (const session of sessions.values()) session.closeModelSettingsChanges() })
   try { stopFeishuWs?.() }
   catch (error) {
     shutdownExitCode = 1
@@ -170,7 +186,7 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
         const sessionResults = await Promise.allSettled(
           [...sessions.values()].map(session => session.stop(`daemon ${reason}`, { announce: false })),
         )
-        return [await activationStopped, ...agentResults, ...accountCardResults, ...sessionResults]
+        return [await activationStopped, await agentUpdatesStopped, ...agentResults, ...accountCardResults, ...sessionResults]
       })()
       let deadlineTimer: ReturnType<typeof setTimeout> | null = null
       const deadline = new Promise<'deadline'>(resolve => {
@@ -279,6 +295,13 @@ function enqueueMessage(data: any): boolean {
   if (!admitted.accepted) {
     log('daemon.inbound.admission_rejected')
     return false
+  }
+  // The message is queued behind a pending `cm`; a stop/kill among them ends it now.
+  // Replays the handler would drop (stale, or a redelivery of a handled message) must not.
+  const inbound = data?.message
+  if (inbound && !seenMessageIds.has(String(inbound.message_id ?? ''))
+    && !isStaleAtReceipt(Number(inbound.create_time ?? 0), Date.now(), STALE_THRESHOLD_MS)) {
+    cancelCompactionOnArrival(sessions.get(String(inbound.chat_id ?? '')), inbound.message_type, inbound.content)
   }
   void admitted.completion.catch(e => {
     logError('daemon.inbound.failed', e)
@@ -464,12 +487,12 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   const debugTextRaw = (message.message_type === 'text' ? contentObjForDebug.text ?? '' : '')
   if (typeof debugTextRaw === 'string' && debugTextRaw.startsWith('[DEBUG]')) {
     try {
-      writeFileSync(DEBUG_CTX_FILE, JSON.stringify({
+      writeJsonStateAtomic(DEBUG_CTX_FILE, {
         chat_id: chatId,
         sender_open_id: userOpenId,
         seeded_at: new Date().toISOString(),
         seeded_msg_id: msgId ?? '',
-      }, null, 2))
+      })
     } catch (e) { logError('daemon.debug_context.write_failed', e) }
     const stripped = debugTextRaw.slice('[DEBUG]'.length)
     contentObjForDebug.text = stripped
@@ -1389,12 +1412,22 @@ async function boot(): Promise<void> {
     }, delayMs)
   }
 
-  const wsLogger = {
+  // Retired clients are re-closed for a while because close() cannot cancel an
+  // in-flight connect (see src/ws-retire.ts).
+  const wsRetirement = createWsRetirement<lark.WSClient>({
+    close: client => client.close({ force: true }),
+    onCloseError: e => logError('daemon.websocket.old_close_failed', e),
+  })
+  // Bound to one client: a retired client's liveness warning must not rebuild
+  // the current connection, it only retires that client again.
+  const wsLogger = (self?: () => lark.WSClient) => ({
     error: (m: any[]) => logError('daemon.websocket.sdk_error', m.flat(2).find(value => value instanceof Error || value && typeof value === 'object')),
     warn:  (m: any[]) => {
       const messages = m.flat(2)
       logError('daemon.websocket.sdk_warning', messages.find(value => value instanceof Error || value && typeof value === 'object'))
       if (messages.some(value => typeof value === 'string' && value.includes('no pong/inbound'))) {
+        const client = self?.()
+        if (client && client !== ws) { wsRetirement.retire(client); return }
         scheduleWsRebuild(
           'ping-timeout: SDK liveness watchdog fired',
           2_000,
@@ -1405,8 +1438,10 @@ async function boot(): Promise<void> {
     info:  (_m: any[]) => { /* routine SDK messages are not diagnostic output */ },
     debug: (_m: any[]) => { /* drop */ },
     trace: (_m: any[]) => { /* drop */ },
-  }
-  const dispatcher = new lark.EventDispatcher({ logger: wsLogger, loggerLevel: lark.LoggerLevel.warn })
+  })
+  // Shared by every client: events arriving through a not-yet-closed retired
+  // client are still handled (message handling deduplicates).
+  const dispatcher = new lark.EventDispatcher({ logger: wsLogger(), loggerLevel: lark.LoggerLevel.warn })
 
   // ── connected-but-deaf self-heal ────────────────────────────────────────
   // Feishu 长连接是**集群模式**(官方文档原话:"同一应用部署多个 client,
@@ -1435,7 +1470,6 @@ async function boot(): Promise<void> {
 
   dispatcher.register({
     'im.message.receive_v1': async (d: any) => {
-      markEvent()
       // ⚠️ 不要 await handleMessage —— Lark WS 长连接对事件 ack 有 ~4s
       // 硬超时,handleMessage 内部可能触发 openTurnCard / spawn Codex /
       // sendInterrupt 等数百 ms~数秒的链路,任一组合超 4s 飞书侧就判投递
@@ -1449,51 +1483,75 @@ async function boot(): Promise<void> {
   })
   dispatcher.register({
     'card.action.trigger': async (d: any) => {
-      markEvent()
       // Synchronous acceptance only: reserve the per-chat actor and dedupe
       // slots before returning, then let the queued handler start next task.
       return acceptCardAction(d)
     },
   })
 
-  const makeWs = (): lark.WSClient => new lark.WSClient({
-    appId: config.feishu.app_id,
-    appSecret: config.feishu.app_secret,
-    // 飞书为 Domain.Feishu（历史默认）；[feishu].domain = "lark" 走国际版。
-    domain: feishu.sdkDomain(),
-    loggerLevel: lark.LoggerLevel.info,
-    logger: wsLogger,
-    // MUST be < the SDK's 120s pingInterval. The pong-watchdog is re-armed on
-    // every ping and (deliberately) NOT re-armed on inbound; it only fires if a
-    // full pingTimeout window elapses with no inbound between two pings. With
-    // pingTimeout ≥ 120 the next ping always re-arms it before it can expire, so
-    // on a half-open/zombie socket it NEVER terminates — the whole
-    // close→reConnect→onReconnected→rebuildWs self-heal chain below stays dead.
-    // 60s leaves margin under the 120s interval so a dead link is killed within
-    // ~60s of the next ping. (Earlier 180 silently disabled the watchdog.)
-    wsConfig: { pingTimeout: 60 },
-    // Without this, connect() awaits the 'open'/'error' event forever when
-    // neither fires (wedged WS upgrade behind NAT/proxy) — start() deadlocks
-    // silently: process alive, REST fine, but permanently deaf, no log and no
-    // reconnect (the pingTimeout watchdog only arms AFTER 'open'). 10s cap →
-    // fail-fast into the SDK's reconnect loop instead of hanging indefinitely.
-    handshakeTimeoutMs: 10_000,
-    onReconnecting: () => log('daemon.websocket.reconnecting'),
-    // SDK 自己重连成功了 —— 但这正是僵尸聋的高发点。不信它,延迟一拍后整个
-    // 换新 client(见 onReconnectedHeal)。
-    onReconnected:  () => onReconnectedHeal(),
-    // SDK exhausted its own reconnect budget. Do NOT exit the process — that
-    // SIGTERMs every Codex subprocess / live card across all
-    // groups. Rebuild a fresh WS client in place; the rest keeps running.
-    onError: (err) => { logError('daemon.websocket.connection_failed', err); rebuildWs('sdk-error') },
-  })
+  // Lifecycle callbacks only drive the current client. One fired by a replaced
+  // client means its late connect landed: close it again, never treat it as
+  // the live connection.
+  const makeWs = (): lark.WSClient => {
+    const current = () => client === ws
+    const client: lark.WSClient = new lark.WSClient({
+      appId: config.feishu.app_id,
+      appSecret: config.feishu.app_secret,
+      // 飞书为 Domain.Feishu（历史默认）；[feishu].domain = "lark" 走国际版。
+      domain: feishu.sdkDomain(),
+      loggerLevel: lark.LoggerLevel.info,
+      logger: wsLogger(() => client),
+      // MUST be < the SDK's 120s pingInterval. The pong-watchdog is re-armed on
+      // every ping and (deliberately) NOT re-armed on inbound; it only fires if a
+      // full pingTimeout window elapses with no inbound between two pings. With
+      // pingTimeout ≥ 120 the next ping always re-arms it before it can expire, so
+      // on a half-open/zombie socket it NEVER terminates — the whole
+      // close→reConnect→onReconnected→rebuildWs self-heal chain below stays dead.
+      // 60s leaves margin under the 120s interval so a dead link is killed within
+      // ~60s of the next ping. (Earlier 180 silently disabled the watchdog.)
+      wsConfig: { pingTimeout: 60 },
+      // Without this, connect() awaits the 'open'/'error' event forever when
+      // neither fires (wedged WS upgrade behind NAT/proxy) — start() deadlocks
+      // silently: process alive, REST fine, but permanently deaf, no log and no
+      // reconnect (the pingTimeout watchdog only arms AFTER 'open'). 10s cap →
+      // fail-fast into the SDK's reconnect loop instead of hanging indefinitely.
+      handshakeTimeoutMs: 10_000,
+      onReady: () => { if (!current()) wsRetirement.retire(client) },
+      onReconnecting: () => {
+        if (!current()) { wsRetirement.retire(client); return }
+        log('daemon.websocket.reconnecting')
+      },
+      // SDK 自己重连成功了 —— 但这正是僵尸聋的高发点。不信它,延迟一拍后整个
+      // 换新 client(见 onReconnectedHeal)。
+      onReconnected:  () => { if (current()) onReconnectedHeal(); else wsRetirement.retire(client) },
+      // SDK exhausted its own reconnect budget. Do NOT exit the process — that
+      // SIGTERMs every Codex subprocess / live card across all
+      // groups. Rebuild a fresh WS client in place; the rest keeps running.
+      onError: (err) => {
+        if (!current()) { wsRetirement.retire(client); return }
+        logError('daemon.websocket.connection_failed', err)
+        rebuildWs('sdk-error')
+      },
+    })
+    return client
+  }
+  const startWs = (
+    client: lark.WSClient, event: 'daemon.websocket.start_failed' | 'daemon.websocket.rebuild_start_failed',
+    reason: string, verifyAfter: boolean,
+  ) => {
+    // markEvent 只认当前 client 送达的事件：经已退役连接送达的事件照常处理，但不能证明新连接收得到事件。
+    void client.start({ eventDispatcher: clientEventDispatcher(dispatcher, () => client === ws, markEvent) }).catch(e => {
+      logError(event, e)
+      if (client === ws) scheduleWsRebuild(`${reason}: ${e}`, SETTLE_MS, verifyAfter)
+    })
+  }
 
   // Fresh-client rebuild: force-close the (possibly server-side-zombie) old
   // client, stand up a brand-new WSClient with a fresh token + connection, and
   // hand it the same dispatcher. Never touches Codex subprocesses or live
-  // cards; never exits the process. close({force}) does
-  // removeAllListeners() before terminate(), so the old client fires no stray
-  // reconnect. verifyAfter arms a post-rebuild check (only for active groups).
+  // cards; never exits the process. close() cannot cancel a connect already in
+  // flight, so the old client goes through wsRetirement (repeated closes) rather
+  // than a single close. verifyAfter arms a post-rebuild check (only for active groups).
   rebuildWs = (_reason: string, verifyAfter = false) => {
     if (shutdownRequested) return
     if (rebuilding) return
@@ -1506,12 +1564,9 @@ async function boot(): Promise<void> {
     consecRebuilds++
     logDiagnostic('daemon.websocket.rebuild', { attempt: consecRebuilds })
     const old = ws
-    try { old?.close({ force: true }) } catch (e) { logError('daemon.websocket.old_close_failed', e) }
     ws = makeWs()
-    void ws.start({ eventDispatcher: dispatcher }).catch(e => {
-      logError('daemon.websocket.rebuild_start_failed', e)
-      scheduleWsRebuild(`fresh client start failed: ${e}`, SETTLE_MS, verifyAfter)
-    })
+    if (old) wsRetirement.retire(old)
+    startWs(ws, 'daemon.websocket.rebuild_start_failed', 'fresh client start failed', verifyAfter)
     rebuilding = false
     if (verifyAfter) armVerify()
   }
@@ -1582,6 +1637,7 @@ async function boot(): Promise<void> {
     if (scheduledRebuildTimer) clearTimeout(scheduledRebuildTimer)
     if (verifyTimer) clearTimeout(verifyTimer)
     ws.close({ force: true })
+    wsRetirement.closeAll()
   }
   const recoveredCallbacks = loadCallbacks()
   const projectClient = createAgentProjectClient(agentApiUrl(config.notify.bind, config.notify.port))
@@ -1625,10 +1681,7 @@ async function boot(): Promise<void> {
     if (message.includes('自动更新未完成:')) logError('daemon.agent_update.failed', message)
     else if (message.includes('已更新，新进程使用新版')) log('daemon.agent_update.completed')
   }, { enabled: config.runtime.agent_auto_update })
-  void ws.start({ eventDispatcher: dispatcher }).catch(e => {
-    logError('daemon.websocket.start_failed', e)
-    scheduleWsRebuild(`initial start failed: ${e}`, SETTLE_MS, false)
-  })
+  startWs(ws, 'daemon.websocket.start_failed', 'initial start failed', false)
   log('daemon.ready')
   startDebugSocket()
   for (const reg of recoveredCallbacks) {

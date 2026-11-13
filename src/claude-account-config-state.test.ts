@@ -351,4 +351,19 @@ describe('Claude startup-only native MCP configuration synchronization', () => {
     expect(readdirSync(f.account)).toEqual(['.claude.json'])
     expect(readdirSync(f.root).sort()).toEqual(['.claude', '.claude-accounts', '.claude.json'])
   })
+
+  test('a temporary write that fails after creating the file is removed and the original error is reported', () => {
+    const f = fixture()
+    put(f.native, { mcpServers: { desired: {} } }); put(f.current, { mcpServers: { old: {} } })
+    const originalWrite = fs.writeFileSync
+    const write = spyOn(fs, 'writeFileSync').mockImplementation((path, _contents, options) => {
+      originalWrite(path, '{"partial"', options)
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+    })
+    try {
+      expect(() => f.sync()).toThrow('ENOSPC')
+    } finally { write.mockRestore() }
+    expect(read(f.current)).toEqual({ mcpServers: { old: {} } })
+    expect(readdirSync(f.account)).toEqual(['.claude.json'])
+  })
 })

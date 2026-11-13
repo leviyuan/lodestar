@@ -139,3 +139,15 @@ test('Packy model tokens and both Agents use one wallet row and identical real b
     assert.equal(requests.length, 2)
   `)
 })
+
+test('synchronous account listing failures reject the usage read instead of throwing', () => {
+  isolated(`
+    import assert from 'node:assert/strict'
+    const { codexAccounts } = await import('./src/codex-accounts')
+    codexAccounts.list = () => { throw new Error('accounts file unreadable') }
+    const { readAllAccountUsage } = await import('./src/account-usage')
+    let pending
+    assert.doesNotThrow(() => { pending = readAllAccountUsage() })
+    await assert.rejects(pending, /accounts file unreadable/)
+  `)
+})

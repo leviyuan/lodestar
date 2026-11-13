@@ -523,6 +523,8 @@ export class Session {
    * compaction. Suppresses the generic no-turn compaction text alert;
    * command feedback is rendered on that status card instead. */
   manualContextCompactionPending = false
+  /** A stop/kill/restart ended the pending `compact`; its status card says so. */
+  manualContextCompactionCancelled = false
   /** Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板。codex
    * 的 TodoWrite 一次就带完整列表,直接渲染即可;但 Claude Code 把它拆成 4
    * 个单点工具,只有 TaskList 才有完整快照。这里跨 turn / rotate 累积一份
@@ -923,8 +925,12 @@ export class Session {
     if (this.selectedProvider === 'claude' && source?.agent === 'claude') {
       return this.selectedEffort ?? tokenSourceRuntimeModel(source, this.selectedModel ?? source.defaultModel)?.defaultEffort ?? null
     }
+    if (this.selectedProvider === 'dsh') {
+      // Display only: without a catalog entry show MISS; dshEffortForSpawn still refuses the spawn.
+      const entry = this.selectedEffort ? null : source && tokenSourceRuntimeModel(source, this.selectedModel ?? source.defaultModel)
+      return this.selectedEffort ?? (entry && isDshReasoningEffort(entry.defaultEffort) ? entry.defaultEffort : null)
+    }
     return this.selectedEffort
-      ?? (this.selectedProvider === 'dsh' ? this.dshEffortForSpawn() : undefined)
       ?? this.proc?.lastEffort
       ?? (this.selectedProvider === 'claude' ? CLAUDE_EFFORT : CODEX_EFFORT)
   }
@@ -2129,6 +2135,27 @@ export class Session {
     opts: LifecycleProgressOpts = {},
     onResumeInvalidated?: (sessionId: string) => void,
   ): Promise<boolean> {
+    // An exception must not leave the internal status card's footer timer running forever.
+    const owned: { statusCard: StatusCardHandle | null } = { statusCard: null }
+    try {
+      return await this.restartWithStatusCard(resume, opts, onResumeInvalidated, owned)
+    } catch (error) {
+      const statusCard = owned.statusCard
+      owned.statusCard = null
+      if (statusCard) {
+        await this.closeStatusCard(statusCard, `❌ 重启失败: ${messageOf(error)}`)
+          .catch(closeError => logError('session: restart failure status-card close failed', closeError))
+      }
+      throw error
+    }
+  }
+
+  private async restartWithStatusCard(
+    resume: boolean,
+    opts: LifecycleProgressOpts,
+    onResumeInvalidated: ((sessionId: string) => void) | undefined,
+    owned: { statusCard: StatusCardHandle | null },
+  ): Promise<boolean> {
     const announce = opts.announce ?? true
     let report = opts.onStatus
     const statusBeforeResumeValidation = this.status
@@ -2196,10 +2223,12 @@ export class Session {
         ? this.withModel(`🔁 重启 ${this.backendLabel(this.proc.provider)}`)
         : this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}`)
       statusCard = await this.openStatusCard('restart', initialStatus)
+      owned.statusCard = statusCard
       if (statusCard) report = status => this.setStatusCard(statusCard, status)
     }
     const announceText = announce && !statusCard
     const closeInternalStatusCard = async (finalStatus: string): Promise<void> => {
+      owned.statusCard = null
       if (statusCard) await this.closeStatusCard(statusCard, finalStatus)
     }
     const hadActiveConversationWork = Boolean(
@@ -3042,6 +3071,22 @@ export class Session {
     this.proc.sendInterrupt()
   }
 
+  /** `compact` keeps this chat's queue until the native compaction ends, so the command
+   * that should end it would wait behind it. This runs as that command arrives, before it
+   * is queued. `force` (kill/restart/clear) also stops a backend that ignores the interrupt. */
+  cancelManualCompaction(force: boolean, graceMs = 10_000): void {
+    const proc = this.proc
+    if (!this.manualContextCompactionPending || !proc?.isAlive()) return
+    this.manualContextCompactionCancelled = true
+    proc.sendInterrupt()
+    if (!force) return
+    const timer = setTimeout(() => {
+      if (!this.manualContextCompactionPending || this.proc !== proc || !proc.isAlive()) return
+      void proc.kill().catch(error => logError('session: compaction force stop failed', error))
+    }, graceMs)
+    timer.unref?.()
+  }
+
   private disabledClaudeSourceMessage(sourceId = this.selectedTokenSourceId): string | null {
     const source = this.tokenSource(sourceId)
     return source?.kind === 'claude-subscription' && !source.enabled
@@ -3093,15 +3138,17 @@ export class Session {
         status => this.withModel(status),
       )
       let lastBootStatus = `🚀 启动 ${this.backendLabel()}`
-      const ok = await this.startUnlocked({
-        announce: false,
-        freshConversationStateAlreadyReset: true,
-        onStatus: status => {
-          lastBootStatus = status
-          bootTimer.setStatus(status)
-        },
-      })
-      bootTimer.stop()
+      let ok: boolean
+      try {
+        ok = await this.startUnlocked({
+          announce: false,
+          freshConversationStateAlreadyReset: true,
+          onStatus: status => {
+            lastBootStatus = status
+            bootTimer.setStatus(status)
+          },
+        })
+      } finally { bootTimer.stop() }
       await cardkit.flush(turn.cardId)
       if (!ok) {
         this.pendingUserMessageCount = 0

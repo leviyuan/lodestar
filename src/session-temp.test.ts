@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import type { ConversationLaunch, ConversationRouting, ConversationSummary } from './conversation'
 import type { TurnAnchor } from './feishu'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { resetAgentSessionRegistryForTest } from './agent-session-registry'
@@ -723,6 +723,36 @@ describe('session-temp Codex stopped-session history', () => {
       resetAgentSessionRegistryForTest()
       if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
       else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Claude history opens only as many transcripts as the picker can show, newest first', () => {
+    const configDir = mkdtempSync(join(tmpdir(), 'lodestar-claude-history-limit-'))
+    const workDir = '/workspace/limited'
+    const transcriptDir = join(configDir, 'projects', workDir.replace(/[^a-zA-Z0-9]/g, '-'))
+    mkdirSync(transcriptDir, { recursive: true })
+    const line = (content: string) => `${JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content })}\n`
+    const write = (name: string, content: string, ageMinutes: number) => {
+      const path = join(transcriptDir, name)
+      writeFileSync(path, content)
+      const time = new Date(Date.now() - ageMinutes * 60_000)
+      utimesSync(path, time, time)
+    }
+    write('newest.jsonl', line('newest'), 1)
+    // Not a conversation of this picker (a sidechain): skipped without using up a row.
+    write('sidechain.jsonl', `${JSON.stringify({ isSidechain: true })}\n`, 2)
+    write('second.jsonl', line('second'), 3)
+    write('third.jsonl', line('third'), 4)
+    // Older than everything the picker shows: a directory here would fail the listing if opened.
+    mkdirSync(join(transcriptDir, 'unreadable.jsonl'))
+    const old = new Date(Date.now() - 60 * 60_000)
+    utimesSync(join(transcriptDir, 'unreadable.jsonl'), old, old)
+    try {
+      expect(listClaudeSessions(workDir, { configDir }, 2).map(item => item.preview)).toEqual(['newest', 'second'])
+      expect(listClaudeSessions(workDir, { configDir }, 3).map(item => item.sessionId)).toEqual(['newest', 'second', 'third'])
+      expect(() => listClaudeSessions(workDir, { configDir }, 4)).toThrow('读取 Claude 会话摘要失败')
+    } finally {
       rmSync(configDir, { recursive: true, force: true })
     }
   })

@@ -192,6 +192,7 @@ export async function runCompactCommand(s: Session): Promise<void> {
   const watch = watchManualCompaction(proc)
   const usageWatch = watchManualCompactionUsage(proc, proc.sessionId)
   s.manualContextCompactionPending = true
+  s.manualContextCompactionCancelled = false
   try {
     s.setStatusCard(statusCard, s.withModel('🧠 发起上下文压缩'))
     await proc.compactThread()
@@ -204,6 +205,10 @@ export async function runCompactCommand(s: Session): Promise<void> {
     watch.cancel()
     if (e instanceof NothingToCompactError) {
       await finishStatus(s.withModel(`ⓘ ${e.message}`))
+    } else if (s.manualContextCompactionCancelled && /cancel|interrupt|abort|exited/i.test(messageOf(e))) {
+      // Only an outcome the cancellation produced is shown as cancelled; a backend that
+      // ignored the interrupt and then failed for another reason reports that reason.
+      await finishStatus('🛑 上下文压缩已取消')
     } else {
       await finishStatus(`❌ 上下文压缩失败: ${messageOf(e)}`)
     }

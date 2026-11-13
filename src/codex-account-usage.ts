@@ -1,6 +1,5 @@
 import { codexAccounts, type CodexAccount } from './codex-accounts'
-import { AppServerOnce, readUsageForDisplay, requestCodexControlWithRetry, type UsageSnapshot, type UsageWindow } from './usage'
-import { logError } from './log'
+import { readUsageForDisplay, type UsageSnapshot, type UsageWindow } from './usage'
 import { peekCodexAccountEmail } from './codex-account-info'
 import { codexQuotaAccess } from './codex-quota'
 
@@ -50,37 +49,6 @@ export function aggregateCodexUsage(input: CodexAccountUsage[]): CodexUsageTotal
     return { kind, count: rows.length, remaining: known ? rows.reduce((sum, w) => sum + (100 - w.percent!) / 100, 0) : null }
   }).filter(w => w.count || !complete)
   return { entries, complete, available, resetCredits, windows }
-}
-
-/** Explicit account inspection reads every login, even when quota identities have been merged. */
-export async function refreshCodexAccountEmails(
-  total: CodexUsageTotal,
-  createClient: (id: string) => Pick<AppServerOnce, 'initialize' | 'request' | 'close'> = id => new AppServerOnce({ accountId: id }),
-): Promise<CodexUsageTotal> {
-  const entries = await Promise.all(total.entries.map(async entry => {
-    let app: ReturnType<typeof createClient> | undefined
-    let email: string | null = null
-    let emailError: string | undefined
-    try {
-      app = createClient(entry.account.id)
-      await app.initialize('lodestar-account-email')
-      const response = await requestCodexControlWithRetry(() => app!.request('account/read', { refreshToken: false }), '账号邮箱查询')
-      if (response?.account === null || response?.account?.type === 'apiKey') throw new Error('该账号未登录 ChatGPT')
-      if (response?.account?.type !== 'chatgpt') throw new Error('account/read 返回的账号状态无效')
-      if (typeof response.account.email !== 'string' || !response.account.email.trim()) throw new Error('原生账号未提供邮箱')
-      email = response.account.email.trim()
-    } catch (error) {
-      emailError = error instanceof Error ? error.message : String(error)
-    } finally {
-      if (app) {
-        try { await app.close() }
-        catch (error) { emailError = [emailError, `账号查询进程关闭失败：${error instanceof Error ? error.message : String(error)}`].filter(Boolean).join('；') }
-      }
-    }
-    if (emailError) logError('codex account email read failed', emailError)
-    return { ...entry, email, emailError }
-  }))
-  return { ...total, entries }
 }
 
 /** Account inspection is a projection of the background cache, including a genuine MISS. */

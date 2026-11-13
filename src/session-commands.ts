@@ -16,6 +16,23 @@ const CONTROL_COMMAND_ALIASES = new Map<string, ControlCommand>([
   ['model', 'model'], ['md', 'model'],
 ])
 
+/** `compact` holds its chat's queue until the native compaction ends, so a stop, kill,
+ * restart or clear sent meanwhile would wait behind the very thing it is meant to end.
+ * Called as an inbound message arrives, before it is queued: such a command cancels the
+ * compaction right away and still runs in order afterwards. */
+export function cancelCompactionOnArrival(
+  s: Pick<Session, 'manualContextCompactionPending' | 'cancelManualCompaction'> | undefined,
+  messageType: unknown, content: unknown,
+): boolean {
+  if (!s?.manualContextCompactionPending || messageType !== 'text' || typeof content !== 'string') return false
+  let text: unknown
+  try { text = JSON.parse(content)?.text } catch { return false }
+  const command = typeof text === 'string' ? CONTROL_COMMAND_ALIASES.get(text.trim().toLowerCase()) : undefined
+  if (command !== 'stop' && command !== 'kill' && command !== 'restart' && command !== 'clear') return false
+  s.cancelManualCompaction(command !== 'stop')
+  return true
+}
+
 const sourceCommandWork = new Set<Promise<void>>()
 
 function backgroundSourceCommand(s: Session, work: Promise<void>): void {
@@ -30,6 +47,25 @@ function backgroundSourceCommand(s: Session, work: Promise<void>): void {
 }
 
 export function pendingSourceCommands(): Promise<void>[] { return [...sourceCommandWork] }
+
+/** A throwing restart must still end the command's status card: left open, its timer
+ * keeps running and the card stays "restarting" forever. The caller closes the card. */
+async function restartWithStatus(
+  s: Session, resume: boolean, statusCard: Awaited<ReturnType<Session['openStatusCard']>>, onStatus: (status: string) => void,
+): Promise<{ ok: boolean; failure?: unknown }> {
+  try {
+    return { ok: await s.restart(resume, {
+      announce: !statusCard,
+      onStatus: status => {
+        onStatus(status)
+        s.setStatusCard(statusCard, status)
+      },
+    }) }
+  } catch (failure) {
+    logError('session-commands: restart failed', failure)
+    return { ok: false, failure }
+  }
+}
 
 /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
  * plus their two-letter aliases where applicable.
@@ -320,21 +356,18 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
             : s.withModel(`🔁 启动 ${backend}`)
         const statusCard = await s.openStatusCard('restart', initialStatus)
         let lastStatus = initialStatus
-        const ok = await s.restart(true, {
-          announce: !statusCard,
-          onStatus: status => {
-            lastStatus = status
-            s.setStatusCard(statusCard, status)
-          },
-        })
-        const finalStatus = ok
-          ? (
-              lastStatus.startsWith('✅')
-                ? lastStatus
-                : s.withWorktreeInstructionNotice(resumeThreadLabel ? '✅ 已恢复上一会话' : `✅ ${s.backendLabel()} 已就绪`)
-            )
-          : (lastStatus.startsWith('❌') ? lastStatus : '❌ 重启失败')
+        const { ok, failure } = await restartWithStatus(s, true, statusCard, status => { lastStatus = status })
+        const finalStatus = failure !== undefined
+          ? `❌ 重启失败: ${messageOf(failure)}`
+          : ok
+            ? (
+                lastStatus.startsWith('✅')
+                  ? lastStatus
+                  : s.withWorktreeInstructionNotice(resumeThreadLabel ? '✅ 已恢复上一会话' : `✅ ${s.backendLabel()} 已就绪`)
+              )
+            : (lastStatus.startsWith('❌') ? lastStatus : '❌ 重启失败')
         await s.closeStatusCard(statusCard, ok ? s.withModel(finalStatus) : finalStatus)
+        if (failure !== undefined && !statusCard) throw failure
       }
       return true
     case 'clear':
@@ -358,19 +391,16 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
       {
         const statusCard = await s.openStatusCard('clear', '🧹 清空并启动新会话', 'orange')
         let lastStatus = '🧹 清空并启动新会话'
-        const ok = await s.restart(false, {
-          announce: !statusCard,
-          onStatus: status => {
-            lastStatus = status
-            s.setStatusCard(statusCard, status)
-          },
-        })
+        const { ok, failure } = await restartWithStatus(s, false, statusCard, status => { lastStatus = status })
         await s.closeStatusCard(
           statusCard,
-          ok
-            ? s.withModel(s.withWorktreeInstructionNotice('✅ 已清空并启动新会话'))
-            : (lastStatus.startsWith('❌') ? lastStatus : '❌ 清空失败'),
+          failure !== undefined
+            ? `❌ 清空失败: ${messageOf(failure)}`
+            : ok
+              ? s.withModel(s.withWorktreeInstructionNotice('✅ 已清空并启动新会话'))
+              : (lastStatus.startsWith('❌') ? lastStatus : '❌ 清空失败'),
         )
+        if (failure !== undefined && !statusCard) throw failure
       }
       return true
   }

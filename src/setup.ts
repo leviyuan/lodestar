@@ -9,8 +9,8 @@ import { fetchGlmAnthropicModelIds, GLM_ANTHROPIC_BASE_URL } from './glm-models'
  * GLM key 写入本机 Claude settings，由 daemon 的 Token Source 检测并加载。
  */
 
-import { execFileSync, spawn } from 'node:child_process'
-import { spawn as spawnCommand } from 'cross-spawn'
+import { spawn } from 'node:child_process'
+import { spawn as spawnCommand, sync as spawnCommandSync } from 'cross-spawn'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { createInterface } from 'node:readline/promises'
 import { dirname, join } from 'node:path'
@@ -65,10 +65,13 @@ function escapeTomlString(s: string): string {
 }
 
 // ── Codex CLI (optional second backend) ────────────────────────────
-function isCodexChatGPTLoggedIn(codexBin: string): boolean {
+/** No shell: a Windows install path with spaces must stay one argument; cross-spawn runs the .cmd shim. */
+export function isCodexChatGPTLoggedIn(codexBin: string, run: typeof spawnCommandSync = spawnCommandSync): boolean {
   try {
-    const out = execFileSync(codexBin, ['login', 'status'], { timeout: 10_000, shell: process.platform === 'win32' }).toString()
-    return /Logged in using ChatGPT/i.test(out)
+    const result = run(codexBin, ['login', 'status'], { timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+    if (result.error || result.status !== 0) return false
+    // Current Codex prints the status line on stderr; older builds used stdout.
+    return /Logged in using ChatGPT/i.test(`${result.stdout ?? ''}\n${result.stderr ?? ''}`)
   } catch { return false }
 }
 

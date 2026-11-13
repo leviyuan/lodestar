@@ -3,7 +3,7 @@
 import { randomUUID } from 'node:crypto'
 import {
   get, findPendingReply, pendingRepliesForChat, hasReplyMessage, setReplyState, markResolved, markUnknown,
-  recordCallbackSuccess, isDispatching, setDispatching, clearDispatching,
+  recordCallbackSuccess, markUnknownRecovered, isDispatching, setDispatching, clearDispatching,
   type NotifyRegistration, type NotifyReplyState, type NotifyTextResponse, type DispatchResult,
 } from './notify-callbacks'
 import { buildNotifyCardFromReg, buildNotifyReplyCard, type NotifyResolution } from './notify'
@@ -64,6 +64,7 @@ export function createNotifyReplyRuntime(deps: {
           status: 'unknown', buttonId: state.buttonId, text: button?.text ?? state.buttonId,
           operatorOpenId: state.openId, detail: reg.unknownReason,
         }), '按钮回调送达状态未知')
+        markUnknownRecovered(reg.notifyId)
         return
       }
       const state = reg.replyState
@@ -74,6 +75,9 @@ export function createNotifyReplyRuntime(deps: {
       }
       await update(reg, state.promptMessageId, buildNotifyReplyCard(reg, state, resolution), '回复送达状态未知')
       await update(reg, reg.messageId, buildNotifyCardFromReg(reg, resolution), '回复送达状态未知')
+      // Only after the card update (or its failure notice) reached the chat;
+      // a thrown presentation error leaves the record for the next boot.
+      markUnknownRecovered(reg.notifyId)
     },
 
     async open(notifyId: string, chatId: string, openId: string): Promise<ReplyActionResult> {

@@ -23,6 +23,12 @@ function cacheKey(): string {
 
 /** One row per billing account, independent of the Agent selected in this chat. */
 export function readAllAccountUsage(): Promise<AccountUsage[]> {
+  // Callers chain .then/.catch; a synchronous throw (account file, registry) must reject instead.
+  try { return startAccountUsageRead() }
+  catch (error) { return Promise.reject(error) }
+}
+
+function startAccountUsageRead(): Promise<AccountUsage[]> {
   const key = cacheKey()
   if (pending?.key === key) return pending.promise
   const order = ['codex-sub', 'claude-sub', 'glm', 'dsh-glm', 'deepseek', 'deepseek-harness', 'openrouter']

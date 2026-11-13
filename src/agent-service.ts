@@ -311,7 +311,11 @@ export class AgentService {
     const roots = [...this.runs.values()].filter(run => !run.snapshot.parentRunId && this.treeHasActiveRun(run))
     const results = await Promise.allSettled([
       ...roots.map(run => this.cancelTree(run, reason)),
-      ...[...this.pendingRunCreations].map(creation => creation.then(() => {})),
+      // A failed creation already rejected to its own caller; it must not abort shutdown.
+      ...[...this.pendingRunCreations].map(creation => creation.then(
+        () => {},
+        error => logError('agent-service: pending run creation failed during shutdown', error),
+      )),
     ])
     const remaining = [...this.runs.values()].flatMap(run => [...run.handles.values()])
     const remainingResults = results.some(result => result.status === 'rejected')
@@ -438,8 +442,11 @@ export class AgentService {
         worker.status = 'failed'
         worker.error = reason
       }
+      // The caller must receive the card error, not a secondary bookkeeping or notice failure.
       await this.finalizeRun(run, 'failed', reason)
+        .catch(finalizeError => logError('agent-service: card init failure finalization failed', finalizeError))
       await this.deps.sendTextRaw(owner.chatId, `❌ ${reason}`)
+        .catch(noticeError => logError('agent-service: card init failure notice failed', noticeError))
       throw error
     }
     this.runs.set(runId, run)

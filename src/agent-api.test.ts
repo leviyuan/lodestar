@@ -142,6 +142,24 @@ describe('delegated Agent HTTP API', () => {
     expect((await fetch(`${base}/agents/identities`, { headers: { authorization: 'Bearer wrong' } })).status).toBe(403)
   })
 
+  test('identity catalog failures stay inside the JSON error boundary', async () => {
+    const session = { sessionName: 'project', chatId: 'chat', workDir: '/repo',
+      codexAccountId: () => { throw new Error('account binding unavailable') } } as any
+    const service = { rootPrincipal: () => ({ kind: 'session', session, depth: -1 }), principalForCapability: () => null }
+    server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', `http://${req.headers.host}`)
+      // Mirrors the notify server: an escaped rejection becomes a plain-text 500.
+      handleAgentRequest(req, res, url, { service: service as any, authorizeSession: () => session })
+        .catch(() => { res.statusCode = 500; res.end('internal error') })
+    })
+    await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', resolve))
+    const address = server.address() as import('node:net').AddressInfo
+    const response = await fetch(`http://127.0.0.1:${address.port}/agents/identities`, { headers: { authorization: 'Bearer secret' } })
+    expect(response.status).toBe(409)
+    expect(response.headers.get('content-type')).toBe('application/json')
+    expect(await response.json()).toEqual({ error: 'account binding unavailable' })
+  })
+
   test('passes work_dir to the service and reports the selected directory in run and status responses', async () => {
     const requests: any[] = []
     const base = await serve(request => requests.push(request))

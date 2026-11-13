@@ -100,6 +100,9 @@ export interface NotifyRegistration {
   unknownAt?: number
   unknownBy?: { buttonId?: string; openId: string }
   unknownReason?: string
+  /** Set once boot recovery has re-rendered an interrupted dispatch as UNKNOWN.
+   * Absent on older records, which are therefore recovered one more time. */
+  unknownRecoveredAt?: number
 }
 
 /** Drop registrations older than this on load. 7 days matches the
@@ -177,7 +180,9 @@ export function loadCallbacks(): NotifyRegistration[] {
         interrupted++
       }
       map.set(rec.notifyId, rec as NotifyRegistration)
-      if ((rec.replyState?.status === 'sending' || rec.dispatchState) && rec.unknownAt) interruptedCallbacks.push(rec)
+      if ((rec.replyState?.status === 'sending' || rec.dispatchState) && rec.unknownAt && !rec.unknownRecoveredAt) {
+        interruptedCallbacks.push(rec)
+      }
     }
     if (interrupted) log('notify.callbacks.interrupted_state_unknown')
     if (dropped > 0 || interrupted > 0) saveCallbacks()
@@ -304,6 +309,15 @@ export function markResolved(notifyId: string, buttonId: string | undefined, ope
   }
 }
 
+/** Boot recovery presented this interruption; later boots must not repeat it. */
+export function markUnknownRecovered(notifyId: string): void {
+  const rec = map.get(notifyId)
+  if (!rec) throw new Error(`notify registration not found: ${notifyId}`)
+  rec.unknownRecoveredAt = Date.now()
+  try { saveCallbacks() }
+  catch (error) { delete rec.unknownRecoveredAt; throw error }
+}
+
 export function markUnknown(
   notifyId: string,
   buttonId: string | undefined,
@@ -317,6 +331,7 @@ export function markUnknown(
   rec.unknownAt = Date.now()
   rec.unknownBy = { ...(buttonId !== undefined ? { buttonId } : {}), openId }
   rec.unknownReason = reason
+  delete rec.unknownRecoveredAt
   // Keep the in-memory unknown guard even if this write throws. The caller
   // will also freeze the visible card so an ambiguous external success is not
   // exposed as a retryable button after a local persistence failure.

@@ -1,12 +1,13 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { codexAccounts, isCodexLoginPending, type CodexAccount } from './codex-accounts'
-import { peekSuccessfulUsage, peekUsage, readUsage, type UsageSnapshot } from './usage'
+import { peekSuccessfulUsage, peekUsage, readUsage, type UsageSnapshot, type UsageWindow } from './usage'
 import { codexModelQuota, codexQuotaMeter, codexWeekUsedSince, compareCodexQuota, rankCodexQuota, type CodexQuotaRank } from './codex-quota'
 import { getTokenSourceForAccount, tokenSourceRuntimeModel, type TokenSource } from './token-source'
 import type { AgentReasoningEffort } from './agent-process'
 import { CODEX_QUOTA_BLOCKS_FILE } from './paths'
 import { writeJsonStateAtomic } from './state-store'
 import { codexCreditsReplenished, parseCodexCredits, type CodexCredits } from './codex-credits'
+import { logError } from './log'
 
 export interface CodexAccountCandidate extends CodexQuotaRank {
   account: CodexAccount
@@ -64,9 +65,15 @@ export class CodexAccountScheduler {
     const usage = observed ?? this.deps.cachedUsage(accountId)
     // A manual launch may not have queried quota yet; its first read will observe the running window.
     if (usage?.state !== 'ok') return
-    const identity = usage.accountFingerprint ?? this.deps.identity(accountId)
-    if (!identity) return
-    this.lastUses.set(JSON.stringify([identity, codexQuotaMeter(usage, model)]), this.deps.now())
+    // Called from a process event listener: an unreadable auth.json must not escape into the emitter.
+    // Losing one observation only weakens the redundant-activation guard for this week.
+    try {
+      const identity = usage.accountFingerprint ?? this.deps.identity(accountId)
+      if (!identity) return
+      this.lastUses.set(JSON.stringify([identity, codexQuotaMeter(usage, model)]), this.deps.now())
+    } catch (error) {
+      logError('codex account usage record failed', error)
+    }
   }
 
   weekWasUsed(identity: string, usage: Extract<UsageSnapshot, { state: 'ok' }>, model: string): boolean {
@@ -175,10 +182,20 @@ export class CodexAccountScheduler {
         const fresh = readAt > (block.blockedAt ?? 0)
         const freshCredits = fresh && readAt > (block.creditsObservedAt ?? 0)
         const replenished = freshCredits && codexCreditsReplenished(block.credits, quota.credits)
+        // A window that had already reset when the block was written came from an older cached read;
+        // it describes a previous window, so neither its reset nor its percentage is recovery evidence.
+        // Only a fresh window that started after the block proves the exhausted window rolled over.
+        const blockedAt = block.blockedAt
+        const staleAtBlock = (old: Block['windows'][number]) =>
+          blockedAt !== undefined && old.reset !== null && old.reset <= blockedAt
+        const startedAfterBlock = (w: UsageWindow) => blockedAt !== undefined && w.percent !== null
+          && w.resetsAt !== null && w.durationMins != null && w.durationMins > 0
+          && w.resetsAt.getTime() - w.durationMins * 60_000 > blockedAt
         const resetObserved = fresh && rank.funding !== 'credits' && block.windows.some(old => {
           const w = quota[old.kind]
           // A successful read can remove a limit; do not wait for that absent window to reset.
           if (w === null) return true
+          if (staleAtBlock(old)) return !!w && startedAfterBlock(w)
           return w && w.percent !== null && ((old.percent !== null && w.percent < old.percent)
             || (old.reset !== null && old.reset <= now && (w.resetsAt?.getTime() ?? 0) > old.reset))
         })
@@ -193,9 +210,23 @@ export class CodexAccountScheduler {
         }
         // Observe an actually depleted balance before a later, possibly smaller replenishment.
         // Unknown credit data never erases the last observation or becomes a zero baseline.
+        let observed: Block | undefined
         if (!recovered.has(block.key) && freshCredits && !replenished && quota.credits != null) {
-          observations.set(block.key, { ...block, credits: quota.credits, creditsObservedAt: readAt })
+          observed = { ...block, credits: quota.credits, creditsObservedAt: readAt }
         }
+        // A fresh read of the window that was current at the block replaces the stale baseline.
+        // A window without a reset time could never prove recovery later, so it stays stale and is re-read.
+        const baseline = (old: Block['windows'][number]) => {
+          const w = quota[old.kind]
+          return staleAtBlock(old) && w && w.resetsAt !== null && !startedAfterBlock(w) ? w : null
+        }
+        if (!recovered.has(block.key) && fresh && block.windows.some(baseline)) {
+          observed = { ...(observed ?? block), windows: block.windows.map(old => {
+            const w = baseline(old)
+            return w ? { kind: old.kind, percent: w.percent, reset: w.resetsAt!.getTime() } : old
+          }) }
+        }
+        if (observed) observations.set(block.key, observed)
       }
       return { account, usage, identity, ...rank, ...(duplicateOf ? { duplicateOf } : {}) }
     })

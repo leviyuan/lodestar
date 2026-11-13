@@ -1,11 +1,16 @@
 import { execFile } from 'node:child_process'
-import { realpathSync } from 'node:fs'
+import { realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { spawn } from 'cross-spawn'
 
 const REGISTRY = 'https://registry.npmjs.org'
 
 /** Cleanup must not race an installer whose process tree may still own EXEs. */
 export class AgentInstallTerminationError extends Error {}
+
+/** Names the npm PID inside its staging directory while it runs, so a later sweep
+ * can tell whether a preserved directory's installer is still alive. Removed on success. */
+export const AGENT_INSTALLER_RECORD = '.lodestar-installer.json'
 
 export function terminateWindowsInstaller(pid: number): Promise<void> {
   if (!Number.isSafeInteger(pid) || pid <= 0) return Promise.reject(new Error(`Invalid npm installer PID: ${pid}`))
@@ -43,6 +48,7 @@ export async function installAgentPackages(directory: string, signal?: AbortSign
     let settled = false
     let closed = false
     let terminationTimer: ReturnType<typeof setTimeout> | undefined
+    const record = join(directory, AGENT_INSTALLER_RECORD)
     const capture = (chunk: Buffer) => { output = (output + chunk.toString()).slice(-16_384) }
     child.stdout!.on('data', capture)
     child.stderr!.on('data', capture)
@@ -86,9 +92,18 @@ export async function installAgentPackages(directory: string, signal?: AbortSign
         finish(unconfirmed(error instanceof Error ? error.message : String(error)))
         return
       }
-      if (failure || code !== 0) finish(new Error(`${failure?.message ?? `npm install exited code=${code} signal=${exitSignal}`}\n${output}`))
-      else finish()
+      if (failure || code !== 0) {
+        finish(new Error(`${failure?.message ?? `npm install exited code=${code} signal=${exitSignal}`}\n${output}`))
+        return
+      }
+      try { rmSync(record, { force: true }) }
+      catch (error) { finish(new Error(`installer record cleanup failed: ${error instanceof Error ? error.message : String(error)}`)); return }
+      finish()
     })
+    if (child.pid) {
+      try { writeFileSync(record, JSON.stringify({ pid: child.pid }) + '\n', { mode: 0o600 }) }
+      catch (error) { cancel(`installer record could not be written: ${error instanceof Error ? error.message : String(error)}`) }
+    }
     if (signal?.aborted) onAbort()
   })
 }

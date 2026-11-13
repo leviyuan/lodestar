@@ -12,8 +12,14 @@ export function fileLoggingEnabled(nodeEnv: string | undefined = process.env.NOD
   return nodeEnv !== 'test'
 }
 
+/** The data dir holds state and credentials alongside logs; mode only applies
+ * when the directory is created, existing user directories are left alone. */
+export function ensureDataDir(dir: string = DATA_DIR): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+}
+
 if (fileLoggingEnabled()) {
-  try { mkdirSync(DATA_DIR, { recursive: true }) } catch {}
+  try { ensureDataDir() } catch {}
 }
 
 /** 按日日志保留天数(含今天);超过即清理。 */

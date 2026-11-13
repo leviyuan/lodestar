@@ -9,7 +9,7 @@ import { join, isAbsolute } from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { AGENT_RUNTIMES_DIR } from './paths'
-import { AgentInstallTerminationError, installAgentPackages } from './agent-install'
+import { AGENT_INSTALLER_RECORD, AgentInstallTerminationError, installAgentPackages } from './agent-install'
 import { writeStateFileAtomic } from './state-store'
 export { installAgentPackages } from './agent-install'
 
@@ -51,6 +51,14 @@ export interface AgentUpdateOptions {
 const RUNTIME_KEEP = 3
 const RUNTIME_FINGERPRINT = /^[0-9a-f]{20}$/
 const execFileAsync = promisify(execFile)
+const STALE_LOCK_PREFIX = '.stale-lock-'
+/** Far longer than mkdir -> atomic PID write, including Windows sharing retries. */
+const LOCK_PID_GRACE_MS = 30_000
+/** A recently moved-aside lock may still be verified and renamed back by its reclaimer. */
+const STALE_LOCK_SWEEP_AGE_MS = 5 * 60_000
+/** Staging without a readable installer record (crash before spawn, older Lodestar):
+ * its installer cannot be checked, so only age proves it is abandoned. */
+const UNRECORDED_STAGING_AGE_MS = 24 * 60 * 60_000
 
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error)
 
@@ -205,10 +213,37 @@ async function runningCommandLines(): Promise<string[] | null> {
   }
 }
 
+/** A path argument ends at `/`, whitespace or the end of the command line; the
+ * npm installer names its staging directory as `--prefix <dir> --include...`. */
 function processUsesDirectory(commands: string[], directory: string): boolean {
   const paths = new Set([directory])
   try { paths.add(realpathSync(directory)) } catch {}
-  return commands.some(command => [...paths].some(path => command.includes(`${path}/`) || command.endsWith(path)))
+  return commands.some(command => [...paths].some(path => {
+    for (let index = command.indexOf(path); index >= 0; index = command.indexOf(path, index + 1)) {
+      const next = command[index + path.length]
+      if (next === undefined || next === '/' || /\s/.test(next)) return true
+    }
+    return false
+  }))
+}
+
+/** Removes directories no live process uses. `null` means the process table
+ * is unavailable and nothing was attempted. */
+async function removeUnusedDirectories(paths: string[], options: AgentUpdateOptions): Promise<{ removed: number; failed: boolean } | null> {
+  let commands: string[] | null
+  try { commands = await (options.runningCommands ?? runningCommandLines)() } catch { commands = null }
+  if (!commands) return null
+  let removed = 0
+  let failed = false
+  for (const path of paths) {
+    if (options.signal?.aborted) break
+    if (processUsesDirectory(commands, path)) continue
+    try {
+      await retryAgentFileOperation(() => rm(path, { recursive: true, force: true }))
+      removed++
+    } catch { failed = true }
+  }
+  return { removed, failed }
 }
 
 /** Keep the selected install and the newest releases. A directory any live
@@ -226,28 +261,96 @@ async function pruneAgentRuntimes(agent: UpdatedAgent, directory: string, select
     const keep = new Set([selected, ...versions.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, RUNTIME_KEEP).map(version => version.path)])
     const expired = versions.filter(version => !keep.has(version.path))
     if (expired.length === 0) return
-    let commands: string[] | null
-    try { commands = await (options.runningCommands ?? runningCommandLines)() } catch { commands = null }
-    if (!commands) {
+    const result = await removeUnusedDirectories(expired.map(version => version.path), options)
+    if (!result) {
       report(`${agent}: 旧运行时清理跳过（无法确认占用）`)
       return
     }
-    let removed = 0
-    let failed = false
-    for (const version of expired) {
-      if (options.signal?.aborted) return
-      if (processUsesDirectory(commands, version.path)) continue
-      try {
-        await retryAgentFileOperation(() => rm(version.path, { recursive: true, force: true }))
-        removed++
-      } catch { failed = true }
-    }
-    if (removed > 0) report(`${agent}: 已清理 ${removed} 个旧运行时`)
-    if (failed) report(`${agent}: 旧运行时清理未完成，保留原目录`)
+    if (result.removed > 0) report(`${agent}: 已清理 ${result.removed} 个旧运行时`)
+    if (result.failed) report(`${agent}: 旧运行时清理未完成，保留原目录`)
   } catch {
     // Cleanup runs after the update is committed; report it without failing the update.
     report(`${agent}: 旧运行时清理未完成，保留原目录`)
   }
+}
+
+/** Rename keeps a directory's mtime; ctime records the move aside. */
+async function ageMs(path: string): Promise<number> {
+  const info = await stat(path)
+  return Date.now() - Math.max(info.mtimeMs, info.ctimeMs)
+}
+
+function processAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH' }
+}
+
+/** npm lifecycle children run with their cwd in the staging directory and no path
+ * in argv, so the recorded installer PID must be gone too, not just command lines. */
+async function stagingAbandoned(path: string): Promise<boolean> {
+  let pid: unknown
+  // A missing or torn record falls back to the age rule below.
+  try { pid = JSON.parse(await readFile(join(path, AGENT_INSTALLER_RECORD), 'utf8'))?.pid }
+  catch {}
+  if (Number.isSafeInteger(pid) && (pid as number) > 0) return !processAlive(pid as number)
+  return await ageMs(path) >= UNRECORDED_STAGING_AGE_MS
+}
+
+async function staleLockAbandoned(name: string, path: string): Promise<boolean> {
+  const movedAt = Number(/^\.stale-lock-(\d+)-/.exec(name)?.[1])
+  const age = Number.isSafeInteger(movedAt) ? Date.now() - movedAt : await ageMs(path)
+  return age >= STALE_LOCK_SWEEP_AGE_MS
+}
+
+/** Staging directories of interrupted or cancelled installs (and reclaimed
+ * locks) belong to no updater once this one holds the lock. One an orphaned
+ * installer may still own stays; without a process table nothing is removed. */
+async function pruneStaleStaging(agent: UpdatedAgent, directory: string, options: AgentUpdateOptions): Promise<void> {
+  const report = (message: string) => { try { options.report?.(message) } catch {} }
+  try {
+    const stale: string[] = []
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue
+      const path = join(directory, entry.name)
+      try {
+        if (entry.name.startsWith('.install-') ? await stagingAbandoned(path)
+          : entry.name.startsWith(STALE_LOCK_PREFIX) && await staleLockAbandoned(entry.name, path)) stale.push(path)
+      } catch (error) {
+        // Already removed by its own reclaimer; anything else keeps the directory.
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+    }
+    if (stale.length === 0) return
+    const result = await removeUnusedDirectories(stale, options)
+    if (!result) {
+      report(`${agent}: 中断安装的临时目录清理跳过（无法确认占用）`)
+      return
+    }
+    if (result.removed > 0) report(`${agent}: 已清理 ${result.removed} 个中断安装的临时目录`)
+    if (result.failed) report(`${agent}: 中断安装的临时目录清理未完成，保留原目录`)
+  } catch {
+    report(`${agent}: 中断安装的临时目录清理未完成，保留原目录`)
+  }
+}
+
+/** Moves a dead updater's lock aside, then checks it is the same lock that was
+ * judged stale: another waiter may have reclaimed it and taken a fresh one in
+ * between, and that live lock is handed back instead of deleted. */
+async function reclaimLock(directory: string, path: string, observed: { ino: number; mtimeMs: number }): Promise<void> {
+  const aside = join(directory, `${STALE_LOCK_PREFIX}${Date.now()}-${randomUUID()}`)
+  try { await retryAgentFileOperation(() => rename(path, aside)) }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  const moved = await stat(aside)
+  if (moved.ino !== observed.ino || moved.mtimeMs !== observed.mtimeMs) {
+    try { await retryAgentFileOperation(() => rename(aside, path)) }
+    catch (error) { throw new Error(`Runtime update lock was replaced while reclaiming a stale lock and could not be restored: ${path}: ${errorMessage(error)}`) }
+    return
+  }
+  // A failed removal leaves only an inert directory; the next successful update sweeps and reports it.
+  try { await retryAgentFileOperation(() => rm(aside, { recursive: true })) } catch {}
 }
 
 /** Directory lock also serializes a manual CLI update with the daemon timer. */
@@ -258,25 +361,45 @@ async function lock(directory: string, signal?: AbortSignal): Promise<() => Prom
     signal?.throwIfAborted()
     try {
       await mkdir(path)
+      let ino: number
       try {
         // Other updaters may inspect the directory immediately. Publish a complete PID atomically.
         await retryAgentFileOperation(async () => writeStateFileAtomic(join(path, 'pid'), String(process.pid)))
+        ino = (await stat(path)).ino
       } catch (error) {
         try { await retryAgentFileOperation(() => rm(path, { recursive: true })) }
         catch (cleanup) { throw new AggregateError([error, cleanup], `${errorMessage(error)}; runtime update lock cleanup failed: ${errorMessage(cleanup)}`) }
         throw error
       }
-      return () => retryAgentFileOperation(() => rm(path, { recursive: true }))
+      // A lock already gone, or replaced by another updater's, is not this updater's to remove.
+      return async () => {
+        try {
+          if ((await stat(path)).ino !== ino) return
+          await retryAgentFileOperation(() => rm(path, { recursive: true }))
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        }
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
       try {
-        const pid = Number(await readFile(join(path, 'pid'), 'utf8'))
-        if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`Invalid runtime update lock: ${path}`)
-        try { process.kill(pid, 0) }
-        catch (cause) {
-          if ((cause as NodeJS.ErrnoException).code !== 'ESRCH') throw cause
-          await retryAgentFileOperation(() => rm(path, { recursive: true }))
-          continue
+        const observed = await stat(path)
+        let text: string | undefined
+        try { text = await readFile(join(path, 'pid'), 'utf8') }
+        catch (cause) { if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause }
+        if (text === undefined) {
+          // The PID is published right after mkdir; a lock still without one
+          // long after belongs to an updater that died in between.
+          if (Date.now() - observed.mtimeMs >= LOCK_PID_GRACE_MS) { await reclaimLock(directory, path, observed); continue }
+        } else {
+          const pid = Number(text)
+          if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`Invalid runtime update lock: ${path}`)
+          try { process.kill(pid, 0) }
+          catch (cause) {
+            if ((cause as NodeJS.ErrnoException).code !== 'ESRCH') throw cause
+            await reclaimLock(directory, path, observed)
+            continue
+          }
         }
       } catch (cause) {
         if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause
@@ -333,6 +456,8 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
     await writeState(directory, state)
     options.report?.(`${agent}: ${PACKAGES[agent][0]}@${versions[PACKAGES[agent][0]]}${unchanged ? ' 已是 latest' : ' 已更新，新进程使用新版'}`)
     await pruneAgentRuntimes(agent, directory, destination, options)
+    // This update's own staging was renamed into place; any left is foreign.
+    await pruneStaleStaging(agent, directory, options)
     return state
   } catch (error) {
     // Failed updates leave the selected installation untouched. The updater
@@ -372,18 +497,19 @@ export async function updateAgentRuntimes(options: AgentUpdateOptions = {}): Pro
 export function startAgentAutoUpdates(report: (message: string) => void, options: {
   enabled?: Partial<Record<UpdatedAgent, boolean>>
   update?: typeof updateAgentRuntime
-} = {}): () => void {
+} = {}): () => Promise<void> {
   const stops = AGENTS.filter(agent => options.enabled?.[agent] === true).map(agent => {
     const controller = new AbortController()
-    let pending: Promise<unknown> | undefined
+    let pending: Promise<void> | undefined
     const timer = setInterval(() => {
       if (pending) return
       pending = (options.update ?? updateAgentRuntime)(agent, { report, signal: controller.signal })
-        .catch(error => report(`${agent} 自动更新未完成: ${errorMessage(error)}`))
+        .then(() => {}, error => report(`${agent} 自动更新未完成: ${errorMessage(error)}`))
         .finally(() => { pending = undefined })
     }, AGENT_UPDATE_INTERVAL_MS)
     timer.unref()
-    return () => { clearInterval(timer); controller.abort() }
+    return (): Promise<void> => { clearInterval(timer); controller.abort(); return pending ?? Promise.resolve() }
   })
-  return () => { for (const stop of stops) stop() }
+  /** Stops synchronously; the result settles once cancelled updates released their lock and staging. */
+  return async () => { await Promise.all(stops.map(stop => stop())) }
 }

@@ -110,6 +110,40 @@ export class DshRuntime extends EventEmitter {
     mkdirSync(home, { recursive: true, mode: 0o700 })
     const mcp = projectMcpRows(opts.cwd, opts.profile)
     this.launchDir = mkdtempSync(join(tmpdir(), 'lodestar-dsh-'))
+    try {
+      this.child = this.spawnChild(opts, runtimeRoot, manifestPath, manifest, providerPatches, home, mcp)
+    } catch (error) {
+      // Only the child's close removes the directory; a launch that never produced one must remove it here.
+      try { rmSync(this.launchDir, { recursive: true, force: true }) }
+      catch (cleanup) { logError('dsh.launch_dir.cleanup_failed', cleanup) }
+      throw error
+    }
+    this.child.stderr!.setEncoding('utf8')
+    this.child.stderr!.on('data', (chunk: string) => {
+      this.stderr = (this.stderr + chunk).slice(-16_384)
+    })
+    this.child.stdin!.on('error', error => this.transportFailure(error))
+    const lines = createInterface({ input: this.child.stdout!, crlfDelay: Infinity })
+    lines.on('line', line => this.receive(line))
+    this.exitTask = new Promise(resolve => {
+      this.child.once('error', error => this.transportFailure(error))
+      this.child.once('close', (code, signal) => {
+        this.exited = true
+        lines.close()
+        const error = new Error(`DSH exited code=${code} signal=${signal}\n${this.stderr}`)
+        this.rejectPending(error)
+        // A throw here would escape the event listener and take the daemon down.
+        try { rmSync(this.launchDir, { recursive: true, force: true }) }
+        catch (cleanup) { logError('dsh.launch_dir.cleanup_failed', cleanup) }
+        resolve()
+        this.emit('exit', { code, signal, expected: this.closing })
+      })
+    })
+  }
+
+  /** Publishes the bridge and patch into the launch directory and starts DSH. */
+  private spawnChild(opts: DshRuntimeOptions, runtimeRoot: string, manifestPath: string, manifest: any,
+    providerPatches: object[], home: string, mcp: object[]): ChildProcess {
     const sourceMode = import.meta.url.endsWith('.ts')
     const bridgeName = sourceMode ? 'dsh-bridge.ts' : 'dsh-bridge.js'
     const source = readFileSync(fileURLToPath(new URL(`./${bridgeName}`, import.meta.url)))
@@ -161,30 +195,9 @@ export class DshRuntime extends EventEmitter {
       })
     }
     for (const key of Object.keys(childEnv)) if (key.startsWith('LODESTAR_AGENT_')) delete childEnv[key]
-    try {
-      this.child = spawn(node, args, {
-        cwd: opts.cwd, stdio: ['pipe', 'pipe', 'pipe'], shell: false,
-        env: { ...childEnv, DSH_HOME: home, DSH_PERMISSION_MODE: 'danger-full-access' },
-      })
-    } catch (error) { rmSync(this.launchDir, { recursive: true, force: true }); throw error }
-    this.child.stderr!.setEncoding('utf8')
-    this.child.stderr!.on('data', (chunk: string) => {
-      this.stderr = (this.stderr + chunk).slice(-16_384)
-    })
-    this.child.stdin!.on('error', error => this.transportFailure(error))
-    const lines = createInterface({ input: this.child.stdout!, crlfDelay: Infinity })
-    lines.on('line', line => this.receive(line))
-    this.exitTask = new Promise(resolve => {
-      this.child.once('error', error => this.transportFailure(error))
-      this.child.once('close', (code, signal) => {
-        this.exited = true
-        lines.close()
-        const error = new Error(`DSH exited code=${code} signal=${signal}\n${this.stderr}`)
-        this.rejectPending(error)
-        rmSync(this.launchDir, { recursive: true, force: true })
-        resolve()
-        this.emit('exit', { code, signal, expected: this.closing })
-      })
+    return spawn(node, args, {
+      cwd: opts.cwd, stdio: ['pipe', 'pipe', 'pipe'], shell: false,
+      env: { ...childEnv, DSH_HOME: home, DSH_PERMISSION_MODE: 'danger-full-access' },
     })
   }
 

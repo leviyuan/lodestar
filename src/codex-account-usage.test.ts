@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { aggregateCodexUsage, refreshCodexAccountEmails, type CodexAccountUsage } from './codex-account-usage'
+import { aggregateCodexUsage, type CodexAccountUsage } from './codex-account-usage'
 import { codexAccountCard } from './cards/codex-account'
 
 function entry(id: string, short: number | null, weekly: number | null, fingerprint: string | null = id): CodexAccountUsage {
@@ -37,28 +37,14 @@ describe('Codex account usage aggregation', () => {
       }
     }
   })
-  test('account inspection reads each native email even when quota identities are duplicated', async () => {
+  test('account cards show every record native email even when quota identities are duplicated', () => {
     const rows = [entry('default', 20, 40, 'same'), entry('named', 20, 40, 'same')]
     rows[0].account.name = '默认'
     rows[1].account.name = 'remark@example.test'
     rows[1].account.email = 'old-login@example.test'
     const total = aggregateCodexUsage(rows)
-    const reads: string[] = [], closed: string[] = []
-    const inspected = await refreshCodexAccountEmails(total, id => ({
-      initialize: async () => {},
-      request: async (method, params) => {
-        expect(method).toBe('account/read')
-        expect(params).toEqual({ refreshToken: false })
-        reads.push(id)
-        return { account: { type: 'chatgpt', email: `${id}@actual.example`, planType: 'pro' } }
-      },
-      close: async () => { closed.push(id) },
-    }))
-    expect(reads).toEqual(['default', 'named'])
-    expect(closed).toEqual(reads)
-    expect(inspected.entries.map(row => row.email)).toEqual(['default@actual.example', 'named@actual.example'])
+    const inspected = { ...total, entries: total.entries.map(row => ({ ...row, email: `${row.account.id}@actual.example` })) }
     expect(inspected.entries[1].duplicateOf).toBe('默认')
-    expect(inspected.available).toBe(total.available)
     const card = JSON.stringify(codexAccountCard({ phase: 'accounts', total: inspected }))
     expect(card).toContain('#—·默认「MISS」')
     expect(card).toContain('#—·remark@example.test「重复」')
@@ -67,25 +53,16 @@ describe('Codex account usage aggregation', () => {
     expect(card).toContain('同一账号')
     expect(card).not.toContain('old-login@example.test')
   })
-  test('missing emails and native read or close errors stay visible without using recorded emails', async () => {
+  test('missing emails and native read or close errors stay visible without using recorded emails', () => {
     const rows = ['missing', 'failed', 'close-failed'].map(id => entry(id, 10, 20))
     for (const row of rows) row.account.email = 'old-login@example.test'
-    const closed: string[] = []
-    const total = await refreshCodexAccountEmails(aggregateCodexUsage(rows), id => ({
-      initialize: async () => {},
-      request: async () => {
-        if (id === 'failed') throw new Error('HTTP 401 account access denied')
-        return { account: { type: 'chatgpt', email: id === 'missing' ? null : 'current@actual.example' } }
-      },
-      close: async () => {
-        closed.push(id)
-        if (id === 'close-failed') throw new Error('SIGTERM rejected')
-      },
-    }))
-    expect(closed.sort()).toEqual(['close-failed', 'failed', 'missing'])
-    expect(total.entries[0]).toMatchObject({ email: null, emailError: '原生账号未提供邮箱' })
-    expect(total.entries[1]).toMatchObject({ email: null, emailError: 'HTTP 401 account access denied' })
-    expect(total.entries[2]).toMatchObject({ email: 'current@actual.example', emailError: '账号查询进程关闭失败：SIGTERM rejected' })
+    const reads: Record<string, Pick<CodexAccountUsage, 'email' | 'emailError'>> = {
+      missing: { email: null, emailError: '原生账号未提供邮箱' },
+      failed: { email: null, emailError: 'HTTP 401 account access denied' },
+      'close-failed': { email: 'current@actual.example', emailError: '账号查询进程关闭失败：SIGTERM rejected' },
+    }
+    const aggregated = aggregateCodexUsage(rows)
+    const total = { ...aggregated, entries: aggregated.entries.map(row => ({ ...row, ...reads[row.account.id] })) }
     const card = JSON.stringify(codexAccountCard({ phase: 'accounts', total }))
     expect(card).toContain('邮箱：MISS')
     expect(card).toContain('邮箱查询错误')

@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { addedReactions, resetFeishuMock } from './feishu-test-mock'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
   __setStoreFileForTest, register, get, loadCallbacks, buildNotifyResult, findPendingReply, pendingRepliesForChat, beginCallbackDispatch,
+  setReplyState,
   type NotifyRegistration, type NotifyTextResponse, type DispatchResult,
 } from './notify-callbacks'
 import { handleNotifyRequest } from './notify'
@@ -572,6 +573,59 @@ describe('notification text reply workflow', () => {
     expect(card).not.toContain('已成功')
     expect(card).not.toContain('notify_callback')
     expect(h.delivered).toEqual([])
+  })
+
+  test('an interrupted callback is recovered on one boot only', async () => {
+    register(registration({ allowReply: false, buttons: [{ id: 'approve', text: '通过', type: 'primary' }] }))
+    beginCallbackDispatch('nf_reply', 'approve', 'ou_owner')
+    __setStoreFileForTest(file)
+    const h = harness()
+    const first = loadCallbacks()
+    expect(first).toHaveLength(1)
+    await h.runtime.recover(first[0])
+    __setStoreFileForTest(file)
+    expect(loadCallbacks()).toEqual([])
+    expect(buildNotifyResult(get('nf_reply')!)).toMatchObject({ resolved: false, unknown: true })
+    expect(h.updated).toHaveLength(1)
+  })
+
+  test('an interrupted reply whose recovery could not be shown is recovered again next boot', async () => {
+    register(registration())
+    const h = harness()
+    await h.open()
+    setReplyState('nf_reply', { ...get('nf_reply')!.replyState!, status: 'sending', response: {
+      text: '明天十点', message_id: 'om_input', prompt_message_id: get('nf_reply')!.replyState!.promptMessageId,
+    } })
+    __setStoreFileForTest(file)
+    const first = loadCallbacks()
+    expect(first).toHaveLength(1)
+    h.controls.update = async () => { throw new Error('patch rejected') }
+    h.controls.textFailure = new Error('send rejected')
+    await expect(h.runtime.recover(first[0])).rejects.toThrow()
+    __setStoreFileForTest(file)
+    const second = loadCallbacks()
+    expect(second).toHaveLength(1)
+    h.controls.update = async () => {}
+    h.controls.textFailure = undefined
+    await h.runtime.recover(second[0])
+    __setStoreFileForTest(file)
+    expect(loadCallbacks()).toEqual([])
+    expect(h.delivered).toEqual([])
+  })
+
+  test('a legacy UNKNOWN record without the recovery marker still loads and is recovered once', async () => {
+    const legacy = registration({
+      allowReply: false, buttons: [{ id: 'approve', text: '通过', type: 'primary' }],
+      dispatchState: { buttonId: 'approve', openId: 'ou_owner', startedAt: Date.now() },
+      unknownAt: Date.now(), unknownBy: { buttonId: 'approve', openId: 'ou_owner' }, unknownReason: '中断',
+    })
+    writeFileSync(file, JSON.stringify({ nf_reply: legacy }))
+    __setStoreFileForTest(file)
+    const first = loadCallbacks()
+    expect(first.map(reg => reg.notifyId)).toEqual(['nf_reply'])
+    await harness().runtime.recover(first[0])
+    __setStoreFileForTest(file)
+    expect(loadCallbacks()).toEqual([])
   })
 
   test('unsupported, wrong-chat and anonymous reply actions do not send waiting cards', async () => {

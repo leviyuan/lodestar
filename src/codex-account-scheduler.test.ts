@@ -7,6 +7,7 @@ import { compareCodexQuota, isCodexQuotaError, rankCodexQuota, unusedCodexWeek }
 import type { AgentReasoningEffort } from './agent-process'
 import type { TokenSource, TokenSourceModel } from './token-source'
 import { snapshotFromReadResponse, type UsageSnapshot } from './usage'
+import * as logModule from './log'
 
 const NOW = 1_800_000_000_000
 const roots: string[] = []
@@ -279,6 +280,18 @@ describe('weekly quota scheduling', () => {
     expect(h.scheduler.weekWasUsed('shared', alias, 'model')).toBe(true)
     expect(h.scheduler.weekWasUsed('different', other, 'model')).toBe(false)
     expect(h.scheduler.weekWasUsed('shared', full, 'spark')).toBe(false)
+  })
+  test('an unreadable account identity while recording usage is logged, not thrown into the process event listener', () => {
+    const usage = quota('pro', 0, 168)
+    const h = harness({ pro: usage }, { pro: usage })
+    ;(h.scheduler as any).deps.identity = () => { throw new Error('EACCES: auth.json') }
+    const logged = spyOn(logModule, 'logError').mockImplementation(() => {})
+    try {
+      expect(() => h.scheduler.recordUsage('pro', 'model')).not.toThrow()
+      expect(logged).toHaveBeenCalledTimes(1)
+      expect(logged.mock.calls[0][0]).toBe('codex account usage record failed')
+      expect(h.scheduler.weekWasUsed('pro', usage, 'model')).toBe(false)
+    } finally { logged.mockRestore() }
   })
   test('last five hours are explicit priority, including Plus, with earliest reset first and no infinite score', async () => {
     const h = harness({ normal: quota('pro', 0, 5.001), five: quota('pro', 0, 5), two: quota('plus', 50, 2) })
@@ -612,6 +625,43 @@ describe('weekly quota scheduling', () => {
     expect(wait.candidates.slice(1).every(c => c.state === 'waiting')).toBe(true)
     expect(wait.retryAt).toBe(NOW + 20 * 3600_000)
     expect((await h.scheduler.choose({ model: 'model', effort: 'max' })).selected).not.toBeNull()
+  })
+  test('a window that had already reset when exhaustion was recorded cannot clear it; the first fresh read becomes the baseline', async () => {
+    const h = harness({ pro: quota('pro') })
+    const stale = quota('pro', 100, -1) // cached from the previous week, read before the native failure
+    h.scheduler.block({ account: { id: 'pro', name: 'pro' }, usage: stale, identity: 'pro',
+      ...rankCodexQuota(stale, 'model', NOW) }, 'model')
+    // The new week is nearly used up: the reset moved and the percentage dropped, yet the failure is current.
+    h.input.pro = { ...quota('pro', 99, 100), readStartedAt: NOW + 1, fetchedAt: NOW + 2 }
+    const blocked = await h.scheduler.choose({ model: 'model' })
+    expect(blocked.selected).toBeNull()
+    expect(blocked.candidates[0].state).toBe('exhausted')
+    const [block] = JSON.parse(readFileSync(h.stateFile, 'utf8')).blocks
+    expect(block.windows).toEqual([{ kind: 'weekly', percent: 99, reset: NOW + 100 * 3600_000 }])
+    expect((await h.scheduler.choose({ model: 'model' })).candidates[0]).toMatchObject({
+      state: 'exhausted', retryAt: NOW + 100 * 3600_000 })
+    h.input.pro = { ...quota('pro', 10, 100), readStartedAt: NOW + 3, fetchedAt: NOW + 4 }
+    expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('pro')
+    expect(JSON.parse(readFileSync(h.stateFile, 'utf8')).blocks).toEqual([])
+  })
+  test('a stale-at-block window is recovered once a fresh window started after the block; unusable reads never become the baseline', async () => {
+    const H = 3_600_000
+    const plus = (five: { percent: number | null; resetsAt: Date | null; durationMins: number }, week: number, at: number) =>
+      ({ ...quota('plus', week, 100), fiveHour: five, readStartedAt: at, fetchedAt: at })
+    const h = harness({ plus: quota('plus') })
+    // Cached two hours before the native failure: that 5h window had rolled over 30 min before the block.
+    const stale = plus({ percent: 60, resetsAt: new Date(NOW - H / 2), durationMins: 300 }, 50, NOW - 2 * H)
+    h.scheduler.block({ account: { id: 'plus', name: 'plus' }, usage: stale, identity: 'plus',
+      ...rankCodexQuota(stale, 'model', NOW) }, 'model')
+    // Malformed short window: no baseline is adopted from it, the stale record stays for the next read.
+    h.input.plus = plus({ percent: null, resetsAt: null, durationMins: 300 }, 52, NOW + 1)
+    expect((await h.scheduler.choose({ model: 'model' })).selected).toBeNull()
+    expect(JSON.parse(readFileSync(h.stateFile, 'utf8')).blocks[0].windows)
+      .toContainEqual({ kind: 'fiveHour', percent: 60, reset: NOW - H / 2 })
+    // The exhausted window (current at the block) rolled over: the fresh 5h window started after the block.
+    h.input.plus = plus({ percent: 0, resetsAt: new Date(NOW + 5 * H + 60_000), durationMins: 300 }, 55, NOW + 2)
+    expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('plus')
+    expect(JSON.parse(readFileSync(h.stateFile, 'utf8')).blocks).toEqual([])
   })
   test('short-window recovery is observed when Plus stops reporting an exhausted 5h window', async () => {
     const plus = quota('plus', 20, 80)

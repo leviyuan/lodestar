@@ -1148,6 +1148,37 @@ describe('AgentService', () => {
     expect(shutdownComplete).toBe(true)
   })
 
+  test('shutdown still closes chats when a run still opening its card fails', async () => {
+    let cardEntered!: () => void
+    let failCard!: () => void
+    const entered = new Promise<void>(resolve => { cardEntered = resolve })
+    const failed = new Promise<void>(resolve => { failCard = resolve })
+    const { service, root } = harness({
+      sendCard: async () => { cardEntered(); await failed; throw new Error('card rejected') },
+    })
+    const closed: string[] = []
+    service.presentation.closeChat = async chatId => { closed.push(chatId) }
+    const creating = service.startRun(root, { description: '关停期间开卡失败', identityIds: ['agent:a'], prompt: 'racing root' })
+    const creationError = creating.catch(error => error)
+    await entered
+    const stopping = service.shutdown('daemon shutdown')
+    failCard()
+    expect(String(await creationError)).toContain('card rejected')
+    await stopping
+    expect(closed).toEqual(['chat-1'])
+  })
+
+  test('card initialisation failure keeps the original error when the failure notice cannot be sent', async () => {
+    const { service, root } = harness({
+      sendCard: async () => { throw new Error('card rejected') },
+      sendTextRaw: async () => { throw new Error('notice rejected') },
+    })
+    try {
+      await expect(service.startRun(root, { description: '开卡失败', identityIds: ['agent:a'], prompt: 'fails' }))
+        .rejects.toThrow('card rejected')
+    } finally { await service.shutdown('test cleanup') }
+  })
+
   test('invalidates a main-Agent follow-up whose card was opening during Session cancellation', async () => {
     let cardEntered!: () => void
     let releaseCard!: () => void

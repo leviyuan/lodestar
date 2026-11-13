@@ -374,10 +374,6 @@ function bucketsFromReadResponse(limitsRes: any): { buckets: UsageBucket[]; defa
   return { buckets, defaultLimitId: limitsRes?.rateLimits?.limitId ?? undefined }
 }
 
-/** Rolling quota notifications are not authoritative and cannot update cached usage.
- * Keep the observer entry point without logging account/bucket identifiers. */
-export function observeRateLimitsNotification(_rateLimits: any, _accountId = DEFAULT_CODEX_ACCOUNT): void {}
-
 async function fetchUsage(accountId: string): Promise<UsageSnapshot> {
   const revision = codexAccounts.revision(accountId)
   const app = new AppServerOnce({ accountId })
@@ -570,12 +566,16 @@ export function supersedeCodexUsageReads(accountId: string): void {
 }
 
 function requestCodexQuotaWithRetry<T>(request: () => Promise<T>): Promise<T> {
-  return requestCodexControlWithRetry(request, '额度查询', { retryRateLimits: false })
+  return requestCodexControlWithRetry(request, '额度查询')
+}
+
+/** Spacing between Codex control retries; tests replace `wait` to observe the delays without sleeping. */
+export const codexControlRetryTiming = {
+  wait: (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms)),
 }
 
 /** 网络抖动重试同一个 Codex 控制请求；命中限流立即返回，不把限流继续打成重试风暴。 */
-export async function requestCodexControlWithRetry<T>(request: () => Promise<T>, operation = '额度查询',
-  _options: { retryRateLimits?: boolean } = {}): Promise<T> {
+export async function requestCodexControlWithRetry<T>(request: () => Promise<T>, operation = '额度查询'): Promise<T> {
   const delays = [1000, 4000]
   for (let attempt = 0; ; attempt++) {
     try { return await withTimeout(request(), API_TIMEOUT_MS) }
@@ -583,10 +583,10 @@ export async function requestCodexControlWithRetry<T>(request: () => Promise<T>,
       const message = error instanceof Error ? error.message : String(error)
       if (isUsageAuthError(error)) throw error
       if (isUsageRateLimitError(error)) throw error
-      const transient = /error sending request|timed? ?out|timeout|ECONNRESET|ETIMEDOUT|EAI_AGAIN|connection (?:reset|closed)|\b(?:429|502|503|504)\b/i.test(message)
+      const transient = /error sending request|timed? ?out|timeout|ECONNRESET|ETIMEDOUT|EAI_AGAIN|connection (?:reset|closed)|\b(?:502|503|504)\b/i.test(message)
       if (!transient) throw error
       if (attempt >= delays.length) throw new Error(`Codex ${operation}失败（已尝试 ${attempt + 1} 次）：${message}`, { cause: error })
-      await new Promise(resolve => setTimeout(resolve, delays[attempt]))
+      await codexControlRetryTiming.wait(delays[attempt])
     }
   }
 }

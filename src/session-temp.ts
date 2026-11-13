@@ -211,7 +211,9 @@ function usableBranchBase(s: Session): ConversationBranchBase {
 
 // ── Claude stopped-session history catalog ───────────────────────────
 
-export function listClaudeSessions(workDir: string, options?: { configDir?: string; projectDirName?: string }): ConversationSummary[] {
+export function listClaudeSessions(
+  workDir: string, options?: { configDir?: string; projectDirName?: string }, limit = HISTORY_CARD_MAX,
+): ConversationSummary[] {
   const dir = claudeTranscriptDir(workDir, options)
   let names: string[]
   try {
@@ -220,30 +222,32 @@ export function listClaudeSessions(workDir: string, options?: { configDir?: stri
     if (error?.code === 'ENOENT') return []
     throw new Error(`读取 Claude 会话目录失败: ${error?.message ?? error}`)
   }
-  const all: Array<{ summary: ConversationSummary; path: string }> = []
+  const candidates: Array<{ sessionId: string; path: string; ts: number }> = []
   for (const name of names) {
     if (!name.endsWith('.jsonl') || name.includes('.orphaned-') || name.includes('.superseded-')) continue
     const sessionId = name.slice(0, -6)
     if (isAgentSession('claude', sessionId)) continue
     const full = join(dir, name)
-    const preview = firstUserSummary(full, workDir)
-    if (preview === null) continue
-    let mtime: number
-    try { mtime = statSync(full).mtimeMs } catch (error: any) {
+    let ts: number
+    try { ts = statSync(full).mtimeMs } catch (error: any) {
       throw new Error(`读取 Claude 会话元数据失败 (${name}): ${error?.message ?? error}`)
     }
-    all.push({ summary: { provider: 'claude', sessionId, cwd: workDir, preview, ts: mtime }, path: full })
+    candidates.push({ sessionId, path: full, ts })
   }
-  all.sort((a, b) => b.summary.ts - a.summary.ts)
-  // The picker only ever renders the newest HISTORY_CARD_MAX rows, so the
-  // heavier tail read runs for those only instead of every transcript.
-  return all.map((row, index) => {
-    if (index >= HISTORY_CARD_MAX) return row.summary
-    const lastPreview = lastMessageSummary(row.path)
-    return lastPreview && lastPreview !== row.summary.preview
-      ? { ...row.summary, lastPreview }
-      : row.summary
-  })
+  candidates.sort((a, b) => b.ts - a.ts)
+  // The picker renders at most `limit` rows, newest first. Transcripts are opened in that
+  // order and the scan stops once the card is full: a long-lived project has hundreds of
+  // them, and reading every head would block the daemon for the whole listing.
+  const rows: ConversationSummary[] = []
+  for (const candidate of candidates) {
+    if (rows.length >= limit) break
+    const preview = firstUserSummary(candidate.path, workDir)
+    if (preview === null) continue
+    const summary: ConversationSummary = { provider: 'claude', sessionId: candidate.sessionId, cwd: workDir, preview, ts: candidate.ts }
+    const lastPreview = lastMessageSummary(candidate.path)
+    rows.push(lastPreview && lastPreview !== preview ? { ...summary, lastPreview } : summary)
+  }
+  return rows
 }
 
 /** Tail size for the last-input scan. Tool output can be large, so a small

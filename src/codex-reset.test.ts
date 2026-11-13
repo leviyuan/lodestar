@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import {
-  consumeCodexResetCredit, invalidateCodexUsage, peekSuccessfulUsage, peekUsage, refreshUsageFromConnection,
+  codexControlRetryTiming, consumeCodexResetCredit, invalidateCodexUsage, peekSuccessfulUsage, peekUsage, refreshUsageFromConnection,
 } from './usage'
 
 const ACCOUNT = 'reset-test-account'
@@ -40,7 +40,9 @@ class ResetApp {
     if (this.closeError) throw this.closeError
   }
 }
-afterEach(() => { invalidateCodexUsage(ACCOUNT); invalidateCodexUsage(OTHER) })
+let retryWaits: ReturnType<typeof spyOn>
+beforeEach(() => { retryWaits = spyOn(codexControlRetryTiming, 'wait').mockImplementation(async () => {}) })
+afterEach(() => { invalidateCodexUsage(ACCOUNT); invalidateCodexUsage(OTHER); retryWaits.mockRestore() })
 
 describe('Codex earned reset redemption', () => {
   test('uses the selected account and refreshes authoritative quota, including a real zero card count', async () => {
@@ -76,6 +78,7 @@ describe('Codex earned reset redemption', () => {
     expect((await consumeCodexResetCredit(ACCOUNT, 'same-attempt', () => app)).outcome).toBe('alreadyRedeemed')
     expect(app.calls.filter(c => c.method === 'account/rateLimitResetCredit/consume').map(c => c.params))
       .toEqual([{ idempotencyKey: 'same-attempt' }, { idempotencyKey: 'same-attempt' }])
+    expect(retryWaits.mock.calls).toEqual([[1000]])
   })
 
   test('persistent redemption failures stay visible after bounded retries and clear old quota', async () => {
@@ -84,9 +87,10 @@ describe('Codex earned reset redemption', () => {
     await expect(consumeCodexResetCredit(ACCOUNT, 'failed-attempt', () => app))
       .rejects.toThrow('Codex 重置卡请求失败（已尝试 3 次）：HTTP 503')
     expect(app.calls.filter(c => c.method === 'account/rateLimitResetCredit/consume')).toHaveLength(3)
+    expect(retryWaits.mock.calls).toEqual([[1000], [4000]])
     expect(app.calls.at(-1)?.method).toBe('close')
     expect(peekUsage(ACCOUNT)).toBeNull(); expect(peekSuccessfulUsage(ACCOUNT)).toBeNull()
-  }, 10_000)
+  })
 
   test('failed quota readback enters cooldown and preserves the confirmed redemption and original error', async () => {
     const app = new ResetApp()
@@ -98,10 +102,11 @@ describe('Codex earned reset redemption', () => {
     expect(result.usage.state === 'network' && result.usage.reason).toContain('已尝试 3 次')
     expect(app.calls.filter(c => c.method === 'account/rateLimitResetCredit/consume')).toHaveLength(1)
     expect(app.calls.filter(c => c.method === 'account/rateLimits/read')).toHaveLength(3)
+    expect(retryWaits.mock.calls).toEqual([[1000], [4000]])
     expect(app.calls.at(-1)?.method).toBe('close')
     expect(peekUsage(ACCOUNT)).toEqual(result.usage)
     expect(peekSuccessfulUsage(ACCOUNT)).toBeNull()
-  }, 10_000)
+  })
 
   test('unknown outcomes and authentication errors never become successful redemptions', async () => {
     for (const response of [undefined, {}, { outcome: 'unexpected' }]) {

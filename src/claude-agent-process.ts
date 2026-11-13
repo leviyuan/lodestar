@@ -52,11 +52,17 @@ class AsyncQueue<T> implements AsyncIterableIterator<T> {
   private waiters: QueueWaiter<T>[] = []
   private closed = false
 
+  constructor(private readonly onTake: () => void = () => {}) {}
+
+  get size(): number { return this.items.length }
+
   push(item: T): void {
     if (this.closed) throw new Error('input stream is closed')
     const waiter = this.waiters.shift()
-    if (waiter) waiter({ value: item, done: false })
-    else this.items.push(item)
+    if (waiter) {
+      this.onTake()
+      waiter({ value: item, done: false })
+    } else this.items.push(item)
   }
 
   close(): void {
@@ -77,7 +83,10 @@ class AsyncQueue<T> implements AsyncIterableIterator<T> {
   }
 
   next(): Promise<IteratorResult<T>> {
-    if (this.items.length > 0) return Promise.resolve({ value: this.items.shift()!, done: false })
+    if (this.items.length > 0) {
+      this.onTake()
+      return Promise.resolve({ value: this.items.shift()!, done: false })
+    }
     if (this.closed) return Promise.resolve({ value: undefined, done: true })
     return new Promise(resolve => this.waiters.push(resolve))
   }
@@ -645,12 +654,26 @@ export interface BgTaskSettledEvent {
   usage?: BgTaskUsage
 }
 
+/** Tool ids are deduplicated only against recent ones: a days-long process must not grow without bound. */
+const EMITTED_ID_LIMIT = 4096
+
+function rememberEmittedId(ids: Set<string>, id: string): boolean {
+  if (ids.has(id)) return false
+  ids.add(id)
+  if (ids.size > EMITTED_ID_LIMIT) ids.delete(ids.values().next().value!)
+  return true
+}
+
+/** Fixed native /compact outputs meaning there is nothing to compact
+ * (too few message groups, or an empty history after filtering). */
+const NOTHING_TO_COMPACT_TEXTS = ['Not enough messages to compact', 'No messages to compact']
+
 export class ClaudeAgentProcess extends EventEmitter {
   readonly provider = 'claude' as const
   readonly tokenSourceId: string | null
 
   private opts: ClaudeSpawnOpts
-  private input = new AsyncQueue<SDKUserMessage>()
+  private input = new AsyncQueue<SDKUserMessage>(() => { this.nativeInputTaken = true })
   private query: Query | null = null
   private readonly abortController = new AbortController()
   private alive = true
@@ -681,6 +704,8 @@ export class ClaudeAgentProcess extends EventEmitter {
   private deferredSteeringResult: { raw: any; subtype: string; error: string | null } | null = null
   private emittedToolUseIds = new Set<string>()
   private emittedToolResultIds = new Set<string>()
+  /** Set when the SDK takes an input from the local queue; reset at each result. */
+  private nativeInputTaken = false
   private pendingServerToolInputs: PendingServerToolInput[] = []
 
   sessionId: string | null = null
@@ -836,7 +861,8 @@ export class ClaudeAgentProcess extends EventEmitter {
       } catch (error) {
         this.initializationError = error instanceof Error ? error : new Error(String(error))
         this.emit('error', this.initializationError)
-        await this.kill()
+        // The validation failure stays authoritative; kill() has already logged its own failure.
+        await this.kill().catch(() => {})
       }
     }
   }
@@ -892,7 +918,11 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   sendInterrupt(): void {
+    const dropped = this.input.size
     this.input.clear()
+    // Inputs that never left the local queue started no native turn, so no
+    // result will arrive to clear the shared session lease's busy state.
+    if (dropped > 0 && !this.nativeInputTaken) this.nativeTurnPending = false
     this.inputTurnPending = false
     this.steeringInputs.clear()
     this.steeringResults = []
@@ -1048,9 +1078,13 @@ export class ClaudeAgentProcess extends EventEmitter {
   async compactThread(): Promise<void> {
     if (this.opts.controlOnly) throw new Error('Claude 控制查询不允许压缩会话')
     // /compact 通过 streaming input 执行，以 compact_boundary 为完成信号。
-    // 不设固定时限；仅明确的 "Not enough messages to compact" 表示无需压缩。
-    // result 可能先于 boundary 到达，不能据此提前结束等待。
-    if (!this.input) throw new Error('claude thread not initialized')
+    // 不设固定时限；成功的 result 可能先于 boundary 到达，不能据此提前结束等待。
+    // 原生 /compact 的其他终态都以本地命令输出（失败时另有 error result）结束：
+    // 无需压缩、取消、跳过和压缩失败；成功路径不产生本地命令输出。
+    if (!this.alive || this.expectedExit) throw new Error('Claude 进程已退出，无法压缩上下文')
+    // A turn stopped just before `cm` still owes its (error) result; that result ends the
+    // earlier turn, not this compaction.
+    let earlierTurnResults = this.turnActive || this.nativeTurnPending ? 1 : 0
     this.compactionPending = true
     try { this.input.push({
       type: 'user',
@@ -1065,6 +1099,8 @@ export class ClaudeAgentProcess extends EventEmitter {
         this.compactionPending = false
         this.off('context_compacted', onCompacted)
         this.off('assistant_text', onAssistantText)
+        this.off('local_command_output', onLocalCommandOutput)
+        this.off('result', onResult)
         this.off('exit', onExit)
         this.off('error', onError)
       }
@@ -1074,16 +1110,23 @@ export class ClaudeAgentProcess extends EventEmitter {
         cleanup()
         resolve()
       }
-      const onAssistantText = (e: { text?: string } | undefined) => {
-        // 只认 claude code /compact 在 transcript 不足时的固定输出文案。真压缩不会 emit
-        // 这句(实测:真压缩 emit compact_boundary + 可选总结文本,无此句),所以不会误杀真压缩。
+      const failWithNativeText = (text: string) => {
         if (settled) return
+        settled = true
+        cleanup()
+        reject(NOTHING_TO_COMPACT_TEXTS.some(fixed => text.includes(fixed))
+          ? new NothingToCompactError()
+          : new Error(text.trim() || 'Claude /compact 未完成，原生未返回原因'))
+      }
+      const onAssistantText = (e: { text?: string } | undefined) => {
+        // 不带本地命令标记的旧原生输出：只认固定的无需压缩文案。
         const text = e?.text ?? ''
-        if (text.includes('Not enough messages to compact')) {
-          settled = true
-          cleanup()
-          reject(new NothingToCompactError())
-        }
+        if (NOTHING_TO_COMPACT_TEXTS.some(fixed => text.includes(fixed))) failWithNativeText(text)
+      }
+      const onLocalCommandOutput = (e: { text: string }) => failWithNativeText(e.text)
+      const onResult = (e: { is_error?: boolean; error?: string; subtype?: string | null }) => {
+        if (earlierTurnResults > 0) { earlierTurnResults--; return }
+        if (e.is_error) failWithNativeText(e.error ?? e.subtype ?? '')
       }
       const onExit = () => {
         if (settled) return
@@ -1099,6 +1142,8 @@ export class ClaudeAgentProcess extends EventEmitter {
       }
       this.on('context_compacted', onCompacted)
       this.on('assistant_text', onAssistantText)
+      this.on('local_command_output', onLocalCommandOutput)
+      this.on('result', onResult)
       this.once('exit', onExit)
       this.once('error', onError)
     })
@@ -1323,6 +1368,9 @@ export class ClaudeAgentProcess extends EventEmitter {
       case 'permission_denied':
         logDiagnostic('claude-agent-process: permission denied')
         return
+      case 'local_command_output':
+        if (typeof raw.content === 'string') this.emit('local_command_output', { text: raw.content })
+        return
       // ── 后台任务 / 子 agent 生命周期(SDK 的 task_* 消息族,统一 type:'system')
       // 全部 emit 出去给 session 维护 backgroundTasks 状态 + 驱动后台游标卡。
       // 之前落 default 静默丢,子 agent 启动后全程黑盒直到 tool_result 回来。
@@ -1390,6 +1438,11 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (!parentToolUseId && typeof raw.uuid === 'string') this.lastAssistantUuid = raw.uuid
     if (typeof message?.model === 'string' && message.model) this.lastModel = claudeModelKey(message.model)
     const content = Array.isArray(message?.content) ? message.content : []
+    if (!parentToolUseId && typeof raw.local_command_source === 'string') {
+      this.emit('local_command_output', {
+        text: content.flatMap((block: any) => block?.type === 'text' && typeof block.text === 'string' ? [block.text] : []).join('\n'),
+      })
+    }
     for (const block of content) {
       if (!block || typeof block !== 'object') continue
       if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
@@ -1417,8 +1470,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   private emitToolUseOnce(id: string, name: string, input: any, parentToolUseId: string | null): void {
-    if (this.emittedToolUseIds.has(id)) return
-    this.emittedToolUseIds.add(id)
+    if (!rememberEmittedId(this.emittedToolUseIds, id)) return
     if (!name.trim()) {
       logDiagnostic('claude-agent-process: tool name missing')
       name = 'MISS'
@@ -1454,8 +1506,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   private emitToolResultOnce(toolUseId: string, content: string, isError: boolean, parentToolUseId: string | null): void {
-    if (this.emittedToolResultIds.has(toolUseId)) return
-    this.emittedToolResultIds.add(toolUseId)
+    if (!rememberEmittedId(this.emittedToolResultIds, toolUseId)) return
     this.emit('tool_result', {
       tool_use_id: toolUseId,
       content,
@@ -1506,6 +1557,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (typeof raw.session_id === 'string' && raw.session_id) this.sessionId = raw.session_id
     this.turnActive = false
     this.nativeTurnPending = false
+    this.nativeInputTaken = false
     this.inputTurnPending = false
     const usage = usageFromSdk(raw.usage)
     const modelUsageRaw = raw.modelUsage ?? raw.model_usage

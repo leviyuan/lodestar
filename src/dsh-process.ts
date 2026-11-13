@@ -33,6 +33,17 @@ const emptyResult = (): CodexResultMeta => ({ cost_usd: null, cost_delta_usd: nu
   num_turns: null, usage: null, subtype: null, is_error: false })
 const toolAliases: Record<string, string> = { bash: 'Bash', read: 'Read', write: 'Write', edit: 'Edit', glob: 'Glob', grep: 'Grep' }
 
+/** Arguments are model output relayed verbatim. Malformed JSON is the model's
+ * error, which DSH reports in the tool result; it must not end the session. */
+function toolCallInput(text: unknown): Record<string, any> {
+  if (typeof text !== 'string') throw new Error('invalid DSH tool call arguments')
+  try {
+    const value = JSON.parse(text)
+    if (value && typeof value === 'object' && !Array.isArray(value)) return value
+  } catch {}
+  return { raw: text }
+}
+
 /** Feishu image downloads use .png names even when the payload is JPEG. */
 function imageMediaType(bytes: Buffer): string {
   if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png'
@@ -348,7 +359,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         } else if (e.type === 'turn/end' && !sub) {
           this.activeTurnId = null
         } else if (e.type === 'tool/call') {
-          const input = JSON.parse(data.arguments)
+          const input = toolCallInput(data.arguments)
           const name = toolAliases[data.name] ?? data.name
           if (['read', 'write', 'edit'].includes(data.name) && input.path) input.file_path = input.path
           if (!sub && data.name === 'subagent') this.rememberSubagentTitle(input)

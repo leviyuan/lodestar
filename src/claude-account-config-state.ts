@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync, lstatSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync, type Stats } from 'node:fs'
+import { existsSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, type Stats } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
@@ -128,16 +128,17 @@ export function syncClaudeAccountConfigState(accountDir: string, sharedDir: stri
       if (isDeepStrictEqual(mcpConfig(old.value), mcpConfig(source.value))) return
       const next = mergeMcp(old.value, source.value)
       const temporary = join(accountDir, `${basename(target)}.${process.pid}.${randomUUID()}.tmp`)
-      let temporaryExists = false
+      // The fresh UUID name with 'wx' means anything at this path is ours, even
+      // after a write that failed once the file had been created.
+      let temporaryMayExist = true
       try {
         writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, { flag: 'wx', mode: 0o600 })
-        temporaryExists = true
         if (canonical(nativeConfigFile) !== sourcePath || !unchanged(source, readState(sourcePath))
           || !unchanged(old, readState(target))) continue
         renameSync(temporary, target)
-        temporaryExists = false
+        temporaryMayExist = false
         return
-      } finally { if (temporaryExists) unlinkSync(temporary) }
+      } finally { if (temporaryMayExist) rmSync(temporary, { force: true }) }
     }
     throw new Error('原生配置在 MCP 同步期间持续变化，未覆盖；请重试启动')
   } catch (error) {
