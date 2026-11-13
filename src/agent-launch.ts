@@ -6,10 +6,12 @@ import type {
 } from './agent-process'
 import { isClaudeReasoningEffort, isDshReasoningEffort } from './agent-process'
 import { DshProcess } from './dsh-process'
+import { existsSync } from 'node:fs'
 import { ClaudeAgentProcess, assertClaudeCodeAvailable } from './claude-agent-process'
+import { claudeTranscriptPath } from './claude-transcript'
 import { CodexProcess, isCodexReasoningEffort } from './codex-process'
 import type { ConversationLaunch } from './conversation'
-import { getTokenSourceForAccount, tokenSourceProcessRevision, tokenSourceRuntimeModel } from './token-source'
+import { getTokenSourceForAccount, listTokenSources, tokenSourceProcessRevision, tokenSourceRuntimeModel, type TokenSource } from './token-source'
 import { bindProcessCodexAccount, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
 import { CodexAccountProcess } from './codex-account-process'
 import { bindProcessClaudeAccount, claudeAccounts, DEFAULT_CLAUDE_ACCOUNT } from './claude-accounts'
@@ -46,6 +48,25 @@ export interface AgentLaunchOptions {
 export interface CreatedAgentProcess {
   process: AgentProcess
   sourceRevision: string | null
+}
+
+/** A launcher source (reclaude) keeps conversations in its own directory, apart from the
+ * store every other Claude source shares. Continuing a conversation in a process that reads
+ * the other store fails natively with a bare "not found"; say what happened instead. */
+function assertClaudeHistoryReachable(source: TokenSource, launch: ConversationLaunch | undefined, workDir: string): void {
+  if (!launch || launch.kind === 'fresh') return
+  const { sessionId, cwd } = launch.source
+  const recorded = (configDir: string) =>
+    existsSync(claudeTranscriptPath(cwd ?? workDir, sessionId, { configDir, projectDirName: '' }))
+  const own = source.claudeHistoryDir
+  if (own) {
+    if (recorded(own)) return
+    throw new Error(`该会话的记录不在 ${source.display} 的会话目录中（${source.display} 与其他 Claude 来源的会话记录各自独立），无法在这里续接。发送 hi 开始新会话，或用 md 切回原来源后继续`)
+  }
+  const owner = listTokenSources().find(other => other.claudeHistoryDir && recorded(other.claudeHistoryDir))
+  if (owner) {
+    throw new Error(`该会话的记录保存在 ${owner.display} 的会话目录中（${owner.display} 与其他 Claude 来源的会话记录各自独立），${source.display} 无法续接。发送 hi 开始新会话，或用 md 切回 ${owner.display} 后继续`)
+  }
 }
 
 /** Single source of truth for main Sessions and delegated agents, including
@@ -113,6 +134,7 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
   if (opts.provider === 'claude') {
     assertClaudeCodeAvailable()
     if (!isClaudeReasoningEffort(opts.effort)) throw new Error(`invalid Claude effort: ${opts.effort ?? 'MISS'}`)
+    if (source) assertClaudeHistoryReachable(source, opts.launch, opts.workDir)
     if (managedClaudeAccount) claudeAccounts.prepareShared(accountId)
     const releaseAccount = managedClaudeAccount ? claudeAccounts.acquireUse(accountId) : undefined
     let process: ClaudeAgentProcess
@@ -136,6 +158,7 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
         ...(source ? { settingSources: source.settingSources ?? ['project', 'local'] } : {}),
         ...(source?.claudeSettings ? { settings: source.claudeSettings } : {}),
         ...(source?.validateClaudeAccount ? { validateAccount: source.validateClaudeAccount } : {}),
+        ...(source?.claudeLauncher ? { launcher: source.claudeLauncher } : {}),
         ...(opts.managedSkillPluginPath ? { managedSkillPluginPath: opts.managedSkillPluginPath } : {}),
         tokenSourceId: source?.id ?? null,
         transformEnv,

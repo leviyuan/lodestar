@@ -112,6 +112,8 @@ export interface TokenSourceConfig {
   /** 只复用指定来源的余额账号，不复用它的模型 Key。 */
   billing_source?: string
   bin?: string
+  /** reclaude 组织 ID；省略时跟随 reclaude 的当前组织。 */
+  org?: string
   model?: string
   effort?: string
   models?: string
@@ -355,7 +357,7 @@ export function loadConfig(): LodestarConfig {
           field === 'agent' || field === 'display' || field === 'auth' ||
           field === 'base_url' || field === 'auth_token' || field === 'api_key' ||
           field === 'management_token' || field === 'management_user_id' || field === 'management_url' || field === 'billing_source' ||
-          field === 'bin' || field === 'model' || field === 'effort' ||
+          field === 'bin' || field === 'org' || field === 'model' || field === 'effort' ||
           field === 'models' || field === 'hidden_models' || field === 'shown_models' || field === 'custom_models' || field === 'slots' || field === 'usage'
         ) {
           ;(cfg as Record<string, string>)[field] = value

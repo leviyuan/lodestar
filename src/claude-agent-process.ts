@@ -1,7 +1,7 @@
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, realpathSync } from 'node:fs'
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { spawn as crossSpawn } from 'cross-spawn'
-import { delimiter, join, resolve } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { randomUUID } from 'node:crypto'
 import {
@@ -44,6 +44,8 @@ import type {
 import { usageFromTokenUsagePayload } from './codex-usage'
 import { observeContextWindow } from './context-window-observe'
 import { acquireClaudeSessionLease, type ClaudeSessionLease } from './claude-session-lease'
+import { LauncherDiagnostics, spawnThroughLauncher, type ClaudeLauncher } from './claude-launcher'
+import { claudeTranscriptPath, type ClaudeTranscriptOptions } from './claude-transcript'
 
 type QueueWaiter<T> = (value: IteratorResult<T>) => void
 
@@ -132,6 +134,8 @@ export interface ClaudeSpawnOpts extends Omit<SpawnOpts, 'effort'> {
   controlOnly?: boolean
   /** 该进程 spawn 时绑定的 token source id;stopIdleMismatchedProcess 据此判跨 source 重启。 */
   tokenSourceId?: string | null
+  /** Start Claude Code through this wrapper (reclaude) instead of directly. */
+  launcher?: ClaudeLauncher
   /** Daemon-owned local plugin containing shared Skills. Loaded only when the
    * effective settingSources omit `user`. */
   managedSkillPluginPath?: string
@@ -252,36 +256,7 @@ function contextOccupancyFromUsage(usage: CodexUsage | null | undefined): number
   return occ > 0 ? occ : null
 }
 
-/** Native history naming: canonical cwd, ASCII path encoding, and the native long-path hash. */
-export interface ClaudeTranscriptOptions {
-  /** Effective child CONFIG_DIR; explicit empty string uses the native default. */
-  configDir?: string
-  /** Effective child PROJECT_DIR_NAME; explicit empty string disables an inherited override. */
-  projectDirName?: string
-}
-
-export function claudeTranscriptDir(workDir: string, options: ClaudeTranscriptOptions = {}): string {
-  const configuredDir = options.configDir ?? process.env.CLAUDE_CONFIG_DIR
-  const configDir = (configuredDir || join(homedir(), '.claude')).normalize('NFC')
-  const override = options.projectDirName ?? process.env.CLAUDE_CODE_PROJECT_DIR_NAME
-  if (configuredDir && override && /^[A-Za-z0-9_-]{1,64}$/.test(override)
-    && !/^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$/i.test(override)) {
-    return join(configDir, 'projects', override)
-  }
-  let canonical = resolve(workDir)
-  // The native catalog falls back to the absolute spelling if realpath is unavailable.
-  try { canonical = realpathSync(canonical) } catch {}
-  if (process.platform === 'darwin') canonical = canonical.normalize('NFC')
-  const encoded = canonical.replace(/[^a-zA-Z0-9]/g, '-')
-  // Claude Code uses a signed 32-bit string hash, then abs/base36, past 200 chars.
-  let hash = 0
-  if (encoded.length > 200) for (let i = 0; i < canonical.length; i++) hash = ((hash << 5) - hash + canonical.charCodeAt(i)) | 0
-  return join(configDir, 'projects', encoded.length > 200 ? `${encoded.slice(0, 200)}-${Math.abs(hash).toString(36)}` : encoded)
-}
-
-export function claudeTranscriptPath(workDir: string, sessionId: string, options: ClaudeTranscriptOptions = {}): string {
-  return join(claudeTranscriptDir(workDir, options), `${sessionId}.jsonl`)
-}
+export { claudeTranscriptDir, claudeTranscriptPath, type ClaudeTranscriptOptions } from './claude-transcript'
 
 /** 读 transcript jsonl,取最后一条 assistant message 的 usage —— 这是最后一次 API
  * call 的真实 per-call usage(transcript 是 claude CLI 写的,assistant 行带 finalize
@@ -707,6 +682,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   /** Set when the SDK takes an input from the local queue; reset at each result. */
   private nativeInputTaken = false
   private pendingServerToolInputs: PendingServerToolInput[] = []
+  private readonly launcherDiagnostics = new LauncherDiagnostics()
 
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
@@ -819,9 +795,11 @@ export class ClaudeAgentProcess extends EventEmitter {
           ...(executable.pathToClaudeCodeExecutable
             ? { pathToClaudeCodeExecutable: executable.pathToClaudeCodeExecutable }
             : {}),
-          ...(executable.spawnClaudeCodeProcess
-            ? { spawnClaudeCodeProcess: executable.spawnClaudeCodeProcess }
-            : {}),
+          ...(this.opts.launcher
+            ? { spawnClaudeCodeProcess: spawnThroughLauncher(this.opts.launcher, this.launcherDiagnostics) }
+            : executable.spawnClaudeCodeProcess
+              ? { spawnClaudeCodeProcess: executable.spawnClaudeCodeProcess }
+              : {}),
           permissionMode: CLAUDE_PERMISSION_MODE,
           env,
           settingSources: [...settingSources] as SettingSource[],
@@ -1021,7 +999,9 @@ export class ClaudeAgentProcess extends EventEmitter {
     await this.queryStart
     if (this.initializationError) throw this.initializationError
     if (!this.query) throw new Error('claude-agent-process: SDK query not initialized (sendInitialize failed or not called)')
-    const models = await this.query.supportedModels()
+    let models: ModelInfo[]
+    try { models = await this.query.supportedModels() }
+    catch (error) { throw await this.launcherDiagnostics.describe(error) }
     return models.map(mapModelInfo)
   }
 
@@ -1203,11 +1183,11 @@ export class ClaudeAgentProcess extends EventEmitter {
       for await (const message of q) this.handleMessage(message)
       this.finishExit(null, null)
     } catch (e) {
-      const err = e instanceof Error ? e : new Error(String(e))
       if (this.expectedExit && this.abortController.signal.aborted) {
         this.finishExit(null, null)
         return
       }
+      const err = await this.launcherDiagnostics.describe(e)
       logError('claude-agent-process: read loop failed', err)
       this.emit('error', err)
       this.finishExit(1, null)

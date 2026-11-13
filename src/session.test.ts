@@ -1654,6 +1654,38 @@ describe('Session compact command process exit', () => {
   })
 })
 
+describe('Session Claude history store', () => {
+  test('a launcher source lists and resolves conversations from its own directory, other sources from the shared one', () => {
+    const previous = listTokenSources()
+    resetTokenSourceRegistry()
+    const make = (id: string, claudeHistoryDir?: string) => registerTokenSource({
+      id, kind: claudeHistoryDir ? 'reclaude' : 'test', agent: 'claude', display: id, enabled: true,
+      models: [], defaultModel: '', modelCatalogState: { status: 'ready', updatedAt: 1 },
+      ...(claudeHistoryDir ? { claudeHistoryDir } : {}),
+      refreshModels: async () => {}, spawnEnv: (env: Record<string, string | undefined>) => env,
+      resolveSpawnModel: (model: string) => model,
+      readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
+    })
+    make('shared-source')
+    make('launcher-source', '/rec/accounts/101/config')
+    const session = new Session('history-store', 'chat_id') as any
+    try {
+      session.selectedProvider = 'claude'
+      session.selectedTokenSourceId = 'shared-source'
+      const shared = session.claudeHistoryOptions().configDir
+      expect(shared).not.toBe('/rec/accounts/101/config')
+      session.selectedTokenSourceId = 'launcher-source'
+      expect(session.claudeHistoryOptions()).toEqual({ configDir: '/rec/accounts/101/config' })
+      session.selectedTokenSourceId = null
+      expect(session.claudeHistoryOptions()).toEqual({ configDir: shared })
+    } finally {
+      session.dispose()
+      resetTokenSourceRegistry()
+      for (const item of previous) registerTokenSource(item)
+    }
+  })
+})
+
 describe('Session compact command cancellation', () => {
   /** Like the Claude backend: the compaction stays pending until the native side answers. */
   class CompactingProc extends EventEmitter {

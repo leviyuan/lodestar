@@ -66,7 +66,7 @@ export function startAgentWorker(opts: {
   }
   assertAgentIdentityIdAllowed(opts.identity.id)
   assertAgentSourceAllowed(opts.identity.tokenSourceId)
-  assertAgentSourceAllowed(source.kind === 'claude-subscription' ? 'claude-sub' : source.id)
+  assertAgentSourceAllowed(source.kind === 'claude-subscription' ? 'claude-sub' : source.kind === 'reclaude' ? 'reclaude' : source.id)
   if (!opts.identity.supportedEfforts.includes(opts.effort)) {
     throw new Error(`${opts.identity.displayName} does not support effort ${opts.effort}`)
   }

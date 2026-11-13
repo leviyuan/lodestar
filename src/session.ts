@@ -685,9 +685,10 @@ export class Session {
       ?? this.claudeStartAccountOverride ?? DEFAULT_CLAUDE_ACCOUNT
   }
 
-  /** Histories belong to the shared native store, regardless of the billing account. */
+  /** Histories belong to the shared native store, regardless of the billing account;
+   * only a launcher source (reclaude) keeps its conversations in a directory of its own. */
   claudeHistoryOptions(): { configDir: string } {
-    return { configDir: claudeAccounts.sharedConfigDir() }
+    return { configDir: this.currentTokenSource()?.claudeHistoryDir ?? claudeAccounts.sharedConfigDir() }
   }
 
   currentProvider(): AgentProvider { return this.selectedProvider }
@@ -6063,7 +6064,7 @@ export class Session {
       const snap = await ts.readUsage()
       if (snap.state === 'ok' && snap.kind !== 'balance') {
         const fiveHour = snap.windows.find(w => w.kind === 'fiveHour')
-        if (ts.kind === 'claude-subscription') {
+        if (ts.kind === 'claude-subscription' || ts.kind === 'reclaude') {
           const weekly = claudeWeeklyUsageWindow(snap, model)
           const missing = { percent: null, resetsAt: null }
           // 没有 5h 窗口表示该账号已取消 5 小时限额：不补 MISS，只显示周额度。

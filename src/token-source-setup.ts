@@ -65,6 +65,9 @@ export async function onTokenSourceEnable(s: Session, sourceId: string): Promise
     await feishu.sendText(s.chatId, config.token_sources['claude-sub']?.enabled === false
       ? 'Claude Code 订阅已在 Lodestar 中禁用。发送 `claude-sub on` 启用，所有群共用，本机登录态保持不变。'
       : ts.modelCatalogState?.error ?? '请在运行 Lodestar 的本机执行 `claude auth login` 登录 Claude 订阅，完成后等待后台刷新，发送 `md` 查看状态。')
+  } else if (ts.kind === 'reclaude') {
+    // 不可用原因由来源给出：未安装、被配置禁用、未登录或组织未绑定。
+    await feishu.sendText(s.chatId, `${ts.display} 当前不可用：${ts.modelCatalogState?.error ?? 'MISS'}\n处理后等待后台刷新（约 5 分钟），或重启 Lodestar 后发送 \`md\` 查看状态。`)
   }
 }
 

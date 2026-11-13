@@ -42,8 +42,12 @@ export function agentIdentityId(tokenSourceId: string, model: string): string {
   return `agent:${Buffer.from(`${tokenSourceId}\u0000${model}`, 'utf8').toString('base64url')}`
 }
 
+/** The native subscription, and reclaude, which starts Claude Code on an organisation's
+ * subscription login: both are subscription use, so neither is offered to Lodestar Agent. */
+const CLAUDE_SUBSCRIPTION_KINDS = ['claude-subscription', 'reclaude']
+
 function isClaudeSubscriptionSource(tokenSourceId: string): boolean {
-  return ['claude-sub', 'claude-subscription'].includes(tokenSourceId.toLowerCase())
+  return ['claude-sub', ...CLAUDE_SUBSCRIPTION_KINDS].includes(tokenSourceId.toLowerCase())
 }
 
 export function assertAgentSourceAllowed(tokenSourceId: string): void {
@@ -103,7 +107,7 @@ function collectSource(
   identities: AgentIdentity[],
   failures: AgentSourceFailure[],
 ): void {
-  if (source.kind === 'claude-subscription' || isClaudeSubscriptionSource(source.id)) return
+  if (CLAUDE_SUBSCRIPTION_KINDS.includes(source.kind) || isClaudeSubscriptionSource(source.id)) return
   const catalogState = source.modelCatalogState?.status
     ?? (!source.enabled ? 'disabled' : source.models.length > 0 ? 'ready' : 'idle')
   if (!source.enabled) {

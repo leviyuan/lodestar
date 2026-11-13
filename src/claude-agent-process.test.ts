@@ -1883,3 +1883,94 @@ describe('Claude protocol log privacy', () => {
     } finally { diagnostic.mockRestore(); failure.mockRestore() }
   })
 })
+
+describe.skipIf(process.platform === 'win32')('Claude launcher', () => {
+  function fixture(wrapperBody: string) {
+    const root = mkdtempSync(join(tmpdir(), 'claude-process-launcher-'))
+    mkdirSync(join(root, 'sdk'))
+    const native = join(root, 'sdk', 'claude')
+    writeFileSync(native, '#!/bin/sh\necho "native:$*"\n', { mode: 0o755 })
+    const wrapper = join(root, 'reclaude')
+    writeFileSync(wrapper, `#!/bin/sh\n${wrapperBody}\n`, { mode: 0o755 })
+    const captures: any[] = []
+    let started: Promise<{ code: number | null; stdout: string }> | undefined
+    // The SDK transport: start the process it resolved, then report a non-zero exit as an error.
+    const start = (options: any) => started ??= new Promise(resolve => {
+      const child = options.spawnClaudeCodeProcess({ command: native, args: ['--verbose'], cwd: root, env: options.env,
+        signal: options.abortController.signal })
+      let stdout = ''
+      child.stdout.on('data', (chunk: Buffer) => { stdout += chunk })
+      child.once('exit', (code: number | null) => resolve({ code, stdout }))
+    })
+    const spy = spyOn(agentUpdates, 'loadClaudeSdk').mockResolvedValue({
+      query({ options }: any) {
+        captures.push(options)
+        const exit = async () => {
+          const { code } = await start(options)
+          if (code !== 0) throw new Error(`Claude Code process exited with code ${code}`)
+        }
+        return {
+          supportedModels: async () => { await exit(); return [] },
+          close() {},
+          async *[Symbol.asyncIterator]() { await exit() },
+        }
+      },
+    } as any)
+    const launcher = { command: wrapper, args: ['--org', '7', 'cli'], diagnosticPrefix: 'reclaude:' }
+    return { root, launcher, captures, output: () => started!, cleanup: () => { spy.mockRestore(); rmSync(root, { recursive: true, force: true }) } }
+  }
+
+  test('starts the binary the SDK resolved through the launcher, with the launcher arguments first', async () => {
+    // Like reclaude: consume its own arguments, then exec the first `claude` on PATH.
+    const f = fixture('[ "$1 $2 $3" = "--org 7 cli" ] || exit 9\nshift 3\nexec claude "$@"')
+    const proc = new ClaudeAgentProcess({ workDir: f.root, effort: 'max', controlOnly: true, launcher: f.launcher })
+    try {
+      expect(await proc.listModels()).toEqual([])
+      expect(typeof f.captures[0].spawnClaudeCodeProcess).toBe('function')
+      expect(f.captures[0].pathToClaudeCodeExecutable).toBeUndefined()
+      expect(await f.output()).toEqual({ code: 0, stdout: 'native:--verbose\n' })
+    } finally {
+      await proc.kill().catch(() => {})
+      f.cleanup()
+    }
+  })
+
+  test('a launcher that fails before handing over is reported with its own explanation', async () => {
+    const f = fixture('echo "同步配置…" >&2\necho "reclaude: 本机还没有绑定组织 7，请先运行 reclaude org bind 7" >&2\nexit 1')
+    const logged = spyOn(logModule, 'logError').mockImplementation(() => {})
+    const proc = new ClaudeAgentProcess({ workDir: f.root, effort: 'max', controlOnly: true, launcher: f.launcher })
+    const errors: string[] = []
+    proc.on('error', (error: Error) => errors.push(error.message))
+    const exited = new Promise(resolve => proc.once('exit', resolve))
+    const expected = 'Claude Code process exited with code 1：reclaude: 本机还没有绑定组织 7，请先运行 reclaude org bind 7'
+    try {
+      await expect(proc.listModels()).rejects.toThrow(expected)
+      await exited
+      expect(errors).toEqual([expected])
+      expect(proc.isAlive()).toBe(false)
+    } finally {
+      logged.mockRestore()
+      f.cleanup()
+    }
+  })
+
+  test('without a launcher the SDK starts Claude Code itself', async () => {
+    const captures: any[] = []
+    const spy = spyOn(agentUpdates, 'loadClaudeSdk').mockResolvedValue({
+      query({ options }: any) {
+        captures.push(options)
+        let finish!: () => void
+        const ended = new Promise<void>(resolve => { finish = resolve })
+        return { close: finish, async *[Symbol.asyncIterator]() { await ended } }
+      },
+    } as any)
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'max', controlOnly: true })
+    try {
+      await proc.initializationPromise()
+      expect('spawnClaudeCodeProcess' in captures[0]).toBe(false)
+    } finally {
+      await proc.kill()
+      spy.mockRestore()
+    }
+  })
+})

@@ -23,7 +23,7 @@ export function claudeSubscriptionSettings(accountEnv: Record<string, string | u
   return { env, apiKeyHelper: '', forceLoginMethod: 'claudeai' }
 }
 
-function defaultOpus(models: TokenSource['models']): string {
+export function defaultOpus(models: TokenSource['models']): string {
   const candidates = models.filter(model => /^(?:claude:)?(?:claude-)?opus(?:$|[-\[])/i.test(model.model))
   return candidates.find(model => model.model === 'opus')?.model
     ?? candidates.sort((a, b) => b.model.localeCompare(a.model, undefined, { numeric: true }))[0]?.model ?? ''

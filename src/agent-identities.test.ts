@@ -52,6 +52,9 @@ describe('Lodestar Agent Claude subscription exclusion', () => {
       source({ id: 'claude-subscription', kind: 'other' }),
       source({ id: 'renamed-subscription', kind: 'claude-subscription' }),
       source({ id: 'claude-sub', kind: 'other' }),
+      // reclaude starts Claude Code on a subscription login as well.
+      source({ id: 'reclaude', kind: 'reclaude' }),
+      source({ id: 'renamed-launcher', kind: 'reclaude' }),
     ]
     for (const subscription of subscriptions) {
       subscription.readUsage = async () => { checks++; throw new Error('must not query subscription usage') }
@@ -126,6 +129,7 @@ describe('Lodestar Agent Claude subscription exclusion', () => {
     ['claude-sub', 'sonnet'],
     ['claude-sub', 'GLM-5.3'],
     ['claude-subscription', 'opaque'],
+    ['reclaude', 'opus'],
   ])('rejects subscription %s/%s regardless of model name', (sourceId, model) => {
     const message = "Lodestar Agent does not support Claude subscription calls; comply with Claude's user agreement."
     expect(() => assertAgentSourceAllowed(sourceId!)).toThrow(message)

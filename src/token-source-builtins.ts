@@ -19,6 +19,7 @@ import { buildRelayTokenSource, relayAgentTargets } from './token-source-relay'
 import './token-source-codex'
 import './token-source-glm'
 import './token-source-claude'
+import './token-source-reclaude'
 import './token-source-deepseek'
 import './token-source-openrouter'
 import './token-source-dsh'
@@ -98,6 +99,7 @@ export function tokenSourceSpawnRevision(
     auth_token: value?.auth_token,
     api_key: value?.api_key,
     bin: value?.bin,
+    org: value?.org,
     model: value?.model,
     effort: value?.effort,
     slots: value?.slots,

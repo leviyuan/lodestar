@@ -35,12 +35,18 @@ function codexEffort(e: unknown): AgentReasoningEffort | null {
 export const CLAUDE_EFFORTS: AgentReasoningEffort[] = ['max', 'xhigh', 'high', 'medium', 'low']
 
 type NativeClaudeModelOptions = Pick<ClaudeSpawnOpts,
-  'settingSources' | 'settings' | 'transformEnv' | 'validateAccount' | 'tokenSourceId'> & { acquireUse?(): () => void }
+  'settingSources' | 'settings' | 'transformEnv' | 'validateAccount' | 'tokenSourceId' | 'launcher'> & {
+  acquireUse?(): () => void
+  /** 经启动器时首次启动较慢，可放宽目录查询时限。 */
+  timeoutMs?: number
+  /** 目录读取成功后、关闭进程前，在同一控制进程上追加查询（如额度），省去再启动一次。 */
+  afterCatalog?(proc: { readSubscriptionUsage(): Promise<unknown> }): Promise<void>
+}
 
 /** SDK 控制接口不发送用户输入；目录读取后关闭这个独立查询进程。 */
 export async function fetchNativeClaudeModels(options: NativeClaudeModelOptions = {}): Promise<TokenSourceModel[]> {
   const { ClaudeAgentProcess } = await import('./claude-agent-process')
-  const { acquireUse, ...spawn } = options
+  const { acquireUse, timeoutMs, afterCatalog, ...spawn } = options
   const release = acquireUse?.()
   let proc: InstanceType<typeof ClaudeAgentProcess>
   try { proc = new ClaudeAgentProcess({ workDir: homedir(), effort: 'high',
@@ -49,8 +55,9 @@ export async function fetchNativeClaudeModels(options: NativeClaudeModelOptions 
   if (release) proc.once('exit', release)
   proc.on('error', error => logError('claude model catalog failed', error))
   try {
-    const catalog = await withTimeout(proc.listModels())
+    const catalog = await withTimeout(proc.listModels(), timeoutMs)
     if (!catalog.length) throw new Error('Claude SDK model catalog is empty')
+    await afterCatalog?.(proc)
     return catalog.map(model => ({ model: model.model.replace(/^claude:/, ''), display: model.displayName,
       efforts: model.supportedReasoningEfforts.map(item => item.reasoningEffort as AgentReasoningEffort),
       defaultEffort: model.defaultReasoningEffort as AgentReasoningEffort }))

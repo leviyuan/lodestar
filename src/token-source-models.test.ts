@@ -214,3 +214,45 @@ test('Codex model discovery reads every page, retries the same account and expos
   })
   expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
 })
+
+test('a native catalog read can reuse its control process for one more query before it closes', () => {
+  const script = `
+    import { mock } from 'bun:test'
+    import assert from 'node:assert/strict'
+    import { EventEmitter } from 'node:events'
+    const events = []
+    let listDelayMs = 0
+    class FakeProcess extends EventEmitter {
+      constructor(options) { super(); this.options = options; this.alive = true; events.push('spawn') }
+      isAlive() { return this.alive }
+      async kill() { this.alive = false; events.push('kill'); this.emit('exit', 0, null) }
+      async listModels() {
+        if (listDelayMs) await new Promise(resolve => setTimeout(resolve, listDelayMs))
+        events.push('models')
+        return [{ model: 'claude:opus', displayName: 'Opus', supportedReasoningEfforts: [{ reasoningEffort: 'high' }], defaultReasoningEffort: 'high' }]
+      }
+      async readSubscriptionUsage() { events.push('usage'); return { ok: true } }
+    }
+    mock.module('./src/claude-agent-process', () => ({ ClaudeAgentProcess: FakeProcess }))
+    const { fetchNativeClaudeModels } = await import('./src/token-source-models')
+    const launcher = { command: '/opt/reclaude', args: ['cli'], diagnosticPrefix: 'reclaude:' }
+    let seen
+    const models = await fetchNativeClaudeModels({ launcher, timeoutMs: 1000,
+      afterCatalog: async proc => { seen = await proc.readSubscriptionUsage() } })
+    assert.deepEqual(models, [{ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' }])
+    assert.deepEqual(seen, { ok: true })
+    assert.deepEqual(events, ['spawn', 'models', 'usage', 'kill'])
+    // A failing extra query fails the read, and the process is still closed.
+    events.length = 0
+    await assert.rejects(fetchNativeClaudeModels({ afterCatalog: async () => { throw new Error('extra query failed') } }), /extra query failed/)
+    assert.deepEqual(events, ['spawn', 'models', 'kill'])
+    // The caller's time limit replaces the default one.
+    events.length = 0; listDelayMs = 200
+    await assert.rejects(fetchNativeClaudeModels({ timeoutMs: 20 }), /timeout 20ms/)
+    assert.deepEqual(events.slice(0, 2), ['spawn', 'kill'])
+  `
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+    cwd: process.cwd(), stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: 20_000,
+  })
+  expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+})

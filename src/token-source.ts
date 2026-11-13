@@ -8,6 +8,7 @@ import type { TokenSourceConfig } from './config'
 import type { AccountInfo, Settings } from '@anthropic-ai/claude-agent-sdk'
 import type { CodexApiProvider } from './codex-process'
 import type { CodexCredits } from './codex-credits'
+import type { ClaudeLauncher } from './claude-launcher'
 import { codexAccounts } from './codex-accounts'
 
 export type TokenSourceAgent = AgentProvider
@@ -149,6 +150,10 @@ export interface TokenSource {
   settingSources?: readonly string[]
   /** Claude 来源的进程级设置覆盖；不修改本机 settings 文件。 */
   claudeSettings?: Settings
+  /** 经该启动器运行 Claude Code（reclaude）；会话、委派和目录查询共用。 */
+  claudeLauncher?: ClaudeLauncher
+  /** 该来源的会话记录不在共享的原生目录，而在这个配置目录下；其他来源的进程读不到。 */
+  claudeHistoryDir?: string
   /** Custom Responses provider; subscription account selection/usage do not apply. */
   codexApiProvider?: CodexApiProvider
   /** 在 Claude SDK 接收用户输入前确认实际认证来源。 */

@@ -1,5 +1,9 @@
 import { expect, test } from 'bun:test'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { createAgentProcess } from './agent-launch'
+import { claudeTranscriptPath } from './claude-agent-process'
 import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, tokenSourceFactories, type TokenSource } from './token-source'
 import './token-source-openrouter'
 
@@ -121,5 +125,78 @@ test('the shared Claude launch passes the selected OpenRouter slug to its role e
   } finally {
     resetTokenSourceRegistry()
     for (const item of previous) registerTokenSource(item)
+  }
+})
+
+test('a source launcher reaches the Claude process together with the default setting sources', () => {
+  const previous = listTokenSources()
+  resetTokenSourceRegistry()
+  const launcher = { command: '/opt/reclaude', args: ['--org', '7', 'cli'], diagnosticPrefix: 'reclaude:' }
+  const source: TokenSource = {
+    id: 'launcher-test', kind: 'reclaude', agent: 'claude', display: 'Launcher', enabled: true,
+    models: [{ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' }], defaultModel: 'opus',
+    modelCatalogState: { status: 'ready', updatedAt: 1 }, claudeLauncher: launcher,
+    refreshModels: async () => {},
+    spawnEnv: env => ({ ...env, CLAUDE_CONFIG_DIR: '/rec/config' }),
+    resolveSpawnModel: model => model,
+    readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+  }
+  registerTokenSource(source)
+  try {
+    const opts = { provider: 'claude' as const, workDir: '/tmp', tokenSourceId: source.id, model: 'opus', effort: 'high' as const }
+    const created = (createAgentProcess(opts).process as any).opts
+    expect(created.launcher).toBe(launcher)
+    expect(created.settingSources).toEqual(['project', 'local'])
+    expect(created.transformEnv({}).CLAUDE_CONFIG_DIR).toBe('/rec/config')
+    // A source without a launcher starts Claude Code directly.
+    delete source.claudeLauncher
+    expect('launcher' in (createAgentProcess(opts).process as any).opts).toBe(false)
+  } finally {
+    resetTokenSourceRegistry()
+    for (const item of previous) registerTokenSource(item)
+  }
+})
+
+test('a conversation kept in a launcher source cannot be continued from the shared store, or the reverse', () => {
+  const previous = listTokenSources()
+  resetTokenSourceRegistry()
+  const root = mkdtempSync(join(tmpdir(), 'lodestar-launch-history-'))
+  const workDir = join(root, 'project')
+  const launcherDir = join(root, 'launcher-config')
+  const transcript = claudeTranscriptPath(workDir, 'kept-by-launcher', { configDir: launcherDir, projectDirName: '' })
+  mkdirSync(dirname(transcript), { recursive: true })
+  writeFileSync(transcript, '{}\n')
+  const make = (overrides: Partial<TokenSource>): TokenSource => ({
+    id: 'shared-test', kind: 'test', agent: 'claude', display: '共享来源', enabled: true,
+    models: [{ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' }], defaultModel: 'opus',
+    modelCatalogState: { status: 'ready', updatedAt: 1 },
+    refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
+    readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    ...overrides,
+  })
+  registerTokenSource(make({}))
+  registerTokenSource(make({ id: 'launcher-test', kind: 'reclaude', display: '启动器来源', claudeHistoryDir: launcherDir,
+    claudeLauncher: { command: '/opt/reclaude', args: ['cli'], diagnosticPrefix: 'reclaude:' } }))
+  const launch = (tokenSourceId: string, sessionId: string, kind: 'resume' | 'fork' = 'resume') => createAgentProcess({
+    provider: 'claude', workDir, tokenSourceId, model: 'opus', effort: 'high',
+    launch: { kind, source: { provider: 'claude', sessionId, cwd: workDir } },
+  })
+  try {
+    // Within one store nothing changes, and an unknown id is left to the native resume.
+    expect(launch('launcher-test', 'kept-by-launcher').process.provider).toBe('claude')
+    expect(launch('shared-test', 'kept-in-shared-store').process.provider).toBe('claude')
+    expect(createAgentProcess({ provider: 'claude', workDir, tokenSourceId: 'launcher-test', model: 'opus', effort: 'high' })
+      .process.provider).toBe('claude')
+
+    expect(() => launch('launcher-test', 'kept-in-shared-store'))
+      .toThrow('该会话的记录不在 启动器来源 的会话目录中')
+    for (const kind of ['resume', 'fork'] as const) {
+      expect(() => launch('shared-test', 'kept-by-launcher', kind))
+        .toThrow('该会话的记录保存在 启动器来源 的会话目录中')
+    }
+  } finally {
+    resetTokenSourceRegistry()
+    for (const item of previous) registerTokenSource(item)
+    rmSync(root, { recursive: true, force: true })
   }
 })
