@@ -361,11 +361,13 @@ async function lock(directory: string, signal?: AbortSignal): Promise<() => Prom
     signal?.throwIfAborted()
     try {
       await mkdir(path)
-      let ino: number
+      // Identifies this updater's lock at release. An inode cannot: Linux hands the same
+      // number to a directory created right after one was removed.
+      const owner = randomUUID()
       try {
         // Other updaters may inspect the directory immediately. Publish a complete PID atomically.
         await retryAgentFileOperation(async () => writeStateFileAtomic(join(path, 'pid'), String(process.pid)))
-        ino = (await stat(path)).ino
+        await retryAgentFileOperation(async () => writeStateFileAtomic(join(path, 'owner'), owner))
       } catch (error) {
         try { await retryAgentFileOperation(() => rm(path, { recursive: true })) }
         catch (cleanup) { throw new AggregateError([error, cleanup], `${errorMessage(error)}; runtime update lock cleanup failed: ${errorMessage(cleanup)}`) }
@@ -374,7 +376,7 @@ async function lock(directory: string, signal?: AbortSignal): Promise<() => Prom
       // A lock already gone, or replaced by another updater's, is not this updater's to remove.
       return async () => {
         try {
-          if ((await stat(path)).ino !== ino) return
+          if (await readFile(join(path, 'owner'), 'utf8') !== owner) return
           await retryAgentFileOperation(() => rm(path, { recursive: true }))
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
