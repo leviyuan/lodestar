@@ -333,24 +333,45 @@ async function pruneStaleStaging(agent: UpdatedAgent, directory: string, options
   }
 }
 
+/** What identified a lock when it was judged stale: the PID and owner token recorded in it.
+ * Never the inode or the timestamps of the directory: Linux gives the inode of a directory
+ * just removed to the next one created, and a check that kept failing on some platform made
+ * the reclaim retry without pause. `mtimeMs` only dates a lock that has no PID yet. */
+interface ObservedLock { pid: string | undefined; owner: string | undefined; mtimeMs: number }
+
+async function observeLock(path: string): Promise<ObservedLock> {
+  const { mtimeMs } = await stat(path)
+  const read = async (name: string): Promise<string | undefined> => {
+    try { return await readFile(join(path, name), 'utf8') }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      return undefined
+    }
+  }
+  return { pid: await read('pid'), owner: await read('owner'), mtimeMs }
+}
+
 /** Moves a dead updater's lock aside, then checks it is the same lock that was
  * judged stale: another waiter may have reclaimed it and taken a fresh one in
- * between, and that live lock is handed back instead of deleted. */
-async function reclaimLock(directory: string, path: string, observed: { ino: number; mtimeMs: number }): Promise<void> {
+ * between, and that live lock is handed back instead of deleted. Returns whether
+ * the path is now free; false means another updater holds it and the caller waits. */
+async function reclaimLock(directory: string, path: string, observed: ObservedLock): Promise<boolean> {
   const aside = join(directory, `${STALE_LOCK_PREFIX}${Date.now()}-${randomUUID()}`)
   try { await retryAgentFileOperation(() => rename(path, aside)) }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true
     throw error
   }
-  const moved = await stat(aside)
-  if (moved.ino !== observed.ino || moved.mtimeMs !== observed.mtimeMs) {
+  const moved = await observeLock(aside)
+  // A lock taken meanwhile carries its holder's PID and token within moments of its creation.
+  if (moved.pid !== observed.pid || moved.owner !== observed.owner) {
     try { await retryAgentFileOperation(() => rename(aside, path)) }
     catch (error) { throw new Error(`Runtime update lock was replaced while reclaiming a stale lock and could not be restored: ${path}: ${errorMessage(error)}`) }
-    return
+    return false
   }
   // A failed removal leaves only an inert directory; the next successful update sweeps and reports it.
   try { await retryAgentFileOperation(() => rm(aside, { recursive: true })) } catch {}
+  return true
 }
 
 /** Directory lock also serializes a manual CLI update with the daemon timer. */
@@ -385,24 +406,24 @@ async function lock(directory: string, signal?: AbortSignal): Promise<() => Prom
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
       try {
-        const observed = await stat(path)
-        let text: string | undefined
-        try { text = await readFile(join(path, 'pid'), 'utf8') }
-        catch (cause) { if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause }
-        if (text === undefined) {
+        const observed = await observeLock(path)
+        // A reclaim that finds another updater's lock in its place waits like any other
+        // waiter; retrying at once would spin on a lock that keeps failing the check.
+        let stale = false
+        if (observed.pid === undefined) {
           // The PID is published right after mkdir; a lock still without one
           // long after belongs to an updater that died in between.
-          if (Date.now() - observed.mtimeMs >= LOCK_PID_GRACE_MS) { await reclaimLock(directory, path, observed); continue }
+          stale = Date.now() - observed.mtimeMs >= LOCK_PID_GRACE_MS
         } else {
-          const pid = Number(text)
+          const pid = Number(observed.pid)
           if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`Invalid runtime update lock: ${path}`)
           try { process.kill(pid, 0) }
           catch (cause) {
             if ((cause as NodeJS.ErrnoException).code !== 'ESRCH') throw cause
-            await reclaimLock(directory, path, observed)
-            continue
+            stale = true
           }
         }
+        if (stale && await reclaimLock(directory, path, observed)) continue
       } catch (cause) {
         if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause
       }
