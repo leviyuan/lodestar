@@ -6,6 +6,7 @@ import { formatDuration } from './duration'
 import {
   AGENT_CARD_TASK_KIND_ORDER,
   agentCardTaskKindLabel,
+  agentCardTaskKindShortLabel,
   type AgentCardTaskKind,
 } from './task-kind'
 import { boundedResultContent, compactTaskContent } from './task-content'
@@ -129,7 +130,7 @@ export function delegationCardSummary(tasks: Array<{
   return done ? `✅ ${done}` : `✅ ${tasks.length}项已完成`
 }
 
-/** e.g. `后台1·子Agent1`; three or more kinds return null so the caller can
+/** e.g. `子Agent1·后台1`; three or more kinds return null so the caller can
  * collapse to a total that still fits the ~15 character preview. */
 function kindCounts(tasks: Array<{ kind?: AgentCardTaskKind }>): string | null {
   const counts = new Map<AgentCardTaskKind, number>()
@@ -140,15 +141,6 @@ function kindCounts(tasks: Array<{ kind?: AgentCardTaskKind }>): string | null {
   const parts = AGENT_CARD_TASK_KIND_ORDER.filter(kind => counts.has(kind))
     .map(kind => `${agentCardTaskKindShortLabel(kind)}${counts.get(kind)}`)
   return parts.length > 2 ? null : parts.join('·')
-}
-
-function agentCardTaskKindShortLabel(kind: AgentCardTaskKind): string {
-  switch (kind) {
-    case 'project': return '项目'
-    case 'delegated': return '委派'
-    case 'subagent': return '子Agent'
-    case 'background': return '后台'
-  }
 }
 
 /** Render a bounded worker result; only the task prompt uses the shorter limit. */

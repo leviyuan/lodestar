@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, modelChangeStatusCard, modelCustomPromptCard, modelEffortSelectionCard, modelResultCard, modelResultPanelElement, modelSelectionCard, providerSelectionCard, statusCard, streamingOffSettings } from './console'
+import { consoleBodyElements, consoleCurrentModelContent, consoleMainContent, consoleUsageContent, modelChangeStatusCard, modelCustomPromptCard, modelEffortSelectionCard, modelResultCard, modelResultPanelElement, modelSelectionCard, providerSelectionCard, statusCard, streamingOffSettings } from './console'
 import {
   askUserQuestionElement,
   contextCompactionElement,
@@ -296,6 +296,25 @@ describe('main conversation card rendering', () => {
     expect(body).not.toContain('上一轮')
     expect(body).not.toContain('累计')
     expect(body).not.toContain('thread')
+  })
+
+  test('active project rows count background work right after the status', () => {
+    const lines = consoleMainContent({
+      sessionName: 'probe',
+      status: 'idle',
+      peers: [
+        { name: 'busy-idle', isCurrent: true, status: 'idle', uptimeMs: 65_000, workload: { background: 2, subagents: 1 } },
+        { name: 'quiet', isCurrent: false, status: 'idle', workload: { background: 0, subagents: 0 } },
+        { name: 'codex', isCurrent: false, status: 'working', codexAccountName: '工作订阅', workload: { background: null, subagents: 0 } },
+        { name: 'legacy', isCurrent: false, status: 'idle' },
+      ],
+    }).split('\n')
+
+    expect(lines[0]).toBe('　· 🟢 `busy-idle` · 闲 · 子Agent1·后台2 · 1m · 当前')
+    // Nothing running beside the main turn keeps the row exactly as before.
+    expect(lines[1]).toBe('　· 🟢 `quiet` · 闲')
+    expect(lines[2]).toBe('　· ⚙️ `codex` · 工作中 · 后台MISS · Codex：`工作订阅`')
+    expect(lines[3]).toBe('　· 🟢 `legacy` · 闲')
   })
 
   test('console keeps the original Codex model header but labels Claude explicitly', () => {

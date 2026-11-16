@@ -578,15 +578,15 @@ export async function runBtwCommand(s: Session, userOpenId: string, role = ''): 
 }
 
 /** `bl` / `btwlist`：列出本机登记的全部临时会话（btw/fk 都算），
- * 并合并本 daemon 已构造会话的实时状态；只读本地租约与内存，不发网络查询。 */
+ * 并合并本 daemon 已构造会话的实时状态；只读本地租约、内存和运行中后端的本机进程状态，不发网络查询。 */
 export async function runBtwListCommand(s: Session): Promise<void> {
-  const peers = new Map(s.tempSessionPeers().map(peer => [peer.chatId, peer]))
+  const peers = new Map((await s.tempSessionPeers()).map(peer => [peer.chatId, peer]))
   const entries = new Map<string, cards.BtwListEntry>()
   const entryFor = (
     chatName: string,
     chatId: string,
     createdAt: number | null,
-    peer: ReturnType<Session['tempSessionPeers']>[number] | undefined,
+    peer: Awaited<ReturnType<Session['tempSessionPeers']>>[number] | undefined,
   ): cards.BtwListEntry => {
     const selection = peer ? null : feishu.getSessionModelSelection(chatName)
     return {
@@ -599,6 +599,7 @@ export async function runBtwListCommand(s: Session): Promise<void> {
       provider: peer?.provider ?? selection?.provider ?? null,
       model: peer ? peer.model : selection?.model ?? null,
       effort: peer ? peer.effort : selection?.effort ?? null,
+      workload: peer?.workload ?? null,
     }
   }
   for (const lease of feishu.listTempSessionLeases()) {

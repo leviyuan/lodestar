@@ -144,4 +144,4 @@ export {
   LIVE_ELAPSED_SECOND_FOOTER_TICK_MS,
   type LiveElapsedMode,
 } from './cards/background'
-export { type AgentCardTaskKind } from './cards/task-kind'
+export { type AgentCardTaskKind, type SessionWorkload, sessionWorkloadLabel } from './cards/task-kind'

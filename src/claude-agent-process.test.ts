@@ -882,6 +882,47 @@ describe('Claude background task protocol validation', () => {
     })
     expect(settled).toEqual([{ task_id: 'task-1', status: 'completed', tool_use_id: undefined, summary: undefined, usage: undefined }])
   })
+
+  test('counts live background processes from the SDK level, without subagents or ambient tasks', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    // The level is per process and nothing is sent at startup: no level yet.
+    expect(await proc.backgroundProcessCount()).toBeUndefined()
+
+    proc.handleMessage({
+      type: 'system', subtype: 'background_tasks_changed', uuid: 'level-1', session_id: 'session-1',
+      tasks: [
+        { task_id: 'bash-1', task_type: 'local_bash', description: 'dev server' },
+        { task_id: 'agent-1', task_type: 'local_agent', subagent_type: 'general-purpose', description: 'review' },
+        { task_id: 'flow-1', task_type: 'local_workflow', description: 'spec' },
+        { task_id: 'watch-1', task_type: 'monitor_ws', description: 'watch', ambient: true },
+      ],
+    })
+    expect(await proc.backgroundProcessCount()).toBe(2)
+
+    // REPLACE semantics: each payload is the whole live set.
+    proc.handleMessage({ type: 'system', subtype: 'background_tasks_changed', uuid: 'level-2', session_id: 'session-1', tasks: [] })
+    expect(await proc.backgroundProcessCount()).toBe(0)
+  })
+
+  test('an unreadable level is an error until the next valid payload', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const diagnostic = spyOn(logModule, 'logDiagnostic').mockImplementation(() => {})
+    try {
+      proc.handleMessage({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'bash-1' }] })
+      const error = await proc.backgroundProcessCount().then(() => undefined, (failure: Error) => failure)
+      expect(error?.message).toBe('Claude 后台任务列表无法识别')
+      expect(diagnostic).toHaveBeenCalledWith('claude-agent-process: malformed background task level')
+
+      proc.handleMessage({ type: 'system', subtype: 'background_tasks_changed', tasks: 'not-a-list' })
+      expect(await proc.backgroundProcessCount().then(() => undefined, (failure: Error) => failure)).toBeInstanceOf(Error)
+
+      proc.handleMessage({
+        type: 'system', subtype: 'background_tasks_changed',
+        tasks: [{ task_id: 'bash-1', task_type: 'local_bash', description: 'dev server' }],
+      })
+      expect(await proc.backgroundProcessCount()).toBe(1)
+    } finally { diagnostic.mockRestore() }
+  })
 })
 
 describe('Claude user dialog bridge', () => {
@@ -1867,18 +1908,24 @@ describe('Claude protocol log privacy', () => {
       const proc = new ClaudeAgentProcess({ workDir: '/private/project', effort: 'high' }) as any
       const privateText = 'private-user private-group private-task /private/source.ts'
       proc.handleMessage({ type: 'tool_progress', session_id: 'private-session', tool_use_id: privateText })
-      for (const subtype of ['background_tasks_changed', 'vcs_state_changed', 'hook_started', 'hook_response']) {
+      for (const subtype of ['vcs_state_changed', 'hook_started', 'hook_response']) {
         proc.handleMessage({ type: 'system', subtype, session_id: 'private-session', text: privateText })
       }
+      proc.handleMessage({
+        type: 'system', subtype: 'background_tasks_changed', session_id: 'private-session',
+        tasks: [{ task_id: privateText, task_type: 'local_bash', description: privateText }],
+      })
       expect(diagnostic).not.toHaveBeenCalled()
       expect(failure).not.toHaveBeenCalled()
       proc.handleMessage({ type: privateText, session_id: 'private-session', text: privateText })
       proc.handleMessage({ type: 'system', subtype: privateText, text: privateText })
       proc.handleMessage({ type: 'command_lifecycle', command_uuid: privateText, state: privateText })
+      proc.handleMessage({ type: 'system', subtype: 'background_tasks_changed', session_id: 'private-session', text: privateText })
       expect(diagnostic.mock.calls).toEqual([
         ['claude-agent-process: unknown message'],
         ['claude-agent-process: unknown system event'],
         ['claude-agent-process: malformed command lifecycle'],
+        ['claude-agent-process: malformed background task level'],
       ])
     } finally { diagnostic.mockRestore(); failure.mockRestore() }
   })

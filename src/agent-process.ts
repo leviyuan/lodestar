@@ -150,6 +150,10 @@ export interface AgentProcess extends EventEmitter {
   /** codex:在现有 app-server 连接上读账号额度(read 端点,权威多桶);
    *  claude:无此通道,返回 null(session 的额度走 token source)。 */
   readRateLimits?(): Promise<any>
+  /** 后端自报的实时后台进程数(不含子 Agent),供 hi/bl 状态行:Claude 取 SDK
+   *  `background_tasks_changed` 电平,Codex 查询主线程后台终端。尚未收到电平时
+   *  resolve undefined,调用方退回任务卡跟踪;读不到实时集合时 reject。 */
+  backgroundProcessCount?(): Promise<number | undefined>
 }
 
 export interface AgentModel extends Omit<CodexModel, 'supportedReasoningEfforts' | 'defaultReasoningEffort'> {

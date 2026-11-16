@@ -107,7 +107,8 @@ export function backgroundMigratedElement(): object {
 
 // ── 归一化 / 判定 ────────────────────────────────────────────────────
 
-function normalizeType(taskType?: string, subagentType?: string): BgTaskType {
+/** 任务卡与 hi/bl 计数共用的种类判定(含 SDK `background_tasks_changed` 电平条目)。 */
+export function bgTaskTypeOf(taskType?: string, subagentType?: string): BgTaskType {
   // SDK 实测 task_type 带 local_ 前缀:local_agent / local_bash / local_workflow。
   const t = taskType ?? ''
   if (t === 'agent' || t === 'subagent' || t === 'local_agent') return 'subagent'
@@ -141,7 +142,7 @@ export function applyBgTaskStarted(
   e: BgTaskStartedEvent,
   now: number = Date.now(),
 ): BgStore {
-  const type = normalizeType(e.task_type, e.subagent_type)
+  const type = bgTaskTypeOf(e.task_type, e.subagent_type)
   // A native Agent/Task tool can precede the SDK's task id. Its tool_use_id
   // keeps that same panel and accumulated steps when the real id arrives.
   const matches = (t: BgTaskEntry): boolean => t.id === e.task_id

@@ -623,6 +623,24 @@ export class Session {
     return [...this.backgroundTasks, ...this.pendingBgTasks]
       .filter(task => task.type === 'subagent' && !cards.isBgTerminal(task)).length
   }
+  /** What still runs beside the main turn, for the hi/bl status rows. Subagents are
+   * the running rows of the shared task card (foreground included, every backend).
+   * Background processes prefer the backend's own live set (Claude's SDK level,
+   * Codex's background terminals) and fall back to the task card's non-subagent
+   * rows until a backend reports one; an unreadable live set is null (MISS). */
+  async workload(): Promise<cards.SessionWorkload> {
+    const proc = this.proc
+    if (!proc?.isAlive()) return { background: 0, subagents: 0 }
+    const subagents = this.activeSubagents()
+    const tracked = this.backgroundTasks.filter(task => task.type !== 'subagent' && !cards.isBgTerminal(task)).length
+    if (!proc.backgroundProcessCount) return { background: tracked, subagents }
+    try {
+      return { background: (await proc.backgroundProcessCount()) ?? tracked, subagents }
+    } catch (error) {
+      logError('session: background process count failed', error)
+      return { background: null, subagents }
+    }
+  }
   /** Running sessions normally revive after daemon restart. A process kept
    * only because the user's explicit stop could not yet be confirmed must not
    * undo that stop intent on the next boot. */
@@ -853,7 +871,7 @@ export class Session {
 
   /** 本 daemon 中已构造的临时群会话；`bl` 列表与 hi 的 peers 同源。
    * 还没被任何消息唤醒的旧临时群不在里面，由持久化租约补全。 */
-  tempSessionPeers(): Array<{
+  async tempSessionPeers(): Promise<Array<{
     sessionName: string
     chatId: string
     status: Status
@@ -861,18 +879,23 @@ export class Session {
     provider: AgentProvider
     model: string | null
     effort: AgentReasoningEffort | null
-  }> {
-    return [...Session.all]
+    /** 运行中会话的后台进程与子 Agent 数；未运行为 null。 */
+    workload: cards.SessionWorkload | null
+  }>> {
+    const peers = [...Session.all]
       .filter(peer => feishu.tempProjectName(peer.sessionName) !== null)
-      .map(peer => ({
-        sessionName: peer.sessionName,
-        chatId: peer.chatId,
-        status: peer.status,
-        running: peer.isRunning(),
-        provider: peer.selectedProvider,
-        model: peer.selectedModel,
-        effort: peer.selectedEffort,
-      }))
+      .map(peer => ({ peer, running: peer.isRunning() }))
+    const workloads = await Promise.all(peers.map(({ peer, running }) => running ? peer.workload() : null))
+    return peers.map(({ peer, running }, index) => ({
+      sessionName: peer.sessionName,
+      chatId: peer.chatId,
+      status: peer.status,
+      running,
+      provider: peer.selectedProvider,
+      model: peer.selectedModel,
+      effort: peer.selectedEffort,
+      workload: workloads[index] ?? null,
+    }))
   }
 
   private modelForSpawn(): string | undefined {
@@ -2934,7 +2957,8 @@ export class Session {
 
   /** Build the hi-panel data snapshot for this session, including the cached account usage. */
   async buildConsoleOpts(): Promise<cards.ConsoleOpts> {
-    const sysinfo = await readSysInfo()
+    const running = [...Session.all].filter(s => s.isRunning())
+    const [sysinfo, workloads] = await Promise.all([readSysInfo(), Promise.all(running.map(s => s.workload()))])
     const runtime = this.runtimeModelSelection()
     return {
       sessionName: this.sessionName,
@@ -2943,12 +2967,11 @@ export class Session {
       model: runtime.model ?? undefined,
       effort: runtime.effort ?? 'MISS',
       worktreeInstructionNotice: this.worktreeInstructionLoadedNotice(),
-      peers: [...Session.all]
-        .filter(s => s.isRunning())
-        .map(s => ({
-          ...s.peerSnapshot(),
-          isCurrent: s === this,
-        })),
+      peers: running.map((s, index) => ({
+        ...s.peerSnapshot(),
+        isCurrent: s === this,
+        workload: workloads[index],
+      })),
       accountUsages: await readAllAccountUsage(),
       sysinfo,
     }

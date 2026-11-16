@@ -14,6 +14,7 @@ import { formatDuration } from './duration'
 import { codexCreditsSummary, fmtResetIn } from './usage'
 import type { AccountUsage } from '../account-usage'
 import { accountUsageRow, compactAccountUsage } from './account-usage'
+import { sessionWorkloadLabel, type SessionWorkload } from './task-kind'
 
 export { fmtResetIn } from './usage'
 
@@ -37,6 +38,8 @@ export interface ConsoleOpts {
     /** Actual live Codex process account, independent of the next-start selection. */
     codexAccountName?: string
     claudeAccountName?: string
+    /** Background processes and subagents still running beside the main turn. */
+    workload?: SessionWorkload
   }>
   /** 统一用量快照(来自 tokenSource.readUsage)。
    * 加新 token source 的额度自动支持 —— 只要 source.readUsage 返回 unified。 */
@@ -303,7 +306,9 @@ export function consoleMainContent(opts: ConsoleOpts): string {
   if (peers.length === 0) return '_无_'
   return peers.map((p) => {
     const dot = PEER_STATUS_EMOJI[p.status] ?? '·'
-    const label = PEER_STATUS_LABEL[p.status] ?? p.status
+    // 「闲」只说明主线程空着；后台进程和子 Agent 仍在跑时紧跟状态写出数量。
+    const workload = sessionWorkloadLabel(p.workload)
+    const label = `${PEER_STATUS_LABEL[p.status] ?? p.status}${workload ? ` · ${workload}` : ''}`
     const up = p.uptimeMs != null && p.uptimeMs > 0 ? ` · ${fmtUptime(p.uptimeMs)}` : ''
     const mark = p.isCurrent ? ' · 当前' : ''
     const account = p.claudeAccountName !== undefined

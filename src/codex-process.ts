@@ -67,6 +67,10 @@ const CODEX_GENERATED_IMAGES_DIR = join(codexAccounts.defaultHome, 'generated_im
 // app-server control requests return an acknowledgement, not the whole model
 // turn. Bound them so a live PID with a dead transport cannot leak promises.
 const CODEX_REQUEST_TIMEOUT_MS = 30_000
+// `thread/backgroundTerminals/list` feeds an instant hi/bl snapshot: keep each page short.
+const BACKGROUND_TERMINAL_LIST_TIMEOUT_MS = 3_000
+const BACKGROUND_TERMINAL_PAGE_SIZE = 100
+const BACKGROUND_TERMINAL_MAX_PAGES = 10
 const CODEX_MATERIALIZATION_VERIFY_TIMEOUT_MS = 10 * 60_000
 const CODEX_TURN_RETRY_BASE_MS = 5_000
 const CODEX_TURN_RETRY_MAX_MS = 60_000
@@ -1601,6 +1605,29 @@ export class CodexProcess extends EventEmitter {
   async readRateLimits(): Promise<any> {
     await this.ensureInitialized()
     return this.request('account/rateLimits/read', {})
+  }
+
+  /** 主线程仍在运行的后台终端数(hi/bl 的「后台N」)。app-server 不推送后台终端
+   *  变化,只能按需查 `thread/backgroundTerminals/list` 并跟随分页;尚未建线程时
+   *  没有终端。hi/bl 是即时快照,单页查询用短超时,失败如实上抛。 */
+  async backgroundProcessCount(): Promise<number> {
+    const threadId = this.sessionId
+    if (!threadId) return 0
+    let count = 0
+    let cursor: string | null = null
+    for (let page = 0; page < BACKGROUND_TERMINAL_MAX_PAGES; page++) {
+      const result = await this.request('thread/backgroundTerminals/list', {
+        threadId, limit: BACKGROUND_TERMINAL_PAGE_SIZE, ...(cursor ? { cursor } : {}),
+      }, BACKGROUND_TERMINAL_LIST_TIMEOUT_MS)
+      const next = result?.nextCursor
+      if (!Array.isArray(result?.data) || next != null && typeof next !== 'string') {
+        throw new Error('Codex 后台终端列表格式无法识别')
+      }
+      count += result.data.length
+      cursor = next || null
+      if (!cursor) return count
+    }
+    throw new Error('Codex 后台终端列表分页超过上限')
   }
 
   private initializeParams(): Record<string, unknown> {

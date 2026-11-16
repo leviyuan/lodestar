@@ -323,6 +323,15 @@ export class CodexAccountProcess extends EventEmitter implements AgentProcess {
     if (!child.readRateLimits) throw new Error('Codex 额度接口 MISS')
     return child.readRateLimits()
   }
+  /** Read-only, so it asks whichever child is actually running, even mid-switch.
+   * While waiting for quota, or after the old child stopped, no app-server exists
+   * and therefore no background terminal does either. */
+  async backgroundProcessCount() {
+    const child = this.inner
+    if (!child?.isAlive()) return 0
+    if (!child.backgroundProcessCount) throw new Error('Codex 后台终端接口 MISS')
+    return child.backgroundProcessCount()
+  }
   private respondingChild(): AgentProcess {
     if (!this.inner?.isAlive() || this.lifetime.signal.aborted) throw new Error('Codex 请求所属进程已退出')
     return this.inner

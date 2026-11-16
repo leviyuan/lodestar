@@ -82,6 +82,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - Codex 生图超过 30 MB 时自动转云空间交付；其余图片与提示词默认放在同一个折叠面板，提示词包含完成事件补回的内容，不在折叠标题中展开。图片成功嵌入后不再单发；无法嵌入时按用户要求单独发图。关闭或换卡前等待所属图片上传和写入完成。
 - `hi` 展示全部已配置账号，一账号一行；DeepSeek、GLM 不按 Agent 重复展示。Codex 只显示主额度，不显示 Spark/gpt-reserve；Codex 账号可用的重置卡次数来自 `account/rateLimits/read` 的 `rateLimitResetCredits.availableCount`，简写为“重置”，这不是飞书换卡计数，也不加入回复 footer。GLM 月工具只显示百分比，无底部说明。
 - Claude 订阅账号行末显示登录凭据剩余天数（`凭据 24–27d`），只来自原生 `claude auth status --json` 的 `loginExpiresAt`，不读取钥匙串、凭据文件或令牌，也不改用其他来源；按原生口径显示“最晚到期前 3 天至最晚到期”的整天区间，显示上限不超过 10 天橙色，最早到期不足 1 天（`凭据 ≤2.4d`）或已过期红色；缺失或原生输出无法识别为 `凭据 MISS`，不加入回复 footer。实现约束见 `src/AGENTS.md`。
+- `hi` 活跃项目与 `bl` 在会话状态后追加仍在运行的子 Agent 与后台进程数，写法同运行任务卡预览（`闲 · 子Agent2·后台1`，0 省略），使主线程空闲但后台仍在工作的会话不再只显示「闲/空闲」；后台进程优先取后端实时集合（Claude SDK 电平、Codex 后台终端），读取失败显示 `后台MISS`，不当作 0。实现约束见 `src/AGENTS.md`。
 - `codex-reset [备注]` 显式使用一次账号重置卡；省略备注只取当前运行账号，账号未知时要求指定。调用原生 `account/rateLimitResetCredit/consume`，同一消息及其网络重试复用幂等标识；按四种原生 outcome 展示结果，之后重新读额度，不能推算卡数或掩盖已扣卡后的刷新/关闭失败。
 
 ## 运行中的 daemon

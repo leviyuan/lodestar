@@ -2798,3 +2798,52 @@ describe('Codex protocol log privacy', () => {
     } finally { diagnostic.mockRestore() }
   })
 })
+
+describe('Codex background terminal count for hi/bl', () => {
+  test('counts the main thread background terminals across pages', async () => {
+    const { proc, calls } = makeCodexProtocolHarness({}, async (method, params) => {
+      if (method !== 'thread/backgroundTerminals/list') throw new Error(`unexpected request ${method}`)
+      return params.cursor
+        ? { data: [{ processId: 'p3', itemId: 'i3', command: 'tail -f log', cwd: '/repo' }], nextCursor: null }
+        : { data: [{ processId: 'p1', itemId: 'i1', command: 'npm run dev', cwd: '/repo' }, { processId: 'p2', itemId: 'i2', command: 'make watch', cwd: '/repo' }], nextCursor: 'page-2' }
+    })
+    proc.sessionId = 'main-thread'
+
+    expect(await proc.backgroundProcessCount()).toBe(3)
+    expect(calls).toEqual([
+      { method: 'thread/backgroundTerminals/list', params: { threadId: 'main-thread', limit: 100 } },
+      { method: 'thread/backgroundTerminals/list', params: { threadId: 'main-thread', limit: 100, cursor: 'page-2' } },
+    ])
+  })
+
+  test('a process without a thread has no terminals and sends no request', async () => {
+    const { proc, calls } = makeCodexProtocolHarness()
+
+    expect(await proc.backgroundProcessCount()).toBe(0)
+    expect(calls).toEqual([])
+  })
+
+  test('an unrecognized or endless list is an error, never a zero count', async () => {
+    const malformed = makeCodexProtocolHarness({}, async () => ({ terminals: [] }))
+    malformed.proc.sessionId = 'main-thread'
+    const shapeError = await malformed.proc.backgroundProcessCount().then(() => undefined, (error: Error) => error)
+    expect(shapeError?.message).toBe('Codex 后台终端列表格式无法识别')
+
+    // A cursor of the wrong type must not end the list early with a partial count.
+    const badCursor = makeCodexProtocolHarness({}, async () => ({ data: [{}], nextCursor: 2 }))
+    badCursor.proc.sessionId = 'main-thread'
+    const cursorError = await badCursor.proc.backgroundProcessCount().then(() => undefined, (error: Error) => error)
+    expect(cursorError?.message).toBe('Codex 后台终端列表格式无法识别')
+
+    // Omitting the optional cursor still ends the list.
+    const noCursor = makeCodexProtocolHarness({}, async () => ({ data: [{}, {}] }))
+    noCursor.proc.sessionId = 'main-thread'
+    expect(await noCursor.proc.backgroundProcessCount()).toBe(2)
+
+    const endless = makeCodexProtocolHarness({}, async () => ({ data: [{}], nextCursor: 'again' }))
+    endless.proc.sessionId = 'main-thread'
+    const pageError = await endless.proc.backgroundProcessCount().then(() => undefined, (error: Error) => error)
+    expect(pageError?.message).toBe('Codex 后台终端列表分页超过上限')
+    expect(endless.calls).toHaveLength(10)
+  })
+})

@@ -411,6 +411,25 @@ test('btwListCard：汇总数量、当前群、模型与运行状态', () => {
   expect(text).not.toContain('callback')
 })
 
+test('btwListCard：运行中会话在状态后写出子 Agent 与后台进程数，0 不显示', () => {
+  const base = {
+    projectName: 'project', createdAt: null, isCurrent: false, running: true,
+    provider: 'claude' as const, model: null, effort: null,
+  }
+  const card = btwListCard({
+    entries: [
+      { ...base, chatName: 'project*后台', status: 'idle', workload: { background: 1, subagents: 2 } },
+      { ...base, chatName: 'project*安静', status: 'idle', workload: { background: 0, subagents: 0 } },
+      { ...base, chatName: 'project*读不到', status: 'working', workload: { background: null, subagents: 0 } },
+    ],
+  }) as any
+  const rows: string[] = card.body.elements[1].content.split('\n\n')
+
+  expect(rows[0]).toEndWith('🟢 空闲 · 子Agent2·后台1')
+  expect(rows[1]).toEndWith('🟢 空闲')
+  expect(rows[2]).toEndWith('⚙️ 工作中 · 后台MISS')
+})
+
 test('btwListCard：空列表显示占位，不伪造条目', () => {
   const card = btwListCard({ entries: [] }) as any
   const text = JSON.stringify(card)

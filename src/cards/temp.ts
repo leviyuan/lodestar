@@ -12,6 +12,7 @@
 import { agentProviderLabel, type AgentProvider } from '../agent-process'
 import { diagnosticIdLabel } from '../session-util'
 import { fencedCodeBlock, sliceWholeCharacters } from '../markdown-code'
+import { sessionWorkloadLabel, type SessionWorkload } from './task-kind'
 
 export interface TurnListEntry {
   /** 仅供当前 panel 解析的稳定、不透明 choice id。 */
@@ -426,6 +427,8 @@ export interface BtwListEntry {
   provider: AgentProvider | null
   model: string | null
   effort: string | null
+  /** 运行中会话的后台进程与子 Agent 数；未运行或未构造时省略。 */
+  workload?: SessionWorkload | null
 }
 
 export interface BtwListCardOpts {
@@ -474,6 +477,8 @@ function btwListEntryMarkdown(entry: BtwListEntry): string {
   const status = entry.status
     ? BTW_LIST_STATUS[entry.status]
     : { emoji: entry.running ? '🟢' : '⚪', label: entry.running ? '运行中' : '未运行' }
+  // 「空闲」只说明主线程空着；后台进程和子 Agent 仍在跑时紧跟状态写出数量。
+  const workload = sessionWorkloadLabel(entry.workload)
   return [
     `**${inlineCode(entry.chatName)}**${entry.isCurrent ? ' · 本群' : ''}`,
     [
@@ -481,6 +486,7 @@ function btwListEntryMarkdown(entry: BtwListEntry): string {
       entry.createdAt === null ? '创建 MISS' : `创建 ${fmtTime(entry.createdAt)}`,
       btwListModelLabel(entry),
       `${status.emoji} ${status.label}`,
+      ...(workload ? [workload] : []),
     ].join(' · '),
   ].join('\n')
 }

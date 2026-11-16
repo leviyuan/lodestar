@@ -43,6 +43,7 @@ import type {
   SpawnOpts,
 } from './codex-process'
 import { usageFromTokenUsagePayload } from './codex-usage'
+import { bgTaskTypeOf } from './cards/background'
 import { observeContextWindow } from './context-window-observe'
 import { acquireClaudeSessionLease, type ClaudeSessionLease } from './claude-session-lease'
 import { LauncherDiagnostics, spawnThroughLauncher, type ClaudeLauncher } from './claude-launcher'
@@ -675,6 +676,11 @@ export class ClaudeAgentProcess extends EventEmitter {
   private pendingServerToolInputs: PendingServerToolInput[] = []
   private readonly launcherDiagnostics = new LauncherDiagnostics()
 
+  /** Latest SDK `background_tasks_changed` level: every live background task,
+   * replaced as a whole on each change. The level is per process and nothing is
+   * sent at startup, so null means no level yet; `invalid` is an unreadable payload. */
+  private backgroundTaskLevel: Array<{ subagent: boolean; ambient: boolean }> | 'invalid' | null = null
+
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
   lastModel: string | null = null
@@ -1051,6 +1057,28 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.lastEffort = effort
   }
 
+  /** Live background processes for hi/bl: the SDK level minus subagents and
+   * `ambient` housekeeping tasks, which the SDK says activity indicators exclude.
+   * Undefined until the CLI has sent a level. */
+  async backgroundProcessCount(): Promise<number | undefined> {
+    const level = this.backgroundTaskLevel
+    if (level === 'invalid') throw new Error('Claude 后台任务列表无法识别')
+    return level?.filter(task => !task.subagent && !task.ambient).length
+  }
+
+  private recordBackgroundTaskLevel(tasks: unknown): void {
+    const entries = Array.isArray(tasks) ? tasks : null
+    if (!entries?.every(task => typeof task?.task_id === 'string' && typeof task.task_type === 'string')) {
+      this.backgroundTaskLevel = 'invalid'
+      logDiagnostic('claude-agent-process: malformed background task level')
+      return
+    }
+    this.backgroundTaskLevel = entries.map(task => ({
+      subagent: bgTaskTypeOf(task.task_type, typeof task.subagent_type === 'string' ? task.subagent_type : undefined) === 'subagent',
+      ambient: task.ambient === true,
+    }))
+  }
+
   async compactThread(): Promise<void> {
     if (this.opts.controlOnly) throw new Error('Claude 控制查询不允许压缩会话')
     // /compact 通过 streaming input 执行，以 compact_boundary 为完成信号。
@@ -1294,6 +1322,8 @@ export class ClaudeAgentProcess extends EventEmitter {
   private handleSystemMessage(raw: any): void {
     switch (raw.subtype) {
       case 'background_tasks_changed':
+        this.recordBackgroundTaskLevel(raw.tasks)
+        return
       case 'vcs_state_changed':
       case 'hook_started':
       case 'hook_response':

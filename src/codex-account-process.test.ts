@@ -64,6 +64,27 @@ function harness(choices: Array<CodexAccountDecision | Promise<CodexAccountDecis
 }
 
 describe('Codex account process ownership and recovery', () => {
+  test('background terminal count asks the running child and is zero when no app-server runs', async () => {
+    const h = harness()
+    // Waiting to choose an account: no child, so no terminal can exist.
+    expect(await h.proc.backgroundProcessCount()).toBe(0)
+
+    await h.proc.initializationPromise()
+    const failure = await h.proc.backgroundProcessCount().then(() => undefined, (error: Error) => error)
+    expect(failure?.message).toBe('Codex 后台终端接口 MISS')
+
+    Object.assign(h.children[0], { backgroundProcessCount: async () => 2 })
+    expect(await h.proc.backgroundProcessCount()).toBe(2)
+    // A read cannot reach the wrong process, so a live child still answers mid-switch.
+    ;(h.proc as any).starting = true
+    expect(await h.proc.backgroundProcessCount()).toBe(2)
+    ;(h.proc as any).starting = false
+
+    // Quota recovery stopped the old child before the next account starts.
+    h.children[0].alive = false
+    expect(await h.proc.backgroundProcessCount()).toBe(0)
+  })
+
   test('steering uses only the current ready child and is not retained for account recovery', async () => {
     const h = harness()
     expect(await h.proc.steerUserText('before init')).toBe(false)

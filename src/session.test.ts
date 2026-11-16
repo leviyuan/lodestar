@@ -28,6 +28,7 @@ const { config } = await import('./config')
 const { getTokenSource, listTokenSources, registerTokenSource, refreshAllTokenSourceModels, resetTokenSourceRegistry, tokenSourceProcessRevision } = await import('./token-source')
 const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
 const { peekUsage, refreshUsageFromConnection, invalidateCodexUsage } = await import('./usage')
+const logModule = await import('./log')
 
 const DETERMINISTIC_FOOTER_HANDLE = 0xdeadbeef as unknown as ReturnType<typeof setTimeout>
 
@@ -8760,6 +8761,80 @@ describe('Session lifecycle reliability', () => {
     expect((await session.onForkSelect(0, 'ou_user')).ok).toBe(false)
     expect((await session.onBackSelect(0)).ok).toBe(false)
     expect((await session.onResumeSelect('session-1')).ok).toBe(false)
+  })
+})
+
+describe('Session workload shown by hi and bl', () => {
+  test('counts the task card rows when the backend has no live set of its own (DSH)', async () => {
+    const session = new Session('probe-workload-tracked', 'chat_workload_tracked') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1') as any
+    session.proc = proc
+    session.wireProc(proc)
+    try {
+      proc.emit('bg_task_started', { task_id: 'agent-1', tool_use_id: 'tool-1', description: '审查', task_type: 'local_agent' })
+      proc.emit('bg_task_started', { task_id: 'flow-1', description: 'spec', task_type: 'local_workflow' })
+      // An ordinary command stays in the observation pool: it is still the main turn's own work.
+      proc.emit('bg_task_started', { task_id: 'bash-1', description: 'npm test', task_type: 'local_bash' })
+      await session.backgroundSync
+      expect(await session.workload()).toEqual({ background: 1, subagents: 1 })
+
+      proc.emit('bg_task_settled', { task_id: 'agent-1', status: 'completed' })
+      await session.backgroundSync
+      expect(await session.workload()).toEqual({ background: 1, subagents: 0 })
+    } finally { session.dispose() }
+  })
+
+  test('prefers the backend live set and shows MISS when it cannot be read', async () => {
+    const session = new Session('probe-workload-native', 'chat_workload_native') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1') as any
+    session.proc = proc
+    session.wireProc(proc)
+    const logged = spyOn(logModule, 'logError').mockImplementation(() => {})
+    try {
+      proc.emit('bg_task_started', { task_id: 'agent-1', tool_use_id: 'tool-1', description: '审查', task_type: 'local_agent' })
+      proc.emit('bg_task_started', { task_id: 'flow-1', description: 'spec', task_type: 'local_workflow' })
+      await session.backgroundSync
+
+      proc.backgroundProcessCount = async () => 3
+      expect(await session.workload()).toEqual({ background: 3, subagents: 1 })
+      proc.backgroundProcessCount = async () => 0
+      expect(await session.workload()).toEqual({ background: 0, subagents: 1 })
+      // No level from the backend yet: fall back to the task card's own rows.
+      proc.backgroundProcessCount = async () => undefined
+      expect(await session.workload()).toEqual({ background: 1, subagents: 1 })
+
+      proc.backgroundProcessCount = async () => { throw new Error('list unavailable') }
+      expect(await session.workload()).toEqual({ background: null, subagents: 1 })
+      expect(logged).toHaveBeenCalledWith('session: background process count failed', expect.any(Error))
+
+      proc.alive = false
+      expect(await session.workload()).toEqual({ background: 0, subagents: 0 })
+    } finally {
+      logged.mockRestore()
+      session.dispose()
+    }
+  })
+
+  test('bl peers carry the workload of running temporary sessions only', async () => {
+    const running = new Session('probe-workload*运行', 'chat_workload_running') as any
+    const idle = new Session('probe-workload*未启动', 'chat_workload_idle') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-1') as any
+    proc.backgroundProcessCount = async () => 2
+    running.proc = proc
+    running.wireProc(proc)
+    running.status = 'idle'
+    try {
+      const peers = await running.tempSessionPeers()
+      expect(peers.find((peer: any) => peer.chatId === 'chat_workload_running')).toMatchObject({
+        running: true, workload: { background: 2, subagents: 0 },
+      })
+      expect(peers.find((peer: any) => peer.chatId === 'chat_workload_idle')).toMatchObject({
+        running: false, workload: null,
+      })
+    } finally {
+      running.dispose()
+      idle.dispose()
+    }
   })
 })
 

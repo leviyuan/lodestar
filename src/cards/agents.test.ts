@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import type { AgentIdentity } from '../agent-identities'
 import type { AgentRunSnapshot } from '../agent-run-types'
 import { agentIdentityListCard, agentRunCard, agentRunSummary, agentRunElementId, delegationCardSummary } from './agents'
+import { sessionWorkloadLabel } from './task-kind'
 
 const identity: AgentIdentity = {
   id: 'agent:a', displayName: 'GLM · 5.3', tokenSourceId: 'glm', tokenSourceDisplay: 'GLM',
@@ -151,5 +152,21 @@ describe('shared card chat-list summary', () => {
   test('lets a dedicated project card keep its descriptive summary', () => {
     const project = { summary: '⏳ 项目任务正在执行 · 检查接口', status: 'running', terminal: false, kind: 'project' as const }
     expect(delegationCardSummary([project])).toBe(project.summary)
+  })
+})
+
+describe('session status workload label', () => {
+  test('uses the task-card preview notation and omits kinds with nothing running', () => {
+    expect(sessionWorkloadLabel({ background: 2, subagents: 1 })).toBe('子Agent1·后台2')
+    expect(sessionWorkloadLabel({ background: 1, subagents: 0 })).toBe('后台1')
+    expect(sessionWorkloadLabel({ background: 0, subagents: 3 })).toBe('子Agent3')
+    expect(sessionWorkloadLabel({ background: 0, subagents: 0 })).toBe('')
+    expect(sessionWorkloadLabel(null)).toBe('')
+    expect(sessionWorkloadLabel(undefined)).toBe('')
+  })
+
+  test('shows an unreadable background set as MISS instead of zero', () => {
+    expect(sessionWorkloadLabel({ background: null, subagents: 0 })).toBe('后台MISS')
+    expect(sessionWorkloadLabel({ background: null, subagents: 2 })).toBe('子Agent2·后台MISS')
   })
 })
