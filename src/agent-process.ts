@@ -118,6 +118,10 @@ export interface AgentProcess extends EventEmitter {
   quotaWaitPromise?(): Promise<void>
   /** Codex launch/persistence metadata. Claude does not use these hooks. */
   readonly launchKind?: 'fresh' | 'resume' | 'fork'
+  /** Claude only: the saved conversation this process resumes in place (never a fork). Claude
+   * reports `sessionId` with its first native message, which needs a first input; until then this
+   * identifies a resumed conversation. Absent/null for fresh starts, forks and other backends. */
+  readonly resumedSessionId?: string | null
   isConversationResumable?(): boolean
   conversationMaterializationBarrier?(): Promise<void> | null
   conversationMaterializationFailure?(): Error | null

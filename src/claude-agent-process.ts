@@ -699,6 +699,11 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.lastModel = opts.model ? claudeModelKey(opts.model) : null
   }
 
+  /** Known at launch, unlike `sessionId`, which arrives with the first native message. */
+  get resumedSessionId(): string | null {
+    return this.opts.resumeSessionId && !this.opts.forkSession ? this.opts.resumeSessionId : null
+  }
+
   sendInitialize(): void {
     if (this.started) return
     this.started = true

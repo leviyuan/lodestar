@@ -2116,9 +2116,15 @@ export class Session {
   async continueAfterDaemonRestart(): Promise<void> {
     await this.runLifecycle('daemon-continue', async () => {
       const proc = this.proc
-      if (this.daemonRestoreRequired || this.status !== 'idle' || this.initCount < 1 || !proc?.isAlive()
-        || !this.lastSessionRef || proc.sessionId !== this.lastSessionRef.sessionId
-        || proc.provider !== this.lastSessionRef.provider || this.lastSessionId !== proc.sessionId
+      // Codex and DSH report init and their session id when the conversation opens. Claude reports
+      // both only with its first native message, which needs an input: a restored Claude process is
+      // ready once initialized, before any init (the state the first ordinary message after a restore
+      // is delivered in), and is identified by the saved conversation it resumes in place.
+      const initialized = this.initCount >= 1 || proc?.provider === 'claude'
+      const procSessionId = proc?.sessionId ?? proc?.resumedSessionId ?? null
+      if (this.daemonRestoreRequired || this.status !== 'idle' || !initialized || !proc?.isAlive()
+        || !this.lastSessionRef || !procSessionId || procSessionId !== this.lastSessionRef.sessionId
+        || proc.provider !== this.lastSessionRef.provider || this.lastSessionId !== procSessionId
         || this.modelSelectionNeedsProcessStop()
         || this.currentTurn || this.openingTurn || this.steeringSend
         || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) {
@@ -3355,7 +3361,10 @@ export class Session {
       return
     }
     this.pendingTurnInputs.push(text)
-    if (!await this.sendClaimedUserText(this.proc!, wireText)) return
+    if (!await this.sendClaimedUserText(this.proc!, wireText)) {
+      if (resumedProc) throw new Error('自动续接请求提交失败，未重试')
+      return
+    }
     if (wasBusy && msgId) {
       // Bootstrap race / sibling-opening race: until a card is open,
       // the OneSecond ⏳ is the only ack the user gets. The init handler

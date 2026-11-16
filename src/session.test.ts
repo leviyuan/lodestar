@@ -157,6 +157,7 @@ class FakeAgentProc extends EventEmitter {
   setModelSettingsCalls: Array<[string, string]> = []
   alive = true
   launchKind: 'fresh' | 'resume' | 'fork' | undefined
+  resumedSessionId: string | null = null
   conversationResumable = true
   initialization: Promise<void> = Promise.resolve()
   materializationBarrier: Promise<void> | null = null
@@ -6728,6 +6729,117 @@ describe('Session lifecycle reliability', () => {
       await expect(session.continueAfterDaemonRestart()).rejects.toThrow('未发送自动续接请求')
       expect(proc.sentTexts).toHaveLength(1)
     } finally { await session.stop('测试收尾', { announce: false }) }
+  })
+
+  test('restart continuation reaches a restored Claude conversation before its first native message', async () => {
+    // Claude reports system/init and its session id only once a turn starts. A daemon-restored
+    // process is initialized and idle with neither, the state the first ordinary message meets.
+    const session = new Session('daemon-continue-claude', 'chat_id') as any
+    const ref = { provider: 'claude' as const, sessionId: 'saved-claude-session', cwd: session.workDir }
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.lastSessionRef = ref
+    session.lastSessionId = ref.sessionId
+    const proc = new FakeAgentProc('claude', null)
+    proc.resumedSessionId = ref.sessionId
+    let spawnCount = 0
+    session.spawnAgent = (source: unknown) => {
+      expect(source).toEqual(ref)
+      spawnCount++
+      return proc
+    }
+    try {
+      expect(await session.restoreAfterDaemonRestart()).toBe(true)
+      expect(session.status).toBe('idle')
+      expect(session.initCount).toBe(0)
+      expect(proc.sessionId).toBeNull()
+      await session.continueAfterDaemonRestart()
+      expect(proc.sentTexts).toHaveLength(1)
+      expect(proc.sentTexts[0]).toContain('[宿主重启自动续接]')
+      // A second request is refused while the first is still unconsumed: never two continuations.
+      await expect(session.continueAfterDaemonRestart()).rejects.toThrow('未发送自动续接请求')
+      // The native turn then starts on the restored conversation and its init opens the turn card.
+      proc.sessionId = ref.sessionId
+      proc.emit('init', { session_id: ref.sessionId })
+      for (let i = 0; i < 20 && !session.currentTurn; i++) await new Promise(resolve => setTimeout(resolve, 5))
+      expect(session.currentTurn).not.toBeNull()
+      expect(proc.sentTexts).toHaveLength(1)
+      expect(spawnCount).toBe(1)
+      expect(proc.killCalls).toBe(0)
+      expect(session.lastSessionId).toBe(ref.sessionId)
+    } finally { await session.stop('测试收尾', { announce: false }) }
+  })
+
+  test('restart continuation submits through a real restored ClaudeAgentProcess before any native message', async () => {
+    const agentUpdates = await import('./agent-updates')
+    const inputs: any[] = []
+    let finish!: () => void
+    const ended = new Promise<void>(resolve => { finish = resolve })
+    // Streaming input: the SDK yields nothing, neither init nor a session id, before the first input.
+    const sdk = spyOn(agentUpdates, 'loadClaudeSdk').mockResolvedValue({
+      query({ prompt }: any) {
+        void (async () => { for await (const message of prompt) inputs.push(message) })()
+        return {
+          accountInfo: async () => ({}),
+          interrupt: async () => ({ still_queued: [] }),
+          close() { finish() },
+          async *[Symbol.asyncIterator]() { await ended },
+        }
+      },
+    } as any)
+    const configDir = mkdtempSync(join(tmpdir(), 'restart-continue-claude-'))
+    const session = new Session('daemon-continue-real-claude', 'chat_id') as any
+    const ref = { provider: 'claude' as const, sessionId: 'saved-claude-session', cwd: session.workDir }
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.selectedEffort = 'max'
+    session.lastSessionRef = ref
+    session.lastSessionId = ref.sessionId
+    let proc: any = null
+    session.spawnAgent = () => (proc = new ClaudeAgentProcess({ workDir: session.workDir, effort: 'max',
+      resumeSessionId: ref.sessionId, transformEnv: (env: Record<string, string | undefined>) => ({ ...env, CLAUDE_CONFIG_DIR: configDir }) }))
+    try {
+      expect(await session.restoreAfterDaemonRestart()).toBe(true)
+      expect(session.initCount).toBe(0)
+      expect(proc.sessionId).toBeNull()
+      expect(proc.resumedSessionId).toBe(ref.sessionId)
+      await session.continueAfterDaemonRestart()
+      for (let i = 0; i < 40 && inputs.length === 0; i++) await new Promise(resolve => setTimeout(resolve, 5))
+      expect(inputs).toHaveLength(1)
+      expect(JSON.stringify(inputs[0])).toContain('[宿主重启自动续接]')
+    } finally {
+      await session.stop('测试收尾', { announce: false })
+      sdk.mockRestore()
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  test.each(['fork-or-fresh', 'other-conversation'])(
+    'restart continuation refuses a Claude process that does not resume the saved conversation in place: %s', async reason => {
+      const session = new Session(`daemon-continue-claude-${reason}`, 'chat_id') as any
+      const ref = { provider: 'claude' as const, sessionId: 'saved-claude-session', cwd: session.workDir }
+      session.selectedProvider = 'claude'
+      session.selectedTokenSourceId = null
+      session.lastSessionRef = ref
+      session.lastSessionId = ref.sessionId
+      const proc = new FakeAgentProc('claude', null)
+      proc.resumedSessionId = reason === 'other-conversation' ? 'another-session' : null
+      session.proc = proc
+      session.initCount = 0
+      session.status = 'idle'
+      session.spawnAgent = () => { throw new Error('must not spawn another conversation') }
+      try {
+        await expect(session.continueAfterDaemonRestart()).rejects.toThrow('未发送')
+        expect(proc.sentTexts).toEqual([])
+        expect(session.lastSessionId).toBe(ref.sessionId)
+      } finally { session.proc = null; session.dispose() }
+    },
+  )
+
+  test('ClaudeAgentProcess names only an in-place resume as the conversation it continues', () => {
+    expect(new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', resumeSessionId: 'saved' }).resumedSessionId).toBe('saved')
+    expect(new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', resumeSessionId: 'saved', forkSession: true }).resumedSessionId).toBeNull()
+    expect(new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max' }).resumedSessionId).toBeNull()
   })
 
   test.each(['quota', 'exited', 'different-thread', 'busy', 'different-source', 'exits-before-send', 'card-open-failed'])(

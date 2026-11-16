@@ -14,7 +14,7 @@
 
 ## 会话与后端
 
-- 本机环境变量 `LODESTAR_RESTART_CONTINUE_CHAT_ID` 可显式给一个精确群开启重启自动续接，默认关闭。只在原生会话成功恢复且空闲时，在同群 actor 内提交一次标明宿主来源的新续接请求；不重放旧输入、不启动新会话、不跨群。恢复或提交失败明确报告，不自动重试；不修改普通用户消息路径的默认行为。
+- 本机环境变量 `LODESTAR_RESTART_CONTINUE_CHAT_ID` 可显式给一个精确群开启重启自动续接，默认关闭。只在原生会话成功恢复且空闲时，在同群 actor 内提交一次标明宿主来源的新续接请求；不重放旧输入、不启动新会话、不跨群。恢复或提交失败明确报告，不自动重试；不修改普通用户消息路径的默认行为。就绪与身份按后端区分：Codex、DSH 在打开会话时就发 init 并给出会话 ID，须已收到；Claude 的原生 init 与 `sessionId` 要到首轮的第一条原生消息才出现，恢复流程完成初始化并置为空闲即就绪（此时 `initCount` 为 0、`sessionId` 为 null），身份在 `sessionId` 未知时改用进程的 `resumedSessionId`（就地 resume 的保存会话，fork 与新会话为 null）与保存的会话比对，`sessionId` 一旦已知仍以它为准。续接请求与恢复后的第一条普通消息同路送入，由首轮 init 开卡，提交失败同样报错；开卡失败与普通消息相同（红色提示并中断该轮），日志仍记为已提交。不能统一要求 `initCount ≥ 1` 或 `proc.sessionId`，否则 Claude 会话的续接必然失败；测试替身须在首条原生消息前保持 `sessionId` 为 null。
 
 - `workspace.ts` 定义工作目录键与项目 profile：BTW/FK 去临时后缀并共享原目录，WT 保留独立目录；别名和软链接归一化，冲突报错。主会话与委派按实际执行目录查工具/MCP 配置。任务清单按主项目名持久化，主群、所有 WT 及其临时群共用。云空间目录按项目主群共享（BTW/FK/WT 群都进主群目录），模型/账号与会话历史各自保留原边界；临时会话模型/账号创建时继承，之后独立。带备注的 `btw` 群名精确等于 `<基名>*<备注>`，基名跟随当前群（主群 `<项目>`、WT 群 `<项目>[分支]`），总长受 `SESSION_NAME_MAX` 限制且超长明确拒绝；同名群由 `ensureTempChatForSession` 加入并拉人，不追加 `-2`，只有新建群才启动会话；`bye` 不看创建者：群成员用 `leaveChatForMember` 把自己移出，退出前后按 `chatMemberOpenIds` 复核，最后一人退出时停止会话并解散群。`wt` 的「删」先用 `tempChatNamesUnderWorktree` 收集该分支下的临时群，逐群确认非运行且唯一后先解散它们，再删 worktree 群和目录。`btw`/`bye` 的状态提示统一用 `cards.tempSessionNoticeCard`：一次操作只发一张卡，创建/加入/退出/解散的终态用 `message.patch` 原地更新，正文只保留一行状态和一行短提示（群名由标题承载）；发送失败回退原文并带飞书诊断，原地更新失败只回退原文，不补发第二张卡。`bl`/`btwlist` 从 `listTempSessionLeases()` 和本 daemon 的 `Session.all` 汇总全部临时会话（含未构造的旧租约），按创建时间倒序展示群名、项目、模型与实时状态；只读本地状态，不发群列表查询，不把未加载会话标成成功运行。
 - 命令、模型、权限、工具、临时会话、worktree、Agent 身份和任务清单放在对应 `session-*.ts` helper；这些模块可协作访问 Session 的内部字段。
