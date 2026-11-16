@@ -377,6 +377,7 @@ export async function runSetup(): Promise<void> {
   console.log(`         ${C.dim}└ 关键: 没它机器人只收 @ 自己的消息, 拿不到群里其他对话, 一定要开${C.reset}`)
   console.log(`         ${C.dim}└ 敏感权限要走审批: 申请时填用途, 个人开发者通常秒过${C.reset}`)
   console.log(`       • ${C.bold}im:message.group_at_msg:readonly${C.reset}  ${C.dim}# 读 @ 机器人消息 (兜底)${C.reset}`)
+  console.log(`       • ${C.bold}im:message.p2p_msg:readonly${C.reset}       ${C.dim}# 读用户发给机器人的单聊消息 (单聊只读面板)${C.reset}`)
   console.log(`     ${C.dim}卡片类 (Card Kit):${C.reset}`)
   console.log(`       • ${C.bold}cardkit:card:read${C.reset}                 ${C.dim}# 读卡片状态${C.reset}`)
   console.log(`       • ${C.bold}cardkit:card:write${C.reset}                ${C.dim}# 创建/更新卡片 (流式渲染核心)${C.reset}`)

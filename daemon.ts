@@ -29,7 +29,7 @@ import { dirname } from 'node:path'
 import { Session } from './src/session'
 import { sessionActivity } from './src/session-activity'
 import * as feishu from './src/feishu'
-import { formatFeishuError } from './src/feishu-errors'
+import { formatFeishuError, redactMemberIds } from './src/feishu-errors'
 import * as cards from './src/cards'
 import { actionCardResponse } from './src/card-action'
 import { debugModelActionEvent, debugModelState } from './src/debug-model'
@@ -90,6 +90,10 @@ import {
   type CreateTempSessionResult,
   type DisbandTempSessionResult,
 } from './src/temp-session-runtime'
+import { cardActionRequesterTenant, messageRequesterTenant, shouldSeedDebugContext } from './src/requester-tenant'
+import { isP2pMessage, p2pViewerRestricted, replyP2pPanel, type P2pPanelDeps } from './src/p2p-panel'
+import { readAllAccountUsage } from './src/account-usage'
+import { readSysInfo } from './src/sysinfo'
 
 // ── PID guard ───────────────────────────────────────────────────────────
 // dev 路径 (`bun daemon.ts` 直接跑) 不经过 cli.ts, 所以这里也守一道。
@@ -308,7 +312,8 @@ function enqueueMessage(data: any): boolean {
     // A message that could not be handled must not vanish: its sender is told why.
     const chatId = String(data?.message?.chat_id ?? '')
     if (!chatId) return
-    void feishu.sendTextRaw(chatId, `❌ 消息处理出错：${e instanceof Error ? e.message : String(e)}`)
+    // 原因会留在群里：去掉飞书回显的成员 ID。
+    void feishu.sendTextRaw(chatId, `❌ 消息处理出错：${redactMemberIds(e instanceof Error ? e.message : String(e))}`)
       .catch(error => logError('daemon.inbound.failure_notice_failed', error))
   })
   return true
@@ -444,6 +449,17 @@ const notifyReplies = createNotifyReplyRuntime({
   onWaitingChanged: chatId => sessions.get(chatId)?.refreshPendingAsks(),
   logError,
 })
+// 单聊只读面板的依赖：只读运行中的会话、群主、已保存的群名绑定与成员关系、额度与主机信息，再发消息。
+const p2pPanelDeps: P2pPanelDeps = {
+  runningSessions: () => [...Session.all].filter(session => session.isRunning()),
+  listChatOwners: feishu.listChatOwners,
+  isChatMember: feishu.isChatMember,
+  boundChatIdForSession: feishu.boundChatIdForSession,
+  readAllAccountUsage,
+  readSysInfo,
+  sendCard: feishu.sendCard,
+  sendTextRaw: feishu.sendTextRaw,
+}
 
 async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> {
   const message = data?.message
@@ -456,6 +472,8 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   // SDK wraps the payload differently.
   const senderId = data?.sender?.sender_id ?? data?.event?.sender?.sender_id ?? message?.sender?.sender_id
   const userOpenId: string = senderId?.open_id ?? ''
+  // 发送者是否外部联系人：只比较本条事件里发送者与机器人所在的租户，结果随命令传递，不记录发送者。
+  const requester = messageRequesterTenant(data)
 
   const msgId = message.message_id as string | undefined
   if (msgId && seenMessageIds.has(msgId)) return
@@ -478,6 +496,13 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
 
   const chatId = message.chat_id as string
 
+  // 单聊不对应项目：任何消息都只回只读面板。不建 Session、不绑定群、不写调试上下文或活跃时间，也不启动任何东西。
+  if (isP2pMessage(message)) {
+    // 租户字段缺失时单聊面板按外部联系人显示（与群命令的 requester 不同）。
+    await replyP2pPanel(chatId, userOpenId, p2pViewerRestricted(data), p2pPanelDeps)
+    return
+  }
+
   // `[DEBUG]` prefix — seed the inject context with the real chat/sender
   // captured from a live WS event, then strip the prefix and continue as
   // normal. The injector script (scripts/test-inject.ts) reads this
@@ -485,7 +510,8 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   let contentObjForDebug: any = {}
   try { contentObjForDebug = JSON.parse(message.content ?? '{}') } catch {}
   const debugTextRaw = (message.message_type === 'text' ? contentObjForDebug.text ?? '' : '')
-  if (typeof debugTextRaw === 'string' && debugTextRaw.startsWith('[DEBUG]')) {
+  // 外部联系人的消息不写调试上下文（其中含发送者 open_id），按普通文本处理。
+  if (shouldSeedDebugContext(requester, debugTextRaw)) {
     try {
       writeJsonStateAtomic(DEBUG_CTX_FILE, {
         chat_id: chatId,
@@ -558,7 +584,7 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   // for project worktree/group orchestration. Post 富文本整段不可能正好
   // 等于这些 bare word,所以这里只对 text 触发。
   if (msgType === 'text' && text) {
-    if (await session.runCommand(text, userOpenId, msgId)) return
+    if (await session.runCommand(text, userOpenId, msgId, requester)) return
   }
 
   // Pending text is consumed once: notification reply → Agent question.
@@ -968,7 +994,10 @@ async function handleCardAction(data: any): Promise<any> {
       return withBusinessOutcome(actionCardResponse(result.card), result.ok)
     }
     case 'temp_fork_select': {
-      const result = await session.onForkSelect(String(value.panel_id ?? ''), String(value.choice_id ?? ''), userId)
+      // 外部联系人分叉时新群需要本企业群主；只比较本次回调里的两个租户字段，不记录操作者。
+      const result = await session.onForkSelect(
+        String(value.panel_id ?? ''), String(value.choice_id ?? ''), userId, cardActionRequesterTenant(data),
+      )
       return withBusinessOutcome(result.replaceCard === false
         ? { toast: { type: 'error', content: result.message } }
         : actionCardResponse(cards.selectionResultCard({ title: '🔱 会话分叉', message: result.message, ok: result.ok })), result.ok)

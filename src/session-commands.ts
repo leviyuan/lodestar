@@ -3,6 +3,7 @@ import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
 import { logError } from './log'
 import { diagnosticIdLabel, messageOf } from './session-util'
+import type { RequesterTenant } from './requester-tenant'
 
 type ControlCommand = 'hi' | 'stop' | 'kill' | 'restart' | 'clear' | 'compact' | 'model'
 
@@ -80,7 +81,13 @@ async function restartWithStatus(
  * auto-interrupt on mid-turn user messages was removed (matching
  * Codex's native type-ahead behavior) — explicit barge-out
  * needed a knob and `kill` (full subprocess teardown) is too heavy. */
-export async function runCommand(s: Session, raw: string, userOpenId = '', messageId?: string): Promise<boolean> {
+export async function runCommand(
+  s: Session,
+  raw: string,
+  userOpenId = '',
+  messageId?: string,
+  requester?: RequesterTenant,
+): Promise<boolean> {
   const namedHi = raw.trim().match(/^hi[ \t]+([^\r\n]+)$/i)
   if (namedHi) {
     if (s.currentProvider() === 'claude') {
@@ -109,7 +116,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
   }
   const wt = raw.trim().match(/^(?:wt|worktree)(?:\s+(.+))?$/i)
   if (wt) {
-    await s.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId)
+    await s.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId, requester)
     return true
   }
   // bl/btwlist = 列出本机登记的全部临时会话；btw = 开临时会话(同目录,自动启动)，
@@ -117,7 +124,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
   // bk/back = 列 turn；点选并通过 stale/owner 校验后才终止并切到新分支。
   const btw = raw.trim().match(/^btw(?:[ \t]+([^\r\n]+))?$/i)
   if (btw) {
-    await s.runBtwCommand(userOpenId, (btw[1] ?? '').trim())
+    await s.runBtwCommand(userOpenId, (btw[1] ?? '').trim(), requester)
     return true
   }
   if (raw.trim().match(/^(?:bl|btwlist)$/i)) {

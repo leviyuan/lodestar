@@ -194,7 +194,9 @@ export interface SessionOpts {
    * that construct Session directly can omit it. */
   onLifecycleChange?: () => void
   /** Daemon hook:建临时群并按显式 launch/routing 启动一个 session。
-   * `groupMode: 'reuse'` 表示同名群已存在时只把发起人拉进群,不新建也不重启会话。 */
+   * `groupMode: 'reuse'` 表示同名群已存在时只把发起人拉进群,不新建也不重启会话。
+   * `externalRequester` 只在外部联系人发起时给出;`ownerOpenId` 只在外部联系人需要新建群时给出,
+   * 新建的外部群由该本企业成员当群主。 */
   onCreateTempSession?: (opts: {
     chatName: string
     userOpenId: string
@@ -204,9 +206,13 @@ export interface SessionOpts {
     branchBase: ConversationBranchBase
     seedAnchors?: TurnAnchor[]
     groupMode?: 'create' | 'reuse'
+    ownerOpenId?: string
+    externalRequester?: boolean
   }) => Promise<{ ok: boolean; chatId?: string; error?: string; join?: 'added' | 'present' }>
-  /** Daemon hook:解散临时群 + 清掉它的 Session 对象(bye 用)。*/
-  onDisbandTempSession?: (chatName: string, chatId: string) => Promise<{ ok: boolean; error?: string }>
+  /** Daemon hook:解散临时群 + 清掉它的 Session 对象(bye 用)。
+   * 外部群不能解散:`left` 表示会话已停止、机器人已退群,群留给群主手动解散;
+   * `ok` 为 false 且 `left` 时机器人已不在群里,本地清理失败要报到别处。 */
+  onDisbandTempSession?: (chatName: string, chatId: string) => Promise<{ ok: boolean; error?: string; left?: boolean }>
   /** Daemon-owned delegated Agents are outside Session.proc but must be
    * cancelled by stop/kill/restart and staged daemon shutdown. */
   onCancelAgentRuns?: (sessionName: string, chatId: string, reason: string) => Promise<void>

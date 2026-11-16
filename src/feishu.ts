@@ -1,6 +1,6 @@
 import { networkFetch } from './network'
 import { FeishuRecoveryWindow, FeishuRequestError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
-import { feishuErrorDetails, formatFeishuError } from './feishu-errors'
+import { feishuErrorDetails, formatFeishuError, redactMemberIds } from './feishu-errors'
 import { withChatMessageOrder } from './chat-message-order'
 import { AGENT_PROVIDERS, isAgentProvider, isDshReasoningEffort } from './agent-process'
 /**
@@ -1088,6 +1088,12 @@ export function chatIdForSession(sessionName: string): string | null {
   return null
 }
 
+/** 只看已保存的项目群绑定（`bindSessionToChat`），不按缓存群名猜测、不写日志。
+ * 单聊面板据此锚定群主：改名后留下的同名群不能冒认原项目。 */
+export function boundChatIdForSession(sessionName: string): string | null {
+  return preferredChatForSession.get(sessionName) ?? null
+}
+
 /** Resolve the main group's chat id while keeping the current chat as a safe
  * fallback for a main session whose binding has not been persisted yet. */
 export function mainChatIdForSession(sessionName: string, fallbackChatId?: string): string | null {
@@ -1149,7 +1155,125 @@ export async function findNormalChatIdByName(sessionName: string): Promise<strin
   throw new Error(`multiple Feishu groups named "${sessionName}": ${matches.join(', ')}`)
 }
 
-export async function ensureChatForSession(sessionName: string, userOpenId: string): Promise<{ chatId: string; created: boolean; joined: boolean }> {
+// ── External contacts ──────────────────────────────────────────────────
+// 外部联系人（其他租户的用户）发起的临时群是外部群：机器人不能当群主，
+// 群主须是本企业的真人。白话提示只在外部联系人流程里追加；
+// 临时群建群/拉人的报错一律去掉飞书回显的成员 ID，这些文本会留在群里。
+
+/** 按拒绝码和飞书拒绝原文（可能列出成员 ID）挑一句白话提示；没有对应提示时返回 undefined。 */
+type TempChatHint = (code: string, rejection: string) => string | undefined
+
+const EXTERNAL_CONTACT_UNAVAILABLE_HINT = '外部联系人须先点开机器人发起单聊并确认，应用也须在「对外共享」中开启「允许外部用户与机器人单聊」；完成后重试。'
+const TEMP_OWNER_UNAVAILABLE_HINT = '群主不在应用的可用范围内：请在开发者后台的「可用范围」里加入群主后重试。'
+const MEMBERS_UNAVAILABLE_HINT = '机器人看不到请求里的成员：外部联系人须先点开机器人发起单聊并确认（应用须在「对外共享」中开启「允许外部用户与机器人单聊」），群主须在应用的「可用范围」内；完成后重试。'
+const EXTERNAL_JOIN_INTERNAL_GROUP_HINT = '外部联系人不能加入内部群；请换一个备注新建临时群。'
+
+/**
+ * 外部联系人流程的拒绝提示。232043 按飞书列出的不可见成员区分：只列发起人时提示先单聊确认，
+ * 只列群主时提示把群主加入可用范围，其余情况两条都给。成员 ID 只在这里比较，不保留、不展示。
+ */
+function externalRequesterHint(requesterOpenId: string, ownerOpenId: string | undefined, joining: boolean): TempChatHint {
+  return (code, rejection) => {
+    if (code === '232043') {
+      const requesterListed = requesterOpenId !== '' && rejection.includes(requesterOpenId)
+      const ownerListed = ownerOpenId !== undefined && ownerOpenId !== '' && rejection.includes(ownerOpenId)
+      if (requesterListed && !ownerListed) return EXTERNAL_CONTACT_UNAVAILABLE_HINT
+      if (ownerListed && !requesterListed) return TEMP_OWNER_UNAVAILABLE_HINT
+      return MEMBERS_UNAVAILABLE_HINT
+    }
+    return joining && code === '232028' ? EXTERNAL_JOIN_INTERNAL_GROUP_HINT : undefined
+  }
+}
+
+/** 临时群请求失败：去掉成员 ID，需要时在原诊断（code/原因/log_id）之后追加白话提示。
+ * 原错误不挂到新错误上，避免带请求体的 SDK 错误对象继续传递成员 ID。 */
+async function withTempChatErrors<T>(hint: TempChatHint | undefined, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run()
+  } catch (error) {
+    const details = feishuErrorDetails(error)
+    const original = error instanceof Error ? error.message : formatFeishuError(error)
+    // 拒绝原文可能列出成员 ID：只用来挑提示，展示前去掉。
+    const extra = hint?.(String(details.code ?? ''), `${original}\n${details.message}`)
+    const message = redactMemberIds(original)
+    if (!extra && message === original) throw error
+    throw new FeishuRequestError(
+      extra ? `${message}；${extra}` : message,
+      details.status, details.code, details.retryAfter, details.logId, redactMemberIds(details.message),
+    )
+  }
+}
+
+/** 建群请求体。指定群主时群主也要在成员列表里；不指定时与原请求逐字段一致。 */
+function chatCreateData(sessionName: string, userOpenId: string, ownerOpenId?: string) {
+  if (!ownerOpenId) return { name: sessionName, user_id_list: [userOpenId], group_message_type: 'chat' as const }
+  return {
+    name: sessionName,
+    owner_id: ownerOpenId,
+    user_id_list: ownerOpenId === userOpenId ? [userOpenId] : [userOpenId, ownerOpenId],
+    group_message_type: 'chat' as const,
+  }
+}
+
+const TEMP_OWNER_REQUIREMENT = '外部联系人发起的临时群须由本企业成员当群主'
+const TEMP_OWNER_REMEDY = '请把当前群转让给本企业成员后重试，或由本企业成员发起。'
+
+/**
+ * 外部联系人建临时群时的群主：取当前群（命令来源群）的群主。群主必须是机器人所在
+ * 企业的真人且不是发起人本人，否则抛出面向用户的中文说明（不含成员 ID），调用方不得建群。
+ */
+export async function resolveTempGroupOwner(
+  sourceChatId: string,
+  requesterOpenId: string,
+  appTenantKey: string,
+): Promise<string> {
+  if (!sourceChatId) throw new Error(`找不到当前群，无法确定临时群群主；${TEMP_OWNER_REMEDY}`)
+  if (!appTenantKey) throw new Error('无法确认机器人所在企业，不能确定临时群群主；请稍后重试。')
+  return await withTempChatErrors(undefined, async () => {
+    const res = await client.im.chat.get({ path: { chat_id: sourceChatId }, params: { user_id_type: 'open_id' } })
+    if (res.code && res.code !== 0) throw sdkApiError('feishu chat.get', res)
+    const ownerId = res.data?.owner_id
+    const ownerIdType = res.data?.owner_id_type
+    // 机器人自己建的群，群主是应用而不是 ou_ 开头的用户。
+    if (typeof ownerId !== 'string' || !ownerId.startsWith('ou_') || (ownerIdType && ownerIdType !== 'open_id')) {
+      throw new Error(`${TEMP_OWNER_REQUIREMENT}，但当前群的群主不是用户（可能是机器人）；${TEMP_OWNER_REMEDY}`)
+    }
+    if (ownerId === requesterOpenId) {
+      throw new Error(`${TEMP_OWNER_REQUIREMENT}，但当前群的群主就是发起人本人；${TEMP_OWNER_REMEDY}`)
+    }
+    const ownerTenant = await chatMemberTenantKey(sourceChatId, ownerId)
+    if (ownerTenant !== appTenantKey) {
+      const reason = ownerTenant === null
+        ? '当前群的群主不在成员列表中，无法确认其所属企业'
+        : ownerTenant === '' ? '无法确认当前群群主的所属企业' : '当前群的群主不属于机器人所在企业'
+      throw new Error(`${TEMP_OWNER_REQUIREMENT}，但${reason}；${TEMP_OWNER_REMEDY}`)
+    }
+    return ownerId
+  })
+}
+
+/** 群成员的租户：成员不在群里为 null，飞书未返回租户为空串。只比对、不保留成员列表。 */
+async function chatMemberTenantKey(chatId: string, openId: string): Promise<string | null> {
+  let pageToken: string | undefined
+  do {
+    const res = await client.im.chatMembers.get({
+      path: { chat_id: chatId },
+      params: { member_id_type: 'open_id', page_size: 100, ...(pageToken ? { page_token: pageToken } : {}) },
+    })
+    if (res.code && res.code !== 0) throw sdkApiError('feishu chatMembers.get', res)
+    for (const item of res.data?.items ?? []) {
+      if (item.member_id === openId) return typeof item.tenant_key === 'string' ? item.tenant_key.trim() : ''
+    }
+    pageToken = res.data?.page_token
+  } while (pageToken)
+  return null
+}
+
+export async function ensureChatForSession(
+  sessionName: string,
+  userOpenId: string,
+  ownerOpenId?: string,
+): Promise<{ chatId: string; created: boolean; joined: boolean }> {
   if (!userOpenId) throw new Error('missing sender open_id; cannot add user to worktree group')
   const existing = await findNormalChatIdByName(sessionName)
   if (existing) {
@@ -1160,11 +1284,7 @@ export async function ensureChatForSession(sessionName: string, userOpenId: stri
 
   const res = await client.im.chat.create({
     params: { user_id_type: 'open_id', uuid: randomUUID() },
-    data: {
-      name: sessionName,
-      user_id_list: [userOpenId],
-      group_message_type: 'chat',
-    },
+    data: chatCreateData(sessionName, userOpenId, ownerOpenId),
   })
   if (res.code && res.code !== 0) {
     throw sdkApiError('feishu chat.create', res)
@@ -1176,25 +1296,29 @@ export async function ensureChatForSession(sessionName: string, userOpenId: stri
   return { chatId, created: true, joined: true }
 }
 
-/** Create a brand-new temporary chat; never join/reuse an existing same-name chat. */
+/** Create a brand-new temporary chat; never join/reuse an existing same-name chat.
+ * `ownerOpenId` is only set for an external requester: the group becomes an
+ * external group owned by that person, because the bot cannot own one. */
 export async function createTempChatForSession(
   sessionName: string,
   userOpenId: string,
+  ownerOpenId?: string,
+  externalRequester = ownerOpenId !== undefined,
 ): Promise<{ chatId: string; created: true; joined: true }> {
   if (!userOpenId) throw new Error('missing sender open_id; cannot create temporary group')
   const existing = await findNormalChatIdByName(sessionName)
   if (existing) throw new Error(`temporary group name already exists: ${sessionName}`)
-  const res = await client.im.chat.create({
-    params: { user_id_type: 'open_id', uuid: randomUUID() },
-    data: {
-      name: sessionName,
-      user_id_list: [userOpenId],
-      group_message_type: 'chat',
-    },
+  const hint = externalRequester ? externalRequesterHint(userOpenId, ownerOpenId, false) : undefined
+  const res = await withTempChatErrors(hint, async () => {
+    const res = await client.im.chat.create({
+      params: { user_id_type: 'open_id', uuid: randomUUID() },
+      data: chatCreateData(sessionName, userOpenId, ownerOpenId),
+    })
+    if (res.code && res.code !== 0) {
+      throw sdkApiError('feishu chat.create', res)
+    }
+    return res
   })
-  if (res.code && res.code !== 0) {
-    throw sdkApiError('feishu chat.create', res)
-  }
   const chatId = res.data?.chat_id
   if (!chatId) throw new Error('feishu chat.create returned no chat_id')
   chatNameCache.set(chatId, sessionName)
@@ -1228,16 +1352,24 @@ export async function withChatNameLock<T>(name: string, run: () => Promise<T>): 
 
 /**
  * 临时群入口。`create` 必须新建(时间后缀 btw / fk / bk);`reuse` 复用同名群并把
- * 发起人拉进去(带备注的 btw 同名即同一个群)。
+ * 发起人拉进去(带备注的 btw 同名即同一个群)。`externalRequester` 表示发起人是外部联系人，
+ * 拒绝码附加处理提示；`ownerOpenId` 只在外部联系人需要新建群时传入，新群由该成员当群主
+ * （加入已存在的同名群不需要群主）。报错不含成员 ID。
  */
 export async function ensureTempChatForSession(
   sessionName: string,
   userOpenId: string,
   mode: 'create' | 'reuse' = 'create',
+  ownerOpenId?: string,
+  externalRequester = ownerOpenId !== undefined,
 ): Promise<{ chatId: string; created: boolean; joined: boolean }> {
-  if (mode === 'create') return await createTempChatForSession(sessionName, userOpenId)
+  if (mode === 'create') return await createTempChatForSession(sessionName, userOpenId, ownerOpenId, externalRequester)
   if (!userOpenId) throw new Error('missing sender open_id; cannot join temporary group')
-  return await withChatNameLock(sessionName, () => ensureChatForSession(sessionName, userOpenId))
+  const hint = externalRequester ? externalRequesterHint(userOpenId, ownerOpenId, true) : undefined
+  return await withChatNameLock(sessionName, () => withTempChatErrors(
+    hint,
+    () => ensureChatForSession(sessionName, userOpenId, ownerOpenId),
+  ))
 }
 
 export async function disbandChatForSession(sessionName: string): Promise<{ chatId: string | null; disbanded: boolean }> {
@@ -1255,11 +1387,13 @@ export async function disbandChatForSession(sessionName: string): Promise<{ chat
   return { chatId, disbanded: true }
 }
 
-/** Delete one already-resolved chat only after confirming its current name. */
+/** Delete one already-resolved chat only after confirming its current name.
+ * An external group cannot be deleted by the bot (chat.delete returns 232033):
+ * the bot leaves it instead and reports `left`, leaving the group to its owner. */
 export async function disbandChatForSessionExact(
   sessionName: string,
   chatId: string,
-): Promise<{ chatId: string; disbanded: boolean }> {
+): Promise<{ chatId: string; disbanded: boolean; left?: boolean }> {
   if (!chatId) throw new Error('cannot disband a temporary session without an exact chat_id')
   const status = await fetchChatStatus(chatId)
   if (status.name !== sessionName) {
@@ -1267,6 +1401,10 @@ export async function disbandChatForSessionExact(
   }
   if (!isNormalChatStatus(status.status)) {
     throw new Error(`refusing to delete chat ${chatId}: status=${status.status ?? 'unknown'}`)
+  }
+  if (status.external) {
+    await leaveChatAsBot(chatId)
+    return { chatId, disbanded: false, left: true }
   }
   const res = await client.im.chat.delete({ path: { chat_id: chatId } })
   if (res.code && res.code !== 0) {
@@ -1345,6 +1483,107 @@ export async function leaveChatForMember(chatId: string, userOpenId: string): Pr
   return { left: true }
 }
 
+/**
+ * 机器人自己退群。外部群里机器人不能解散群、也不能移出他人，但任何情况下都能自己退出；
+ * 群本身留给群主处理。用应用自己的 app_id 移出自己。
+ */
+export async function leaveChatAsBot(chatId: string): Promise<{ left: true }> {
+  if (!chatId) throw new Error('cannot leave a group without chat_id')
+  const res = await client.im.chatMembers.delete({
+    path: { chat_id: chatId },
+    params: { member_id_type: 'app_id' },
+    data: { id_list: [APP_ID] },
+  })
+  if (res.code && res.code !== 0) {
+    throw sdkApiError('feishu chatMembers.delete', res)
+  }
+  if ((res.data?.invalid_id_list ?? []).includes(APP_ID)) {
+    throw new Error('飞书拒绝机器人退群：app_id 无效或机器人不在群内')
+  }
+  chatNameCache.delete(chatId)
+  return { left: true }
+}
+
+/** 外部群（成员含其他企业的用户）：机器人不能解散，也不能移出他人。读取失败直接抛出。 */
+export async function isExternalChat(chatId: string): Promise<boolean> {
+  if (!chatId) throw new Error('cannot inspect a group without chat_id')
+  return (await fetchChatStatus(chatId)).external
+}
+
+export interface ChatOwner {
+  chatId: string
+  name: string
+  /** 群主不是 open_id 用户（如机器人建的群）时为 null。 */
+  ownerOpenId: string | null
+}
+
+/** 单聊面板查询在调用方没给期限时的整体上限。 */
+const LOOKUP_WINDOW_MS = 20_000
+
+/**
+ * 单聊面板的群主/成员查询共用一个截止到 `deadlineAt` 的恢复窗口：每个请求（含 SDK 取令牌）的超时取单次上限与
+ * 窗口剩余时间的较小值，到点即中止；已知瞬态错误只按既有退避在窗口内重试；窗口到期后不再翻页、直接抛出。
+ */
+function lookupWindow(deadlineAt: number | undefined): FeishuRecoveryWindow {
+  return new FeishuRecoveryWindow(deadlineAt === undefined ? LOOKUP_WINDOW_MS : Math.max(0, deadlineAt - Date.now()))
+}
+
+function inLookupWindow<T>(recovery: FeishuRecoveryWindow, label: string, request: () => Promise<T>): Promise<T> {
+  return sdkRecovery.run(recovery, () => withFeishuRetry(label, request, { recovery }))
+}
+
+/**
+ * 机器人所在的正常群及群主（分页读完一次 `im.chat.list`）。单聊面板只在本次请求里拿它比较，
+ * 不写 `chatNameCache`、不缓存群主；读取失败或到了 `deadlineAt` 直接抛出。
+ */
+export async function listChatOwners(deadlineAt?: number): Promise<ChatOwner[]> {
+  const recovery = lookupWindow(deadlineAt)
+  const out: ChatOwner[] = []
+  let pageToken: string | undefined
+  do {
+    const token = pageToken
+    const res = await inLookupWindow(recovery, 'feishu chat.list', async () => {
+      const page = await client.im.chat.list({
+        params: { user_id_type: 'open_id', page_size: 100, ...(token ? { page_token: token } : {}) },
+      })
+      if (page.code && page.code !== 0) throw sdkApiError('feishu chat.list', page)
+      return page
+    })
+    for (const chat of res.data?.items ?? []) {
+      if (!chat.chat_id || !chat.name) continue
+      if (chat.chat_status && chat.chat_status !== 'normal') continue
+      const ownerId = chat.owner_id
+      const userOwner = typeof ownerId === 'string' && ownerId.startsWith('ou_')
+        && (!chat.owner_id_type || chat.owner_id_type === 'open_id')
+      out.push({ chatId: chat.chat_id, name: chat.name, ownerOpenId: userOwner ? ownerId : null })
+    }
+    pageToken = res.data?.page_token
+  } while (pageToken)
+  return out
+}
+
+/** `openId` 当前是否在群里（实时分页 `chatMembers.get`）。只比较、不保留成员列表；读取失败或到了 `deadlineAt` 直接抛出。 */
+export async function isChatMember(chatId: string, openId: string, deadlineAt?: number): Promise<boolean> {
+  if (!chatId) throw new Error('cannot check group membership without chat_id')
+  if (!openId) throw new Error('cannot check group membership without open_id')
+  const recovery = lookupWindow(deadlineAt)
+  let pageToken: string | undefined
+  do {
+    const token = pageToken
+    const res = await inLookupWindow(recovery, 'feishu chatMembers.get', async () => {
+      const page = await client.im.chatMembers.get({
+        path: { chat_id: chatId },
+        params: { member_id_type: 'open_id', page_size: 100, ...(token ? { page_token: token } : {}) },
+      })
+      if (page.code && page.code !== 0) throw sdkApiError('feishu chatMembers.get', page)
+      return page
+    })
+    if ((res.data?.items ?? []).some(item => item.member_id === openId)) return true
+    pageToken = res.data?.page_token
+  } while (pageToken)
+  return false
+}
+
 /** Resolve ONE chat's name by chat_id via `im.chat.get`, bypassing the
  * eventually-consistent `im.chat.list` that {@link refreshChatList} walks.
  * A group the bot was just added to can lag the list endpoint by several
@@ -1407,7 +1646,7 @@ async function sendViaSdkWithRetry(
   } // withFeishuRetry logs the final failure; callers surface null.
 }
 
-async function fetchChatStatus(chatId: string): Promise<{ name: string | null; status: string | null }> {
+async function fetchChatStatus(chatId: string): Promise<{ name: string | null; status: string | null; external: boolean }> {
   const res = await client.im.chat.get({ path: { chat_id: chatId } })
   if (res.code && res.code !== 0) {
     throw sdkApiError('feishu chat.get', res)
@@ -1415,6 +1654,8 @@ async function fetchChatStatus(chatId: string): Promise<{ name: string | null; s
   return {
     name: res.data?.name ?? null,
     status: res.data?.chat_status ?? null,
+    // 缺字段按内部群处理，与原行为一致。
+    external: res.data?.external === true,
   }
 }
 
@@ -1763,7 +2004,5 @@ export function isOpenAIChatGPTAuthenticated(accountId = DEFAULT_CODEX_ACCOUNT):
   return result.status === 0 && /Logged in using ChatGPT/i.test(`${result.stdout}\n${result.stderr}`)
 }
 
-export function sanitizeSessionName(raw: string): string {
-  // `*` 给临时群后缀(*MMDD-HHMM / *备注)用,和 worktree 的 `[]` 一样显式放行。
-  return raw.replace(/[^\w一-鿿\-\[\]\*]/g, '_').slice(0, SESSION_NAME_MAX)
-}
+// 纯函数，放在 session-name.ts，单聊面板与测试可以直接用。
+export { sanitizeSessionName } from './session-name'

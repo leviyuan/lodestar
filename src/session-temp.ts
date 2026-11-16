@@ -7,7 +7,9 @@
 
 import type { Session } from './session'
 import * as feishu from './feishu'
-import { formatFeishuError } from './feishu-errors'
+import { formatFeishuError, redactMemberIds } from './feishu-errors'
+import { logError } from './log'
+import { INTERNAL_REQUESTER, type RequesterTenant } from './requester-tenant'
 import * as cards from './cards'
 import { claudeTranscriptDir } from './claude-agent-process'
 import { isAgentSession } from './agent-session-registry'
@@ -514,10 +516,76 @@ function tempNoticeFailure(
   message: string,
   messageId?: string | null,
 ): Promise<string | null> {
-  return sendTempNotice(s, { chatName, state: 'error', body: message }, `❌ ${message}`, messageId)
+  // 提示会留在群里：去掉飞书拒绝原因里回显的成员 ID，code 与 log_id 保留。
+  const body = redactMemberIds(message)
+  return sendTempNotice(s, { chatName, state: 'error', body }, `❌ ${body}`, messageId)
 }
 
-export async function runBtwCommand(s: Session, userOpenId: string, role = ''): Promise<void> {
+type ExternalTempGroupFields = { ownerOpenId?: string; externalRequester?: true }
+
+/**
+ * 外部联系人发起时建群请求的额外字段。内部成员返回空对象，请求里既没有 `ownerOpenId` 也没有
+ * `externalRequester`，与原行为一致。外部联系人要新建群时，群主取当前群的群主（须为本企业成员；
+ * 机器人不能当外部群群主）；带备注的 btw 遇到已存在的同名群只加入，不需要群主。检查之后才出现的
+ * 同名群同样只加入，群主不被使用。查询失败记固定事件名的日志（不含 ID），再抛给调用方在群里显示。
+ */
+async function externalTempGroupFields(
+  s: Session,
+  userOpenId: string,
+  requester: RequesterTenant,
+  reuseChatName: string | null,
+): Promise<ExternalTempGroupFields> {
+  if (!requester.external) return {}
+  if (reuseChatName) {
+    let existing: string | null
+    try {
+      existing = await feishu.findNormalChatIdByName(reuseChatName)
+    } catch (error) {
+      logError('session-temp: same-name temp group lookup failed', error)
+      throw new Error(`查找同名临时群失败: ${messageOf(error)}`)
+    }
+    if (existing) return { externalRequester: true }
+  }
+  try {
+    const ownerOpenId = await feishu.resolveTempGroupOwner(s.chatId, userOpenId, requester.appTenantKey)
+    return { ownerOpenId, externalRequester: true }
+  } catch (error) {
+    logError('session-temp: temp group owner lookup failed', error)
+    throw error
+  }
+}
+
+/** 临时群的来源群：先找基名群（发起 btw/fk 的主群或 WT 群），再找项目主群；都找不到为 null。 */
+function parentGroupChatId(s: Session): string | null {
+  for (const name of [baseSessionName(s), feishu.mainSessionName(s.sessionName)]) {
+    const chatId = feishu.chatIdForSession(name)
+    if (chatId && chatId !== s.chatId) return chatId
+  }
+  return null
+}
+
+/** 机器人已经离开临时群、在群里发不出消息时，把失败报到来源群；找不到来源群就只靠日志。 */
+async function reportToParentGroup(s: Session, message: string): Promise<void> {
+  const parentChatId = parentGroupChatId(s)
+  if (!parentChatId) return
+  const body = redactMemberIds(message)
+  const card = cards.tempSessionNoticeCard({ chatName: s.sessionName, state: 'error', body })
+  let failure: unknown
+  let sentId: string | null = null
+  try {
+    sentId = await feishu.sendCard(parentChatId, card, error => { failure = error })
+  } catch (error) {
+    failure = error
+  }
+  if (!sentId) await feishu.sendTextRaw(parentChatId, `❌ ${s.sessionName}: ${body}\n${formatFeishuError(failure)}`)
+}
+
+export async function runBtwCommand(
+  s: Session,
+  userOpenId: string,
+  role = '',
+  requester: RequesterTenant = INTERNAL_REQUESTER,
+): Promise<void> {
   const baseName = baseSessionName(s)
   const normalizedRole = feishu.normalizeTempRole(role)
   if (!userOpenId) { await tempNoticeFailure(s, baseName, '找不到发起人，无法建临时群。'); return }
@@ -546,6 +614,15 @@ export async function runBtwCommand(s: Session, userOpenId: string, role = ''): 
     { chatName, state: 'creating', backendLabel: s.backendLabel() },
     reuse ? `🚀 正在创建或加入 ${chatName} · ${s.backendLabel()}` : `🚀 正在创建 ${chatName} · ${s.backendLabel()}`,
   )
+  // 群主不合格或查询失败时直接失败，不建群也不拉人。
+  let external: ExternalTempGroupFields
+  try {
+    external = await externalTempGroupFields(s, userOpenId, requester, reuse ? chatName : null)
+  } catch (error) {
+    if (!reuse) releaseTempChatName(chatName)
+    await tempNoticeFailure(s, chatName, `建临时会话失败: ${messageOf(error)}`, noticeId)
+    return
+  }
   let result
   try {
     result = await s.opts.onCreateTempSession({
@@ -557,6 +634,7 @@ export async function runBtwCommand(s: Session, userOpenId: string, role = ''): 
       branchBase: { kind: 'fresh' },
       seedAnchors: [],
       ...(reuse ? { groupMode: 'reuse' as const } : {}),
+      ...external,
     })
   } finally {
     if (!reuse) releaseTempChatName(chatName)
@@ -635,6 +713,20 @@ export async function runByeCommand(s: Session, userOpenId = ''): Promise<void> 
   if (!s.opts.onDisbandTempSession) { await tempNoticeFailure(s, s.sessionName, '解散能力未就绪（daemon 未注入回调）。'); return }
   if (!userOpenId) { await tempNoticeFailure(s, s.sessionName, '找不到发起人，无法退出临时群。'); return }
 
+  // 外部群里机器人既不能解散群，也不能移出成员，不走下面的退出/最后一人解散流程。
+  let external: boolean
+  try {
+    external = await feishu.isExternalChat(s.chatId)
+  } catch (error) {
+    logError('session-temp: temp group type lookup failed', error)
+    await tempNoticeFailure(s, s.sessionName, `读取群信息失败: ${messageOf(error)}；未执行退出或解散。`)
+    return
+  }
+  if (external) {
+    await retireExternalTempChat(s)
+    return
+  }
+
   // bye 不看创建者：谁发谁退出；群里的最后一个人退出时连同会话一起解散。
   // 退出和解散共用同一张卡，拿到 message id 后原地更新。
   let noticeId: string | null = null
@@ -677,9 +769,36 @@ export async function runByeCommand(s: Session, userOpenId = ''): Promise<void> 
   await disband()
 }
 
+/**
+ * 外部群的 bye（任何成员都可以发）：停止会话、机器人退群，本地状态与普通解散一样清理，群本身保留。
+ * 机器人退群后可能无法再在群里发言，所以「请群主手动解散」的提示必须在退群之前发出。
+ */
+async function retireExternalTempChat(s: Session): Promise<void> {
+  const noticeId = await sendTempNotice(
+    s,
+    { chatName: s.sessionName, state: 'retiring' },
+    `👋 正在停止会话：外部群机器人无法解散，请群主在群设置里解散 ${s.sessionName}`,
+  )
+  const result = await s.opts.onDisbandTempSession!(s.sessionName, s.chatId)
+  if (result.ok) return
+  if (result.left) {
+    // 机器人已经退群，原群里再也发不出消息：记日志，并把失败报到来源群（找不到就只靠日志）。
+    logError('session-temp: external temp group cleanup failed after the bot left', result.error)
+    await reportToParentGroup(s, `bye 未完成：${result.error ?? '机器人已退出外部临时群，但本地状态清理失败'}`)
+    return
+  }
+  await tempNoticeFailure(s, s.sessionName, `停止会话或退群失败: ${result.error ?? '未知'}`, noticeId)
+}
+
 // ── Picker actions ───────────────────────────────────────────────────
 
-export async function onForkSelect(s: Session, panelId: string, choiceId: string, userOpenId: string): Promise<TempSelectionResult> {
+export async function onForkSelect(
+  s: Session,
+  panelId: string,
+  choiceId: string,
+  userOpenId: string,
+  requester: RequesterTenant = INTERNAL_REQUESTER,
+): Promise<TempSelectionResult> {
   const claimed = claimPanelChoice(s, 'fork', panelId, choiceId, userOpenId)
   if ('error' in claimed) return { ok: false, message: claimed.error, replaceCard: false }
   const { panel, choice } = claimed
@@ -687,9 +806,11 @@ export async function onForkSelect(s: Session, panelId: string, choiceId: string
     if (choice.kind !== 'fork') return { ok: false, message: '选择项类型不匹配' }
     if (!s.opts.onCreateTempSession) return { ok: false, message: '临时群能力未就绪' }
     const chatName = reserveTempChatName(panel.baseName)
-    await feishu.sendText(s.chatId, `🔱 正在分叉到 ${chatName}…`)
     let result
     try {
+      // 群主不合格或查询失败时直接失败，不建群。
+      const external = await externalTempGroupFields(s, userOpenId, requester, null)
+      await feishu.sendText(s.chatId, `🔱 正在分叉到 ${chatName}…`)
       result = await s.opts.onCreateTempSession({
         chatName,
         userOpenId,
@@ -698,14 +819,15 @@ export async function onForkSelect(s: Session, panelId: string, choiceId: string
         launch: choice.launch,
         branchBase: choice.branchBase,
         seedAnchors: choice.seedAnchors,
+        ...external,
       })
     } finally {
       releaseTempChatName(chatName)
     }
-    if (!result.ok) return { ok: false, message: `分叉失败: ${result.error ?? '未知'}` }
+    if (!result.ok) return { ok: false, message: `分叉失败: ${redactMemberIds(result.error ?? '未知')}` }
     return { ok: true, message: `已分叉到 ${chatName}；原会话和磁盘文件未回滚` }
   } catch (error) {
-    return { ok: false, message: `分叉失败: ${error instanceof Error ? error.message : error}` }
+    return { ok: false, message: `分叉失败: ${redactMemberIds(messageOf(error))}` }
   } finally {
     consumePanel(panel)
   }

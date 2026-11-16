@@ -69,6 +69,17 @@ export function feishuErrorDetails(raw: unknown): FeishuErrorDetails {
   }
 }
 
+/** 飞书的拒绝原因会回显成员 ID（如 `bot is invisible to user ids: [ou_…]`）。展示到群里的文本
+ * 去掉 open_id/union_id、成员 ID 列表和 `user_id: …` 取值；code、log_id 和其余原因保留。
+ * 单独出现的 ID 只按真实形态（`ou_`/`on_` 加至少 28 位小写字母数字）识别，`on_call`、
+ * `project*on_call`、路径等普通文本保持原样。 */
+export function redactMemberIds(text: string): string {
+  return text
+    .replace(/(\b(?:user[_ ]?)?ids?\s*[:：=]\s*)\[[^\]]*\]/gi, '$1[…]')
+    .replace(/(\b(?:user|open|union|member)[_ ]?ids?\s*[:：=]\s*)(?!\[|…)[^\s,;，；)\]]+/gi, '$1…')
+    .replace(/\b(?:ou|on)_[0-9a-z]{28,}\b/g, '…')
+}
+
 /** Every displayed API failure names all three fields, even if Feishu omitted one. */
 export function formatFeishuError(raw: unknown): string {
   const details = feishuErrorDetails(raw)

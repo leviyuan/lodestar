@@ -52,6 +52,75 @@ export const disbandedChats: string[] = []
 export const leftChats: Array<[string, string]> = []
 let leaveChatError: Error | null = null
 export function setLeaveChatError(error: Error | null): void { leaveChatError = error }
+/** 外部群的 bye / 补偿：机器人自己退群的记录（chat_id）。 */
+export const botLeftChats: string[] = []
+let leaveChatAsBotError: Error | null = null
+export function setLeaveChatAsBotError(error: Error | null): void { leaveChatAsBotError = error }
+/** `isExternalChat` 替身：标记为外部群的 chat_id；查询记录与失败注入。 */
+export const externalChatIds = new Set<string>()
+export const externalChatChecks: string[] = []
+let externalChatError: Error | null = null
+export function setExternalChat(chatId: string, external = true): void {
+  if (external) externalChatIds.add(chatId)
+  else externalChatIds.delete(chatId)
+}
+export function setExternalChatError(error: Error | null): void { externalChatError = error }
+/** 单聊面板：`listChatOwners` 返回的群与群主、失败注入；`isChatMember` 按 `chatMembersById` 判断，
+ * 记录每次查询，可按群注入失败。 */
+export const chatOwners: Array<{ chatId: string; name: string; ownerOpenId: string | null }> = []
+let chatOwnersError: Error | null = null
+export function setChatOwners(owners: Array<{ chatId: string; name: string; ownerOpenId: string | null }>): void {
+  chatOwners.splice(0, chatOwners.length, ...owners.map(owner => ({ ...owner })))
+}
+export function setChatOwnersError(error: Error | null): void { chatOwnersError = error }
+export const chatMemberChecks: Array<[string, string]> = []
+const chatMemberCheckErrors = new Map<string, Error>()
+export function setChatMemberCheckError(chatId: string, error: Error | null): void {
+  if (error) chatMemberCheckErrors.set(chatId, error)
+  else chatMemberCheckErrors.delete(chatId)
+}
+/** 外部联系人临时群的群主解析：调用参数 [来源群, 发起人, 机器人租户]，结果或失败可注入。 */
+export const resolvedTempGroupOwners: Array<[string, string, string]> = []
+const DEFAULT_TEMP_GROUP_OWNER = 'ou_group_owner'
+let tempGroupOwner: string | Error = DEFAULT_TEMP_GROUP_OWNER
+export function setTempGroupOwner(result: string | Error): void { tempGroupOwner = result }
+/** 建群 / 拉人入口的调用记录；`tempChatResult`、`tempChatError` 同时作用于三个入口。 */
+export const ensuredChats: Array<{ sessionName: string; userOpenId: string; ownerOpenId?: string }> = []
+export const ensuredTempChats: Array<{
+  sessionName: string
+  userOpenId: string
+  mode: 'create' | 'reuse'
+  ownerOpenId?: string
+  externalRequester?: boolean
+}> = []
+export const createdTempChats: Array<{
+  sessionName: string
+  userOpenId: string
+  ownerOpenId?: string
+  externalRequester?: boolean
+}> = []
+/** `findNormalChatIdByName` 替身：按 `chatIdsByName` 查同名群（重名时报错），记录查询并可注入失败。 */
+export const normalChatLookups: string[] = []
+let normalChatLookupError: Error | null = null
+export function setNormalChatLookupError(error: Error | null): void { normalChatLookupError = error }
+let tempChatResult: { chatId: string; created: boolean; joined: boolean } | null = null
+let tempChatError: Error | null = null
+export function setTempChatResult(result: { chatId: string; created: boolean; joined: boolean } | null): void {
+  tempChatResult = result
+}
+export function setTempChatError(error: Error | null): void { tempChatError = error }
+function tempChatOutcome(sessionName: string): { chatId: string; created: boolean; joined: boolean } {
+  if (tempChatError) throw tempChatError
+  return tempChatResult ? { ...tempChatResult } : { chatId: `oc_${sessionName}`, created: true, joined: true }
+}
+/** `disbandChatForSessionExact` 替身：缺省确认解散；外部群可注入 `{ disbanded: false, left: true }`。 */
+export const exactDisbands: Array<[string, string]> = []
+let exactDisbandResult: { chatId: string | null; disbanded: boolean; left?: boolean } | null = null
+let exactDisbandError: Error | null = null
+export function setExactDisbandResult(result: { chatId: string | null; disbanded: boolean; left?: boolean } | null): void {
+  exactDisbandResult = result
+}
+export function setExactDisbandError(error: Error | null): void { exactDisbandError = error }
 let resumeWriteError: Error | null = null
 export function setResumeWriteError(error: Error | null): void { resumeWriteError = error }
 let turnAnchorWriteError: Error | null = null
@@ -98,6 +167,25 @@ export function resetFeishuMock(): void {
   chatMembersError = null
   chatIdsByName.clear()
   disbandedChats.length = 0
+  for (const arr of [
+    botLeftChats, externalChatChecks, resolvedTempGroupOwners, ensuredChats, ensuredTempChats, createdTempChats, exactDisbands,
+    normalChatLookups,
+  ]) {
+    arr.length = 0
+  }
+  normalChatLookupError = null
+  leaveChatAsBotError = null
+  externalChatIds.clear()
+  externalChatError = null
+  chatOwners.length = 0
+  chatOwnersError = null
+  chatMemberChecks.length = 0
+  chatMemberCheckErrors.clear()
+  tempGroupOwner = DEFAULT_TEMP_GROUP_OWNER
+  tempChatResult = null
+  tempChatError = null
+  exactDisbandResult = null
+  exactDisbandError = null
 }
 
 mock.module('./feishu', () => ({
@@ -217,7 +305,74 @@ mock.module('./feishu', () => ({
       else pendingConversationLaunchBySession.delete(sessionName)
     }
   },
-  ensureChatForSession: async (chatName: string) => ({ chatId: `oc_${chatName}`, created: true, joined: true }),
+  ensureChatForSession: async (sessionName: string, userOpenId: string, ownerOpenId?: string) => {
+    ensuredChats.push({ sessionName, userOpenId, ...(ownerOpenId === undefined ? {} : { ownerOpenId }) })
+    return tempChatOutcome(sessionName)
+  },
+  createTempChatForSession: async (
+    sessionName: string,
+    userOpenId: string,
+    ownerOpenId?: string,
+    externalRequester = ownerOpenId !== undefined,
+  ) => {
+    createdTempChats.push({
+      sessionName, userOpenId, ...(ownerOpenId === undefined ? {} : { ownerOpenId }), ...(externalRequester ? { externalRequester } : {}),
+    })
+    return tempChatOutcome(sessionName)
+  },
+  ensureTempChatForSession: async (
+    sessionName: string,
+    userOpenId: string,
+    mode: 'create' | 'reuse' = 'create',
+    ownerOpenId?: string,
+    externalRequester = ownerOpenId !== undefined,
+  ) => {
+    ensuredTempChats.push({
+      sessionName, userOpenId, mode,
+      ...(ownerOpenId === undefined ? {} : { ownerOpenId }), ...(externalRequester ? { externalRequester } : {}),
+    })
+    return tempChatOutcome(sessionName)
+  },
+  findNormalChatIdByName: async (sessionName: string) => {
+    normalChatLookups.push(sessionName)
+    if (normalChatLookupError) throw normalChatLookupError
+    const ids = chatIdsByName.get(sessionName) ?? []
+    if (ids.length > 1) throw new Error(`multiple Feishu groups named "${sessionName}": ${ids.join(', ')}`)
+    return ids[0] ?? null
+  },
+  chatIdForSession: (sessionName: string) => preferredChatForSession.get(sessionName) ?? null,
+  disbandChatForSessionExact: async (sessionName: string, chatId: string) => {
+    exactDisbands.push([sessionName, chatId])
+    if (exactDisbandError) throw exactDisbandError
+    return exactDisbandResult ? { ...exactDisbandResult } : { chatId, disbanded: true }
+  },
+  resolveTempGroupOwner: async (sourceChatId: string, requesterOpenId: string, appTenantKey: string) => {
+    resolvedTempGroupOwners.push([sourceChatId, requesterOpenId, appTenantKey])
+    if (tempGroupOwner instanceof Error) throw tempGroupOwner
+    return tempGroupOwner
+  },
+  isExternalChat: async (chatId: string) => {
+    externalChatChecks.push(chatId)
+    if (externalChatError) throw externalChatError
+    return externalChatIds.has(chatId)
+  },
+  listChatOwners: async () => {
+    if (chatOwnersError) throw chatOwnersError
+    return chatOwners.map(owner => ({ ...owner }))
+  },
+  isChatMember: async (chatId: string, openId: string) => {
+    chatMemberChecks.push([chatId, openId])
+    const error = chatMemberCheckErrors.get(chatId)
+    if (error) throw error
+    return (chatMembersById.get(chatId) ?? []).includes(openId)
+  },
+  /** 只看已保存的绑定，与 `chatIdForSession` 替身共用 `preferredChatForSession`。 */
+  boundChatIdForSession: (sessionName: string) => preferredChatForSession.get(sessionName) ?? null,
+  leaveChatAsBot: async (chatId: string) => {
+    if (leaveChatAsBotError) throw leaveChatAsBotError
+    botLeftChats.push(chatId)
+    return { left: true as const }
+  },
   listNormalChatIdsByName: async () => new Map([...chatIdsByName].map(([name, ids]) => [name, ids.slice()])),
   disbandChatForSession: async (sessionName: string) => {
     disbandedChats.push(sessionName)

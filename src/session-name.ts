@@ -9,6 +9,13 @@
  */
 /** 飞书群名/会话名的统一上限，和 `sanitizeSessionName` 的截断保持一致。 */
 export const SESSION_NAME_MAX = 64
+
+/** 群名转会话名（项目名）。 */
+export function sanitizeSessionName(raw: string): string {
+  // `*` 给临时群后缀(*MMDD-HHMM / *备注)用,和 worktree 的 `[]` 一样显式放行。
+  return raw.replace(/[^\w一-鿿\-\[\]\*]/g, '_').slice(0, SESSION_NAME_MAX)
+}
+
 const TEMP_SUFFIX_RE = /\*[^*]+$/
 /** A renamed or nested temporary group can carry more than one `*` suffix. */
 const REPEATED_TEMP_SUFFIX_RE = /(\*[^*]+)+$/

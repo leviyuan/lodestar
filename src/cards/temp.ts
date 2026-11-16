@@ -353,13 +353,15 @@ export function resumeSelectionResultCard(opts: ResumeSelectionResultCardOpts): 
   }
 }
 
-/** btw / bye 的生命周期提示卡：创建、加入、退出、解散和失败都用同一套版式。 */
+/** btw / bye 的生命周期提示卡：创建、加入、退出、解散和失败都用同一套版式。
+ * `retiring` 用于外部群的 bye：机器人不能解散外部群，停止会话后自己退群，群由群主手动解散。 */
 export type TempSessionNoticeState =
   | 'creating'
   | 'created'
   | 'joined'
   | 'present'
   | 'disbanding'
+  | 'retiring'
   | 'leaving'
   | 'error'
 
@@ -387,6 +389,7 @@ const TEMP_SESSION_NOTICE_COPY: Record<TempSessionNoticeState, TempSessionNotice
   joined: { emoji: '👥', status: '已加入', template: 'turquoise', hint: '沿用群内会话' },
   present: { emoji: '👤', status: '已在群内', template: 'blue', hint: '沿用群内会话' },
   disbanding: { emoji: '👋', status: '正在解散', template: 'orange', hint: '' },
+  retiring: { emoji: '👋', status: '正在停止会话', template: 'yellow', hint: '外部群机器人无法解散，请群主在群设置里解散' },
   leaving: { emoji: '🚪', status: '正在退出', template: 'grey', hint: '群和会话保留' },
   error: { emoji: '❌', status: '操作失败', template: 'red', hint: '' },
 }

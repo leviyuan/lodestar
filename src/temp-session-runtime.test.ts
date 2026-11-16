@@ -78,8 +78,9 @@ class FakeSession implements TempSessionHandle {
 interface HarnessOverrides {
   ensured?: { chatId: string; created: boolean; joined: boolean }
   chatId?: string | null
-  disband?: (sessionName: string, chatId: string) => Promise<{ chatId: string | null; disbanded: boolean }>
+  disband?: (sessionName: string, chatId: string) => Promise<{ chatId: string | null; disbanded: boolean; left?: boolean }>
   leased?: boolean
+  clearState?: (sessionName: string) => void
 }
 
 function harness(overrides: HarnessOverrides = {}) {
@@ -87,6 +88,8 @@ function harness(overrides: HarnessOverrides = {}) {
   const logs: string[] = []
   const stateClears: string[] = []
   const modes: string[] = []
+  const owners: Array<string | undefined> = []
+  const externals: Array<boolean | undefined> = []
   const leases: Array<[string, string]> = []
   const sessions = new Map<string, FakeSession>()
   const session = new FakeSession(events)
@@ -108,9 +111,11 @@ function harness(overrides: HarnessOverrides = {}) {
       events.push(`factory:${chatId}`)
       return session
     },
-    ensureChatForSession: async (_sessionName, _userOpenId, mode) => {
+    ensureChatForSession: async (_sessionName, _userOpenId, mode, ownerOpenId, externalRequester) => {
       events.push('ensure')
       modes.push(mode)
+      owners.push(ownerOpenId)
+      externals.push(externalRequester)
       return ensured
     },
     disbandChatForSessionExact: overrides.disband ?? (async () => {
@@ -120,6 +125,7 @@ function harness(overrides: HarnessOverrides = {}) {
     chatIdForSession: () => overrides.chatId === undefined ? ensured.chatId : overrides.chatId,
     clearSessionConversationState: sessionName => {
       events.push('state:clear')
+      overrides.clearState?.(sessionName)
       stateClears.push(sessionName)
     },
     registerTempSessionLease: (sessionName, chatId) => {
@@ -130,7 +136,7 @@ function harness(overrides: HarnessOverrides = {}) {
     runExclusive: async (_chatId, task) => await task(),
     log: message => logs.push(message),
   })
-  return { runtime, session, sessions, events, logs, stateClears, modes, leases }
+  return { runtime, session, sessions, events, logs, stateClears, modes, owners, externals, leases }
 }
 
 describe('temporary session creation transaction', () => {
@@ -288,6 +294,50 @@ describe('temporary session creation transaction', () => {
     ])
   })
 
+  test('passes an external requester group owner to the group lookup; internal requests pass none', async () => {
+    const external = harness()
+    await expect(external.runtime.createTempSession({
+      ...createOptions(), ownerOpenId: 'ou_owner', externalRequester: true,
+    })).resolves.toEqual({ ok: true, chatId: 'chat-1' })
+    expect(external.owners).toEqual(['ou_owner'])
+    expect(external.externals).toEqual([true])
+
+    // 外部联系人加入已存在的同名群：没有群主，仍标明外部联系人。
+    const joining = harness({ ensured: { chatId: 'chat-1', created: false, joined: true } })
+    await expect(joining.runtime.createTempSession({ ...createOptions(), groupMode: 'reuse', externalRequester: true }))
+      .resolves.toEqual({ ok: true, chatId: 'chat-1', join: 'added' })
+    expect(joining.owners).toEqual([undefined])
+    expect(joining.externals).toEqual([true])
+
+    const internal = harness()
+    await internal.runtime.createTempSession({ ...createOptions(), groupMode: 'reuse' })
+    expect(internal.owners).toEqual([undefined])
+    expect(internal.externals).toEqual([undefined])
+    expect(internal.modes).toEqual(['reuse'])
+  })
+
+  test('an external group the bot could only leave reports that the owner must disband it', async () => {
+    let events!: string[]
+    const h = harness({
+      disband: async (_sessionName, chatId) => {
+        events.push('leave')
+        return { chatId, disbanded: false, left: true }
+      },
+    })
+    events = h.events
+    h.session.startResult = false
+
+    const result = await h.runtime.createTempSession({ ...createOptions(), ownerOpenId: 'ou_owner' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('Codex 启动失败')
+    expect(result.error).toContain('机器人已退出本次新建的外部临时群，请群主手动解散')
+    expect(result.error).not.toContain('已确认解散')
+    expect(h.sessions.has('chat-1')).toBe(false)
+    expect(h.stateClears).toEqual(['project*0821-1200'])
+    expect(h.events.slice(-5)).toEqual(['stop', 'leave', 'registry:delete:chat-1', 'dispose', 'state:clear'])
+  })
+
   test('keeps the new group, Session, and state when compensating delete fails', async () => {
     let events!: string[]
     const h = harness({
@@ -383,6 +433,83 @@ describe('temporary session disband transaction', () => {
     expect(h.events).toEqual(['stop', 'delete'])
     expect(h.sessions.get('chat-1')).toBe(h.session)
     expect(h.events).not.toContain('dispose')
+    expect(h.stateClears).toEqual([])
+  })
+
+  test('an external group counts as removed once the bot has left it', async () => {
+    let events!: string[]
+    const h = harness({
+      disband: async (_sessionName, chatId) => {
+        events.push('leave')
+        return { chatId, disbanded: false, left: true }
+      },
+    })
+    events = h.events
+    h.sessions.set('chat-1', h.session)
+
+    await expect(h.runtime.disbandTempSession('project*0821-1200', 'chat-1')).resolves.toEqual({ ok: true, left: true })
+    expect(h.events).toEqual(['stop', 'leave', 'registry:delete:chat-1', 'dispose', 'state:clear'])
+    expect(h.sessions.has('chat-1')).toBe(false)
+    expect(h.stateClears).toEqual(['project*0821-1200'])
+  })
+
+  test('a local cleanup failure after the bot left still reports left, so the caller reports elsewhere', async () => {
+    const h = harness({
+      disband: async (_sessionName, chatId) => ({ chatId, disbanded: false, left: true }),
+      clearState: () => { throw new Error('state file locked') },
+    })
+    h.sessions.set('chat-1', h.session)
+
+    const result = await h.runtime.disbandTempSession('project*0821-1200', 'chat-1')
+
+    expect(result).toEqual({
+      ok: false,
+      left: true,
+      error: '机器人已退出外部临时群，但本地状态清理失败: state file locked',
+    })
+    expect(h.logs.some(line => line.startsWith('temp-session: local cleanup after disband failed'))).toBe(true)
+  })
+
+  test('a local cleanup failure after a real disband does not claim the bot left', async () => {
+    const h = harness({ clearState: () => { throw new Error('state file locked') } })
+    h.sessions.set('chat-1', h.session)
+
+    const result = await h.runtime.disbandTempSession('project*0821-1200', 'chat-1')
+
+    expect(result).toEqual({ ok: false, error: '临时群已确认解散，但本地状态清理失败: state file locked' })
+  })
+
+  test('a leave result for a different chat is still rejected and keeps local ownership', async () => {
+    let events!: string[]
+    const h = harness({
+      disband: async () => {
+        events.push('leave:other')
+        return { chatId: 'chat-other', disbanded: false, left: true }
+      },
+    })
+    events = h.events
+    h.sessions.set('chat-1', h.session)
+
+    const result = await h.runtime.disbandTempSession('project*0821-1200', 'chat-1')
+
+    expect(result.ok).toBe(false)
+    expect(result.left).toBeUndefined()
+    expect(result.error).toContain('chat_id 不匹配')
+    expect(result.error).toContain('仍保留')
+    expect(h.events).toEqual(['stop', 'leave:other'])
+    expect(h.sessions.get('chat-1')).toBe(h.session)
+    expect(h.stateClears).toEqual([])
+  })
+
+  test('neither disbanded nor left is not a removal', async () => {
+    const h = harness({ disband: async (_sessionName, chatId) => ({ chatId, disbanded: false, left: false }) })
+    h.sessions.set('chat-1', h.session)
+
+    const result = await h.runtime.disbandTempSession('project*0821-1200', 'chat-1')
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('未确认删除')
+    expect(h.sessions.get('chat-1')).toBe(h.session)
     expect(h.stateClears).toEqual([])
   })
 

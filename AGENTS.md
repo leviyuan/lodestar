@@ -30,6 +30,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 ## 模块边界
 
 - 一个群只有一个 Session 和一个当前主进程。Codex 使用 app-server JSON-RPC，Claude Code 及其第三方来源使用 Agent SDK streaming input，DSH 使用独立 Node 子进程和 Cordis stdio 桥接；不引入 tmux、JSONL 队列或旁路进程控制。
+- 单聊（p2p）不对应项目：不建 Session、不写状态、不启动任何东西，任何消息只回只读面板（`p2p-panel.ts`），没有按钮，操作都留在群里。细节见 `src/AGENTS.md`。
 - DSH 的 `deepseek-harness` 与 Claude 兼容的 `deepseek` 共用 DeepSeek 凭据和平台地址；`dsh-glm` 与 `glm` 共用 GLM Coding Plan 账号，前者通过原生 pi-ai 适配器接入。共享凭据只存一份，模型、effort 和可见性按 Agent 保留；旧配置冲突必须明确报错，任一 setup 入口均更新共享账号。运行时经更新器选择 latest，子进程需要 Node 22.19+（22.x）或 24+；`src/dsh-bridge.ts` 仅在该子进程加载。启动补丁按实际安装的 profile 判断是否已自带 ask-user 工具，避免重复注册；模型接入链需要的 credentials 服务保持启用，凭据仍只由环境变量注入。
 - Agent 运行时更新（`agent-updates.ts`）：
   - 按 `[runtime.agent_auto_update]` 的 `codex`、`claude`、`dsh` 三个独立开关每 6 小时更新对应 Agent，首次检查也在 6 小时后；三项默认关闭，各自防止重叠执行，失败互不阻塞。旧布尔总开关按原值兼容转换并提示迁移，不与新表混用。

@@ -45,7 +45,7 @@ interface Harness {
   running: Set<string>
 }
 
-function harness(repo: string, options: { failTemp?: string } = {}): Harness {
+function harness(repo: string, options: { failTemp?: string; leftTemp?: string } = {}): Harness {
   // session-worktree 通过 feishu.resolveProjectDir 找项目目录，替身这里指向真实仓库。
   projectProfiles.set('feishu', { cwd: repo })
   const tempCalls: Array<[string, string]> = []
@@ -61,7 +61,8 @@ function harness(repo: string, options: { failTemp?: string } = {}): Harness {
         if (options.failTemp === chatName) return { ok: false, error: 'lease 校验失败' }
         tempCalls.push([chatName, chatId])
         chatIdsByName.delete(chatName)
-        return { ok: true }
+        // 外部临时群：机器人只能退群，群本身留给群主。
+        return options.leftTemp === chatName ? { ok: true, left: true } : { ok: true }
       },
     },
   }
@@ -91,6 +92,24 @@ describe('worktree disband cascades to its temp groups', () => {
     expect(result.message).toContain('dir removed')
     // 主项目下的临时群不受影响，也不会被解散。
     expect(h.tempCalls.some(([name]) => name === 'feishu*修复登录')).toBe(false)
+  })
+
+  test('an external temp group the bot could only leave is reported separately, not as disbanded', async () => {
+    const { repo } = initRepo()
+    const chatName = worktree.worktreeChatName('feishu', 'feature')
+    worktree.ensureProjectWorktree(repo, 'feishu', 'feature')
+    chatIdsByName.set(chatName, ['oc_wt'])
+    chatIdsByName.set(`${chatName}*修复登录`, ['oc_temp_a'])
+    chatIdsByName.set(`${chatName}*0821-1337`, ['oc_temp_b'])
+    const h = harness(repo, { leftTemp: `${chatName}*修复登录` })
+
+    const result = await onWorktreeDisband(h.session, 'feature')
+
+    expect(result.ok).toBe(true)
+    expect(h.tempCalls).toHaveLength(2)
+    expect(result.message).toContain('临时群 1 个已解散')
+    expect(result.message).toContain('外部临时群 1 个机器人已退出，请群主手动解散')
+    expect(result.message).not.toContain('无临时群')
   })
 
   test('refuses while a temp group session is still running and keeps everything', async () => {

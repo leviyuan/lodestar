@@ -91,6 +91,7 @@ import { extractSendMarkerPaths, normalizeOutboundPath } from './outbound-marker
 import * as sessionMultimsg from './session-multimsg'
 import * as mathRender from './math-render'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
+import type { RequesterTenant } from './requester-tenant'
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
 import * as sessionPermission from './session-permission'
@@ -2828,8 +2829,8 @@ export class Session {
     return sessionWorktree.worktreeExtraInstruction(this)
   }
 
-  runWorktreeCommand(arg: string, userOpenId: string): Promise<void> {
-    return sessionWorktree.runWorktreeCommand(this, arg, userOpenId)
+  runWorktreeCommand(arg: string, userOpenId: string, requester?: RequesterTenant): Promise<void> {
+    return sessionWorktree.runWorktreeCommand(this, arg, userOpenId, requester)
   }
 
   showWorktrees(): Promise<void> {
@@ -2935,11 +2936,14 @@ export class Session {
   showForkList(userOpenId = ''): Promise<void> { return sessionTemp.showForkList(this, userOpenId) }
   showBackList(userOpenId = ''): Promise<void> { return sessionTemp.showBackList(this, userOpenId) }
   showResumeList(userOpenId = ''): Promise<void> { return sessionTemp.showResumeList(this, userOpenId) }
-  runBtwCommand(userOpenId: string, role = ''): Promise<void> { return sessionTemp.runBtwCommand(this, userOpenId, role) }
+  /** `requester` 只说明发起人是否外部联系人，事件到达时算出，缺省按内部成员处理。 */
+  runBtwCommand(userOpenId: string, role = '', requester?: RequesterTenant): Promise<void> {
+    return sessionTemp.runBtwCommand(this, userOpenId, role, requester)
+  }
   runBtwListCommand(): Promise<void> { return sessionTemp.runBtwListCommand(this) }
   runByeCommand(userOpenId = ''): Promise<void> { return sessionTemp.runByeCommand(this, userOpenId) }
-  onForkSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> {
-    return sessionTemp.onForkSelect(this, panelId, choiceId, userOpenId)
+  onForkSelect(panelId: string, choiceId: string, userOpenId = '', requester?: RequesterTenant): Promise<sessionTemp.TempSelectionResult> {
+    return sessionTemp.onForkSelect(this, panelId, choiceId, userOpenId, requester)
   }
   onBackSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> {
     return sessionTemp.onBackSelect(this, panelId, choiceId, userOpenId)
@@ -2951,8 +2955,8 @@ export class Session {
   /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
    * plus their two-letter aliases where applicable.
    * Returns true if the command was consumed (don't forward to Codex). */
-  runCommand(raw: string, userOpenId = '', messageId?: string): Promise<boolean> {
-    return sessionCommands.runCommand(this, raw, userOpenId, messageId)
+  runCommand(raw: string, userOpenId = '', messageId?: string, requester?: RequesterTenant): Promise<boolean> {
+    return sessionCommands.runCommand(this, raw, userOpenId, messageId, requester)
   }
 
   /** Build the hi-panel data snapshot for this session, including the cached account usage. */

@@ -3,8 +3,9 @@ import type { AgentProvider } from './agent-process'
 import { channelInstructions } from './instructions'
 import * as cards from './cards'
 import * as feishu from './feishu'
-import { formatFeishuError } from './feishu-errors'
+import { formatFeishuError, redactMemberIds } from './feishu-errors'
 import { logError } from './log'
+import { INTERNAL_REQUESTER, type RequesterTenant } from './requester-tenant'
 import * as worktree from './worktree'
 import { messageOf, type WorktreeActionResult } from './session-util'
 
@@ -61,9 +62,20 @@ export function worktreeExtraInstruction(s: Session): string | null {
   ].join('\n')
 }
 
-export async function runWorktreeCommand(s: Session, arg: string, userOpenId: string): Promise<void> {
+export async function runWorktreeCommand(
+  s: Session,
+  arg: string,
+  userOpenId: string,
+  requester: RequesterTenant = INTERNAL_REQUESTER,
+): Promise<void> {
   if (!arg) {
     await showWorktrees(s)
+    return
+  }
+  // WT 群由机器人当群主，含外部联系人就成了外部群，飞书不允许机器人当外部群群主：
+  // 在建 worktree 和分支之前就拒绝，不留下半成品。
+  if (requester.external) {
+    await feishu.sendText(s.chatId, '❌ 外部联系人暂不支持 wt：飞书要求外部群由本企业成员当群主。请让本企业成员操作。')
     return
   }
   const slug = worktree.normalizeWorktreeSlug(arg)
@@ -84,7 +96,7 @@ export async function runWorktreeCommand(s: Session, arg: string, userOpenId: st
       try {
         ensured = worktree.ensureProjectWorktree(projectDir, projectName, slug)
       } catch (e) {
-        await feishu.sendText(s.chatId, `❌ wt 失败: ${messageOf(e)}`)
+        await feishu.sendText(s.chatId, `❌ wt 失败: ${redactMemberIds(messageOf(e))}`)
         return
       }
 
@@ -107,11 +119,11 @@ export async function runWorktreeCommand(s: Session, arg: string, userOpenId: st
         }), error => { childFailure = error })
         if (!childMsg) await feishu.sendTextRaw(chat.chatId, `❌ wt 卡片失败: ${slug}\n${formatFeishuError(childFailure)}`)
       } catch (e) {
-        await feishu.sendText(s.chatId, `❌ wt 已建，拉群失败: ${messageOf(e)}`)
+        await feishu.sendText(s.chatId, `❌ wt 已建，拉群失败: ${redactMemberIds(messageOf(e))}`)
       }
     })
   } catch (e) {
-    await feishu.sendText(s.chatId, `❌ wt 失败: ${messageOf(e)}`)
+    await feishu.sendText(s.chatId, `❌ wt 失败: ${redactMemberIds(messageOf(e))}`)
   }
 }
 
@@ -233,16 +245,22 @@ export async function onWorktreeDisband(s: Session, slugRaw: string): Promise<Wo
       }
       worktree.assertProjectWorktreeClean(projectDir, projectName, slug)
       const disbandedTemps: string[] = []
+      // 外部临时群机器人不能解散，只能退群；群留给群主手动解散，单独计数。
+      const leftTemps: string[] = []
       for (const name of tempNames) {
         const tempChatId = (chatIndex.get(name) ?? [])[0]
         if (!tempChatId) continue
         const result = await s.opts.onDisbandTempSession!(name, tempChatId)
         if (!result.ok) {
-          const done = disbandedTemps.length ? `（已解散 ${disbandedTemps.join('、')}）` : ''
-          const message = `❌ 解散 ${slug} 失败: 临时群 ${name} 未解散${done}: ${result.error ?? '未知'}`
+          const done = [
+            ...(disbandedTemps.length ? [`已解散 ${disbandedTemps.join('、')}`] : []),
+            ...(leftTemps.length ? [`机器人已退出 ${leftTemps.join('、')}`] : []),
+          ].join('；')
+          const message = `❌ 解散 ${slug} 失败: 临时群 ${name} 未解散${done ? `（${done}）` : ''}: ${result.error ?? '未知'}`
           return { ok: false, message, type: 'error' as const }
         }
-        disbandedTemps.push(name)
+        if (result.left) leftTemps.push(name)
+        else disbandedTemps.push(name)
       }
       const disbanded = await feishu.disbandChatForSession(chatName)
       const removed = worktree.removeProjectWorktreeIfClean(projectDir, projectName, slug)
@@ -251,7 +269,10 @@ export async function onWorktreeDisband(s: Session, slugRaw: string): Promise<Wo
         removed.removedWorktree ? 'dir removed' : 'dir missing',
         disbanded.disbanded ? 'group removed' : 'group missing',
         removed.branch,
-        disbandedTemps.length > 0 ? `临时群 ${disbandedTemps.length} 个已解散` : '无临时群',
+        disbandedTemps.length + leftTemps.length === 0 ? '无临时群' : [
+          ...(disbandedTemps.length > 0 ? [`临时群 ${disbandedTemps.length} 个已解散`] : []),
+          ...(leftTemps.length > 0 ? [`外部临时群 ${leftTemps.length} 个机器人已退出，请群主手动解散`] : []),
+        ].join('；'),
       ].join('\n')
       return { ok: true, message, type: 'success' as const }
     })

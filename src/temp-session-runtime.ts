@@ -20,6 +20,10 @@ export interface CreateTempSessionOptions {
   seedAnchors?: TurnAnchor[]
   /** 缺省 `create`:只有新建的群才启动会话,既有群一律拒绝。 */
   groupMode?: TempSessionGroupMode
+  /** 只在外部联系人需要新建群时给出:新建的外部群由这位本企业成员当群主(机器人不能当外部群群主)。 */
+  ownerOpenId?: string
+  /** 发起人是外部联系人;加入已存在的同名群时没有群主,仍靠它给出外部联系人的报错提示。 */
+  externalRequester?: boolean
 }
 
 export interface CreateTempSessionResult {
@@ -34,6 +38,9 @@ export interface CreateTempSessionResult {
 export interface DisbandTempSessionResult {
   ok: boolean
   error?: string
+  /** 外部群不能由机器人解散,机器人已退群,群留给群主手动解散。`ok` 为 false 时表示退群后
+   * 本地状态清理失败:机器人已不在群里,失败要报到别处。 */
+  left?: boolean
 }
 
 export interface TempSessionHandle {
@@ -64,11 +71,14 @@ export interface TempSessionRuntimeDeps<TSession extends TempSessionHandle> {
     sessionName: string,
     userOpenId: string,
     mode: TempSessionGroupMode,
+    ownerOpenId?: string,
+    externalRequester?: boolean,
   ): Promise<{ chatId: string; created: boolean; joined: boolean }>
+  /** 外部群不能删除:机器人退群并返回 `left`,`disbanded` 为 false。 */
   disbandChatForSessionExact(
     sessionName: string,
     chatId: string,
-  ): Promise<{ chatId: string | null; disbanded: boolean }>
+  ): Promise<{ chatId: string | null; disbanded: boolean; left?: boolean }>
   chatIdForSession(sessionName: string): string | null
   /** Drops a name → chat binding that a group rename left pointing at this chat. */
   unbindSessionChat?(sessionName: string): void
@@ -90,24 +100,27 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function confirmDeleted(
+/** 解散或(外部群)机器人退群都算移除成功;`left` 表示群仍在、只是机器人已退出。 */
+function confirmRemoved(
   sessionName: string,
   expectedChatId: string | null,
-  result: { chatId: string | null; disbanded: boolean },
-): string {
-  if (!result.disbanded || !result.chatId) {
+  result: { chatId: string | null; disbanded: boolean; left?: boolean },
+): { chatId: string; left: boolean } {
+  if (!(result.disbanded || result.left === true) || !result.chatId) {
     throw new Error(`飞书未确认删除临时群 "${sessionName}"`)
   }
   if (expectedChatId && result.chatId !== expectedChatId) {
     throw new Error(`飞书删除结果 chat_id 不匹配: expected=${expectedChatId} actual=${result.chatId}`)
   }
-  return result.chatId
+  return { chatId: result.chatId, left: !result.disbanded }
 }
 
 /**
  * Owns the temporary-group lifecycle transaction while keeping Session and
  * Feishu side effects injectable. Remote deletion is the commit point: local
  * registry and persisted conversation state remain intact until it succeeds.
+ * An external group cannot be deleted by the bot; there the bot leaving the
+ * group is the commit point instead.
  */
 export function createTempSessionRuntime<TSession extends TempSessionHandle>(
   deps: TempSessionRuntimeDeps<TSession>,
@@ -145,7 +158,7 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
       if (opts.launch.kind === 'resume') {
         throw new Error('temporary groups must start fresh or fork; resume is not allowed')
       }
-      ensured = await deps.ensureChatForSession(opts.chatName, opts.userOpenId, mode)
+      ensured = await deps.ensureChatForSession(opts.chatName, opts.userOpenId, mode, opts.ownerOpenId, opts.externalRequester)
       if (!ensured.created) {
         if (mode !== 'reuse') {
           return { ok: false, chatId: ensured.chatId, error: '临时会话必须使用新群；既有群保留，未执行加入、启动或删除' }
@@ -195,10 +208,10 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
           }
         }
 
-        let deletedChatId: string
+        let removed: { chatId: string; left: boolean }
         try {
           const deleted = await deps.disbandChatForSessionExact(opts.chatName, ensured.chatId)
-          deletedChatId = confirmDeleted(opts.chatName, ensured.chatId, deleted)
+          removed = confirmRemoved(opts.chatName, ensured.chatId, deleted)
         } catch (deleteError) {
           const cleanupFailure = messageOf(deleteError)
           deps.log(formatLogError('temp-session: create cleanup failed', cleanupFailure))
@@ -209,16 +222,19 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
           }
         }
 
+        const removedNote = removed.left
+          ? '机器人已退出本次新建的外部临时群，请群主手动解散'
+          : '本次新建的临时群已确认解散'
         try {
-          deps.registry.delete(deletedChatId)
+          deps.registry.delete(removed.chatId)
           tempSession?.dispose()
           deps.clearSessionConversationState(opts.chatName)
         } catch (cleanupError) {
           const cleanupFailure = messageOf(cleanupError)
           deps.log(formatLogError('temp-session: local cleanup failed', cleanupFailure))
-          return { ok: false, error: `${failure}；临时群已确认解散，但本地状态清理失败: ${cleanupFailure}` }
+          return { ok: false, error: `${failure}；${removedNote}，但本地状态清理失败: ${cleanupFailure}` }
         }
-        return { ok: false, error: `${failure}；本次新建的临时群已确认解散` }
+        return { ok: false, error: `${failure}；${removedNote}` }
       }
     }
 
@@ -257,10 +273,10 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
       return { ok: false, error: `${failure}；无法确认 Session 已停止，未执行删群` }
     }
 
-    let deletedChatId: string
+    let removed: { chatId: string; left: boolean }
     try {
       const deleted = await deps.disbandChatForSessionExact(chatName, knownChatId)
-      deletedChatId = confirmDeleted(chatName, knownChatId, deleted)
+      removed = confirmRemoved(chatName, knownChatId, deleted)
     } catch (deleteError) {
       const failure = messageOf(deleteError)
       deps.log(formatLogError('temp-session: disband failed', failure))
@@ -268,13 +284,15 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
     }
 
     try {
-      deps.registry.delete(deletedChatId)
+      deps.registry.delete(removed.chatId)
       session?.dispose()
       deps.clearSessionConversationState(chatName)
-      return { ok: true }
+      return removed.left ? { ok: true, left: true } : { ok: true }
     } catch (cleanupError) {
       const failure = messageOf(cleanupError)
       deps.log(formatLogError('temp-session: local cleanup after disband failed', failure))
+      // 外部群:机器人已经退群,调用方不能再往这个群里报错,用 `left` 告诉它改报到别处。
+      if (removed.left) return { ok: false, left: true, error: `机器人已退出外部临时群，但本地状态清理失败: ${failure}` }
       return { ok: false, error: `临时群已确认解散，但本地状态清理失败: ${failure}` }
     }
   }

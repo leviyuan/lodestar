@@ -328,7 +328,7 @@ test('tempSessionNoticeCard：创建 / 就绪 / 加入用不同配色并标出�
 })
 
 test('tempSessionNoticeCard：状态卡只用一行状态，不重复群名和长说明', () => {
-  for (const state of ['creating', 'created', 'joined', 'present', 'disbanding', 'leaving'] as const) {
+  for (const state of ['creating', 'created', 'joined', 'present', 'disbanding', 'retiring', 'leaving'] as const) {
     const card = tempSessionNoticeCard({ chatName: '项目*修复登录', state }) as any
     const content: string = card.body.elements[0].content
     expect(content.length).toBeLessThan(40)
@@ -348,6 +348,16 @@ test('tempSessionNoticeCard：退出与解散区分「离开」和「销毁群�
   const disbanding = tempSessionNoticeCard({ chatName: '项目*修复登录', state: 'disbanding' }) as any
   expect(disbanding.header.template).toBe('orange')
   expect(disbanding.body.elements[0].content).toBe('**正在解散**')
+})
+
+test('tempSessionNoticeCard：外部群 bye 说明机器人无法解散、须由群主在群设置里解散', () => {
+  const retiring = tempSessionNoticeCard({ chatName: '项目*修复登录', state: 'retiring' }) as any
+  expect(retiring.header.title.content).toBe('👋 项目*修复登录')
+  expect(retiring.header.template).toBe('yellow')
+  expect(retiring.body.elements).toHaveLength(1)
+  expect(retiring.body.elements[0].content).toBe('**正在停止会话**\n外部群机器人无法解散，请群主在群设置里解散')
+  // 外部群不会被解散：不能出现「正在解散」这种销毁群的状态。
+  expect(JSON.stringify(retiring)).not.toContain('正在解散')
 })
 
 test('tempSessionNoticeCard：错误态保留原因，缺失时不伪造成功', () => {
