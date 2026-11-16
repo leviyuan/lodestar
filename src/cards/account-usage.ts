@@ -1,6 +1,9 @@
 import type { AccountUsage } from '../account-usage'
 import type { UsageSnapshotUnified, UsageWindowUnified } from '../token-source'
+import { CLAUDE_LOGIN_EARLY_END_MS, CLAUDE_LOGIN_WARNING_MS } from '../claude-credential'
 import { codexCreditsSummary, fmtResetIn } from './usage'
+
+const DAY_MS = 86_400_000
 
 function escape(value: string): string {
   return value.replace(/[\r\n]+/g, ' ').replace(/[&<>\\`*_\[\]~]/g, char => `&#${char.charCodeAt(0)};`)
@@ -21,6 +24,20 @@ function windowContent(window: UsageWindowUnified): string {
   const value = `${escape(label)} ${percent(window.percent)}`
   if (window.kind === 'monthly') return value
   return `${value}/${window.resetsAt && Number.isFinite(window.resetsAt.getTime()) ? fmtResetIn(window.resetsAt) : 'MISS'}`
+}
+
+/** 原生 loginExpiresAt 是最晚到期时刻，实际可能最多提前 3 天结束：按原生口径显示整天区间。
+ * 最早到期已不足 1 天（原生称随时可能结束）时只给上限并标红，已过该时刻同样标红；
+ * 显示的上限不超过 10 天（原生开始提醒）标橙，颜色只看显示值，同一文案不会时有时无颜色。 */
+function credentialExpiry(expiresAt: number | null): string {
+  if (expiresAt === null || !Number.isFinite(expiresAt)) return '凭据 MISS'
+  const remaining = expiresAt - Date.now()
+  if (remaining <= 0) return "<font color='red'>凭据 可能已到期</font>"
+  const earliestDays = Math.floor((remaining - CLAUDE_LOGIN_EARLY_END_MS) / DAY_MS)
+  if (earliestDays < 1) return `<font color='red'>凭据 ≤${fmtResetIn(new Date(expiresAt))}</font>`
+  const latestDays = Math.floor(remaining / DAY_MS)
+  const text = `凭据 ${earliestDays}–${latestDays}d`
+  return latestDays * DAY_MS <= CLAUDE_LOGIN_WARNING_MS ? `<font color='orange'>${text}</font>` : text
 }
 
 export function compactAccountUsage(snapshot: UsageSnapshotUnified | undefined): string {
@@ -46,6 +63,7 @@ export function compactAccountUsage(snapshot: UsageSnapshotUnified | undefined):
   const credits = snapshot.credits !== undefined ? codexCreditsSummary(snapshot.credits) : null
   if (credits) parts.push(credits)
   if (snapshot.resetCredits !== undefined) parts.push(`重置 ${snapshot.resetCredits === null ? 'MISS' : snapshot.resetCredits}`)
+  if (snapshot.credentialExpiresAt !== undefined) parts.push(credentialExpiry(snapshot.credentialExpiresAt))
   return parts.join(' · ')
 }
 

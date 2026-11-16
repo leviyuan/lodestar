@@ -10,6 +10,8 @@ import { fetchClaudeSubscriptionUsage } from './claude-usage'
 import { modelList, withModelVisibility } from './token-source-visibility'
 import { claudeAccounts, DEFAULT_CLAUDE_ACCOUNT } from './claude-accounts'
 import { invalidateClaudeSubscriptionUsage } from './claude-usage'
+import { claudeCredentialExpiry } from './claude-credential'
+import { buildClaudeSpawnPath } from './claude-spawn-path'
 import { isUsageAuthError } from './usage-cache'
 
 /** 覆盖 settings.env，防止 user/project/local settings 重新注入其他账号的路由。 */
@@ -159,11 +161,18 @@ registerTokenSourceFactory({
         catch (error) { return Promise.reject(error) }
         // 并发的 hi/收尾共用本次查询；完成后下一次调用重新读取原生接口。
         const expectedRevision = revision
-        usageRequest ??= fetchClaudeSubscriptionUsage({
-          settingSources: ['user'], settings, transformEnv: source.spawnEnv,
-          validateAccount: source.validateClaudeAccount, tokenSourceId: source.id,
-        }, { accountId, revision: expectedRevision, acquireUse: () => claudeAccounts.acquireUse(accountId),
-          current: () => claudeAccounts.revision(accountId) === expectedRevision })
+        usageRequest ??= Promise.all([
+          fetchClaudeSubscriptionUsage({
+            settingSources: ['user'], settings, transformEnv: source.spawnEnv,
+            validateAccount: source.validateClaudeAccount, tokenSourceId: source.id,
+          }, { accountId, revision: expectedRevision, acquireUse: () => claudeAccounts.acquireUse(accountId),
+            current: () => claudeAccounts.revision(accountId) === expectedRevision }),
+          // hi 的凭据剩余天数：原生 auth status 用与会话相同的账号环境和进程级设置，不读取钥匙串或凭据文件。
+          claudeCredentialExpiry({ accountId, revision: expectedRevision }, () => ({
+            env: source.spawnEnv({ ...process.env, PATH: buildClaudeSpawnPath(), ...config.claude.env }), settings,
+            acquireUse: () => claudeAccounts.acquireUse(accountId),
+          })),
+        ]).then(([usage, credentialExpiresAt]) => credentialExpiresAt === undefined ? usage : { ...usage, credentialExpiresAt })
           .finally(() => { usageRequest = undefined })
         return usageRequest
       },

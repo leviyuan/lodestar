@@ -540,3 +540,83 @@ test('Claude subscription gates queued input on native authentication for main a
     assert.throws(() => validateClaudeSubscriptionAccount({ apiProvider: 'firstParty' }), /订阅未登录/)
   `)
 })
+
+test('hi rows get each account login end from the background usage refresh, in the session environment', () => {
+  isolated(`
+    import assert from 'node:assert/strict'
+    import { mock } from 'bun:test'
+    import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+    import { join } from 'node:path'
+    import { tmpdir } from 'node:os'
+    const DAY = 86400000
+    const dir = mkdtempSync(join(tmpdir(), 'claude-credential-row-'))
+    process.env.CLAUDE_CONFIG_DIR = join(dir, 'native')
+    process.env.ANTHROPIC_API_KEY = 'must-not-leak'
+    const { config } = await import('./src/config'); config.claude.env = {}
+    const accounts = await import('./src/claude-accounts')
+    const manager = new accounts.ClaudeAccounts({ home: dir, accountsDir: join(dir, 'accounts'),
+      stateFile: join(dir, 'accounts.json'), env: process.env })
+    mkdirSync(join(manager.root, 'named'), { recursive: true })
+    const account = await manager.enroll('named', async () => ({ email: 'named@example.test', organization: 'test',
+      subscriptionType: 'max', apiProvider: 'firstParty' }))
+    mock.module('./src/claude-accounts', () => ({ ...accounts, claudeAccounts: manager }))
+    const nativeModels = await import('./src/token-source-models')
+    mock.module('./src/token-source-models', () => ({ ...nativeModels,
+      fetchNativeClaudeModels: async () => [{ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' }] }))
+    const nativeUsage = await import('./src/claude-usage')
+    mock.module('./src/claude-usage', () => ({ ...nativeUsage, fetchClaudeSubscriptionUsage: async () => ({ state: 'ok',
+      windows: [{ kind: 'weekly', label: '周额度', percent: 17, resetsAt: new Date(Date.now() + 6.9 * DAY) }] }) }))
+    const credential = await import('./src/claude-credential')
+    const ends = new Map([['default', Date.now() + 27.3 * DAY], [account.id, Date.now() + 2.4 * DAY]])
+    const probes = []
+    mock.module('./src/claude-credential', () => ({ ...credential, claudeCredentialExpiry: async (binding, probe) => {
+      const { env, settings, acquireUse } = probe()
+      // The real account lease: it repairs and validates the account directory, then releases cleanly.
+      acquireUse()()
+      probes.push({ accountId: binding.accountId, revision: binding.revision, configDir: env.CLAUDE_CONFIG_DIR,
+        apiKey: env.ANTHROPIC_API_KEY, path: env.PATH, settings })
+      return ends.get(binding.accountId) ?? null
+    } }))
+    const registry = await import('./src/token-source')
+    const { buildTokenSourcesFromConfig } = await import('./src/token-source-builtins')
+    buildTokenSourcesFromConfig()
+    const source = registry.getTokenSource('claude-sub')
+    const { accountUsageRow } = await import('./src/cards/account-usage')
+    try {
+      await (await import('./src/token-source-cache')).refreshTokenSourceUsage(source)
+      const background = probes.length
+      const row = async id => {
+        const view = source.forAccount(id)
+        const usage = await view.readUsage()
+        return { usage, content: accountUsageRow({ id, label: view.usageAccount.label, usage }).content }
+      }
+      const native = await row('default'), named = await row(account.id)
+      // hi reads only the committed snapshot: rendering rows starts no native status command.
+      assert.equal(probes.length, background)
+      assert.equal(native.usage.credentialExpiresAt, ends.get('default'))
+      assert.equal(named.usage.credentialExpiresAt, ends.get(account.id))
+      assert.equal(native.content, '**Claude·默认**　周 17%/6.9d · 凭据 24–27d')
+      assert.equal(named.content, "**Claude·named**　周 17%/6.9d · <font color='red'>凭据 ≤2.4d</font>")
+      assert.deepEqual([...new Set(probes.map(probe => probe.accountId))].sort(), [account.id, 'default'].sort())
+      const { claudeSubscriptionSettings } = await import('./src/token-source-claude')
+      const { buildClaudeSpawnPath } = await import('./src/claude-spawn-path')
+      for (const probe of probes) {
+        assert.equal(probe.revision, manager.revision(probe.accountId))
+        assert.equal(probe.configDir, probe.accountId === 'default' ? join(dir, 'native') : account.configDir)
+        assert.equal(probe.apiKey, '')
+        assert.equal(probe.path, buildClaudeSpawnPath())
+        // The same process-level override a session passes, so user settings cannot swap the credential.
+        assert.deepEqual(probe.settings, claudeSubscriptionSettings(manager.candidateEnv(manager.get(probe.accountId), {})))
+        assert.equal(probe.settings.apiKeyHelper, '')
+        assert.equal(probe.settings.forceLoginMethod, 'claudeai')
+      }
+      // A disabled subscription source reads neither quota nor the login end.
+      const before = probes.length
+      const disabled = registry.tokenSourceFactories().find(item => item.kind === 'claude-subscription').build({ enabled: false })
+      const usage = await disabled.forAccount('default').readUsage()
+      assert.equal(usage.state, 'not_applicable')
+      assert.equal(usage.credentialExpiresAt, undefined)
+      assert.equal(probes.length, before)
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  `)
+})

@@ -1,7 +1,8 @@
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { spawn as crossSpawn } from 'cross-spawn'
-import { delimiter, join } from 'node:path'
+import { join } from 'node:path'
+import { buildClaudeSpawnPath } from './claude-spawn-path'
 import { EventEmitter } from 'node:events'
 import { randomUUID } from 'node:crypto'
 import {
@@ -217,17 +218,7 @@ export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): Cl
   return { description: 'sdk-default' }
 }
 
-export function buildClaudeSpawnPath(): string {
-  if (process.platform === 'win32') return process.env.PATH ?? ''
-  const entries = [
-    join(homedir(), '.local', 'npm-global', 'bin'),
-    join(homedir(), '.local', 'bin'),
-    join(homedir(), '.bun', 'bin'),
-    ...(process.env.PATH ?? '').split(delimiter),
-    '/usr/local/bin', '/usr/bin', '/bin',
-  ]
-  return [...new Set(entries.filter(Boolean))].join(delimiter)
-}
+export { buildClaudeSpawnPath }
 
 
 function usageFromSdk(raw: any): CodexUsage | null {

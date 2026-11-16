@@ -4,6 +4,7 @@ import type { UsageSnapshotUnified, UsageWindowUnified } from './token-source'
 import { log, logError } from './log'
 import { resolveClaudeSdkModel } from './claude-models'
 import { UsageReadCache, isUsageRateLimitError } from './usage-cache'
+import { invalidateClaudeCredentialExpiry } from './claude-credential'
 
 const TIMEOUT_MS = 30_000
 /** An unstarted five-hour window is estimated to reset one full window after the read. */
@@ -14,6 +15,8 @@ const usageKeys = new Map<string, Set<string>>()
 export function invalidateClaudeSubscriptionUsage(accountId: string): void {
   for (const key of usageKeys.get(accountId) ?? []) usageReads.invalidate(key)
   usageKeys.delete(accountId)
+  // The login end rides on the same snapshot; a new sign-in must not reuse a settled old date.
+  invalidateClaudeCredentialExpiry(accountId)
 }
 type JsonObject = Record<string, unknown>
 

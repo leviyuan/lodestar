@@ -64,6 +64,8 @@ export interface UsageSnapshotUnified {
   retryAfterMs?: number
   /** Codex 账号可用的额度重置卡次数，仅在 hi 中展示。 */
   resetCredits?: number | null
+  /** Claude 订阅登录凭据的最晚到期时刻（原生 loginExpiresAt，epoch ms），仅在 hi 中展示；null 为 MISS。 */
+  credentialExpiresAt?: number | null
   /** Consumable Codex credits; omitted for sources without this concept. */
   credits?: CodexCredits | null
 }

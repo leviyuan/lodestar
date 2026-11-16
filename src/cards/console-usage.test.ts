@@ -135,6 +135,38 @@ describe('compact hi account quota panel', () => {
     expect(panel.elements[0].content).not.toContain('**bad**')
   })
 
+  test('Claude subscription rows end with the native login end as a day range, colored like native warnings', () => {
+    const DAY = 86400_000
+    const base = { state: 'ok' as const, windows: [
+      { kind: 'weekly', label: '周额度', percent: 17, resetsAt: new Date(Date.now() + 6.9 * DAY) },
+    ] }
+    const render = (days: number | null) => consoleUnifiedUsageContent({ ...base,
+      credentialExpiresAt: days === null ? null : Date.now() + days * DAY })
+    // loginExpiresAt is the latest end; the native lower bound is 3 days earlier. Whole days, rounded down.
+    expect(render(27.3)).toBe('周 17%/6.9d · 凭据 24–27d')
+    expect(render(11)).toBe('周 17%/6.9d · 凭据 8–11d')
+    // The color follows the displayed upper bound, so one label never shows with and without it.
+    expect(render(10.9)).toBe("周 17%/6.9d · <font color='orange'>凭据 7–10d</font>")
+    expect(render(10)).toBe("周 17%/6.9d · <font color='orange'>凭据 7–10d</font>")
+    expect(render(4)).toBe("周 17%/6.9d · <font color='orange'>凭据 1–4d</font>")
+    // Under a day to the earliest end the login may end any day now: only the upper bound, in red.
+    expect(render(3.9)).toBe("周 17%/6.9d · <font color='red'>凭据 ≤3.9d</font>")
+    expect(render(3)).toBe("周 17%/6.9d · <font color='red'>凭据 ≤3.0d</font>")
+    expect(render(0.5)).toBe("周 17%/6.9d · <font color='red'>凭据 ≤12.0h</font>")
+    expect(render(0)).toBe("周 17%/6.9d · <font color='red'>凭据 可能已到期</font>")
+    expect(render(-30)).toBe("周 17%/6.9d · <font color='red'>凭据 可能已到期</font>")
+    expect(render(null)).toBe('周 17%/6.9d · 凭据 MISS')
+    // Other sources carry no login end; failed rows keep only their reason; the footer never shows it.
+    expect(consoleUnifiedUsageContent(base)).toBe('周 17%/6.9d')
+    expect(consoleUnifiedUsageContent({ state: 'no_credentials', windows: [], credentialExpiresAt: Date.now() + 20 * DAY }))
+      .toBe("<font color='red'>MISS · 未登录或未配置</font>")
+    expect(unifiedUsageSummary({ ...base, credentialExpiresAt: Date.now() + DAY })).not.toContain('凭据')
+    const panel = consoleUsageElement({ sessionName: 'test', status: 'idle', accountUsages: [
+      { id: 'claude:default', label: 'Claude·默认', usage: { ...base, credentialExpiresAt: Date.now() + 27.3 * DAY } },
+    ] }) as any
+    expect(panel.elements[0].content).toBe('**Claude·默认**　周 17%/6.9d · 凭据 24–27d')
+  })
+
   test('reset credit counts are compact in hi and never enter the footer summary', () => {
     const snapshot = { state: 'ok' as const, windows: [{ kind: 'weekly', label: '周配额', percent: 22, resetsAt: null }], resetCredits: 0 }
     expect(consoleUnifiedUsageContent(snapshot)).toContain('重置 0')
