@@ -145,3 +145,9 @@ export {
   type LiveElapsedMode,
 } from './cards/background'
 export { type AgentCardTaskKind, type SessionWorkload, sessionWorkloadLabel } from './cards/task-kind'
+export {
+  claudeModelDisplayName,
+  modelRefusalNoticeCard,
+  modelRefusalNoticeText,
+  modelRefusalNoticeTitle,
+} from './cards/model-refusal'

@@ -30,6 +30,7 @@ import {
   ModelSettingsUpdateError,
   type AgentReasoningEffort,
   type ClaudeReasoningEffort,
+  type ModelRefusalNotice,
 } from './agent-process'
 import {
   claudeModelKey,
@@ -685,6 +686,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   lastAssistantUuid: string | null = null
   lastModel: string | null = null
   lastEffort: ClaudeReasoningEffort | null = null
+  refusalFallback: { originalModel: string | null; fallbackModel: string } | null = null
   lastThinkingTokens: number | null = null
   lastUsage: CodexUsage | null = null
   lastTotalUsage: CodexUsage | null = null
@@ -1047,6 +1049,8 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
     this.opts.model = model
     this.lastModel = claudeModel ? claudeModelKey(model) : 'claude:default'
+    // 显式设置模型后原生会话不再停在安全拦截换上的降级模型。
+    this.refusalFallback = null
     this.lastEffort = null
     try {
       await this.query.applyFlagSettings({ effortLevel: effort === 'default' ? null : effort, ultracode: null })
@@ -1327,6 +1331,13 @@ export class ClaudeAgentProcess extends EventEmitter {
       case 'vcs_state_changed':
       case 'hook_started':
       case 'hook_response':
+      // 原生横幅文字（如“安全分类器拦下了上面的回复，带着说明再试一次”）；结论性的
+      // 降级 / 未降级由下面的 model_refusal_* 事件给出。
+      case 'informational':
+        return
+      case 'model_refusal_fallback':
+      case 'model_refusal_no_fallback':
+        this.handleModelRefusal(raw)
         return
       case 'init':
         if (this.opts.forkSession && raw.session_id === this.nativeSessionId) this.sessionLease?.releaseSource()
@@ -1431,6 +1442,31 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
   }
 
+  /** SDK `model_refusal_fallback` / `model_refusal_no_fallback`：原生安全分类器拦截了
+   * 一次回复。`scope` 缺省按旧版 CLI 的会话级处理；会话级降级把 `lastModel` 改成
+   * 降级模型，直到重新设置模型（`setModelSettings`）才回到原模型。 */
+  private handleModelRefusal(raw: any): void {
+    const text = (value: unknown): string | null => typeof value === 'string' && value.trim() ? value.trim() : null
+    const fallback = raw.subtype === 'model_refusal_fallback'
+    const notice: ModelRefusalNotice = {
+      kind: fallback ? 'fallback' : 'no_fallback',
+      scope: raw.scope === 'local' ? 'local' : 'session',
+      originalModel: text(raw.original_model),
+      fallbackModel: fallback ? text(raw.fallback_model) : null,
+      category: text(raw.api_refusal_category),
+      explanation: text(raw.api_refusal_explanation),
+    }
+    if (!notice.originalModel || fallback && !notice.fallbackModel) {
+      logDiagnostic('claude-agent-process: malformed model refusal')
+    }
+    if (fallback && notice.scope === 'session' && notice.fallbackModel) {
+      this.refusalFallback = { originalModel: notice.originalModel, fallbackModel: notice.fallbackModel }
+      this.lastModel = claudeModelKey(notice.fallbackModel)
+    }
+    logDiagnostic(fallback ? 'claude-agent-process: model refusal fallback' : 'claude-agent-process: model refusal without fallback')
+    this.emit('model_refusal', notice)
+  }
+
   private handleAssistantMessage(raw: any): void {
     this.confirmSteeringInputs(raw)
     if (!raw.parent_tool_use_id) this.lastThinkingTokens = null
@@ -1442,7 +1478,13 @@ export class ClaudeAgentProcess extends EventEmitter {
     // 消息送进主 query() stream。只有主线程 UUID 才是本会话可 fork 的
     // checkpoint；子 Agent UUID 属于另一份 transcript，不能污染 rs/fk 锚点。
     if (!parentToolUseId && typeof raw.uuid === 'string') this.lastAssistantUuid = raw.uuid
-    if (typeof message?.model === 'string' && message.model) this.lastModel = claudeModelKey(message.model)
+    // footer/hi 显示主 Agent 实际在用的模型：子 Agent 的回复可能来自别的模型，
+    // 本地命令输出等占位消息的 model 是 `<synthetic>`，都不能顶掉它。
+    if (!parentToolUseId && typeof message?.model === 'string' && message.model && message.model !== '<synthetic>') {
+      this.lastModel = claudeModelKey(message.model)
+      // 原生自己回到了原模型（主线程回复又来自它），降级状态随之结束。
+      if (this.refusalFallback && message.model === this.refusalFallback.originalModel) this.refusalFallback = null
+    }
     const content = Array.isArray(message?.content) ? message.content : []
     if (!parentToolUseId && typeof raw.local_command_source === 'string') {
       this.emit('local_command_output', {

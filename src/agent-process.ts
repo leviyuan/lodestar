@@ -34,6 +34,20 @@ export function isDshReasoningEffort(value: unknown): value is DshReasoningEffor
 export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'default'
 export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort | DshReasoningEffort
 
+/** Claude 原生安全分类器拦截（stop_reason "refusal"）。`fallback`：原生已把这一轮
+ * 改由 `fallbackModel` 重答；`scope: 'session'` 时整个原生会话从此停在降级模型，
+ * 直到重新设置模型，`'local'` 只影响子 Agent / 旁支提问的那一次回复。`no_fallback`：
+ * 没有降级模型，本轮直接结束。模型字段是 SDK 原样的模型 ID；`explanation` 是上游
+ * 说明文字，只用于展示，不能解析。 */
+export interface ModelRefusalNotice {
+  kind: 'fallback' | 'no_fallback'
+  scope: 'session' | 'local'
+  originalModel: string | null
+  fallbackModel: string | null
+  category: string | null
+  explanation: string | null
+}
+
 /** A Codex retry keeps the logical task open while waiting or reconnecting. */
 export interface AgentTurnRetry {
   phase: 'waiting' | 'retrying'
@@ -92,6 +106,9 @@ export interface AgentProcess extends EventEmitter {
   lastCompletedTurnId?: string | null
   lastModel: string | null
   lastEffort: AgentReasoningEffort | null
+  /** Claude only：原生因安全拦截把会话模型换成了降级模型。重新设置模型成功后清空；
+   * 此时 Session 的持久选择仍是原模型，重选同一模型也必须真正下发。 */
+  refusalFallback?: { originalModel: string | null; fallbackModel: string } | null
   /** 当前思考块的实时估计，不能用于计费或累计 token。 */
   lastThinkingTokens?: number | null
   lastUsage: CodexUsage | null
@@ -186,6 +203,8 @@ export type AgentProcessEventMap = {
    * this boundary share one card, even when delivered in separate RPC frames. */
   input_batch_end: { itemId: string }
   thinking_progress: { estimatedTokens: number }
+  /** Claude only：安全分类器拦截了一次回复（见 ModelRefusalNotice）。 */
+  model_refusal: ModelRefusalNotice
   /** Selection succeeded; diagnostics describe unused accounts and are for logs, not proactive alerts. */
   codex_account_changed: { accountId: string; previousAccountId: string | null; diagnostics: string[] }
   token_usage: TokenUsageUpdated

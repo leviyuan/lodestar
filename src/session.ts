@@ -50,6 +50,7 @@ import {
   type AgentProvider,
   type AgentReasoningEffort,
   type ClaudeReasoningEffort,
+  type ModelRefusalNotice,
 } from './agent-process'
 import { config } from './config'
 import { createAgentProcess } from './agent-launch'
@@ -1345,6 +1346,28 @@ export class Session {
         return (Date.now() - startedAt) / 1000
       },
     }
+  }
+
+  /** Claude 原生安全分类器拦截：在群里单独发一张提醒卡，不写进本轮对话卡。会话级降级
+   * 时本轮 footer 改为实际接着回答的降级模型；子 Agent 的局部降级每轮同一对模型只提醒
+   * 一次。卡片发不出去时改发同样内容的纯文本。 */
+  private async announceModelRefusal(notice: ModelRefusalNotice): Promise<void> {
+    const turn = this.currentTurn
+    if (turn && notice.kind === 'fallback' && notice.scope === 'session' && notice.fallbackModel) {
+      turn.model = notice.fallbackModel
+    }
+    if (notice.kind === 'fallback' && notice.scope === 'local' && turn) {
+      const key = `${notice.originalModel ?? ''}\n${notice.fallbackModel ?? ''}`
+      const seen = turn.localRefusalNotices ??= new Set()
+      if (seen.has(key)) return
+      seen.add(key)
+    }
+    let failure: unknown
+    const sent = await feishu.sendCard(this.chatId, cards.modelRefusalNoticeCard(notice), error => { failure = error })
+    if (sent) return
+    logDiagnostic('session: model refusal notice card failed')
+    await feishu.sendTextRaw(this.chatId,
+      `${cards.modelRefusalNoticeText(notice)}\n（提醒卡发送失败，改发文字：${formatFeishuError(failure)}）`)
   }
 
   async openStatusCard(
@@ -4080,6 +4103,11 @@ export class Session {
     on('turn_input_error', ({ error }) => {
       logError('session: native input processing failed', error)
       void feishu.sendTextRaw(this.chatId, `⚠️ ${this.backendLabel(p.provider)} 输入处理错误：${error}`)
+    })
+    on('model_refusal', notice => {
+      void this.announceModelRefusal(notice).catch(error => {
+        logError('session: model refusal notice failed', error)
+      })
     })
     on('user_input_consumed', ({ inputId }) => this.onSteeringInputConsumed(p, epoch, inputId))
     on('input_batch_end', () => {})

@@ -71,6 +71,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - `managed-skills.ts` 同源生成 Codex/Claude standalone Skill 和 Claude 本地插件。GLM/DeepSeek 通过插件加载 Skill，不为此重新引入 user settings 和凭据。
 - 同 provider/source 调用 `setModelSettings`；Claude 后续 turn 生效，Codex 持久设置在重启后生效。跨 provider/source 只在空闲时换进程，resume id 按 provider 隔离。
 - 保留 Claude 的原生 resume/fork、提问、project profile、MCP/Skill、主动压缩和 SDK 后台任务；保留 Codex 的权限、提问、plan/goal、compaction、usage 和 collab 事件。共享接口须表达后端差异。
+- Claude 原生安全分类器拦截（SDK `model_refusal_fallback` / `model_refusal_no_fallback`）必须在群里另发独立提醒卡，写明原模型、降级模型与类别，不能当未知事件丢弃；会话级降级后 footer 显示实际在答的模型，`md` 重选原模型必须真正切回。实现约束见 `src/AGENTS.md`。
 - `cardkit.ts` 独占生产卡的队列、sequence、TTL 重开、元素计数和写入失败状态。正文按完整 block 插入静态元素，footer 用 replace；模板和 Session 不直调 Card Kit HTTP。
 - `workspace.ts` 统一按实际工作目录（含软链接归一化）解析目录配置；BTW/FK 与来源共享目录，WT 是独立目录。项目工具/MCP 配置按目录共享；任务清单属于项目级，主群、所有 WT 及其 BTW/FK 临时群共用同一清单。模型/账号仅创建临时会话时继承快照，后续各会话独立。配置别名冲突必须报错。
 - `worktree.ts` 管理 `work/*` 分支和同级 `<project>[name]` 工作区。飞书任务清单按主项目名绑定，所有 worktree 共用；只提供绑定与删除，不启动自动规划、执行、审核或合并 worker。

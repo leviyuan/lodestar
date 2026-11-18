@@ -699,10 +699,14 @@ export async function onModelEffortSelect(
   const environmentChanged = !s.processSourceMatches(source, model) || !!source?.modelEnvironmentRevision
     && source.modelEnvironmentRevision(s.currentModelLabel() ?? '') !== source.modelEnvironmentRevision(model)
   const processNeedsStop = s.modelSelectionNeedsProcessStop(provider, choice.sourceId ?? s.selectedTokenSourceId, model, effort)
+  // 原生安全拦截把运行中的会话换到了降级模型时，持久选择仍是原模型；重选它必须真正下发，
+  // 否则用户无法从降级中切回。
+  const refusalFallbackActive = !!(s.proc?.isAlive() && s.proc.provider === provider && s.proc.refusalFallback)
   const selectionUnchanged = s.currentProvider() === provider &&
     !sourceChanged &&
     s.currentModelLabel() === model &&
-    s.currentEffortLabel() === effort
+    s.currentEffortLabel() === effort &&
+    !refusalFallbackActive
   if (selectionUnchanged && !s.modelSettingsChange && !processNeedsStop && !environmentChanged) {
     s.modelPanels.delete(panelId)
     return {

@@ -8967,3 +8967,119 @@ describe('Session task-end notifications', () => {
     session.dispose()
   })
 })
+
+describe('Claude safety refusal notices', () => {
+  const fallback = {
+    kind: 'fallback' as const, scope: 'session' as const, originalModel: 'claude-opus-5-5',
+    fallbackModel: 'claude-opus-4-8', category: 'cyber', explanation: 'Cyber safeguards flagged this message.',
+  }
+
+  function wired(name: string) {
+    const session = new Session(name, 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const proc = new FakeAgentProc('claude', 'claude-session') as any
+    session.proc = proc
+    session.wireProc(proc)
+    return { session, proc }
+  }
+
+  test('a session fallback sends its own card and the running turn footer shows the fallback model', async () => {
+    const { session, proc } = wired('refusal-session')
+    const turn = turnState('card_refusal')
+    turn.provider = 'claude'; turn.model = 'claude-opus-5-5'; turn.effort = 'max'
+    session.currentTurn = turn
+    try {
+      proc.emit('model_refusal', fallback)
+      await waitUntil(() => sentCards.length === 1)
+      const card = sentCards[0] as any
+      expect(card.header.title.content).toBe('⚠️ 安全拦截 · 已降级为 Opus 4.8')
+      expect(JSON.stringify(card)).toContain('Claude Code 已改由 Opus 4.8 接着回答')
+      expect(turn.model).toBe('claude-opus-4-8')
+      expect(session.modelLine()).toBe('claude · claude-opus-4-8/max')
+      expect(sentRawTexts).toEqual([])
+    } finally { session.dispose() }
+  })
+
+  test('local fallbacks alert once per turn and model pair; a refusal without a fallback always alerts', async () => {
+    const { session, proc } = wired('refusal-local')
+    const turn = turnState('card_refusal_local')
+    turn.provider = 'claude'; turn.model = 'claude-opus-5-5'
+    session.currentTurn = turn
+    try {
+      const local = { ...fallback, scope: 'local' as const }
+      proc.emit('model_refusal', local)
+      proc.emit('model_refusal', local)
+      proc.emit('model_refusal', { ...local, fallbackModel: 'claude-sonnet-5-5' })
+      proc.emit('model_refusal', { kind: 'no_fallback', scope: 'session', originalModel: 'claude-opus-5-5',
+        fallbackModel: null, category: null, explanation: null })
+      await waitUntil(() => sentCards.length === 3)
+      await new Promise(resolve => setTimeout(resolve, 5))
+      expect(sentCards.map((card: any) => card.header.title.content)).toEqual([
+        '⚠️ 安全拦截 · 子 Agent 改用 Opus 4.8',
+        '⚠️ 安全拦截 · 子 Agent 改用 Sonnet 5.5',
+        '⚠️ 安全拦截 · 本轮已终止',
+      ])
+      // Neither a local fallback nor a terminated turn changes the session's model.
+      expect(turn.model).toBe('claude-opus-5-5')
+    } finally { session.dispose() }
+  })
+
+  test('a failed card send falls back to the same notice as text with the Feishu diagnosis', async () => {
+    const { session, proc } = wired('refusal-text-fallback')
+    const send = spyOn(feishu, 'sendCard').mockImplementation(async (_chatId, _card, onFailure) => {
+      onFailure?.(Object.assign(new Error('card rejected'), { code: 230099 }))
+      return null
+    })
+    try {
+      proc.emit('model_refusal', fallback)
+      await waitUntil(() => sentRawTexts.length === 1)
+      expect(sentRawTexts[0]).toStartWith('⚠️ 安全拦截 · 已降级为 Opus 4.8\nOpus 5.5 的安全分类器拦下了本轮回复（类别 cyber）')
+      expect(sentRawTexts[0]).toContain('（提醒卡发送失败，改发文字：code=230099')
+    } finally {
+      send.mockRestore()
+      session.dispose()
+    }
+  })
+
+  test('reselecting the saved model after a session fallback really switches the live process back', async () => {
+    buildTokenSourcesFromConfig()
+    const glm = getTokenSource('glm')!
+    glm.enabled = true
+    glm.models = [{ model: 'GLM-5.2', display: 'GLM-5.2', efforts: ['max'], defaultEffort: 'max' }]
+    glm.defaultModel = 'GLM-5.2'
+    glm.modelCatalogState = { status: 'ready', updatedAt: 1 }
+    const session = new Session('refusal-reselect', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1', 'glm') as any
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'
+    session.selectedEffort = 'max'
+    proc.refusalFallback = { originalModel: 'GLM-5.2', fallbackModel: 'GLM-4.7' }
+    session.modelPanels.set('panel-glm', { models: [{
+      provider: 'claude', sourceId: 'glm', model: 'GLM-5.2', displayName: 'GLM-5.2',
+      efforts: [{ effort: 'max', isDefault: true, selected: true }],
+    }] })
+    try {
+      const result = await session.onModelEffortSelect('GLM-5.2', 'max', 'panel-glm', 'ou_user', 'claude')
+      expect(result.ok).toBe(true)
+      expect(result.message).not.toContain('当前已是')
+      expect(proc.setModelSettingsCalls).toHaveLength(1)
+      expect(proc.setModelSettingsCalls[0]![1]).toBe('max')
+      expect(proc.killCalls).toBe(0)
+      expect(session.proc).toBe(proc)
+      // Without a fallback the same reselection stays a no-op.
+      proc.refusalFallback = null
+      session.modelPanels.set('panel-glm-again', { models: [{
+        provider: 'claude', sourceId: 'glm', model: 'GLM-5.2', displayName: 'GLM-5.2',
+        efforts: [{ effort: 'max', isDefault: true, selected: true }],
+      }] })
+      const again = await session.onModelEffortSelect('GLM-5.2', 'max', 'panel-glm-again', 'ou_user', 'claude')
+      expect(again.message).toContain('当前已是')
+      expect(proc.setModelSettingsCalls).toHaveLength(1)
+    } finally {
+      session.dispose()
+      resetTokenSourceRegistry()
+    }
+  })
+})
