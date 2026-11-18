@@ -274,9 +274,9 @@ describe('main conversation card rendering', () => {
     expect(elements[1].element_id).toBe('console_projects')
     expect(elements[1].tag).toBe('collapsible_panel')
     expect(elements[1].expanded).toBe(false)
-    expect(elements[1].header.title.content).toBe('🗂 活跃项目 (1)')
-    expect(elements[1].elements[0].content).toContain('`probe` · 工作中 · 1m · 当前')
-    expect(elements[1].elements[0].content).toContain(' · Codex：`工作订阅`')
+    expect(elements[1].header.title.content).toBe('🗂 活跃项目 (1) · 工作中 1')
+    expect(elements[1].elements[0].content).toContain('`probe` · 当前 · 工作中 · 1m')
+    expect(elements[1].elements[0].content).toContain(' · Codex·工作订阅')
     expect(elements[1].elements[0].content).not.toContain('gpt-5-codex')
 
     expect(elements[2].element_id).toBe('console_host')
@@ -310,11 +310,33 @@ describe('main conversation card rendering', () => {
       ],
     }).split('\n')
 
-    expect(lines[0]).toBe('　· 🟢 `busy-idle` · 闲 · 子Agent1·后台2 · 1m · 当前')
+    expect(lines[0]).toBe('　· 🟢 `busy-idle` · 当前 · 闲 · 子Agent1·后台2 · 1m')
     // Nothing running beside the main turn keeps the row exactly as before.
     expect(lines[1]).toBe('　· 🟢 `quiet` · 闲')
-    expect(lines[2]).toBe('　· ⚙️ `codex` · 工作中 · 后台MISS · Codex：`工作订阅`')
+    expect(lines[2]).toBe('　· ⚙️ `codex` · 工作中 · 后台MISS · Codex·工作订阅')
     expect(lines[3]).toBe('　· 🟢 `legacy` · 闲')
+  })
+
+  test('active projects read like the quota panel: same durations, same account labels, attention counts in the title', () => {
+    const MIN = 60_000, HOUR = 3600_000, DAY = 86400_000
+    const peer = (name: string, status: 'idle' | 'working' | 'awaiting_permission', uptimeMs: number, extra: object = {}) =>
+      ({ name, isCurrent: false, status, uptimeMs, ...extra })
+    const opts = { sessionName: 'probe', status: 'idle' as const, peers: [
+      peer('a', 'idle', 8_000), peer('b', 'idle', 59_900), peer('c', 'working', 40 * MIN),
+      peer('d', 'awaiting_permission', 2 * HOUR + 5 * MIN, { claudeAccountName: 'a*b_[c]' }),
+      peer('e', 'working', 3 * DAY, { codexAccountName: '工作订阅' }),
+    ] }
+    // Uptimes share the quota countdown format: seconds, whole minutes, then one decimal hours or days (never "3d 0h").
+    expect(consoleMainContent(opts).split('\n')).toEqual([
+      '　· 🟢 `a` · 闲 · 8s',
+      '　· 🟢 `b` · 闲 · 59s',
+      '　· ⚙️ `c` · 工作中 · 40m',
+      '　· 🔐 `d` · 等审批 · 2.1h · Claude·a&#42;b&#95;&#91;c&#93;',
+      '　· ⚙️ `e` · 工作中 · 3.0d · Codex·工作订阅',
+    ])
+    // The collapsed panel title puts what needs attention first.
+    const element = consoleBodyElements(opts).find((item: any) => item.element_id === 'console_projects') as any
+    expect(element.header.title.content).toBe('🗂 活跃项目 (5) · 等审批 1 · 工作中 2')
   })
 
   test('console keeps the original Codex model header but labels Claude explicitly', () => {

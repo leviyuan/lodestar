@@ -11,9 +11,9 @@ import type { UsageSnapshotUnified, TokenSourceModelCatalogState } from '../toke
 import type { AgentProvider } from '../agent-process'
 import { ELEMENTS } from './elements'
 import { formatDuration } from './duration'
-import { codexCreditsSummary, fmtResetIn } from './usage'
+import { codexCreditsSummary, fmtCountdown, fmtResetIn } from './usage'
 import type { AccountUsage } from '../account-usage'
-import { accountUsageRow, compactAccountUsage } from './account-usage'
+import { accountUsageRow, compactAccountUsage, escapeInlineMarkdown } from './account-usage'
 import { sessionWorkloadLabel, type SessionWorkload } from './task-kind'
 
 export { fmtResetIn } from './usage'
@@ -148,15 +148,9 @@ function fmtTokens(n: number): string {
   return (n / 1_000_000).toFixed(2).replace(/\.?0+$/, '') + 'M'
 }
 
+/** hi 卡片里的时长与额度倒计时同一写法：不足 1 分钟按秒，其余同 fmtCountdown（40m、2.1h、3.0d）。 */
 function fmtUptime(ms: number): string {
-  if (ms < 60_000) return `${Math.round(ms / 1000)}s`
-  const totalMin = Math.floor(ms / 60_000)
-  if (totalMin < 60) return `${totalMin}m`
-  const h = Math.floor(totalMin / 60)
-  const m = totalMin % 60
-  if (h < 24) return `${h}h ${m}m`
-  const d = Math.floor(h / 24)
-  return `${d}d ${h % 24}h`
+  return ms < 60_000 ? `${Math.floor(ms / 1000)}s` : fmtCountdown(ms)
 }
 
 const PEER_STATUS_EMOJI: Record<string, string> = {
@@ -235,7 +229,12 @@ function hostSummary(sysinfo?: SysInfo): string[] {
   const parts: string[] = []
   if (sysinfo?.cpu) parts.push(`L${sysinfo.cpu.load1.toFixed(2)}`)
   if (sysinfo?.mem) parts.push(`M${sysinfo.mem.percent}%`)
-  if (sysinfo && !sysinfo.servicesError) parts.push(`S${sysinfo.services.length}`)
+  if (sysinfo && !sysinfo.servicesError) {
+    parts.push(`S${sysinfo.services.length}`)
+    // 面板默认折叠：有服务挂掉时标题上就能看到，不必展开。
+    const failed = sysinfo.services.filter(service => service.active === 'failed').length
+    if (failed) parts.push(`${SERVICE_STATUS_EMOJI.failed}${failed}`)
+  }
   return parts
 }
 
@@ -272,10 +271,15 @@ export function consoleHostContent(sysinfo?: SysInfo): string {
       const dot = SERVICE_STATUS_EMOJI[s.active] ?? '·'
       const lastActive = s.lastActiveAgoSec
       const stateAge = s.stateAgoSec
-      const parts: string[] = [s.active]
+      // 运行、停止、失败已由圆点和「已运行 / 已停 / 已挂」表达，不再重复英文状态；其余状态照写。
+      const parts: string[] = []
       if (s.active === 'active') {
         if (stateAge != null) parts.push(`已运行 ${fmtUptime(stateAge * 1000)}`)
       } else if (s.active === 'inactive' || s.active === 'failed') {
+        if (stateAge != null) {
+          const verb = s.active === 'failed' ? '已挂' : '已停'
+          parts.push(`${verb} ${fmtUptime(stateAge * 1000)}`)
+        }
         if (lastActive != null) {
           parts.push(`上次活跃 ${fmtUptime(lastActive * 1000)}前`)
         } else if (s.hasStarted === false) {
@@ -283,13 +287,12 @@ export function consoleHostContent(sysinfo?: SysInfo): string {
         } else {
           parts.push('上次活跃 MISS')
         }
-        if (stateAge != null) {
-          const verb = s.active === 'failed' ? '已挂' : '已停'
-          parts.push(`${verb} ${fmtUptime(stateAge * 1000)}`)
-        }
-      } else if (stateAge != null) {
-        parts.push(`已 ${fmtUptime(stateAge * 1000)}`)
+      } else {
+        parts.push(s.active)
+        if (stateAge != null) parts.push(`已 ${fmtUptime(stateAge * 1000)}`)
       }
+      // 只有什么都不写时才退回英文状态；有报错时报错本身就是内容。
+      if (!parts.length && !s.error) parts.push(s.active)
       if (s.active !== 'active' && s.lastExitStatus !== undefined) {
         parts.push(s.lastExitStatus < 0 ? `终止信号 ${-s.lastExitStatus}` : `退出码 ${s.lastExitStatus}`)
       }
@@ -310,12 +313,22 @@ export function consoleMainContent(opts: ConsoleOpts): string {
     const workload = sessionWorkloadLabel(p.workload)
     const label = `${PEER_STATUS_LABEL[p.status] ?? p.status}${workload ? ` · ${workload}` : ''}`
     const up = p.uptimeMs != null && p.uptimeMs > 0 ? ` · ${fmtUptime(p.uptimeMs)}` : ''
+    // 「当前」紧跟项目名，与 bl 的「本群」一致；账号写法与额度区的行名相同（Claude·默认）。
     const mark = p.isCurrent ? ' · 当前' : ''
     const account = p.claudeAccountName !== undefined
-      ? ` · Claude：${inlineCode(escapeMarkdown(p.claudeAccountName))}`
-      : p.codexAccountName === undefined ? '' : ` · Codex：${inlineCode(escapeMarkdown(p.codexAccountName))}`
-    return `　· ${dot} \`${p.name}\` · ${label}${up}${mark}${account}`
+      ? ` · Claude·${escapeInlineMarkdown(p.claudeAccountName)}`
+      : p.codexAccountName === undefined ? '' : ` · Codex·${escapeInlineMarkdown(p.codexAccountName)}`
+    return `　· ${dot} \`${p.name}\`${mark} · ${label}${up}${account}`
   }).join('\n')
+}
+
+/** 面板默认折叠：标题带上等审批、工作中的项目数，不展开也知道哪里要处理。 */
+function peersSummary(peers: NonNullable<ConsoleOpts['peers']>): string {
+  return (['awaiting_permission', 'working'] as const)
+    .map(status => [PEER_STATUS_LABEL[status], peers.filter(peer => peer.status === status).length] as const)
+    .filter(([, count]) => count > 0)
+    .map(([label, count]) => ` · ${label} ${count}`)
+    .join('')
 }
 
 export function consoleMainElement(opts: ConsoleOpts, elementId = ELEMENTS.consoleProjects): object {
@@ -324,7 +337,7 @@ export function consoleMainElement(opts: ConsoleOpts, elementId = ELEMENTS.conso
     tag: 'collapsible_panel',
     element_id: elementId,
     header: {
-      title: { tag: 'plain_text', content: `🗂 活跃项目 (${peers.length})` },
+      title: { tag: 'plain_text', content: `🗂 活跃项目 (${peers.length})${peersSummary(peers)}` },
     },
     expanded: false,
     elements: [{ tag: 'markdown', content: consoleMainContent(opts) }],
@@ -383,7 +396,8 @@ export function unifiedUsageSummary(snap: UsageSnapshotUnified | undefined): str
     ? `余额 ${money(snap.balance.remaining, snap.balance.currency)}` : '余额 MISS'
   if (snap.quota) return snap.quota.limit === null ? '额度 未设上限'
     : snap.quota.remaining === null ? '额度 MISS'
-    : `额度 ${money(snap.quota.remaining, snap.quota.currency)} / ${money(snap.quota.limit, snap.quota.currency)}`
+    // 与 hi 同写法：令牌额度给的是剩余与上限，写明「剩余」免得读成已用。
+    : `剩余 ${money(snap.quota.remaining, snap.quota.currency)} / ${money(snap.quota.limit, snap.quota.currency)}`
   const quota = snap.windows.length ? `额度 ${snap.windows.map(usageWindowSummary).join(' · ')}` : '额度 MISS'
   const credits = snap.credits !== undefined ? codexCreditsSummary(snap.credits) : null
   return [quota, credits].filter(Boolean).join(' · ')
@@ -404,7 +418,7 @@ export function consoleUsageElement(opts: ConsoleOpts): object {
   const rows = opts.accountUsages
   return {
     tag: 'collapsible_panel', element_id: ELEMENTS.consoleUsage, expanded: true,
-    header: { title: { tag: 'plain_text', content: '全部账号额度 · 已用 / 距重置' }, background_color: 'blue-50' },
+    header: { title: { tag: 'plain_text', content: '📊 全部账号额度 · 已用/距重置' }, background_color: 'blue-50' },
     border: { color: 'blue-100', corner_radius: '8px' }, padding: '8px', vertical_spacing: '2px',
     elements: rows === undefined ? [{ tag: 'markdown', text_size: 'notation', content: '加载中…' }]
       : rows.length ? rows.map(accountUsageRow) : [{ tag: 'markdown', text_size: 'notation', content: '暂无已配置账号' }],

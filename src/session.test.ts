@@ -94,7 +94,7 @@ describe('Session delegated-agent capability', () => {
       expect(await session.start({ announce: false })).toBe(true)
       expect(auth).not.toHaveBeenCalled()
       expect(session.peerSnapshot().codexAccountName).toBeUndefined()
-      expect(await session.footerUsageSuffix('codex', proc, source.id, source, null, 'kimi-k3')).toBe('  |  额度 $2.00 / $5.00')
+      expect(await session.footerUsageSuffix('codex', proc, source.id, source, null, 'kimi-k3')).toBe('  |  剩余 $2.00 / $5.00')
       expect(session.conversationRouting().codexAccountId).toBeUndefined()
       expect(session.conversationRouting().codexAccountAutomatic).toBeUndefined()
     } finally {
@@ -5792,7 +5792,7 @@ describe('Session usage cache cross-backend isolation', () => {
       const panel = replaceSpy.mock.calls.at(-1)?.[2] as any
       expect(panel.element_id).toBe('console_usage')
       expect(panel.elements).toHaveLength(1)
-      expect(panel.elements[0].content).toBe('**Claude 订阅**　5h 7%/4.1h · 周 17%/6.9d · Fable周 42%/MISS')
+      expect(panel.elements[0].content).toBe('**Claude 订阅**　5h 7%/4.1h · 周 17%/6.9d · Fable 42%/MISS')
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'opus')).toBe('  |  4.1h·7%·[6.9d·17%]')
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'default')).toBe('  |  4.1h·7%·[6.9d·17%]')
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'claude-fable-5-1[1m]')).toBe('  |  4.1h·7%·[42%]')

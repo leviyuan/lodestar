@@ -20,14 +20,21 @@ export function codexCreditsSummary(credits: CodexCredits | null | undefined): s
   return `积分 ${value}${unit}`
 }
 
+/** Compact positive countdown: whole minutes below an hour, then hours or days to one decimal.
+ * Window resets and the hi login end share it, so every countdown in a row reads the same way.
+ * The unit follows the rounded value: 59.7 minutes reads 1.0h and 23.97 hours 1.0d, never 60m or 24.0h. */
+export function fmtCountdown(ms: number): string {
+  const minutes = Math.max(1, Math.round(ms / 60_000))
+  if (minutes < 60) return `${minutes}m`
+  const hours = (ms / 3_600_000).toFixed(1)
+  return Number(hours) < 24 ? `${hours}h` : `${(ms / 86_400_000).toFixed(1)}d`
+}
+
 /** Human-readable time until reset; keep the compact footer's h/d precision. */
 export function fmtResetIn(date: Date | null): string {
   if (!date) return '?'
   const ms = date.getTime() - Date.now()
-  if (ms <= 0) return '已重置'
-  if (ms < 60 * 60 * 1000) return `${Math.max(1, Math.round(ms / 60_000))}m`
-  if (ms < 24 * 60 * 60 * 1000) return `${(ms / (60 * 60 * 1000)).toFixed(1)}h`
-  return `${(ms / (24 * 60 * 60 * 1000)).toFixed(1)}d`
+  return ms <= 0 ? '已重置' : fmtCountdown(ms)
 }
 
 /** Shared six-cell usage bar and reset caption for hi and Codex account cards. */

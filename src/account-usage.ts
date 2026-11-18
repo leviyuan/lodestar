@@ -60,7 +60,8 @@ function startAccountUsageRead(): Promise<AccountUsage[]> {
     const id = source.usageAccount?.id ?? sharedAccountId(source.id)
     if (seen.has(id)) continue
     seen.add(id)
-    const label = source.usageAccount?.label ?? (id === 'glm' ? 'GLM Coding Plan' : id === 'deepseek' ? 'DeepSeek'
+    // hi 一账号一行：单账号来源只写短名，多账号来源写「来源·备注」。
+    const label = source.usageAccount?.label ?? (id === 'glm' ? 'GLM' : id === 'deepseek' ? 'DeepSeek'
       : source.kind === 'claude-subscription' ? 'Claude 订阅' : source.display)
     reads.push(Promise.resolve().then(() => source.readUsage()).catch((error): UsageSnapshotUnified => {
       const reason = error instanceof Error ? error.message : String(error)

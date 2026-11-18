@@ -232,8 +232,8 @@ describe('1:1 panel builder', () => {
     const card = await buildP2pPanelCard(REQUESTER, INTERNAL, h.deps) as any
 
     expect(names(card)).toEqual(['foo', 'foo*x', 'foo[b]', 'foo[b]*x', 'my_proj', 'member-only'])
-    expect(rows(card)[0]).toBe('　· 🟢 `foo` · 闲 · 2m · Codex：`工作订阅`')
-    expect(rows(card)[5]).toContain('Codex：`备用`')
+    expect(rows(card)[0]).toBe('　· 🟢 `foo` · 闲 · 2m · Codex·工作订阅')
+    expect(rows(card)[5]).toContain('Codex·备用')
     // Membership is only asked for the sessions ownership did not already cover.
     expect(h.memberChecks).toEqual([
       ['oc_foo_bar', REQUESTER], ['oc_elsewhere', REQUESTER], ['oc_member_only', REQUESTER],
@@ -298,7 +298,7 @@ describe('1:1 panel builder', () => {
     expect(h.calls).not.toContain('readAllAccountUsage')
     expect(h.calls).not.toContain('readSysInfo')
     const body = JSON.stringify(card)
-    for (const hidden of ['工作订阅', '备用', 'Codex：', '主机', '全部账号额度', 'GLM']) expect(body).not.toContain(hidden)
+    for (const hidden of ['工作订阅', '备用', 'Codex·', 'Claude·', '主机', '全部账号额度', 'GLM']) expect(body).not.toContain(hidden)
     expect(unexpected).toEqual([])
   })
 
