@@ -1455,6 +1455,10 @@ export class ClaudeAgentProcess extends EventEmitter {
       fallbackModel: fallback ? text(raw.fallback_model) : null,
       category: text(raw.api_refusal_category),
       explanation: text(raw.api_refusal_explanation),
+      uuid: text(raw.uuid),
+      retracted: Array.isArray(raw.retracted_message_uuids)
+        ? raw.retracted_message_uuids.filter((id: unknown): id is string => typeof id === 'string' && !!id)
+        : [],
     }
     if (!notice.originalModel || fallback && !notice.fallbackModel) {
       logDiagnostic('claude-agent-process: malformed model refusal')

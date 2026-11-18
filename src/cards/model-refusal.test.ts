@@ -9,7 +9,7 @@ import {
 
 const sessionFallback: ModelRefusalNotice = {
   kind: 'fallback', scope: 'session', originalModel: 'claude-opus-5-5', fallbackModel: 'claude-opus-4-8',
-  category: 'cyber', explanation: 'Cyber safeguards flagged this message.',
+  category: 'cyber', explanation: 'Cyber safeguards flagged this message.', uuid: 'notice-1', retracted: [],
 }
 
 function body(card: any): string {
@@ -58,7 +58,7 @@ describe('model refusal notice card', () => {
 
   test('a refusal without a fallback says the turn did not finish', () => {
     const notice: ModelRefusalNotice = { kind: 'no_fallback', scope: 'session', originalModel: 'claude-opus-5-5',
-      fallbackModel: null, category: null, explanation: null }
+      fallbackModel: null, category: null, explanation: null, uuid: null, retracted: [] }
     const card = modelRefusalNoticeCard(notice) as any
     expect(card.header.title.content).toBe('⚠️ 安全拦截 · 本轮已终止')
     expect(body(card)).toContain('**Opus 5.5 的安全分类器拦下了本轮回复，没有可用的降级模型，本轮没有完成。**')

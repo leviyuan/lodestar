@@ -10,7 +10,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, te
 import {
   boundResumes, branchBaseBySession, clearedResumes, deletedReactions, projectProfiles, resetFeishuMock,
   modelSelections, sentCards, sentRawTexts, sentTexts, updatedCards, urgentPushes,
-  setResumeWriteError, setTurnAnchorWriteError,
+  setResumeWriteError, setTurnAnchorWriteError, setUpdateCardHandler,
   turnAnchorsBySession, resumeRefs, pendingConversationLaunchBySession,
   sentImages, uploadedImages, sentLocalFiles, setImageUploadHandler,
 } from './feishu-test-mock'
@@ -8972,6 +8972,7 @@ describe('Claude safety refusal notices', () => {
   const fallback = {
     kind: 'fallback' as const, scope: 'session' as const, originalModel: 'claude-opus-5-5',
     fallbackModel: 'claude-opus-4-8', category: 'cyber', explanation: 'Cyber safeguards flagged this message.',
+    uuid: 'notice-1', retracted: [] as string[],
   }
 
   function wired(name: string) {
@@ -9011,7 +9012,7 @@ describe('Claude safety refusal notices', () => {
       proc.emit('model_refusal', local)
       proc.emit('model_refusal', { ...local, fallbackModel: 'claude-sonnet-5-5' })
       proc.emit('model_refusal', { kind: 'no_fallback', scope: 'session', originalModel: 'claude-opus-5-5',
-        fallbackModel: null, category: null, explanation: null })
+        fallbackModel: null, category: null, explanation: null, uuid: 'notice-stop', retracted: [] })
       await waitUntil(() => sentCards.length === 3)
       await new Promise(resolve => setTimeout(resolve, 5))
       expect(sentCards.map((card: any) => card.header.title.content)).toEqual([
@@ -9080,6 +9081,98 @@ describe('Claude safety refusal notices', () => {
     } finally {
       session.dispose()
       resetTokenSourceRegistry()
+    }
+  })
+
+  test('reselecting while a turn is running still switches back, effective from the next turn', async () => {
+    buildTokenSourcesFromConfig()
+    const glm = getTokenSource('glm')!
+    glm.enabled = true
+    glm.models = [{ model: 'GLM-5.2', display: 'GLM-5.2', efforts: ['max'], defaultEffort: 'max' }]
+    glm.defaultModel = 'GLM-5.2'
+    glm.modelCatalogState = { status: 'ready', updatedAt: 1 }
+    const session = new Session('refusal-reselect-busy', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-busy', 'glm') as any
+    session.proc = proc
+    session.selectedProvider = 'claude'; session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'; session.selectedEffort = 'max'
+    session.currentTurn = turnState('card_refusal_busy')
+    proc.refusalFallback = { originalModel: 'GLM-5.2', fallbackModel: 'GLM-4.7' }
+    session.modelPanels.set('panel-busy', { models: [{
+      provider: 'claude', sourceId: 'glm', model: 'GLM-5.2', displayName: 'GLM-5.2',
+      efforts: [{ effort: 'max', isDefault: true, selected: true }],
+    }] })
+    try {
+      const result = await session.onModelEffortSelect('GLM-5.2', 'max', 'panel-busy', 'ou_user', 'claude')
+      expect(result.ok).toBe(true)
+      expect(proc.setModelSettingsCalls).toHaveLength(1)
+      expect(JSON.stringify(result.card)).toContain('当前 turn 不变')
+    } finally {
+      session.currentTurn = null
+      session.dispose()
+      resetTokenSourceRegistry()
+    }
+  })
+
+  test('a notice arriving while an input batch waits survives stop', async () => {
+    const { session, proc } = wired('refusal-steering-stop')
+    session.initCount = 1; session.turnCounter = 1; session.status = 'working'
+    const turn = turnState('card_refusal_steering')
+    turn.provider = 'claude'; turn.model = 'claude-opus-5-5'
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 2)
+    proc.steerUserText = async () => true
+    try {
+      await session.onUserMessage('waiting input', [], 'ou_user', 'om_waiting')
+      await session.steeringSend
+      proc.emit('user_input_consumed', { inputId: [...session.submittedSteering.keys()][0] })
+      expect(session.steeringBoundary.collecting).toBe(true)
+      proc.emit('model_refusal', fallback)
+      // The fallback already applies to this turn even though output events are buffered.
+      expect(turn.model).toBe('claude-opus-4-8')
+      await session.runCommand('stop')
+      expect(session.steeringBoundary).toBeNull()
+      await waitUntil(() => sentCards.length === 1)
+      expect((sentCards[0] as any).header.title.content).toBe('⚠️ 安全拦截 · 已降级为 Opus 4.8')
+    } finally { session.dispose() }
+  })
+
+  test('a later fallback that retracts the earlier notice rewrites that card instead of adding one', async () => {
+    const { session, proc } = wired('refusal-superseded')
+    const turn = turnState('card_refusal_superseded')
+    turn.provider = 'claude'; turn.model = 'claude-opus-5-5'
+    session.currentTurn = turn
+    try {
+      proc.emit('model_refusal', fallback)
+      await waitUntil(() => sentCards.length === 1)
+      proc.emit('model_refusal', { ...fallback, fallbackModel: 'claude-sonnet-5-5[1m]', uuid: 'notice-2',
+        retracted: ['partial-1', 'notice-1'] })
+      await waitUntil(() => updatedCards.length === 1)
+      expect(sentCards).toHaveLength(1)
+      expect(updatedCards[0]![0]).toBe('om_status_1')
+      expect((updatedCards[0]![1] as any).header.title.content).toBe('⚠️ 安全拦截 · 已降级为 Sonnet 5.5')
+      // Same display form as the rest of the footer: no [1m] accounting suffix.
+      expect(turn.model).toBe('claude-sonnet-5-5')
+      // A third notice retracting the second still lands on the same card.
+      proc.emit('model_refusal', { ...fallback, fallbackModel: 'claude-haiku-5-5', uuid: 'notice-3', retracted: ['notice-2'] })
+      await waitUntil(() => updatedCards.length === 2)
+      expect(updatedCards[1]![0]).toBe('om_status_1')
+      expect(sentCards).toHaveLength(1)
+    } finally { session.dispose() }
+  })
+
+  test('if rewriting the earlier card fails, the newer notice is still sent', async () => {
+    const { session, proc } = wired('refusal-superseded-fallback')
+    setUpdateCardHandler(async () => { throw new Error('message.patch rejected') })
+    try {
+      proc.emit('model_refusal', fallback)
+      await waitUntil(() => sentCards.length === 1)
+      proc.emit('model_refusal', { ...fallback, fallbackModel: 'claude-sonnet-5-5', uuid: 'notice-2', retracted: ['notice-1'] })
+      await waitUntil(() => sentCards.length === 2)
+      expect((sentCards[1] as any).header.title.content).toBe('⚠️ 安全拦截 · 已降级为 Sonnet 5.5')
+    } finally {
+      setUpdateCardHandler(null)
+      session.dispose()
     }
   })
 })

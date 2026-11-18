@@ -81,7 +81,25 @@ describe('Agent runtime audit exceptions', () => {
 
   test('any other advisory still blocks, even next to an exempted one', () => {
     const message = failure(() => auditAgentRuntime('dsh', '/runtime', deps(report(PICOMATCH, OTHER))))
-    expect(message).toBe('dsh 运行目录 npm audit 未通过：\nundici moderate GHSA-aaaa-bbbb-cccc undici leaks headers')
+    expect(message).toBe('dsh 运行目录 npm audit 未通过：\nundici <8.12.3 moderate GHSA-aaaa-bbbb-cccc undici leaks headers')
+  })
+
+  test('each affected range of the same advisory is judged on its own', () => {
+    // npm 把同一公告的不同受影响区间报成多条 via：2.x 已有修复时不能因 4.x 段仍受影响而放行。
+    const fixedLine = { ...PICOMATCH, source: 1109875, range: '<2.3.2' }
+    const openLine = { ...PICOMATCH, source: 1109876, range: '>=3.0.0 <=4.0.7' }
+    const output = JSON.stringify({ auditReportVersion: 2, vulnerabilities: {
+      picomatch: { name: 'picomatch', severity: 'high', via: [fixedLine, openLine], effects: [], range: '*', nodes: [] },
+    }, metadata: { vulnerabilities: { total: 1 } } })
+    const message = failure(() => auditAgentRuntime('dsh', '/runtime', deps(output)))
+    expect(message).toBe('dsh 运行目录 npm audit 未通过：\npicomatch <2.3.2 high GHSA-fc5q-39xc-vjpf '
+      + 'picomatch vulnerable to ReDoS through single-branch repeated extglobs'
+      + '（picomatch@4.0.7 已不在受影响范围 <2.3.2：请在 agentRuntimeOverrides.dsh 覆盖到修复版本并删除豁免）')
+    // Exact duplicates of one entry are still merged and exempted once.
+    const twice = JSON.stringify({ auditReportVersion: 2, vulnerabilities: {
+      picomatch: { name: 'picomatch', severity: 'high', via: [openLine, openLine], effects: [], range: '*', nodes: [] },
+    }, metadata: { vulnerabilities: { total: 1 } } })
+    expect(auditAgentRuntime('dsh', '/runtime', deps(twice))).toHaveLength(1)
   })
 
   test('unreadable or failed audits fail closed', () => {

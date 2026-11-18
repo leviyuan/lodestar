@@ -1354,7 +1354,8 @@ export class Session {
   private async announceModelRefusal(notice: ModelRefusalNotice): Promise<void> {
     const turn = this.currentTurn
     if (turn && notice.kind === 'fallback' && notice.scope === 'session' && notice.fallbackModel) {
-      turn.model = notice.fallbackModel
+      // 与 runtimeModelSelection 同一显示口径：去掉 claude: 前缀和 [1m] 记账后缀。
+      turn.model = notice.fallbackModel.replace(/^claude:/i, '').replace(/\[1m\]$/i, '')
     }
     if (notice.kind === 'fallback' && notice.scope === 'local' && turn) {
       const key = `${notice.originalModel ?? ''}\n${notice.fallbackModel ?? ''}`
@@ -1362,12 +1363,39 @@ export class Session {
       if (seen.has(key)) return
       seen.add(key)
     }
+    const card = cards.modelRefusalNoticeCard(notice)
+    // 连续降级时，后一条原生通知撤回前一条：原地改写前一张提醒卡，不再多发一张过时的卡。
+    const superseded = notice.retracted.map(id => this.refusalNoticeMessages.get(id)).find(Boolean)
+    if (superseded) {
+      try {
+        await feishu.updateCard(superseded, card)
+        this.rememberRefusalNotice(notice.uuid, superseded)
+        return
+      } catch (error) {
+        logError('session: model refusal notice update failed', error)
+      }
+    }
     let failure: unknown
-    const sent = await feishu.sendCard(this.chatId, cards.modelRefusalNoticeCard(notice), error => { failure = error })
-    if (sent) return
+    const sent = await feishu.sendCard(this.chatId, card, error => { failure = error })
+    if (sent) {
+      this.rememberRefusalNotice(notice.uuid, sent)
+      return
+    }
     logDiagnostic('session: model refusal notice card failed')
     await feishu.sendTextRaw(this.chatId,
       `${cards.modelRefusalNoticeText(notice)}\n（提醒卡发送失败，改发文字：${formatFeishuError(failure)}）`)
+  }
+
+  /** 原生降级通知 uuid → 已发提醒卡的 message_id，供后续撤回它的通知原地改写；只留最近几条。 */
+  private readonly refusalNoticeMessages = new Map<string, string>()
+
+  private rememberRefusalNotice(uuid: string | null, messageId: string): void {
+    if (!uuid) return
+    this.refusalNoticeMessages.delete(uuid)
+    this.refusalNoticeMessages.set(uuid, messageId)
+    while (this.refusalNoticeMessages.size > 16) {
+      this.refusalNoticeMessages.delete(this.refusalNoticeMessages.keys().next().value!)
+    }
   }
 
   async openStatusCard(
@@ -3870,14 +3898,17 @@ export class Session {
       p.on(event, (payload: AgentProcessEventMap[K]) => {
         const generation = this.steeringGeneration
         const snapshot = { result: { ...p.lastResult }, totalUsage: p.lastTotalUsage ? { ...p.lastTotalUsage } : null }
+        // 安全拦截提醒是独立卡、与正文顺序无关：不进追加换卡的缓冲，也不因 stop 换代而丢弃——
+        // 原生此时已经换到降级模型，丢掉提醒就又回到“悄悄降级”。
+        const unbuffered = event === 'error' || event === 'model_refusal'
         const dispatch = (): void => {
           if (!isCurrent()) {
             return
           }
-          if (generation !== this.steeringGeneration && event !== 'exit' && event !== 'error') return
+          if (generation !== this.steeringGeneration && event !== 'exit' && !unbuffered) return
           const boundary = this.steeringBoundary
           if (boundary && boundary.proc === p && boundary.epoch === epoch
-            && event !== 'error' && !(event === 'exit' && (this.stoppingProc === p || this.blockedProc === p))) {
+            && !unbuffered && !(event === 'exit' && (this.stoppingProc === p || this.blockedProc === p))) {
             if (event === 'user_input_consumed' && boundary.collecting) {
               handler(payload, snapshot)
               return

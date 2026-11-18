@@ -69,7 +69,9 @@ function advisoriesOf(report: any): NpmAdvisory[] {
   for (const entry of Object.values<any>(report.vulnerabilities)) {
     for (const via of Array.isArray(entry?.via) ? entry.via : []) {
       if (!via || typeof via !== 'object') continue
-      found.set(`${via.url}\n${via.name}`, {
+      // 同一个公告可能按受影响区间拆成多条（source、range 不同），每一段都要单独判定，
+      // 只合并完全相同的重复项。
+      found.set(`${via.source ?? ''}\n${via.url}\n${via.name}\n${via.range}`, {
         name: String(via.name), url: String(via.url), severity: String(via.severity),
         title: String(via.title), range: String(via.range),
       })
@@ -99,7 +101,7 @@ export function auditAgentRuntime(agent: AuditedAgent, directory: string, deps: 
   const exempted: string[] = []
   for (const advisory of advisories) {
     const ghsa = ghsaOf(advisory.url)
-    const label = `${advisory.name} ${advisory.severity} ${ghsa ?? advisory.url} ${advisory.title}`
+    const label = `${advisory.name} ${advisory.range} ${advisory.severity} ${ghsa ?? advisory.url} ${advisory.title}`
     const exception = ghsa ? exceptions.find(item => item.agent === agent
       && item.advisory.toLowerCase() === ghsa.toLowerCase() && item.package === advisory.name) : undefined
     if (!exception) {

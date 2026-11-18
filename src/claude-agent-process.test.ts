@@ -1928,7 +1928,7 @@ describe('Claude safety refusal fallback', () => {
       expect(notices).toEqual([])
       proc.handleMessage(fallback())
       expect(notices).toEqual([{ kind: 'fallback', scope: 'session', originalModel: 'claude-opus-5-5',
-        fallbackModel: 'claude-opus-4-8', category: 'cyber', explanation }])
+        fallbackModel: 'claude-opus-4-8', category: 'cyber', explanation, uuid: 'u', retracted: [] }])
       expect(proc.refusalFallback).toEqual({ originalModel: 'claude-opus-5-5', fallbackModel: 'claude-opus-4-8' })
       expect(proc.lastModel).toBe('claude:claude-opus-4-8')
       // Replies from the fallback model keep it; a later explicit model setting ends it.
@@ -1947,7 +1947,7 @@ describe('Claude safety refusal fallback', () => {
     const { proc, notices } = capture()
     proc.handleMessage(fallback({ scope: undefined, api_refusal_category: undefined, api_refusal_explanation: null }))
     expect(notices).toEqual([{ kind: 'fallback', scope: 'session', originalModel: 'claude-opus-5-5',
-      fallbackModel: 'claude-opus-4-8', category: null, explanation: null }])
+      fallbackModel: 'claude-opus-4-8', category: null, explanation: null, uuid: 'u', retracted: [] }])
     expect(proc.refusalFallback).not.toBeNull()
     proc.handleMessage({ type: 'assistant', uuid: 'b', message: { model: 'claude-opus-5-5', content: [] } })
     expect(proc.refusalFallback).toBeNull()
@@ -1956,9 +1956,9 @@ describe('Claude safety refusal fallback', () => {
 
   test('a local fallback (subagent or side question) leaves the session model unchanged', () => {
     const { proc, notices } = capture()
-    proc.handleMessage(fallback({ scope: 'local' }))
+    proc.handleMessage(fallback({ scope: 'local', retracted_message_uuids: ['partial-1', 7, '', 'notice-0'] }))
     expect(notices).toEqual([{ kind: 'fallback', scope: 'local', originalModel: 'claude-opus-5-5',
-      fallbackModel: 'claude-opus-4-8', category: 'cyber', explanation }])
+      fallbackModel: 'claude-opus-4-8', category: 'cyber', explanation, uuid: 'u', retracted: ['partial-1', 'notice-0'] }])
     expect(proc.refusalFallback).toBeNull()
     expect(proc.lastModel).toBe('claude:claude-opus-5-5')
   })
@@ -1970,7 +1970,7 @@ describe('Claude safety refusal fallback', () => {
       proc.handleMessage({ type: 'system', subtype: 'model_refusal_no_fallback', original_model: 'claude-opus-5-5',
         request_id: null, api_refusal_category: 'bio', content: 'stopped', uuid: 'n', session_id: 's' })
       expect(notices).toEqual([{ kind: 'no_fallback', scope: 'session', originalModel: 'claude-opus-5-5',
-        fallbackModel: null, category: 'bio', explanation: null }])
+        fallbackModel: null, category: 'bio', explanation: null, uuid: 'n', retracted: [] }])
       expect(proc.refusalFallback).toBeNull()
       expect(diagnostic.mock.calls).toEqual([['claude-agent-process: model refusal without fallback']])
     } finally { diagnostic.mockRestore() }
@@ -1982,7 +1982,7 @@ describe('Claude safety refusal fallback', () => {
       const { proc, notices } = capture()
       proc.handleMessage(fallback({ fallback_model: '', original_model: 42 }))
       expect(notices).toEqual([{ kind: 'fallback', scope: 'session', originalModel: null,
-        fallbackModel: null, category: 'cyber', explanation }])
+        fallbackModel: null, category: 'cyber', explanation, uuid: 'u', retracted: [] }])
       expect(proc.refusalFallback).toBeNull()
       expect(proc.lastModel).toBe('claude:claude-opus-5-5')
       expect(diagnostic.mock.calls).toEqual([

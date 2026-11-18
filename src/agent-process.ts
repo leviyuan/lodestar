@@ -46,6 +46,10 @@ export interface ModelRefusalNotice {
   fallbackModel: string | null
   category: string | null
   explanation: string | null
+  /** 这条原生通知自己的 uuid；连续降级时后一条通知会在 `retracted` 里撤回前一条。 */
+  uuid: string | null
+  /** 原生 `retracted_message_uuids`：本次降级撤回的消息（含被取代的上一条降级通知）。 */
+  retracted: string[]
 }
 
 /** A Codex retry keeps the logical task open while waiting or reconnecting. */
