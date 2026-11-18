@@ -79,15 +79,16 @@ test('temp chat creation names the source group owner only for an external reque
     assert.deepEqual(Object.keys(calls[0].params), ['user_id_type', 'uuid'])
     assert.equal(calls[0].params.user_id_type, 'open_id')
 
+    // 指定群主即外部群：显式声明 external，不靠成员里恰好有外部联系人。
     await feishu.ensureTempChatForSession('project*0821-1201', guest, 'create', owner)
     assert.equal(JSON.stringify(calls[1].data), JSON.stringify({
-      name: 'project*0821-1201', owner_id: owner, user_id_list: [guest, owner], group_message_type: 'chat',
+      name: 'project*0821-1201', owner_id: owner, user_id_list: [guest, owner], group_message_type: 'chat', external: true,
     }))
 
     // 带备注的 btw：同名群不存在时同样由群主建外部群。
     await feishu.ensureTempChatForSession('project*修复登录', guest, 'reuse', owner)
     assert.deepEqual(calls[2].data, {
-      name: 'project*修复登录', owner_id: owner, user_id_list: [guest, owner], group_message_type: 'chat',
+      name: 'project*修复登录', owner_id: owner, user_id_list: [guest, owner], group_message_type: 'chat', external: true,
     })
     await feishu.ensureTempChatForSession('project*评审', member, 'reuse')
     assert.equal(JSON.stringify(calls[3].data), internal('project*评审'))
@@ -97,6 +98,49 @@ test('temp chat creation names the source group owner only for an external reque
 
     await feishu.createTempChatForSession('project*0821-1202', owner, owner)
     assert.deepEqual(calls[5].data.user_id_list, [owner])
+
+    // 本企业成员在外部群里发起：自己当群主，只有自己一个初始成员，仍是外部群。
+    await feishu.ensureTempChatForSession('project*0821-1203', member, 'create', member, false)
+    assert.equal(JSON.stringify(calls[6].data), JSON.stringify({
+      name: 'project*0821-1203', owner_id: member, user_id_list: [member], group_message_type: 'chat', external: true,
+    }))
+    await feishu.ensureTempChatForSession('project*外部评审', member, 'reuse', member, false)
+    assert.deepEqual(calls[7].data, {
+      name: 'project*外部评审', owner_id: member, user_id_list: [member], group_message_type: 'chat', external: true,
+    })
+  `)
+})
+
+test('external group requests explain 232033; members of the bot tenant get no external-contact hints', async () => {
+  await runIsolated(`
+    ${IDS}
+    feishu.client.im.chat.list = async () => ({ code: 0, data: { items: [] } })
+    const create = (code, msg, logId) => {
+      feishu.client.im.chat.create = async () => ({ code, msg, error: { log_id: logId } })
+    }
+    create(232033, 'The operator or invited bots does NOT have the authority to manage external chats.', 'ext-log')
+    for (const [user, ownerId, external] of [[member, member, false], [guest, owner, true]]) {
+      await assert.rejects(feishu.ensureTempChatForSession('project*0821-1300', user, 'create', ownerId, external), error => {
+        assert.match(error.message, /code=232033.*log_id=ext-log/)
+        assert.match(error.message, /机器人没有外部群权限：应用须在「对外共享」中允许机器人被添加到外部群/)
+        return true
+      })
+    }
+    // 本企业成员自己当群主时，232043 不套外部联系人的单聊确认提示。
+    create(232043, 'Your request contains unavailable ids, ext=bot is invisible to user ids: [' + member + ']', 'own-log')
+    await assert.rejects(feishu.ensureTempChatForSession('project*0821-1301', member, 'create', member, false), error => {
+      assert.match(error.message, /code=232043.*log_id=own-log/)
+      assert.doesNotMatch(error.message, /外部联系人|单聊/)
+      assert.doesNotMatch(error.message, new RegExp(member))
+      return true
+    })
+    // 内部群（不指定群主）不加任何外部群提示。
+    create(232033, 'denied', 'internal-log')
+    await assert.rejects(feishu.ensureTempChatForSession('project*0821-1302', member), error => {
+      assert.match(error.message, /code=232033.*log_id=internal-log/)
+      assert.doesNotMatch(error.message, /对外共享/)
+      return true
+    })
   `)
 })
 
@@ -279,6 +323,113 @@ test('an external group is left by the bot instead of deleted; internal groups a
     feishu.client.im.chatMembers.delete = async () => ({ code: 232033, msg: 'operation not allowed', error: { log_id: 'leave-log' } })
     await assert.rejects(feishu.leaveChatAsBot('oc_external'), /code=232033.*log_id=leave-log/)
     feishu.client.im.chat.get = async () => ({ code: 232010, msg: 'no permission', error: { log_id: 'status-log' } })
-    await assert.rejects(feishu.isExternalChat('oc_external'), /code=232010.*log_id=status-log/)
+    await assert.rejects(feishu.isExternalChat('oc_unread'), /code=232010.*log_id=status-log/)
+  `)
+})
+
+test('wt groups use the temp group request rule and a WT-specific join hint', async () => {
+  await runIsolated(`
+    ${IDS}
+    const calls = []
+    let existing = []
+    feishu.client.im.chat.list = async () => ({ code: 0, data: { items: existing } })
+    feishu.client.im.chat.create = async args => { calls.push(args); return { code: 0, data: { chat_id: 'oc_wt_' + calls.length } } }
+
+    // 内部群里的本企业成员：请求体与改动前逐字节相同。
+    await feishu.ensureWorktreeChatForSession('project[feature]', member)
+    assert.equal(JSON.stringify(calls[0].data), JSON.stringify({ name: 'project[feature]', user_id_list: [member], group_message_type: 'chat' }))
+    // 外部群里的本企业成员：自己当群主的外部群。
+    await feishu.ensureWorktreeChatForSession('project[other]', member, member, false)
+    assert.deepEqual(calls[1].data, {
+      name: 'project[other]', owner_id: member, user_id_list: [member], group_message_type: 'chat', external: true,
+    })
+
+    // 外部联系人加入已存在的内部 WT 群：给 WT 的说明，不提「换备注」。
+    existing = [{ chat_id: 'oc_internal_wt', name: 'project[shared]', chat_status: 'normal' }]
+    feishu.client.im.chatMembers.get = async () => ({ code: 0, data: { items: [{ member_id: member, tenant_key: 'tenant_app' }] } })
+    feishu.client.im.chatMembers.create = async () => ({ code: 232028, msg: 'External members can Not be added to an internal group chat: [' + guest + ']', error: { log_id: 'wt-join' } })
+    await assert.rejects(feishu.ensureWorktreeChatForSession('project[shared]', guest, undefined, true), error => {
+      assert.match(error.message, /code=232028.*log_id=wt-join/)
+      assert.match(error.message, /这个 WT 群建成时是内部群/)
+      assert.doesNotMatch(error.message, /换一个备注/)
+      assert.doesNotMatch(error.message, new RegExp(guest))
+      return true
+    })
+  `)
+})
+
+test('disbanding a WT group by name leaves an external group to its owner and deletes an internal one', async () => {
+  await runIsolated(`
+    feishu.client.im.chat.list = async () => ({ code: 0, data: { items: [
+      { chat_id: 'oc_ext_wt', name: 'project[ext]', chat_status: 'normal' },
+      { chat_id: 'oc_int_wt', name: 'project[int]', chat_status: 'normal' },
+    ] } })
+    feishu.client.im.chat.get = async args => ({ code: 0, data: { external: args.path.chat_id === 'oc_ext_wt', chat_status: 'normal' } })
+    const deleted = []
+    feishu.client.im.chat.delete = async args => { deleted.push(args.path.chat_id); return { code: 0 } }
+    const left = []
+    feishu.client.im.chatMembers.delete = async args => { left.push(args.path.chat_id); return { code: 0, data: { invalid_id_list: [] } } }
+
+    assert.deepEqual(await feishu.disbandChatForSession('project[ext]'), { chatId: 'oc_ext_wt', disbanded: false, left: true })
+    assert.deepEqual(left, ['oc_ext_wt'])
+    assert.deepEqual(deleted, [])
+    assert.deepEqual(await feishu.disbandChatForSession('project[int]'), { chatId: 'oc_int_wt', disbanded: true })
+    assert.deepEqual(deleted, ['oc_int_wt'])
+    assert.deepEqual(left, ['oc_ext_wt'])
+  `)
+})
+
+test('when a same-name group an external contact meant to join vanishes before the lock, it is not recreated internally', async () => {
+  await runIsolated(`
+    ${IDS}
+    // Pre-check saw a group (external contact gets externalRequester:true, no owner), but it is gone now.
+    feishu.client.im.chat.list = async () => ({ code: 0, data: { items: [] } })
+    feishu.client.im.chat.create = async () => { throw new Error('must not create an internal group of only the external user') }
+    for (const sessionName of ['project*修复登录', 'project[feature]']) {
+      await assert.rejects(
+        sessionName.includes('[')
+          ? feishu.ensureWorktreeChatForSession(sessionName, guest, undefined, true)
+          : feishu.ensureTempChatForSession(sessionName, guest, 'reuse', undefined, true),
+        /同名群已不存在，请重试/,
+      )
+    }
+    // An internal member whose reuse group vanished still creates it (owning an internal group is fine).
+    const calls = []
+    feishu.client.im.chat.create = async args => { calls.push(args); return { code: 0, data: { chat_id: 'oc_new' } } }
+    await feishu.ensureTempChatForSession('project*评审', member, 'reuse')
+    assert.equal(calls.length, 1)
+  `)
+})
+
+test('a transient failure reading the group type is retried instead of failing btw / fk / wt', async () => {
+  await runIsolated(`
+    let attempts = 0
+    feishu.client.im.chat.get = async () => {
+      attempts++
+      if (attempts === 1) await sdkFailure(503, { code: 0, msg: 'service unavailable' }, 'flaky-log')()
+      return { code: 0, data: { external: true } }
+    }
+    assert.equal(await feishu.isExternalChat('oc_flaky'), true)
+    assert.equal(attempts, 2)
+  `)
+})
+
+test('a group type read once is remembered, because Feishu cannot change it; a missing field is not', async () => {
+  await runIsolated(`
+    const gets = []
+    let data = { name: 'project', chat_status: 'normal', external: true }
+    feishu.client.im.chat.get = async args => { gets.push(args.path.chat_id); return { code: 0, data } }
+    assert.equal(await feishu.isExternalChat('oc_source'), true)
+    data = { name: 'project', chat_status: 'normal', external: false }
+    assert.equal(await feishu.isExternalChat('oc_source'), true)
+    assert.deepEqual(gets, ['oc_source'])
+
+    // No field: treated as internal as before, but asked again next time.
+    data = { name: 'other', chat_status: 'normal' }
+    assert.equal(await feishu.isExternalChat('oc_other'), false)
+    data = { name: 'other', chat_status: 'normal', external: true }
+    assert.equal(await feishu.isExternalChat('oc_other'), true)
+    assert.equal(await feishu.isExternalChat('oc_other'), true)
+    assert.deepEqual(gets, ['oc_source', 'oc_other', 'oc_other'])
   `)
 })

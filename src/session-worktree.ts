@@ -8,6 +8,7 @@ import { logError } from './log'
 import { INTERNAL_REQUESTER, type RequesterTenant } from './requester-tenant'
 import * as worktree from './worktree'
 import { messageOf, type WorktreeActionResult } from './session-util'
+import { newGroupFields, type NewGroupFields } from './session-group-owner'
 
 export function worktreeProjectName(s: Session): string {
   return feishu.mainSessionName(s.sessionName)
@@ -72,12 +73,6 @@ export async function runWorktreeCommand(
     await showWorktrees(s)
     return
   }
-  // WT 群由机器人当群主，含外部联系人就成了外部群，飞书不允许机器人当外部群群主：
-  // 在建 worktree 和分支之前就拒绝，不留下半成品。
-  if (requester.external) {
-    await feishu.sendText(s.chatId, '❌ 外部联系人暂不支持 wt：飞书要求外部群由本企业成员当群主。请让本企业成员操作。')
-    return
-  }
   const slug = worktree.normalizeWorktreeSlug(arg)
   if (!slug) {
     await feishu.sendText(s.chatId, '❌ 名称无效。用英文/数字/._-，最长 63。')
@@ -90,6 +85,15 @@ export async function runWorktreeCommand(
 
   const projectName = worktreeProjectName(s)
   const projectDir = worktreeProjectDir(s)
+  // WT 群与临时群同一规则：外部群里发起或外部联系人发起时建外部群（机器人不能当群主）。群类型和群主
+  // 在建 worktree 和分支之前就确定，查询失败或群主不合格直接报错，不留下半成品。
+  let group: NewGroupFields
+  try {
+    group = await newGroupFields(s, userOpenId, requester, worktree.worktreeChatName(projectName, slug), 'worktree')
+  } catch (e) {
+    await feishu.sendText(s.chatId, `❌ wt 失败: ${redactMemberIds(messageOf(e))}`)
+    return
+  }
   try {
     await worktree.withProjectWorktreeLock(projectDir, async () => {
       let ensured: worktree.EnsureWorktreeResult
@@ -101,7 +105,9 @@ export async function runWorktreeCommand(
       }
 
       try {
-        const chat = await feishu.ensureChatForSession(ensured.chatName, userOpenId)
+        const chat = await feishu.ensureWorktreeChatForSession(
+          ensured.chatName, userOpenId, group.ownerOpenId, group.externalRequester === true,
+        )
         const action = chat.created ? '已创建' : (chat.joined ? '已加入' : '已在群内')
         let parentFailure: unknown
         const parentMsg = await feishu.sendCard(s.chatId, cards.worktreeNoticeCard({
@@ -267,7 +273,8 @@ export async function onWorktreeDisband(s: Session, slugRaw: string): Promise<Wo
       const message = [
         `✅ ${slug} 已解散`,
         removed.removedWorktree ? 'dir removed' : 'dir missing',
-        disbanded.disbanded ? 'group removed' : 'group missing',
+        // 外部 WT 群机器人不能解散，只能退群：群留给群主手动解散，目录照删。
+        disbanded.disbanded ? 'group removed' : disbanded.left ? '机器人已退出 WT 群，请群主手动解散' : 'group missing',
         removed.branch,
         disbandedTemps.length + leftTemps.length === 0 ? '无临时群' : [
           ...(disbandedTemps.length > 0 ? [`临时群 ${disbandedTemps.length} 个已解散`] : []),

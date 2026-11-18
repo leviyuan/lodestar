@@ -20,9 +20,11 @@ export interface CreateTempSessionOptions {
   seedAnchors?: TurnAnchor[]
   /** 缺省 `create`:只有新建的群才启动会话,既有群一律拒绝。 */
   groupMode?: TempSessionGroupMode
-  /** 只在外部联系人需要新建群时给出:新建的外部群由这位本企业成员当群主(机器人不能当外部群群主)。 */
+  /** 只在新群必须是外部群时给出(外部联系人发起,或本企业成员在外部群里发起):新建的外部群由这位
+   * 本企业成员当群主(机器人不能当外部群群主)。 */
   ownerOpenId?: string
-  /** 发起人是外部联系人;加入已存在的同名群时没有群主,仍靠它给出外部联系人的报错提示。 */
+  /** 发起人是外部联系人;加入已存在的同名群时没有群主,仍靠它给出外部联系人的报错提示。
+   * 本企业成员在外部群里发起时显式为 false,不给外部联系人的提示。 */
   externalRequester?: boolean
 }
 

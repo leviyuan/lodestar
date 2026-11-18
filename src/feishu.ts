@@ -1167,12 +1167,15 @@ const EXTERNAL_CONTACT_UNAVAILABLE_HINT = '外部联系人须先点开机器人�
 const TEMP_OWNER_UNAVAILABLE_HINT = '群主不在应用的可用范围内：请在开发者后台的「可用范围」里加入群主后重试。'
 const MEMBERS_UNAVAILABLE_HINT = '机器人看不到请求里的成员：外部联系人须先点开机器人发起单聊并确认（应用须在「对外共享」中开启「允许外部用户与机器人单聊」），群主须在应用的「可用范围」内；完成后重试。'
 const EXTERNAL_JOIN_INTERNAL_GROUP_HINT = '外部联系人不能加入内部群；请换一个备注新建临时群。'
+const EXTERNAL_JOIN_INTERNAL_WT_HINT = '外部联系人不能加入内部群：这个 WT 群建成时是内部群，群类型之后不能再改；需要的话请本企业成员解散后重新 wt。'
+const EXTERNAL_GROUP_UNAVAILABLE_HINT = '机器人没有外部群权限：应用须在「对外共享」中允许机器人被添加到外部群（企业管理员也可能已关闭该功能）；完成后重试。'
 
 /**
  * 外部联系人流程的拒绝提示。232043 按飞书列出的不可见成员区分：只列发起人时提示先单聊确认，
- * 只列群主时提示把群主加入可用范围，其余情况两条都给。成员 ID 只在这里比较，不保留、不展示。
+ * 只列群主时提示把群主加入可用范围，其余情况两条都给。加入既有群遇 232028（内部群）给 `joinHint`，
+ * 新建时为 null。成员 ID 只在这里比较，不保留、不展示。
  */
-function externalRequesterHint(requesterOpenId: string, ownerOpenId: string | undefined, joining: boolean): TempChatHint {
+function externalRequesterHint(requesterOpenId: string, ownerOpenId: string | undefined, joinHint: string | null): TempChatHint {
   return (code, rejection) => {
     if (code === '232043') {
       const requesterListed = requesterOpenId !== '' && rejection.includes(requesterOpenId)
@@ -1181,8 +1184,21 @@ function externalRequesterHint(requesterOpenId: string, ownerOpenId: string | un
       if (ownerListed && !requesterListed) return TEMP_OWNER_UNAVAILABLE_HINT
       return MEMBERS_UNAVAILABLE_HINT
     }
-    return joining && code === '232028' ? EXTERNAL_JOIN_INTERNAL_GROUP_HINT : undefined
+    return joinHint !== null && code === '232028' ? joinHint : undefined
   }
+}
+
+/** 外部群请求（指定了群主，或发起人是外部联系人）的拒绝提示：232033 说明机器人没有外部群权限，
+ * 其余按外部联系人的规则；本企业成员发起时不给外部联系人的提示。 */
+function externalGroupHint(
+  requesterOpenId: string,
+  ownerOpenId: string | undefined,
+  joinHint: string | null,
+  externalRequester: boolean,
+): TempChatHint | undefined {
+  if (!externalRequester && ownerOpenId === undefined) return undefined
+  const requester = externalRequester ? externalRequesterHint(requesterOpenId, ownerOpenId, joinHint) : undefined
+  return (code, rejection) => code === '232033' ? EXTERNAL_GROUP_UNAVAILABLE_HINT : requester?.(code, rejection)
 }
 
 /** 临时群请求失败：去掉成员 ID，需要时在原诊断（code/原因/log_id）之后追加白话提示。
@@ -1204,7 +1220,9 @@ async function withTempChatErrors<T>(hint: TempChatHint | undefined, run: () => 
   }
 }
 
-/** 建群请求体。指定群主时群主也要在成员列表里；不指定时与原请求逐字段一致。 */
+/** 建群请求体。不指定群主时与原请求逐字段一致（机器人当群主的内部群）。指定群主只用于外部群
+ * （机器人不能当外部群群主）：群主也要在成员列表里，并显式要求外部群——本企业成员在外部群里发起时
+ * 初始成员全是本企业的人，不声明就会建成内部群，之后外部成员再也进不来。 */
 function chatCreateData(sessionName: string, userOpenId: string, ownerOpenId?: string) {
   if (!ownerOpenId) return { name: sessionName, user_id_list: [userOpenId], group_message_type: 'chat' as const }
   return {
@@ -1212,10 +1230,11 @@ function chatCreateData(sessionName: string, userOpenId: string, ownerOpenId?: s
     owner_id: ownerOpenId,
     user_id_list: ownerOpenId === userOpenId ? [userOpenId] : [userOpenId, ownerOpenId],
     group_message_type: 'chat' as const,
+    external: true,
   }
 }
 
-const TEMP_OWNER_REQUIREMENT = '外部联系人发起的临时群须由本企业成员当群主'
+const TEMP_OWNER_REQUIREMENT = '外部联系人新建的群须由本企业成员当群主'
 const TEMP_OWNER_REMEDY = '请把当前群转让给本企业成员后重试，或由本企业成员发起。'
 
 /**
@@ -1273,6 +1292,7 @@ export async function ensureChatForSession(
   sessionName: string,
   userOpenId: string,
   ownerOpenId?: string,
+  joinOnly = false,
 ): Promise<{ chatId: string; created: boolean; joined: boolean }> {
   if (!userOpenId) throw new Error('missing sender open_id; cannot add user to worktree group')
   const existing = await findNormalChatIdByName(sessionName)
@@ -1281,6 +1301,9 @@ export async function ensureChatForSession(
     bindSessionToChat(sessionName, existing)
     return { chatId: existing, created: false, joined }
   }
+  // 外部联系人只有在同名群已存在时才加入（新建须由本企业成员当群主）：若预检后群被并发删除，
+  // 这里只会建一个仅含外部用户的内部群——与本意相反，宁可报错让用户重试。
+  if (joinOnly) throw new Error(`同名群已不存在，请重试：${sessionName}`)
 
   const res = await client.im.chat.create({
     params: { user_id_type: 'open_id', uuid: randomUUID() },
@@ -1297,8 +1320,9 @@ export async function ensureChatForSession(
 }
 
 /** Create a brand-new temporary chat; never join/reuse an existing same-name chat.
- * `ownerOpenId` is only set for an external requester: the group becomes an
- * external group owned by that person, because the bot cannot own one. */
+ * `ownerOpenId` is only set when the group must be external: for an external requester
+ * (the source group's owner) or for a member of the bot's tenant asking from an external
+ * group (the requester). The bot cannot own an external group, so that person owns it. */
 export async function createTempChatForSession(
   sessionName: string,
   userOpenId: string,
@@ -1308,7 +1332,7 @@ export async function createTempChatForSession(
   if (!userOpenId) throw new Error('missing sender open_id; cannot create temporary group')
   const existing = await findNormalChatIdByName(sessionName)
   if (existing) throw new Error(`temporary group name already exists: ${sessionName}`)
-  const hint = externalRequester ? externalRequesterHint(userOpenId, ownerOpenId, false) : undefined
+  const hint = externalGroupHint(userOpenId, ownerOpenId, null, externalRequester)
   const res = await withTempChatErrors(hint, async () => {
     const res = await client.im.chat.create({
       params: { user_id_type: 'open_id', uuid: randomUUID() },
@@ -1353,8 +1377,8 @@ export async function withChatNameLock<T>(name: string, run: () => Promise<T>): 
 /**
  * 临时群入口。`create` 必须新建(时间后缀 btw / fk / bk);`reuse` 复用同名群并把
  * 发起人拉进去(带备注的 btw 同名即同一个群)。`externalRequester` 表示发起人是外部联系人，
- * 拒绝码附加处理提示；`ownerOpenId` 只在外部联系人需要新建群时传入，新群由该成员当群主
- * （加入已存在的同名群不需要群主）。报错不含成员 ID。
+ * 拒绝码附加处理提示；`ownerOpenId` 只在新群必须是外部群时传入（外部联系人发起，或本企业成员
+ * 在外部群里发起），新群由该成员当群主（加入已存在的同名群不需要群主）。报错不含成员 ID。
  */
 export async function ensureTempChatForSession(
   sessionName: string,
@@ -1365,18 +1389,47 @@ export async function ensureTempChatForSession(
 ): Promise<{ chatId: string; created: boolean; joined: boolean }> {
   if (mode === 'create') return await createTempChatForSession(sessionName, userOpenId, ownerOpenId, externalRequester)
   if (!userOpenId) throw new Error('missing sender open_id; cannot join temporary group')
-  const hint = externalRequester ? externalRequesterHint(userOpenId, ownerOpenId, true) : undefined
+  const hint = externalGroupHint(userOpenId, ownerOpenId, EXTERNAL_JOIN_INTERNAL_GROUP_HINT, externalRequester)
+  // 外部联系人预检到同名群存在才不带群主：群在加锁前被并发删除时不能改建仅含外部用户的内部群。
+  const joinOnly = externalRequester && ownerOpenId === undefined
   return await withChatNameLock(sessionName, () => withTempChatErrors(
     hint,
-    () => ensureChatForSession(sessionName, userOpenId, ownerOpenId),
+    () => ensureChatForSession(sessionName, userOpenId, ownerOpenId, joinOnly),
   ))
 }
 
-export async function disbandChatForSession(sessionName: string): Promise<{ chatId: string | null; disbanded: boolean }> {
+/**
+ * WT 群入口：同名群已存在就把发起人拉进去，否则新建。群类型规则与临时群相同（`ownerOpenId` 只在新群
+ * 必须是外部群时传入，见 `session-group-owner.ts`）；同名串行，拒绝码附加提示，报错不含成员 ID。
+ */
+export async function ensureWorktreeChatForSession(
+  sessionName: string,
+  userOpenId: string,
+  ownerOpenId?: string,
+  externalRequester = false,
+): Promise<{ chatId: string; created: boolean; joined: boolean }> {
+  if (!userOpenId) throw new Error('missing sender open_id; cannot add user to worktree group')
+  const hint = externalGroupHint(userOpenId, ownerOpenId, EXTERNAL_JOIN_INTERNAL_WT_HINT, externalRequester)
+  // 外部联系人预检到同名群存在才不带群主：群在加锁前被并发删除时不能改建仅含外部用户的内部群。
+  const joinOnly = externalRequester && ownerOpenId === undefined
+  return await withChatNameLock(sessionName, () => withTempChatErrors(
+    hint,
+    () => ensureChatForSession(sessionName, userOpenId, ownerOpenId, joinOnly),
+  ))
+}
+
+/** 按群名解散（wt 删除）。外部群机器人不能解散（chat.delete 返回 232033）：改为退群并返回 `left`，
+ * 群留给群主手动解散。 */
+export async function disbandChatForSession(sessionName: string): Promise<{ chatId: string | null; disbanded: boolean; left?: boolean }> {
   const chatId = await findNormalChatIdByName(sessionName)
   if (!chatId) {
     unbindSessionChat(sessionName)
     return { chatId: null, disbanded: false }
+  }
+  if (await isExternalChat(chatId)) {
+    await leaveChatAsBot(chatId)
+    if (preferredChatForSession.get(sessionName) === chatId) unbindSessionChat(sessionName)
+    return { chatId, disbanded: false, left: true }
   }
   const res = await client.im.chat.delete({ path: { chat_id: chatId } })
   if (res.code && res.code !== 0) {
@@ -1504,10 +1557,17 @@ export async function leaveChatAsBot(chatId: string): Promise<{ left: true }> {
   return { left: true }
 }
 
-/** 外部群（成员含其他企业的用户）：机器人不能解散，也不能移出他人。读取失败直接抛出。 */
+/** 群类型在建群时就定了（飞书没有把内部群改成外部群的接口）：读到确定值后按 chat_id 记住，
+ * 之后的临时群判断不再依赖这次网络请求。飞书没返回该字段时不记。 */
+const externalChatCache = new Map<string, boolean>()
+
+/** 外部群（成员含其他企业的用户）：机器人不能解散，也不能移出他人。btw / fk / wt 每次建群前都要读，
+ * 所以瞬态错误在查询窗口内按既有退避重试，确定的拒绝或窗口到期才抛出。 */
 export async function isExternalChat(chatId: string): Promise<boolean> {
   if (!chatId) throw new Error('cannot inspect a group without chat_id')
-  return (await fetchChatStatus(chatId)).external
+  const known = externalChatCache.get(chatId)
+  if (known !== undefined) return known
+  return (await inLookupWindow(lookupWindow(undefined), 'feishu chat.get', () => fetchChatStatus(chatId))).external
 }
 
 export interface ChatOwner {
@@ -1651,6 +1711,7 @@ async function fetchChatStatus(chatId: string): Promise<{ name: string | null; s
   if (res.code && res.code !== 0) {
     throw sdkApiError('feishu chat.get', res)
   }
+  if (typeof res.data?.external === 'boolean') externalChatCache.set(chatId, res.data.external)
   return {
     name: res.data?.name ?? null,
     status: res.data?.chat_status ?? null,

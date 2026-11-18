@@ -21,6 +21,7 @@
 | `test-codex-steering.ts` | 指定已安装运行时与新建私有目录，用本地 Responses 模型验证原生 Codex 的“提交回执 → 旧输出 → 消息消费事件 → 新输出”顺序和消息 ID 对应；`--input-count 9` 验证九条独立消费事件在下一次 Agent 输出前构成同一批次，不连接飞书或 live daemon |
 | `test-codex-input-boundary.ts` | 用同样的隔离入口捕获 Codex 实际工具声明、当前指令和原生 thread/read 返回路径上的会话记录，注入同步/异步提问并实际执行文件读取；`--model`/`--effort`/`--code-mode` 检查代码模式，`--fresh-only` 只测外部新建与主 Agent 委派对照，省略时增加续跑和旧 Plan 恢复。只用本地 Responses 模拟端点，不使用真实凭据；验收失败退出非零并在报告明确标记 |
 | `test-dsh-glm.ts` | 使用已配置 GLM Coding Plan 做 DSH Read 与原生 resume 实测，只操作私有临时目录；不连接飞书或控制 daemon |
+| `test-external-temp-group.ts --chat-id oc_xxx [--owner ou_xxx] [--create]` | 在开启「对外共享」的应用上实测：初始成员只有本企业成员时，建群带 `external: true` 能否建出外部群（本企业成员在外部群里发 btw/fk/wt 依赖这一点，不成立就不要发版）。不加 `--create` 只读来源群并打印计划；加上后建一个「Lodestar 外部群实测（可解散）…」群，群主取来源群群主或 `--owner`，成员只有群主和机器人。建成外部群时机器人不能解散，须群主手动解散；建成内部群时尝试删除；建群后读不回群类型时判 INCONCLUSIVE 并保留群供核对，不判 FAIL、不删群。输出遮挡 ID（飞书拒绝原文经 `redactMemberIds`），不连接 daemon |
 | `test-model-panel-live.ts` | 使用现有 daemon，在明确目标群验证分组、隐藏/显示、补录/删除、无效补录拒绝及真实回复；等待最终 footer 后检查模型/effort 与余额/额度，恢复原设置。`--routes-only` 可单测指定模型路由；不自行创建 Session 或控制 daemon |
 | `postinstall.cjs` | 安装/更新时将 Codex 额外账号旧的共享插件链接迁为独立副本，并清理旧 `lodestar-files` 的三处受管副本；不读凭据或启动 Agent/daemon，迁移或清理失败退出非零 |
 | `test-generated-image-card.ts` | 向明确的测试群发送一张图片折叠测试卡，使用指定的已有图片；检查提示词、卡内图片及预览。不会调用生图模型、单发图片或启动 Session |

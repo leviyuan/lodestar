@@ -7,6 +7,7 @@ import {
   resolvedTempGroupOwners,
   sentCards,
   sentTexts,
+  setTempGroupOwner,
   turnAnchorsBySession,
 } from './feishu-test-mock'
 import type { RequesterTenant } from './requester-tenant'
@@ -111,8 +112,25 @@ describe('Session passes the requester tenant to the temp-group commands', () =>
     expect(createCalls[0]).toMatchObject({ userOpenId: 'ou_guest', ownerOpenId: 'ou_group_owner', externalRequester: true })
   })
 
-  test('wt <name> from an external requester is refused before any worktree or branch is created', async () => {
+  test('wt <name> from an external requester resolves the source owner before the worktree flow', async () => {
     const session = realSession()
+    const lock = spyOn(worktree, 'withProjectWorktreeLock').mockImplementation(async () => {
+      // The owner is already settled when the worktree work starts.
+      expect(resolvedTempGroupOwners).toEqual([['oc_requester_project', 'ou_guest', 'tenant_app']])
+      return undefined as never
+    })
+    try {
+      expect(await session.runCommand('wt feature-x', 'ou_guest', 'om_wt', EXTERNAL)).toBe(true)
+      expect(lock).toHaveBeenCalledTimes(1)
+    } finally {
+      lock.mockRestore()
+    }
+    expect(sentTexts).toEqual([])
+  })
+
+  test('wt <name> from an external requester with an unusable owner fails before any worktree or branch is created', async () => {
+    const session = realSession()
+    setTempGroupOwner(new Error('外部联系人新建的群须由本企业成员当群主，但当前群的群主不是用户（可能是机器人）'))
     const ensure = spyOn(worktree, 'ensureProjectWorktree')
     const lock = spyOn(worktree, 'withProjectWorktreeLock')
     try {
@@ -124,7 +142,9 @@ describe('Session passes the requester tenant to the temp-group commands', () =>
       ensure.mockRestore()
       lock.mockRestore()
     }
-    expect(sentTexts).toEqual(['❌ 外部联系人暂不支持 wt：飞书要求外部群由本企业成员当群主。请让本企业成员操作。'])
+    expect(sentTexts).toHaveLength(1)
+    expect(sentTexts[0]).toContain('❌ wt 失败')
+    expect(sentTexts[0]).toContain('本企业成员当群主')
   })
 
   test('wt <name> from an internal requester still goes to the worktree flow', async () => {

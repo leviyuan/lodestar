@@ -230,13 +230,15 @@ describe('external contact btw', () => {
     expect(h.createCalls[0].chatName).toBe('project*0000-0000')
   })
 
-  test('internal requesters are unchanged: no lookups and no external keys', async () => {
+  test('internal requesters in an internal group are unchanged: no owner and no external keys', async () => {
     const h = makeHarness()
 
     await runBtwCommand(h.session, 'ou_member')
     await runBtwCommand(h.session, 'ou_member', '', { external: false })
     expect(await runCommand(h.session, 'btw 评审', 'ou_member')).toBe(true)
 
+    // Only the source group's type is read; no owner or same-name lookups.
+    expect(externalChatChecks).toEqual(['oc_project', 'oc_project', 'oc_project'])
     expect(resolvedTempGroupOwners).toEqual([])
     expect(normalChatLookups).toEqual([])
     expect(h.createCalls).toHaveLength(3)
@@ -254,6 +256,54 @@ describe('external contact btw', () => {
       seedAnchors: [],
     })
     expect(loggedEvents).toEqual([])
+  })
+
+  test('an internal member in an external group creates an external group they own, so external members can join later', async () => {
+    const h = makeHarness()
+    setExternalChat('oc_project')
+
+    await runBtwCommand(h.session, 'ou_member')
+    expect(await runCommand(h.session, 'btw 评审', 'ou_member')).toBe(true)
+
+    expect(externalChatChecks).toEqual(['oc_project', 'oc_project'])
+    // The requester owns the group: no source-owner lookup, and no same-name pre-check (joining ignores the owner).
+    expect(resolvedTempGroupOwners).toEqual([])
+    expect(normalChatLookups).toEqual([])
+    expect(h.createCalls).toHaveLength(2)
+    expect(h.createCalls[0]).toEqual({
+      chatName: 'project*0000-0000',
+      userOpenId: 'ou_member',
+      workDir: WORK_DIR,
+      routing: ROUTING,
+      launch: { kind: 'fresh' },
+      branchBase: { kind: 'fresh' },
+      seedAnchors: [],
+      ownerOpenId: 'ou_member',
+      externalRequester: false,
+    })
+    expect(h.createCalls[1]).toMatchObject({
+      chatName: 'project*评审', groupMode: 'reuse', userOpenId: 'ou_member', ownerOpenId: 'ou_member', externalRequester: false,
+    })
+    expect(loggedEvents).toEqual([])
+  })
+
+  test('an unreadable source group type is shown and logged, and nothing is created', async () => {
+    const h = makeHarness()
+    setExternalChatError(new Error('feishu chat.get failed code=232010 message=no permission log_id=type-log'))
+
+    await runBtwCommand(h.session, 'ou_member')
+
+    expect(h.createCalls).toHaveLength(0)
+    const last = finalCard()
+    expect(last.header.template).toBe('red')
+    expect(JSON.stringify(last)).toContain('读取当前群类型失败')
+    expect(JSON.stringify(last)).toContain('log_id=type-log')
+    expect(loggedEvents).toEqual(['session-temp: source group type lookup failed'])
+
+    // The reserved time-suffix name was released: the retry does not become -2.
+    setExternalChatError(null)
+    await runBtwCommand(h.session, 'ou_member')
+    expect(h.createCalls[0].chatName).toBe('project*0000-0000')
   })
 
   test('member IDs echoed by a Feishu rejection never reach the chat; code, log_id and hint stay', async () => {
@@ -307,6 +357,33 @@ describe('external contact fork', () => {
     expect(resolvedTempGroupOwners).toEqual([])
     expect(Object.prototype.hasOwnProperty.call(h.createCalls[0], 'ownerOpenId')).toBe(false)
     expect(Object.prototype.hasOwnProperty.call(h.createCalls[0], 'externalRequester')).toBe(false)
+  })
+
+  test('an internal fork from an external group creates an external group owned by the requester', async () => {
+    const h = makeHarness()
+    setExternalChat('oc_project')
+    const value = await openForkPicker(h, 'ou_member')
+
+    const result = await onForkSelect(h.session, value.panelId, value.choiceId, 'ou_member')
+
+    expect(result.ok).toBe(true)
+    expect(resolvedTempGroupOwners).toEqual([])
+    expect(h.createCalls[0]).toMatchObject({ userOpenId: 'ou_member', ownerOpenId: 'ou_member', externalRequester: false })
+  })
+
+  test('an unreadable source group type fails the fork before any group work and is logged', async () => {
+    const h = makeHarness()
+    const value = await openForkPicker(h, 'ou_member')
+    setExternalChatError(new Error('feishu chat.get failed code=232010 message=no permission log_id=fork-type-log'))
+
+    const result = await onForkSelect(h.session, value.panelId, value.choiceId, 'ou_member')
+
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('分叉失败')
+    expect(result.message).toContain('读取当前群类型失败')
+    expect(h.createCalls).toHaveLength(0)
+    expect(sentTexts.some(text => text.includes('正在分叉'))).toBe(false)
+    expect(loggedEvents).toEqual(['session-temp: source group type lookup failed'])
   })
 
   test('an unusable owner fails the fork before any group work, is logged and redacts member IDs', async () => {

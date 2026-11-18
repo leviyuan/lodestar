@@ -195,8 +195,8 @@ export interface SessionOpts {
   onLifecycleChange?: () => void
   /** Daemon hook:建临时群并按显式 launch/routing 启动一个 session。
    * `groupMode: 'reuse'` 表示同名群已存在时只把发起人拉进群,不新建也不重启会话。
-   * `externalRequester` 只在外部联系人发起时给出;`ownerOpenId` 只在外部联系人需要新建群时给出,
-   * 新建的外部群由该本企业成员当群主。 */
+   * `externalRequester` 表示发起人是外部联系人(本企业成员在外部群里发起时为 false);`ownerOpenId` 只在
+   * 新群必须是外部群时给出(外部联系人发起,或本企业成员在外部群里发起),新建的外部群由该本企业成员当群主。 */
   onCreateTempSession?: (opts: {
     chatName: string
     userOpenId: string

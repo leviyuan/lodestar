@@ -3,11 +3,26 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { chatIdsByName, disbandedChats, projectProfiles, resetFeishuMock } from './feishu-test-mock'
+import {
+  botLeftChats,
+  chatIdsByName,
+  disbandedChats,
+  ensuredWorktreeChats,
+  externalChatChecks,
+  normalChatLookups,
+  projectProfiles,
+  resetFeishuMock,
+  resolvedTempGroupOwners,
+  sentTexts,
+  setExternalChat,
+  setExternalChatError,
+} from './feishu-test-mock'
+import type { RequesterTenant } from './requester-tenant'
 
 // feishu-test-mock 必须先注册，session-worktree 才会拿到共享的 Feishu 替身。
-const { onWorktreeDisband } = await import('./session-worktree')
+const { onWorktreeDisband, runWorktreeCommand } = await import('./session-worktree')
 const worktree = await import('./worktree')
+const EXTERNAL: RequesterTenant = { external: true, appTenantKey: 'tenant_app' }
 
 let roots: string[] = []
 
@@ -177,5 +192,95 @@ describe('worktree disband cascades to its temp groups', () => {
     expect(h.tempCalls).toEqual([])
     expect(result.message).toContain('无临时群')
     expect(disbandedChats).toEqual([chatName])
+  })
+
+  test('an external WT group is left by the bot for its owner; the directory is still removed', async () => {
+    const { repo } = initRepo()
+    const chatName = worktree.worktreeChatName('feishu', 'feature')
+    worktree.ensureProjectWorktree(repo, 'feishu', 'feature')
+    chatIdsByName.set(chatName, ['oc_wt'])
+    setExternalChat('oc_wt')
+    const h = harness(repo)
+
+    const result = await onWorktreeDisband(h.session, 'feature')
+
+    expect(result.ok).toBe(true)
+    expect(disbandedChats).toEqual([])
+    expect(botLeftChats).toEqual(['oc_wt'])
+    expect(result.message).toContain('机器人已退出 WT 群，请群主手动解散')
+    expect(result.message).toContain('dir removed')
+    expect(worktree.listProjectWorktrees(repo, 'feishu').some(entry => entry.slug === 'feature' && entry.mounted)).toBe(false)
+  })
+})
+
+describe('wt groups follow the temp group rule for internal and external groups', () => {
+  const mounted = (repo: string) => worktree.listProjectWorktrees(repo, 'feishu').some(entry => entry.slug === 'feature' && entry.mounted)
+
+  test('in an internal group a member gets the bot-owned internal WT group as before', async () => {
+    const { repo } = initRepo()
+    const h = harness(repo)
+
+    await runWorktreeCommand(h.session, 'feature', 'ou_member')
+
+    expect(externalChatChecks).toEqual(['oc_main'])
+    expect(ensuredWorktreeChats).toEqual([{ sessionName: worktree.worktreeChatName('feishu', 'feature'), userOpenId: 'ou_member' }])
+    expect(mounted(repo)).toBe(true)
+  })
+
+  test('in an external group a member owns a new external WT group, so external members can join later', async () => {
+    const { repo } = initRepo()
+    setExternalChat('oc_main')
+    const h = harness(repo)
+
+    await runWorktreeCommand(h.session, 'feature', 'ou_member')
+
+    expect(resolvedTempGroupOwners).toEqual([])
+    expect(ensuredWorktreeChats).toEqual([
+      { sessionName: worktree.worktreeChatName('feishu', 'feature'), userOpenId: 'ou_member', ownerOpenId: 'ou_member' },
+    ])
+    expect(mounted(repo)).toBe(true)
+  })
+
+  test('an external contact creates a WT group owned by the source group owner', async () => {
+    const { repo } = initRepo()
+    setExternalChat('oc_main')
+    const h = harness(repo)
+
+    await runWorktreeCommand(h.session, 'feature', 'ou_guest', EXTERNAL)
+
+    const chatName = worktree.worktreeChatName('feishu', 'feature')
+    expect(normalChatLookups).toEqual([chatName])
+    expect(resolvedTempGroupOwners).toEqual([['oc_main', 'ou_guest', 'tenant_app']])
+    expect(ensuredWorktreeChats).toEqual([
+      { sessionName: chatName, userOpenId: 'ou_guest', ownerOpenId: 'ou_group_owner', externalRequester: true },
+    ])
+    expect(mounted(repo)).toBe(true)
+  })
+
+  test('an external contact joining an existing WT group needs no owner', async () => {
+    const { repo } = initRepo()
+    const chatName = worktree.worktreeChatName('feishu', 'feature')
+    worktree.ensureProjectWorktree(repo, 'feishu', 'feature')
+    chatIdsByName.set(chatName, ['oc_wt'])
+    const h = harness(repo)
+
+    await runWorktreeCommand(h.session, 'feature', 'ou_guest', EXTERNAL)
+
+    expect(resolvedTempGroupOwners).toEqual([])
+    expect(ensuredWorktreeChats).toEqual([{ sessionName: chatName, userOpenId: 'ou_guest', externalRequester: true }])
+  })
+
+  test('an unreadable group type fails before any worktree or branch is created', async () => {
+    const { repo } = initRepo()
+    setExternalChatError(new Error('feishu chat.get failed code=232010 message=no permission log_id=wt-type-log'))
+    const h = harness(repo)
+
+    await runWorktreeCommand(h.session, 'feature', 'ou_member')
+
+    expect(ensuredWorktreeChats).toEqual([])
+    expect(mounted(repo)).toBe(false)
+    expect(sentTexts).toHaveLength(1)
+    expect(sentTexts[0]).toContain('❌ wt 失败: 读取当前群类型失败')
+    expect(sentTexts[0]).toContain('log_id=wt-type-log')
   })
 })

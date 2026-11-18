@@ -99,6 +99,13 @@ export const createdTempChats: Array<{
   ownerOpenId?: string
   externalRequester?: boolean
 }> = []
+/** `ensureWorktreeChatForSession` 替身的调用记录（wt 建群 / 拉人），结果同样取 `tempChatResult`、`tempChatError`。 */
+export const ensuredWorktreeChats: Array<{
+  sessionName: string
+  userOpenId: string
+  ownerOpenId?: string
+  externalRequester?: boolean
+}> = []
 /** `findNormalChatIdByName` 替身：按 `chatIdsByName` 查同名群（重名时报错），记录查询并可注入失败。 */
 export const normalChatLookups: string[] = []
 let normalChatLookupError: Error | null = null
@@ -169,7 +176,7 @@ export function resetFeishuMock(): void {
   disbandedChats.length = 0
   for (const arr of [
     botLeftChats, externalChatChecks, resolvedTempGroupOwners, ensuredChats, ensuredTempChats, createdTempChats, exactDisbands,
-    normalChatLookups,
+    normalChatLookups, ensuredWorktreeChats,
   ]) {
     arr.length = 0
   }
@@ -333,6 +340,17 @@ mock.module('./feishu', () => ({
     })
     return tempChatOutcome(sessionName)
   },
+  ensureWorktreeChatForSession: async (
+    sessionName: string,
+    userOpenId: string,
+    ownerOpenId?: string,
+    externalRequester = false,
+  ) => {
+    ensuredWorktreeChats.push({
+      sessionName, userOpenId, ...(ownerOpenId === undefined ? {} : { ownerOpenId }), ...(externalRequester ? { externalRequester } : {}),
+    })
+    return tempChatOutcome(sessionName)
+  },
   findNormalChatIdByName: async (sessionName: string) => {
     normalChatLookups.push(sessionName)
     if (normalChatLookupError) throw normalChatLookupError
@@ -375,8 +393,14 @@ mock.module('./feishu', () => ({
   },
   listNormalChatIdsByName: async () => new Map([...chatIdsByName].map(([name, ids]) => [name, ids.slice()])),
   disbandChatForSession: async (sessionName: string) => {
+    const chatId = chatIdsByName.get(sessionName)?.[0] ?? null
+    // 外部群：机器人只能退群，与 feishu.ts 一致。
+    if (chatId && externalChatIds.has(chatId)) {
+      botLeftChats.push(chatId)
+      return { chatId, disbanded: false, left: true }
+    }
     disbandedChats.push(sessionName)
-    return { chatId: chatIdsByName.get(sessionName)?.[0] ?? null, disbanded: true }
+    return { chatId, disbanded: true }
   },
   chatMemberOpenIds: async (chatId: string) => {
     if (chatMembersError) throw chatMembersError

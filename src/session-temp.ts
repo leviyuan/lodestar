@@ -24,6 +24,7 @@ import { closeSync, openSync, readSync, readdirSync, realpathSync, statSync } fr
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, join, resolve } from 'node:path'
 import { diagnosticIdLabel, messageOf } from './session-util'
+import { newGroupFields, type NewGroupFields } from './session-group-owner'
 import { claudeSessionAccount } from './claude-session-accounts'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -521,38 +522,14 @@ function tempNoticeFailure(
   return sendTempNotice(s, { chatName, state: 'error', body }, `❌ ${body}`, messageId)
 }
 
-type ExternalTempGroupFields = { ownerOpenId?: string; externalRequester?: true }
-
-/**
- * 外部联系人发起时建群请求的额外字段。内部成员返回空对象，请求里既没有 `ownerOpenId` 也没有
- * `externalRequester`，与原行为一致。外部联系人要新建群时，群主取当前群的群主（须为本企业成员；
- * 机器人不能当外部群群主）；带备注的 btw 遇到已存在的同名群只加入，不需要群主。检查之后才出现的
- * 同名群同样只加入，群主不被使用。查询失败记固定事件名的日志（不含 ID），再抛给调用方在群里显示。
- */
-async function externalTempGroupFields(
+/** 临时群的群类型与群主：规则见 `session-group-owner.ts`，与 wt 共用。 */
+function externalTempGroupFields(
   s: Session,
   userOpenId: string,
   requester: RequesterTenant,
   reuseChatName: string | null,
-): Promise<ExternalTempGroupFields> {
-  if (!requester.external) return {}
-  if (reuseChatName) {
-    let existing: string | null
-    try {
-      existing = await feishu.findNormalChatIdByName(reuseChatName)
-    } catch (error) {
-      logError('session-temp: same-name temp group lookup failed', error)
-      throw new Error(`查找同名临时群失败: ${messageOf(error)}`)
-    }
-    if (existing) return { externalRequester: true }
-  }
-  try {
-    const ownerOpenId = await feishu.resolveTempGroupOwner(s.chatId, userOpenId, requester.appTenantKey)
-    return { ownerOpenId, externalRequester: true }
-  } catch (error) {
-    logError('session-temp: temp group owner lookup failed', error)
-    throw error
-  }
+): Promise<NewGroupFields> {
+  return newGroupFields(s, userOpenId, requester, reuseChatName, 'temp')
 }
 
 /** 临时群的来源群：先找基名群（发起 btw/fk 的主群或 WT 群），再找项目主群；都找不到为 null。 */
@@ -614,8 +591,8 @@ export async function runBtwCommand(
     { chatName, state: 'creating', backendLabel: s.backendLabel() },
     reuse ? `🚀 正在创建或加入 ${chatName} · ${s.backendLabel()}` : `🚀 正在创建 ${chatName} · ${s.backendLabel()}`,
   )
-  // 群主不合格或查询失败时直接失败，不建群也不拉人。
-  let external: ExternalTempGroupFields
+  // 群类型、群主不合格或查询失败时直接失败，不建群也不拉人。
+  let external: NewGroupFields
   try {
     external = await externalTempGroupFields(s, userOpenId, requester, reuse ? chatName : null)
   } catch (error) {
@@ -808,7 +785,7 @@ export async function onForkSelect(
     const chatName = reserveTempChatName(panel.baseName)
     let result
     try {
-      // 群主不合格或查询失败时直接失败，不建群。
+      // 群类型、群主不合格或查询失败时直接失败，不建群。
       const external = await externalTempGroupFields(s, userOpenId, requester, null)
       await feishu.sendText(s.chatId, `🔱 正在分叉到 ${chatName}…`)
       result = await s.opts.onCreateTempSession({
