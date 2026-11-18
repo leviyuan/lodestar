@@ -26,7 +26,7 @@
 | `postinstall.cjs` | 安装/更新时将 Codex 额外账号旧的共享插件链接迁为独立副本，并清理旧 `lodestar-files` 的三处受管副本；不读凭据或启动 Agent/daemon，迁移或清理失败退出非零 |
 | `test-generated-image-card.ts` | 向明确的测试群发送一张图片折叠测试卡，使用指定的已有图片；检查提示词、卡内图片及预览。不会调用生图模型、单发图片或启动 Session |
 | `sync-security-deps.ts` | 同步普通安全依赖的发布版本声明，随后需用 Bun 同步锁文件；不锁定 Agent 版本 |
-| `check-installed-package.ts` | 在明确的 npm prefix 验收 tarball、自动安装的最新 Agent、命令链接及原生目录，使用私有临时目录，不连接飞书或模型 API |
+| `check-installed-package.ts` | 在明确的 npm prefix 验收 tarball、自动安装的最新 Agent、命令链接及原生目录，使用私有临时目录，不连接飞书或模型 API；Agent 运行目录的 `npm audit` 由外层脚本按 `agent-audit.ts` 判定，`AGENT_AUDIT_EXCEPTIONS` 只临时放行上游无修复版本的个别公告（规则见 `docs/release.md`） |
 | `publish-verified-package.mjs` | 发布工作流专用：核对已验收 tarball 的完整性后发布到明确指定的 npm/GitHub Packages；等待 npm 平台异步校验，同版本续发只核对完全相同的远端包，不重复上传已接收的版本 |
 
 `smoke-session.ts` 共用账号、持久状态加载和完成检查；`debug-client.ts` 共用注入请求。它们不作为独立命令运行。

@@ -23,6 +23,7 @@
 
 - 打标签前先推送 `main` 并等 `CI` 工作流通过。它在 Linux 上跑全量测试、在 Windows 上跑更新流程用例，本机（macOS）全绿不代表这两处通过：Linux 会立刻复用刚删除目录的 inode，Windows 的文件时间与改名语义也不同。标签指向的提交若在 CI 才暴露问题，就得再发一个版本。
 - `Production dependency audit` 或发布工作流的 `npm audit` 报出新公告时，先升级 `overrides` 中对应的安全依赖，运行 `bun scripts/sync-security-deps.ts` 并用 Bun 同步 `bun.lock`，`bun audit --production` 无告警后再发布；新公告与本次改动无关也会拦住发布。
+- 自动安装的 Agent 运行目录由 `scripts/check-installed-package.ts` 按 `scripts/agent-audit.ts` 审计。公告的包在上游还没有修复版本、无法用 `overrides` / `agentRuntimeOverrides` 修掉时，只有经用户同意，才能在 `AGENT_AUDIT_EXCEPTIONS` 按 Agent、公告编号和包名临时豁免并写明原因与到期日。该包 npm latest 不再落在公告的受影响范围（上游出了修复）或过了到期日，豁免自动失效、重新拦截，届时用 `agentRuntimeOverrides` 覆盖到修复版本并删除豁免。豁免期间验收日志打印 `⚠️ … 暂时豁免`，发版说明须写明；Lodestar 自身依赖的审计没有豁免。
 
 - 本机 npm 是 12.x，`npm pack` 会因 `bundleDependencies`（`mathjax-full`）与 `overrides`（含 `@xmldom/xmldom`）冲突报 `EBUNDLEOVERRIDE`。发布包由工作流的 Node 22 环境生成；需要本地验收制品时才用 `npx npm@11.6.2 pack --json`，不要改 `package.json` 去绕开。
 - 本机没有 `NODE_AUTH_TOKEN`，`gh` 的 OAuth 令牌也没有 `write:packages` 权限；本地 `npm publish` 和 `npm view --registry=https://npm.pkg.github.com` 都会 401，这不代表发布流程有问题。

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
+import { auditAgentRuntime, type AuditedAgent } from './agent-audit'
 
 assert.ok(process.argv[2], '需要实际安装 tarball 的 npm prefix')
 const prefix = resolve(process.argv[2]!)
@@ -39,9 +40,9 @@ try {
     for (const agent of AGENTS) {
       const state = agentRuntimeState(agent)
       assert.ok(state?.directory && !state.error)
-      execFileSync('npm', ['audit', '--prefix', state.directory, '--omit=dev'], { stdio: 'pipe', encoding: 'utf8', timeout: 120000 })
       if (agent !== 'dsh') console.log(execFileSync(agentBin(agent, agent), ['--version'], { encoding: 'utf8', timeout: 30000 }).trim())
-      console.log(JSON.stringify({ agent, version: state.versions[agent === 'codex' ? '@openai/codex' : agent === 'claude' ? '@anthropic-ai/claude-agent-sdk' : '@deepseek-ai/dsh'], audit: 'passed' }))
+      // npm audit 由外层验收脚本按 scripts/agent-audit.ts 的规则执行。
+      console.log(JSON.stringify({ agent, version: state.versions[agent === 'codex' ? '@openai/codex' : agent === 'claude' ? '@anthropic-ai/claude-agent-sdk' : '@deepseek-ai/dsh'], auditDirectory: state.directory }))
     }
     mkdirSync(join(root, 'workspace'))
     const models = await queryDshRuntime({ cwd: join(root, 'workspace'), home: join(root, 'home'),
@@ -58,6 +59,17 @@ try {
   const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
   assert.equal(code, 0, `${stdout}\n${stderr}`)
   console.log(stdout.trim())
+  const runtimes = stdout.split('\n').flatMap(line => {
+    try {
+      const value = JSON.parse(line)
+      return typeof value?.agent === 'string' && typeof value?.auditDirectory === 'string' ? [value as { agent: AuditedAgent; auditDirectory: string }] : []
+    } catch { return [] }
+  })
+  assert.deepEqual(runtimes.map(runtime => runtime.agent).sort(), ['claude', 'codex', 'dsh'], '验收探针没有报告全部 Agent 运行目录')
+  for (const runtime of runtimes) {
+    for (const warning of auditAgentRuntime(runtime.agent, runtime.auditDirectory)) console.log(warning)
+    console.log(JSON.stringify({ agent: runtime.agent, audit: 'passed' }))
+  }
   console.log(JSON.stringify({ installedVersion: installed.version, latestAgentRuntimes: 'passed', cliSymlink: 'passed' }))
   verified = true
 } finally {
