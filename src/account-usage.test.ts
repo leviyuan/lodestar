@@ -114,7 +114,7 @@ test('Packy model tokens and both Agents use one wallet row and identical real b
     await import('./src/token-source-packy')
     const { sharedTokenSourceConfigs } = await import('./src/token-source-accounts')
     const { unifiedUsageSummary } = await import('./src/cards/console')
-    const { compactAccountUsage } = await import('./src/cards/account-usage')
+    const { accountUsageBlock } = await import('./src/cards/account-usage')
     const cfg = sharedTokenSourceConfigs({
       packy: { api_key: 'model-one', management_token: 'system-account', management_user_id: '123' },
       'packy-secondary': { api_key: 'model-two', billing_source: 'packy' },
@@ -134,9 +134,30 @@ test('Packy model tokens and both Agents use one wallet row and identical real b
     const [rows, ...footers] = await Promise.all([readAllAccountUsage(), ...registry.listTokenSources().map(source => source.readUsage())])
     assert.equal(rows.length, 1)
     assert.equal(rows[0].label, 'PackyAPI')
-    assert.equal(compactAccountUsage(rows[0].usage), '余额 $99.67')
+    assert.equal(accountUsageBlock(rows[0]), '**PackyAPI**　余额 $99.67')
     assert.ok(footers.every(usage => unifiedUsageSummary(usage) === '余额 $99.67'))
     assert.equal(requests.length, 2)
+  `)
+})
+
+test('account names: one short name per billing account across Agents, while account views keep their own', () => {
+  isolated(`
+    import assert from 'node:assert/strict'
+    const { tokenSourceUsageAccount, readTokenSourceAccountUsage } = await import('./src/account-usage')
+    const source = (id, extra = {}) => ({ id, kind: id, display: id + '-display', ...extra })
+    // The group hi account line and the 1:1 quota block use the same name for the same billing account.
+    assert.deepEqual(tokenSourceUsageAccount(source('glm')), { id: 'glm', label: 'GLM' })
+    assert.deepEqual(tokenSourceUsageAccount(source('dsh-glm')), { id: 'glm', label: 'GLM' })
+    assert.deepEqual(tokenSourceUsageAccount(source('deepseek')), { id: 'deepseek', label: 'DeepSeek' })
+    assert.deepEqual(tokenSourceUsageAccount(source('deepseek-harness')), { id: 'deepseek', label: 'DeepSeek' })
+    assert.deepEqual(tokenSourceUsageAccount(source('openrouter')), { id: 'openrouter', label: 'openrouter-display' })
+    assert.deepEqual(tokenSourceUsageAccount(source('claude-sub', { kind: 'claude-subscription' })), { id: 'claude-sub', label: 'Claude 订阅' })
+    assert.deepEqual(tokenSourceUsageAccount(source('claude-sub', { kind: 'claude-subscription', usageAccount: { id: 'claude:work', label: 'Claude·工作' } })),
+      { id: 'claude:work', label: 'Claude·工作' })
+    assert.deepEqual(tokenSourceUsageAccount(source('relay:site:codex', { usageAccount: { id: 'relay:site', label: 'Site' } })), { id: 'relay:site', label: 'Site' })
+    // A failing read, even a synchronous throw, is a MISS row under the same name.
+    const row = await readTokenSourceAccountUsage(source('dsh-glm', { readUsage: () => { throw new Error('quota offline') } }))
+    assert.deepEqual(row, { id: 'glm', label: 'GLM', usage: { state: 'network', windows: [], reason: 'quota offline' } })
   `)
 })
 

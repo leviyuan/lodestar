@@ -39,7 +39,7 @@ test('Codex quota displays only main windows, regardless of model-specific bucke
     expect(unified.windows.map(w => [w.kind, w.percent])).toEqual(fiveHour ? [['fiveHour', 0], ['weekly', 24]] : [['weekly', 24]])
     expect(unified.resetCredits).toBe(2)
     for (const content of [consoleUnifiedUsageContent(unified), unifiedUsageSummary(unified),
-      JSON.stringify(consoleUsageElement({ sessionName: 'test', status: 'idle', accountUsages: [{ id: 'codex:default', label: 'Codex·默认', usage: unified }] }))]) {
+      JSON.stringify(consoleUsageElement({ sessionName: 'test', status: 'idle', account: { id: 'codex:default', label: 'Codex·默认', usage: unified } }))]) {
       expect(content).toContain('24%')
       expect(content).not.toMatch(/Spark|5\.3|bengalfox|Another model|11%|25%|99%/)
     }

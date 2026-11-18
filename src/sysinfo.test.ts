@@ -136,12 +136,14 @@ describe('macOS host snapshot', () => {
     expect(content).toContain('⚪ `cc-scheduled` · 上次活跃 MISS · 退出码 0')
     expect(content).toContain('❌ `codex-failed` · 上次活跃 MISS · 退出码 1')
     expect(content).not.toMatch(/ · (active|inactive|failed) · /)
-    // The collapsed host panel shows failed services in its title.
-    expect((consoleHostElement(snapshot) as any).header.title.content).toBe('🖥 主机 · L1.50 · M37% · S4 · ❌2')
+    // The collapsed host panel spells out load, memory and services in words, failed services included.
+    expect((consoleHostElement(snapshot) as any).header.title.content).toBe('🖥 主机 · 负载 1.50 · 内存 37% · 服务 4 · ❌ 失败 2')
     expect(content).toContain('退出码 1')
     expect(content).toContain('终止信号 15')
     expect(content).not.toContain('从未启动')
-    expect(JSON.stringify(consoleHostElement(snapshot))).toContain('L1.50 · M37% · S4')
+    // A service list that could not be read gives no count in the title; the panel body carries the error.
+    expect((consoleHostElement({ ...snapshot, servicesError: 'launchctl MISS' }) as any).header.title.content)
+      .toBe('🖥 主机 · 负载 1.50 · 内存 37%')
     expect(consoleHostContent({ ...snapshot, services: [{ ...services[1]!, hasStarted: false }] })).toContain('从未启动')
   })
 

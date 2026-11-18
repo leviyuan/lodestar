@@ -1,10 +1,15 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { consoleUnifiedUsageContent, consoleUsageContent, consoleUsageElement, unifiedUsageSummary } from './console'
+import { accountUsageBlock } from './account-usage'
 import { fmtCountdown } from './usage'
 import { codexUsageToUnified } from '../token-source-codex'
 import { snapshotFromReadResponse } from '../usage'
 
-describe('compact hi account quota panel', () => {
+/** Six-cell usage bar, colored by the displayed percent. */
+const bar = (cells: number, color = 'green') => `<font color='${color}'>${'▰'.repeat(cells)}${'▱'.repeat(6 - cells)}</font>`
+const grey = (text: string) => `<font color='grey'>${text}</font>`
+
+describe('clear account quota detail', () => {
   let clock: ReturnType<typeof spyOn>
   // Fixtures and countdown formatting must observe the same hour/day boundary.
   beforeEach(() => { clock = spyOn(Date, 'now').mockReturnValue(1_900_000_000_000) })
@@ -16,7 +21,7 @@ describe('compact hi account quota panel', () => {
       credits: { hasCredits: false, unlimited: false, balance: '0' },
     }, rateLimitResetCredits: { availableCount: 0 } })
     const usage = codexUsageToUnified(raw)
-    expect(consoleUnifiedUsageContent(usage)).toBe('周 24%/3.0d')
+    expect(consoleUnifiedUsageContent(usage)).toBe(`周　${bar(1)} 24%　${grey('3.0d 后重置')}`)
     expect(consoleUsageContent(raw)).not.toMatch(/5h|满窗/)
     expect(unifiedUsageSummary(usage)).not.toMatch(/5h|满窗/)
   })
@@ -29,21 +34,23 @@ describe('compact hi account quota panel', () => {
     }
     const render = (primary: object) => consoleUnifiedUsageContent(codexUsageToUnified(snapshotFromReadResponse({
       rateLimits: { ...main, primary }, rateLimitResetCredits: { availableCount: 0 },
-    })))
-    expect(render(main.primary)).toBe('5h 0%/1.0h · 周 24%/3.0d')
-    expect(render({ usedPercent: 0, windowDurationMins: 300 })).toBe('5h 0%/MISS · 周 24%/3.0d')
+    }))).split('\n')
+    const weekly = `周　${bar(1)} 24%　${grey('3.0d 后重置')}`
+    expect(render(main.primary)).toEqual([`5h　${bar(0)} 0%　${grey('1.0h 后重置')}`, weekly])
+    expect(render({ usedPercent: 0, windowDurationMins: 300 })).toEqual([`5h　${bar(0)} 0%　${grey('重置时间 MISS')}`, weekly])
     // A wholly unknown window says MISS once.
-    expect(render({ windowDurationMins: 300 })).toBe('5h MISS · 周 24%/3.0d')
+    expect(render({ windowDurationMins: 300 })).toEqual(['5h　MISS', weekly])
   })
 
-  test('hi and unified summaries show main consumable credits alongside unchanged percentages', () => {
+  test('main consumable credits and reset cards lead the detail, alongside unchanged percentages', () => {
     const main = { limitId: 'codex', primary: { usedPercent: 100, windowDurationMins: 10080 },
       credits: { hasCredits: true, unlimited: false, balance: '62500.25' } }
     const usage = codexUsageToUnified(snapshotFromReadResponse({ rateLimits: main,
       rateLimitsByLimitId: { codex: main, spark: { ...main, limitId: 'spark',
         credits: { hasCredits: true, unlimited: false, balance: '999999' } } },
       rateLimitResetCredits: { availableCount: 2 } }))
-    expect(consoleUnifiedUsageContent(usage)).toBe("周 <font color='red'>100%</font>/MISS · 积分 62.5k · 重置 2")
+    const exhausted = `周　${bar(6, 'red')} <font color='red'>100%</font>　${grey('重置时间 MISS')}`
+    expect(consoleUnifiedUsageContent(usage)).toBe(`积分 62.5k · 重置卡 2\n${exhausted}`)
     expect(unifiedUsageSummary(usage)).toBe('额度 周配额 已用 100% · 积分 62.5k')
     for (const [balance, label] of [
       [62500.25, '62.5k'], [1_250_000, '1.3m'], [1000, '1k'], [1_000_000, '1m'],
@@ -51,34 +58,42 @@ describe('compact hi account quota panel', () => {
       [12.34, '12.3'], [12, '12'], [0.0001, '<0.1'], [0.05, '0.1'],
     ] as const) {
       const snapshot = { ...usage, credits: { hasCredits: true, unlimited: false, balance } }
-      expect(consoleUnifiedUsageContent(snapshot)).toBe(`周 <font color='red'>100%</font>/MISS · 积分 ${label} · 重置 2`)
+      expect(consoleUnifiedUsageContent(snapshot)).toBe(`积分 ${label} · 重置卡 2\n${exhausted}`)
       expect(unifiedUsageSummary(snapshot)).toBe(`额度 周配额 已用 100% · 积分 ${label}`)
     }
     expect(consoleUnifiedUsageContent({ ...usage, credits: { hasCredits: false, unlimited: false, balance: 0 } })).not.toContain('积分')
     expect(consoleUnifiedUsageContent({ ...usage, credits: null })).toContain('积分 MISS')
     expect(consoleUnifiedUsageContent({ ...usage, credits: { hasCredits: true, unlimited: true, balance: null } })).toContain('积分 无限')
     expect(consoleUnifiedUsageContent({ ...usage, credits: { hasCredits: true, unlimited: false, balance: null } })).toContain('积分 MISS')
+    // The 1:1 panel puts the same facts after the account name.
+    expect(accountUsageBlock({ id: 'codex:default', label: 'Codex·默认', usage }))
+      .toBe(`**Codex·默认**　积分 62.5k · 重置卡 2\n${exhausted}`)
   })
 
-  test('one account occupies one row and includes main windows plus reset credits', () => {
+  test('the group panel shows only this project\'s account, one line per window; the 1:1 panel names each account', () => {
     const usage = { state: 'ok' as const, resetCredits: 0, windows: [
       { kind: 'fiveHour', label: '5h 窗口', percent: 11, resetsAt: new Date(Date.now() + 3600_000) },
       { kind: 'weekly', label: '周配额', percent: 24, resetsAt: new Date(Date.now() + 3 * 86400_000) },
     ] }
-    const panel = consoleUsageElement({ sessionName: 'test', status: 'idle', accountUsages: [
-      { id: 'codex:default', label: 'Codex·默认', usage },
-      { id: 'deepseek', label: 'DeepSeek', usage: { state: 'ok', kind: 'balance', balance: { remaining: 12.34, currency: 'CNY' }, windows: [] } },
-    ] }) as any
+    const lines = [`5h　${bar(1)} 11%　${grey('1.0h 后重置')}`, `周　${bar(1)} 24%　${grey('3.0d 后重置')}`]
+    const panel = consoleUsageElement({ sessionName: 'test', status: 'idle',
+      account: { id: 'codex:default', label: 'Codex·默认', usage } }) as any
     expect(panel.element_id).toBe('console_usage')
     expect(panel.tag).toBe('collapsible_panel')
     expect(panel.expanded).toBe(true)
+    expect(panel.header.title.content).toBe('📊 账号额度')
     expect(panel.header.background_color).toBe('blue-50')
-    expect(panel.elements).toHaveLength(2)
-    expect(panel.elements[0]).toMatchObject({ tag: 'markdown', text_size: 'notation',
-      content: '**Codex·默认**　5h 11%/1.0h · 周 24%/3.0d' })
-    expect(panel.elements[1].content).toBe('**DeepSeek**　余额 ¥12.34')
-    expect(JSON.stringify(panel)).not.toContain('▰')
-    expect(panel.elements.every((element: any) => !element.content.includes('\n'))).toBe(true)
+    expect(panel.elements).toEqual([{ tag: 'markdown', content: lines.join('\n') }])
+    // The account name is on the project block above, not repeated in the panel.
+    expect(JSON.stringify(panel)).not.toContain('Codex·默认')
+    expect(accountUsageBlock({ id: 'codex:default', label: 'Codex·默认', usage })).toBe(['**Codex·默认**', ...lines].join('\n'))
+    expect(accountUsageBlock({ id: 'deepseek', label: 'DeepSeek',
+      usage: { state: 'ok', kind: 'balance', balance: { remaining: 12.34, currency: 'CNY' }, windows: [] } })).toBe('**DeepSeek**　余额 ¥12.34')
+    // Not started, or no settled account yet: no quota to show, and the panel says which.
+    const content = (opts: object) => (consoleUsageElement({ sessionName: 'test', status: 'idle', ...opts }) as any).elements[0].content
+    expect(content({ account: null })).toBe(grey('账号未确定'))
+    expect(content({ account: null, status: 'stopped' })).toBe(grey('未启动'))
+    expect(content({})).toBe('加载中…')
   })
 
   test('Spark and reserve remain outside the main quota display', () => {
@@ -91,8 +106,8 @@ describe('compact hi account quota panel', () => {
       rateLimitResetCredits: { availableCount: 3 },
     }))
     const content = consoleUnifiedUsageContent(usage)
-    expect(content).toBe('周 12%/MISS · 积分 MISS · 重置 3')
-    expect(content).not.toMatch(/Spark|reserve|重置卡/)
+    expect(content).toBe(`积分 MISS · 重置卡 3\n周　${bar(1)} 12%　${grey('重置时间 MISS')}`)
+    expect(content).not.toMatch(/Spark|reserve/)
   })
 
   test('GLM monthly tools only show percent while other windows retain countdowns', () => {
@@ -101,7 +116,11 @@ describe('compact hi account quota panel', () => {
       { kind: 'weekly', label: '周配额', percent: 17, resetsAt: new Date(Date.now() + 86400_000) },
       { kind: 'monthly', label: '月度工具', percent: 7, used: 290, total: 4000, resetsAt: new Date(Date.now() + 15 * 86400_000) },
     ] })
-    expect(out).toBe('5h 11%/1.0h · 周 17%/1.0d · 月工具 7%')
+    expect(out.split('\n')).toEqual([
+      `5h　${bar(1)} 11%　${grey('1.0h 后重置')}`,
+      `周　${bar(1)} 17%　${grey('1.0d 后重置')}`,
+      `月工具　${bar(0)} 7%`,
+    ])
     expect(out).not.toMatch(/290|4000|15.0d|Max/)
   })
 
@@ -109,137 +128,176 @@ describe('compact hi account quota panel', () => {
     for (const percent of [null, NaN, -1, 101]) {
       expect(consoleUnifiedUsageContent({ state: 'ok', windows: [
         { kind: 'fiveHour', label: '5h', percent, resetsAt: null },
-      ] })).toBe('5h MISS')
+      ] })).toBe('5h　MISS')
       expect(consoleUnifiedUsageContent({ state: 'ok', windows: [
         { kind: 'fiveHour', label: '5h', percent, resetsAt: new Date(Date.now() + 3600_000) },
-      ] })).toBe('5h MISS/1.0h')
+      ] })).toBe(`5h　MISS　${grey('1.0h 后重置')}`)
     }
+    // A reset time already reached reads as such rather than as a countdown.
+    expect(consoleUnifiedUsageContent({ state: 'ok', windows: [
+      { kind: 'fiveHour', label: '5h', percent: 40, resetsAt: new Date(Date.now() - 1000) },
+    ] })).toBe(`5h　${bar(2)} 40%　${grey('已重置')}`)
     expect(consoleUnifiedUsageContent({ state: 'network', reason: 'upstream offline', windows: [
       { kind: 'fiveHour', label: 'stale', percent: 10, resetsAt: null },
     ] })).toBe("<font color='red'>MISS · upstream offline</font>")
     expect(consoleUnifiedUsageContent({ state: 'rate_limited', windows: [] })).toContain('API 限频')
-    expect(consoleUnifiedUsageContent({ state: 'not_applicable', windows: [] })).toBe('—')
-    const loading = consoleUsageElement({ sessionName: 'test', status: 'idle' }) as any
-    expect(loading.elements[0].content).toBe('加载中…')
+    expect(consoleUnifiedUsageContent({ state: 'not_applicable', windows: [] })).toBe(grey('无额度查询'))
+    // No window at all is a MISS of the whole quota, with any account-level facts after it.
+    expect(consoleUnifiedUsageContent({ state: 'ok', windows: [], resetCredits: null })).toBe('额度 MISS · 重置卡 MISS')
+    expect(consoleUnifiedUsageContent(undefined)).toBe('加载中…')
   })
 
-  test('quota colors and model-specific Claude windows remain distinct', () => {
+  test('quota colors follow the displayed percent on both the bar and the number', () => {
     const content = consoleUnifiedUsageContent({ state: 'ok', windows: [
       { kind: 'seven_day_opus', label: 'Opus 周额度', percent: 80, resetsAt: null },
       { kind: 'seven_day_sonnet', label: 'Sonnet 周额度', percent: 100, resetsAt: null },
     ] })
-    expect(content).toBe("Opus <font color='orange'>80%</font>/MISS · Sonnet <font color='red'>100%</font>/MISS")
+    expect(content.split('\n')).toEqual([
+      `Opus 周　${bar(5, 'orange')} <font color='orange'>80%</font>　${grey('重置时间 MISS')}`,
+      `Sonnet 周　${bar(6, 'red')} <font color='red'>100%</font>　${grey('重置时间 MISS')}`,
+    ])
     // Colors follow the displayed percent, so one label never shows with and without a color.
     const shown = (value: number) => consoleUnifiedUsageContent({ state: 'ok', windows: [{ kind: 'weekly', label: '周额度', percent: value, resetsAt: null }] })
-    expect(shown(79.4)).toBe('周 79%/MISS')
-    expect(shown(79.6)).toBe("周 <font color='orange'>80%</font>/MISS")
-    expect(shown(99.4)).toBe("周 <font color='orange'>99%</font>/MISS")
-    expect(shown(99.6)).toBe("周 <font color='red'>100%</font>/MISS")
+    const missing = `　${grey('重置时间 MISS')}`
+    expect(shown(79.4)).toBe(`周　${bar(5)} 79%${missing}`)
+    expect(shown(79.6)).toBe(`周　${bar(5, 'orange')} <font color='orange'>80%</font>${missing}`)
+    expect(shown(99.4)).toBe(`周　${bar(6, 'orange')} <font color='orange'>99%</font>${missing}`)
+    expect(shown(99.6)).toBe(`周　${bar(6, 'red')} <font color='red'>100%</font>${missing}`)
   })
 
-  test('relay script windows with unparsed dates or unlisted weekly kinds render without breaking the panel', () => {
+  test('relay script windows with unparsed dates or unlisted kinds render without breaking the panel', () => {
     // Relay balance scripts pass raw JSON through, so dates arrive as strings.
     const relay = { state: 'ok', windows: [
       { kind: 'monthly', label: '月度工具', percent: 5, resetsAt: '2026-12-01T00:00:00Z' },
       { kind: 'daily', label: '日额度', percent: 12, resetsAt: '2026-12-01T00:00:00Z' },
       { kind: 'proWeekly', label: 'Pro 周额度', percent: 30, resetsAt: new Date(Date.now() + 86400_000) },
     ] } as any
-    expect(consoleUnifiedUsageContent(relay)).toBe('月工具 5% · 日额度 12%/MISS · Pro周 30%/1.0d')
-    // Windows without a string kind are just unlisted windows.
+    const relayLines = [
+      `月工具　${bar(0)} 5%`,
+      `日额度　${bar(1)} 12%　${grey('重置时间 MISS')}`,
+      `Pro 周额度　${bar(2)} 30%　${grey('1.0d 后重置')}`,
+    ]
+    expect(consoleUnifiedUsageContent(relay).split('\n')).toEqual(relayLines)
+    // Windows without a string kind, label, currency or reason are just unlisted, never a thrown panel.
     for (const kind of [undefined, null, 7]) {
       expect(consoleUnifiedUsageContent({ state: 'ok', windows: [{ kind, label: '日额度', percent: 12, resetsAt: null }] } as any))
-        .toBe('日额度 12%/MISS')
+        .toBe(`日额度　${bar(1)} 12%　${grey('重置时间 MISS')}`)
     }
-    const panel = consoleUsageElement({ sessionName: 'test', status: 'idle', accountUsages: [
-      { id: 'relay:x', label: 'x', usage: relay },
-      { id: 'relay:y', label: 'y', usage: { state: 'ok', windows: [{ label: '日额度', percent: 12, resetsAt: null }] } as any },
-      { id: 'deepseek', label: 'DeepSeek', usage: { state: 'ok', kind: 'balance', balance: { remaining: 12.34, currency: 'CNY' }, windows: [] } },
-    ] }) as any
-    expect(panel.elements.map((element: any) => element.content)).toEqual([
-      '**x**　月工具 5% · 日额度 12%/MISS · Pro周 30%/1.0d', '**y**　日额度 12%/MISS', '**DeepSeek**　余额 ¥12.34',
-    ])
+    expect(consoleUnifiedUsageContent({ state: 'ok', windows: [{ kind: 'x', label: 3, percent: 12, resetsAt: null }] } as any))
+      .toBe(`额度　${bar(1)} 12%　${grey('重置时间 MISS')}`)
+    // A missing or non-string currency leaves just the amount, never `undefined`.
+    for (const currency of [7, undefined, null, '  ']) {
+      expect(consoleUnifiedUsageContent({ state: 'ok', kind: 'balance', balance: { remaining: 5, currency }, windows: [] } as any))
+        .toBe('余额 5.00')
+      expect(consoleUnifiedUsageContent({ state: 'ok', kind: 'quota', quota: { remaining: 1, limit: 2, currency }, windows: [] } as any))
+        .toBe('剩余 1.00 / 2.00')
+    }
+    expect(consoleUnifiedUsageContent({ state: 'network', reason: 404, windows: [] } as any)).toBe("<font color='red'>MISS · 404</font>")
+    // A window entry that is not an object is a wholly unknown window; the other windows still show.
+    expect(consoleUnifiedUsageContent({ state: 'ok', windows: [null, 3, { kind: 'weekly', label: '周', percent: 50, resetsAt: null }] } as any)
+      .split('\n')).toEqual(['额度　MISS', '额度　MISS', `周　${bar(3)} 50%　${grey('重置时间 MISS')}`])
+    // Reset card counts other than a non-negative integer are MISS, so script text never reaches the card.
+    for (const resetCredits of ['<at id=all></at>', 1.5, -1, NaN]) {
+      expect(consoleUnifiedUsageContent({ state: 'ok', windows: [], resetCredits } as any)).toBe('额度 MISS · 重置卡 MISS')
+    }
+    // A date-like object is not a Date: the reset is unknown, nothing throws.
+    expect(consoleUnifiedUsageContent({ state: 'ok', windows: [{ kind: 'weekly', percent: 5, resetsAt: { getTime: 1 } }] } as any))
+      .toBe(`周　${bar(0)} 5%　${grey('重置时间 MISS')}`)
+    // Anything else malformed costs only this account a MISS, never the whole panel.
+    const malformed = { state: 'ok', windows: 'x' } as any
+    expect(consoleUnifiedUsageContent(malformed)).toBe("<font color='red'>MISS · 额度数据格式无效</font>")
+    expect(accountUsageBlock({ id: 'relay:z', label: 'z', usage: malformed })).toBe("**z**　<font color='red'>MISS · 额度数据格式无效</font>")
+    expect(accountUsageBlock({ id: 'relay:x', label: 'x', usage: relay })).toBe(['**x**', ...relayLines].join('\n'))
+    expect(accountUsageBlock({ id: 'relay:y', label: 'y', usage: { state: 'ok', windows: [{ label: '日额度', percent: 12, resetsAt: null }] } as any }))
+      .toBe(`**y**\n日额度　${bar(1)} 12%　${grey('重置时间 MISS')}`)
   })
 
-  test('model weekly buckets carry only the model name and reuse the total weekly countdown', () => {
+  test('model weekly buckets read as "<model> 周" next to the total and each carries its own reset', () => {
     const DAY = 86400_000
     const total = new Date(Date.now() + 2.2 * DAY)
     const render = (fable: Date | null, weekly: Date | null = total) => consoleUnifiedUsageContent({ state: 'ok', windows: [
       { kind: 'weekly', label: '周额度', percent: 100, resetsAt: weekly },
       { kind: 'modelWeekly:Fable', label: 'Fable 周额度', percent: 47, resetsAt: fable },
       { kind: 'seven_day_oauth_apps', label: 'OAuth 应用周额度', percent: 5, resetsAt: weekly },
-    ] })
-    const exhausted = "周 <font color='red'>100%</font>"
-    expect(render(total)).toBe(`${exhausted}/2.2d · Fable 47% · OAuth 5%`)
-    // Same displayed countdown counts as the same reset; a different one stays on the bucket.
-    expect(render(new Date(total.getTime() + 60_000))).toBe(`${exhausted}/2.2d · Fable 47% · OAuth 5%`)
-    expect(render(new Date(Date.now() + 3.1 * DAY))).toBe(`${exhausted}/2.2d · Fable 47%/3.1d · OAuth 5%`)
-    // A missing reset is never folded into another window's, and `name MISS` only ever means nothing is known.
-    expect(render(null)).toBe(`${exhausted}/2.2d · Fable 47%/MISS · OAuth 5%`)
+    ] }).split('\n')
+    const exhausted = `周　${bar(6, 'red')} <font color='red'>100%</font>`
+    const reset = (date: Date | null) => grey(date ? `${fmtCountdown(date.getTime() - Date.now())} 后重置` : '重置时间 MISS')
+    expect(render(total)).toEqual([
+      `${exhausted}　${reset(total)}`, `Fable 周　${bar(3)} 47%　${reset(total)}`, `OAuth 应用周　${bar(0)} 5%　${reset(total)}`,
+    ])
+    expect(reset(total)).toBe(grey('2.2d 后重置'))
+    const later = new Date(Date.now() + 3.1 * DAY)
+    expect(render(later)[1]).toBe(`Fable 周　${bar(3)} 47%　${grey('3.1d 后重置')}`)
+    // A missing reset is never borrowed from another window, and `<name>　MISS` only ever means nothing is known.
+    expect(render(null)[1]).toBe(`Fable 周　${bar(3)} 47%　${grey('重置时间 MISS')}`)
+    expect(render(total, null)).toEqual([
+      `${exhausted}　${grey('重置时间 MISS')}`, `Fable 周　${bar(3)} 47%　${reset(total)}`, `OAuth 应用周　${bar(0)} 5%　${grey('重置时间 MISS')}`,
+    ])
     const unknownFable = consoleUnifiedUsageContent({ state: 'ok', windows: [
       { kind: 'weekly', label: '周额度', percent: 10, resetsAt: total },
       { kind: 'modelWeekly:Fable', label: 'Fable 周额度', percent: null, resetsAt: total },
       { kind: 'seven_day_opus', label: 'Opus 周额度', percent: null, resetsAt: null },
-    ] })
-    expect(unknownFable).toBe('周 10%/2.2d · Fable MISS/2.2d · Opus MISS')
-    expect(render(total, null)).toBe(`${exhausted}/MISS · Fable 47%/2.2d · OAuth 5%/MISS`)
-    expect(render(null, null)).toBe(`${exhausted}/MISS · Fable 47%/MISS · OAuth 5%/MISS`)
-    // The full Claude row from the hi panel, including the login end.
-    const panel = consoleUsageElement({ sessionName: 'test', status: 'idle', accountUsages: [{ id: 'claude:default', label: 'Claude·默认',
+      { kind: 'modelWeekly:Muse', label: '', percent: 3, resetsAt: total },
+    ] }).split('\n')
+    expect(unknownFable).toEqual([
+      `周　${bar(1)} 10%　${reset(total)}`, `Fable 周　MISS　${reset(total)}`, 'Opus 周　MISS', `Muse 周　${bar(0)} 3%　${reset(total)}`,
+    ])
+    // The full Claude block in the 1:1 panel, including the login end.
+    expect(accountUsageBlock({ id: 'claude:default', label: 'Claude·默认',
       usage: { state: 'ok', windows: [
         { kind: 'weekly', label: '周额度', percent: 100, resetsAt: total },
         { kind: 'modelWeekly:Fable', label: 'Fable 周额度', percent: 47, resetsAt: total },
-      ], credentialExpiresAt: Date.now() + 26.2 * DAY } }] }) as any
-    expect(panel.elements[0].content).toBe(`**Claude·默认**　${exhausted}/2.2d · Fable 47% · 凭据 23.2d`)
+      ], credentialExpiresAt: Date.now() + 26.2 * DAY } }).split('\n')).toEqual([
+      '**Claude·默认**　凭据剩余 23.2d', `${exhausted}　${reset(total)}`, `Fable 周　${bar(3)} 47%　${reset(total)}`,
+    ])
   })
 
   test('account names and remote errors cannot inject card markup or extra rows', () => {
-    const panel = consoleUsageElement({ sessionName: 'test', status: 'idle', accountUsages: [
-      { id: 'test', label: '<at id=all>\nname', usage: { state: 'network', reason: '**bad**\n<at id=all>', windows: [] } },
-    ] }) as any
-    expect(panel.elements[0].content).not.toContain('<at')
-    expect(panel.elements[0].content).not.toContain('\n')
-    expect(panel.elements[0].content).not.toContain('**bad**')
+    const block = accountUsageBlock({ id: 'test', label: '<at id=all>\nname', usage: { state: 'network', reason: '**bad**\n<at id=all>', windows: [] } })
+    expect(block).not.toContain('<at')
+    expect(block).not.toContain('\n')
+    expect(block).not.toContain('**bad**')
+    const window = consoleUnifiedUsageContent({ state: 'ok', windows: [{ kind: 'x', label: '<at id=all>**日**', percent: 1, resetsAt: null }] })
+    expect(window).not.toContain('<at')
+    expect(window).not.toContain('**日**')
   })
 
-  test('Claude subscription rows end with a countdown to the earliest native login end, colored like native warnings', () => {
+  test('Claude subscription accounts lead with the time left to the earliest native login end, colored like native warnings', () => {
     const DAY = 86400_000
     const base = { state: 'ok' as const, windows: [
       { kind: 'weekly', label: '周额度', percent: 17, resetsAt: new Date(Date.now() + 6.9 * DAY) },
     ] }
+    const weekly = `周　${bar(1)} 17%　${grey('6.9d 后重置')}`
     const render = (days: number | null) => consoleUnifiedUsageContent({ ...base,
       credentialExpiresAt: days === null ? null : Date.now() + days * DAY })
+    const row = (fact: string) => `${fact}\n${weekly}`
     // loginExpiresAt is the latest end and the login may end 3 days earlier: count down to that earliest end,
     // in the same format as window resets.
-    expect(render(27.3)).toBe('周 17%/6.9d · 凭据 24.3d')
-    expect(render(26.2)).toBe('周 17%/6.9d · 凭据 23.2d')
-    expect(render(11)).toBe('周 17%/6.9d · 凭据 8.0d')
+    expect(render(27.3)).toBe(row('凭据剩余 24.3d'))
+    expect(render(26.2)).toBe(row('凭据剩余 23.2d'))
+    expect(render(11)).toBe(row('凭据剩余 8.0d'))
     // Native warns from 10 days before the latest end, i.e. 7.0d shown. The color follows the displayed value,
     // so one label never shows with and without it.
-    expect(render(10.06)).toBe('周 17%/6.9d · 凭据 7.1d')
-    expect(render(10.04)).toBe("周 17%/6.9d · <font color='orange'>凭据 7.0d</font>")
-    expect(render(10)).toBe("周 17%/6.9d · <font color='orange'>凭据 7.0d</font>")
-    expect(render(4)).toBe("周 17%/6.9d · <font color='orange'>凭据 1.0d</font>")
+    expect(render(10.06)).toBe(row('凭据剩余 7.1d'))
+    expect(render(10.04)).toBe(row("<font color='orange'>凭据剩余 7.0d</font>"))
+    expect(render(10)).toBe(row("<font color='orange'>凭据剩余 7.0d</font>"))
+    expect(render(4)).toBe(row("<font color='orange'>凭据剩余 1.0d</font>"))
     // Just under a day still reads 1.0d, and the same text keeps the same color.
-    expect(render(3 + 23.97 / 24)).toBe("周 17%/6.9d · <font color='orange'>凭据 1.0d</font>")
+    expect(render(3 + 23.97 / 24)).toBe(row("<font color='orange'>凭据剩余 1.0d</font>"))
     // Under a day to the earliest end the login may end any moment: hours or minutes, in red.
-    expect(render(3.9)).toBe("周 17%/6.9d · <font color='red'>凭据 21.6h</font>")
-    expect(render(3.5)).toBe("周 17%/6.9d · <font color='red'>凭据 12.0h</font>")
-    expect(render(3 + 10 * 60_000 / DAY)).toBe("周 17%/6.9d · <font color='red'>凭据 10m</font>")
+    expect(render(3.9)).toBe(row("<font color='red'>凭据剩余 21.6h</font>"))
+    expect(render(3.5)).toBe(row("<font color='red'>凭据剩余 12.0h</font>"))
+    expect(render(3 + 10 * 60_000 / DAY)).toBe(row("<font color='red'>凭据剩余 10m</font>"))
     // Past the earliest end the login may already be over, up to and beyond the latest end.
-    expect(render(3)).toBe("周 17%/6.9d · <font color='red'>凭据 可能已到期</font>")
-    expect(render(0.5)).toBe("周 17%/6.9d · <font color='red'>凭据 可能已到期</font>")
-    expect(render(0)).toBe("周 17%/6.9d · <font color='red'>凭据 可能已到期</font>")
-    expect(render(-30)).toBe("周 17%/6.9d · <font color='red'>凭据 可能已到期</font>")
-    expect(render(null)).toBe('周 17%/6.9d · 凭据 MISS')
+    for (const days of [3, 0.5, 0, -30]) expect(render(days)).toBe(row("<font color='red'>凭据可能已到期</font>"))
+    expect(render(null)).toBe(row('凭据 MISS'))
     // Other sources carry no login end; failed rows keep only their reason; the footer never shows it.
-    expect(consoleUnifiedUsageContent(base)).toBe('周 17%/6.9d')
+    expect(consoleUnifiedUsageContent(base)).toBe(weekly)
     expect(consoleUnifiedUsageContent({ state: 'no_credentials', windows: [], credentialExpiresAt: Date.now() + 20 * DAY }))
       .toBe("<font color='red'>MISS · 未登录或未配置</font>")
     expect(unifiedUsageSummary({ ...base, credentialExpiresAt: Date.now() + DAY })).not.toContain('凭据')
-    const panel = consoleUsageElement({ sessionName: 'test', status: 'idle', accountUsages: [
-      { id: 'claude:default', label: 'Claude·默认', usage: { ...base, credentialExpiresAt: Date.now() + 27.3 * DAY } },
-    ] }) as any
-    expect(panel.elements[0].content).toBe('**Claude·默认**　周 17%/6.9d · 凭据 24.3d')
+    expect(accountUsageBlock({ id: 'claude:default', label: 'Claude·默认', usage: { ...base, credentialExpiresAt: Date.now() + 27.3 * DAY } }))
+      .toBe(`**Claude·默认**　凭据剩余 24.3d\n${weekly}`)
   })
 
   test('countdowns pick their unit from the rounded value', () => {
@@ -253,11 +311,12 @@ describe('compact hi account quota panel', () => {
     expect(fmtCountdown(2.2 * DAY)).toBe('2.2d')
   })
 
-  test('reset credit counts are compact in hi, omitted at zero like credits, and never enter the footer summary', () => {
+  test('reset card counts lead the detail, are omitted at zero like credits, and never enter the footer summary', () => {
     const snapshot = { state: 'ok' as const, windows: [{ kind: 'weekly', label: '周配额', percent: 22, resetsAt: null }], resetCredits: 2 }
-    expect(consoleUnifiedUsageContent(snapshot)).toBe('周 22%/MISS · 重置 2')
-    expect(consoleUnifiedUsageContent({ ...snapshot, resetCredits: 0 })).toBe('周 22%/MISS')
-    expect(consoleUnifiedUsageContent({ ...snapshot, resetCredits: null })).toBe('周 22%/MISS · 重置 MISS')
+    const weekly = `周　${bar(1)} 22%　${grey('重置时间 MISS')}`
+    expect(consoleUnifiedUsageContent(snapshot)).toBe(`重置卡 2\n${weekly}`)
+    expect(consoleUnifiedUsageContent({ ...snapshot, resetCredits: 0 })).toBe(weekly)
+    expect(consoleUnifiedUsageContent({ ...snapshot, resetCredits: null })).toBe(`重置卡 MISS\n${weekly}`)
     expect(unifiedUsageSummary(snapshot)).not.toContain('重置')
   })
 
@@ -267,9 +326,10 @@ describe('compact hi account quota panel', () => {
     expect(row({ kind: 'balance', balance: { remaining: 99.67, currency: 'USD' } })).toBe('余额 $99.67')
     expect(row({ kind: 'balance', balance: { remaining: 5, currency: 'EUR' } })).toBe('余额 EUR 5.00')
     expect(row({ kind: 'balance', balance: { remaining: NaN, currency: 'USD' } })).toBe('余额 MISS')
-    // Key quotas report what is left of the limit; say so under the 已用/距重置 header.
+    // Key quotas report what is left of the limit; say so, so it is not read as usage.
     expect(row({ kind: 'quota', quota: { remaining: 3, limit: 10, currency: 'USD' } })).toBe('剩余 $3.00 / $10.00')
     expect(row({ kind: 'quota', quota: { remaining: 3, limit: null, currency: 'USD' } })).toBe('额度 未设上限')
+    expect(row({ kind: 'quota', quota: { remaining: null, limit: 10, currency: 'USD' } })).toBe('额度 MISS')
   })
 
   test('footer balance and quota match hi: balance as is, key quota as what is left of the limit', () => {

@@ -11,7 +11,7 @@
  * 依赖全部注入且只读（daemon 负责接线），模块本身只引用类型和纯函数，没有建会话、写状态或启动进程的途径。
  */
 import type { AccountUsage } from './account-usage'
-import type { ConsoleOpts } from './cards/console'
+import type { ConsolePeer } from './cards/console'
 import { p2pConsoleCard } from './cards/p2p'
 import type { SessionWorkload } from './cards/task-kind'
 import type { ChatOwner } from './feishu'
@@ -20,19 +20,17 @@ import { logDiagnostic, logError } from './log'
 import { sanitizeSessionName } from './session-name'
 import type { SysInfo } from './sysinfo'
 
-type ConsolePeer = NonNullable<ConsoleOpts['peers']>[number]
-
 /** 单聊面板读取的运行中会话字段；`Session` 满足这个结构。 */
 export interface P2pPanelSession {
   readonly sessionName: string
   readonly chatId: string
-  peerSnapshot(): Omit<ConsolePeer, 'isCurrent' | 'workload'>
+  peerSnapshot(): Omit<ConsolePeer, 'workload'>
   workload(): Promise<SessionWorkload>
 }
 
 /** 单聊面板的全部依赖，只有读取和发消息。 */
 export interface P2pPanelDeps {
-  /** 当前运行中的会话，与群里 `hi` 的活跃项目同源。 */
+  /** 当前运行中的全部会话（daemon 的 `Session.all`），按发起人的可见性过滤后列为活跃项目。 */
   runningSessions(): readonly P2pPanelSession[]
   /** 机器人所在的群及群主（一次分页 `im.chat.list`）；到了 `deadlineAt` 中止请求、不再翻页。 */
   listChatOwners(deadlineAt: number): Promise<ChatOwner[]>
@@ -289,7 +287,7 @@ export async function buildP2pPanelCard(
   checkDeadline(deadline)
   return p2pConsoleCard({
     // 受限时由模板去掉账号名。
-    peers: sessions.map((session, index) => ({ ...session.peerSnapshot(), isCurrent: false, workload: workloads[index] })),
+    peers: sessions.map((session, index) => ({ ...session.peerSnapshot(), workload: workloads[index] })),
     restricted,
     ...(restricted ? {} : { accountUsages, sysinfo }),
     ...(failed ? { notice: P2P_LOOKUP_FAILED_NOTE } : {}),

@@ -79,10 +79,9 @@ import { withChatMessageOrder } from './chat-message-order'
 import { formatFeishuError } from './feishu-errors'
 import { logError, logDiagnostic } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
-import { readSysInfo } from './sysinfo'
 import { captureCodexUsageCache } from './usage'
 import { codexCreditsSummary } from './cards/usage'
-import { readAllAccountUsage } from './account-usage'
+import { readCodexAccountUsage, readTokenSourceAccountUsage, type AccountUsage } from './account-usage'
 import { claudeWeeklyUsageWindow } from './claude-usage'
 import {
   contextLimitFromAppServer,
@@ -243,6 +242,15 @@ function liveElapsedMode(): LiveElapsedMode {
  *  见 startFooterTimer / startFooterStatus。*/
 function timedStatus(status: string, startedAt: number): string {
   return `${status} (${liveElapsed(Date.now() - startedAt, liveElapsedMode()).label})`
+}
+
+/** The Codex subscription account a live process actually runs on. Null for everything else: API relay
+ * processes are never bound to an account, and a process still choosing one or waiting for quota has no
+ * settled account to show. Never the chat's next-start selection. */
+function liveCodexAccount(proc: AgentProcess): string | null {
+  if (proc.provider !== 'codex' || proc.codexAccountSelectionMode?.() === null) return null
+  if (proc.turnRetry?.reason === 'quota' && proc.turnRetry.phase === 'waiting') return null
+  return boundCodexAccount(proc)
 }
 
 function cardFailureDetails(failures: cardkit.CardWriteFailure[]): string {
@@ -588,20 +596,18 @@ export class Session {
     Session.all.add(this)
   }
 
-  /** Minimal cross-chat snapshot for the `hi` peer-list section.
+  /** Minimal cross-chat snapshot for the 1:1 panel's active projects.
    * `startedAt` stays private so this is the documented read path. */
   peerSnapshot(): { name: string; status: Status; uptimeMs?: number; codexAccountName?: string; claudeAccountName?: string } {
+    const proc = this.proc?.isAlive() ? this.proc : null
+    const codexAccount = proc ? liveCodexAccount(proc) : null
     return {
       name: this.sessionName,
       status: this.status,
       uptimeMs: this.startedAt ? (Date.now() - this.startedAt) : undefined,
-      ...(this.proc?.isAlive() && this.proc.provider === 'codex'
-        && !this.currentTokenSource()?.codexApiProvider
-        && this.proc.codexAccountSelectionMode?.() !== null
-        && !(this.proc.turnRetry?.reason === 'quota' && this.proc.turnRetry.phase === 'waiting')
-        ? { codexAccountName: codexAccounts.get(processCodexAccount(this.proc)).name } : {}),
-      ...(this.proc?.isAlive() && this.proc.tokenSourceId === 'claude-sub' && processClaudeAccount(this.proc)
-        ? { claudeAccountName: claudeAccounts.get(processClaudeAccount(this.proc)!).name } : {}),
+      ...(codexAccount !== null ? { codexAccountName: codexAccounts.get(codexAccount).name } : {}),
+      ...(proc?.tokenSourceId === 'claude-sub' && processClaudeAccount(proc)
+        ? { claudeAccountName: claudeAccounts.get(processClaudeAccount(proc)!).name } : {}),
     }
   }
 
@@ -3010,11 +3016,12 @@ export class Session {
     return sessionCommands.runCommand(this, raw, userOpenId, messageId, requester)
   }
 
-  /** Build the hi-panel data snapshot for this session, including the cached account usage. */
+  /** Build the group hi-panel snapshot: this project only — status, model, and the
+   * account its live process actually uses with that account's cached quota.
+   * Every project, the host and every account's quota are in the 1:1 panel. */
   async buildConsoleOpts(): Promise<cards.ConsoleOpts> {
-    const running = [...Session.all].filter(s => s.isRunning())
-    const [sysinfo, workloads] = await Promise.all([readSysInfo(), Promise.all(running.map(s => s.workload()))])
     const runtime = this.runtimeModelSelection()
+    const [workload, account] = await Promise.all([this.workload(), this.consoleAccount()])
     return {
       sessionName: this.sessionName,
       status: this.status,
@@ -3022,26 +3029,41 @@ export class Session {
       model: runtime.model ?? undefined,
       effort: runtime.effort ?? 'MISS',
       worktreeInstructionNotice: this.worktreeInstructionLoadedNotice(),
-      peers: running.map((s, index) => ({
-        ...s.peerSnapshot(),
-        isCurrent: s === this,
-        workload: workloads[index],
-      })),
-      accountUsages: await readAllAccountUsage(),
-      sysinfo,
+      ...(this.isRunning() && this.startedAt ? { uptimeMs: Date.now() - this.startedAt } : {}),
+      workload,
+      account,
+    }
+  }
+
+  /** The account this chat's live process actually runs on, with its cached quota (hi reads
+   * caches only). Null without a live process or while Codex has not settled on an account —
+   * the same cases in which the 1:1 panel omits the account name. A failed lookup shows
+   * MISS instead of failing the whole card. */
+  private async consoleAccount(): Promise<AccountUsage | null> {
+    const proc = this.proc?.isAlive() ? this.proc : null
+    if (!proc) return null
+    try {
+      // The live process decides, never the chat's next-start selection: `codex-account` switches the
+      // selection without a restart, and a relay can leave the config while its process still runs.
+      if (proc.provider === 'codex') {
+        const source = getTokenSource(proc.tokenSourceId)
+        if (source?.codexApiProvider) return await readTokenSourceAccountUsage(source)
+        const account = liveCodexAccount(proc)
+        return account === null ? null : await readCodexAccountUsage(account)
+      }
+      // Claude 订阅取本进程的账号视图（Claude·备注）；其他来源一个计费账号一行（GLM、DeepSeek、中转站）。
+      const source = this.tokenSource(proc.tokenSourceId)
+      if (!source || source.kind === 'claude-subscription' && !processClaudeAccount(proc)) return null
+      return await readTokenSourceAccountUsage(source)
+    } catch (error) {
+      logError('session: console account MISS', error)
+      return { id: 'error', label: 'MISS', usage: { state: 'network', windows: [], reason: messageOf(error) } }
     }
   }
 
   private async patchConsoleUsage(cardId: string): Promise<void> {
-    // The usage panel reads nothing but the account rows: rebuilding the whole console
-    // snapshot here collected host information and usage a second time for every `hi`.
-    const opts: cards.ConsoleOpts = { sessionName: this.sessionName, status: this.status }
-    try { opts.accountUsages = await readAllAccountUsage() }
-    catch (error) {
-      const reason = messageOf(error)
-      logError('session: console usage MISS', reason)
-      opts.accountUsages = [{ id: 'error', label: '额度', usage: { state: 'network', windows: [], reason } }]
-    }
+    // The usage panel shows only this project's account: no other project, host or account is read.
+    const opts: cards.ConsoleOpts = { sessionName: this.sessionName, status: this.status, account: await this.consoleAccount() }
     let failure: cardkit.CardWriteFailure | undefined
     const landed = await cardkit.replaceElementChecked(
       cardId,
@@ -3102,28 +3124,18 @@ export class Session {
     await cardkit.flush(handle.cardId)
     const failures: cardkit.CardWriteFailure[] = []
     const onFailure = (failure: cardkit.CardWriteFailure) => { failures.push(failure) }
-    const currentModelLanded = await cardkit.replaceElementChecked(
+    const projectLanded = await cardkit.replaceElementChecked(
       handle.cardId,
       cards.ELEMENTS.footer,
-      cards.consoleCurrentModelElement(consoleOpts, cards.ELEMENTS.footer),
+      cards.consoleProjectElement(consoleOpts, cards.ELEMENTS.footer),
       { onFailure },
-    )
-    const mainLanded = await cardkit.addElementChecked(
-      handle.cardId,
-      cards.consoleMainElement(consoleOpts),
-      { type: 'insert_after', targetElementId: cards.ELEMENTS.footer, onFailure },
-    )
-    const hostLanded = await cardkit.addElementChecked(
-      handle.cardId,
-      cards.consoleHostElement(consoleOpts.sysinfo),
-      { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleProjects, onFailure },
     )
     const usageLanded = await cardkit.addElementChecked(
       handle.cardId,
       cards.consoleUsageElement(consoleOpts),
-      { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleHost, onFailure },
+      { type: 'insert_after', targetElementId: cards.ELEMENTS.footer, onFailure },
     )
-    if (!currentModelLanded || !mainLanded || !hostLanded || !usageLanded) {
+    if (!projectLanded || !usageLanded) {
       await feishu.sendTextRaw(this.chatId, `⚠️ 控制台卡片结构写入失败，请重新发送 hi。\n${cardFailureDetails(failures)}`)
       await this.mutateStaticCard(handle.cardId, 'console structure', async () => {})
       return

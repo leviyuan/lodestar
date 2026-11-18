@@ -42,11 +42,11 @@ export const ELEMENTS = {
    * static markdown element, so element order in the card matches Codex's
    * emission order. */
   assistant: (i: number) => `assistant_${i}`,
-  /** Console (hi) card — the subscription-usage row is rendered as its
-   * own element so we can replace it after the initial card lands,
-   * decoupling the slow Codex account fetch from the rest of the panel's
-   * synchronous data. */
-  consoleCurrentModel: 'console_model',
+  /** Group `hi` card: this project's status/model/account block, and the
+   * quota of its account as its own element so it can be replaced after the
+   * card lands. The 1:1 panel reuses `consoleUsage` for all accounts and adds
+   * the active-projects and host sections. */
+  consoleProject: 'console_project',
   consoleProjects: 'console_projects',
   consoleHost: 'console_host',
   consoleUsage: 'console_usage',

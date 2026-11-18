@@ -10,7 +10,7 @@ import {
 import type { AccountUsage } from './account-usage'
 import type { ChatOwner } from './feishu'
 import { FeishuRequestError } from './feishu-retry'
-import { sanitizeSessionName } from './session-name'
+import { mainSessionName, sanitizeSessionName } from './session-name'
 import type { SysInfo } from './sysinfo'
 
 const feishu = await import('./feishu')
@@ -107,15 +107,25 @@ function harness(opts: {
   return { deps, calls, memberChecks, cards }
 }
 
+const EMPTY_PROJECTS = "<font color='grey'>暂无运行中的项目</font>"
+
+/** Project blocks as displayed: sorted by name, two lines each, blank-line separated. */
 function rows(card: any): string[] {
   const projects = card.body.elements.find((element: any) => element.element_id === 'console_projects')
-  const content: string = projects.elements[0].content
-  return content === '_无_' ? [] : content.split('\n')
+  return projects.elements.flatMap((element: any) => element.content === EMPTY_PROJECTS ? [] : element.content.split('\n\n'))
 }
 
 function names(card: any): string[] {
   return rows(card).map(row => row.match(/`([^`]+)`/)![1])
 }
+
+/** The panel lists projects by their main project, then by name, so a group's temp and wt groups sit next to it. */
+function byName(names: string[]): string[] {
+  return [...names].sort((a, b) => mainSessionName(a).localeCompare(mainSessionName(b), 'zh-Hans-CN')
+    || a.localeCompare(b, 'zh-Hans-CN'))
+}
+
+const row = (name: string, details: string) => `🟢 **\`${name}\`**　空闲\n<font color='grey'>${details}</font>`
 
 function elementIds(card: any): unknown[] {
   return card.body.elements.map((element: any) => element.element_id)
@@ -231,15 +241,17 @@ describe('1:1 panel builder', () => {
     })
     const card = await buildP2pPanelCard(REQUESTER, INTERNAL, h.deps) as any
 
-    expect(names(card)).toEqual(['foo', 'foo*x', 'foo[b]', 'foo[b]*x', 'my_proj', 'member-only'])
-    expect(rows(card)[0]).toBe('　· 🟢 `foo` · 闲 · 2m · Codex·工作订阅')
-    expect(rows(card)[5]).toContain('Codex·备用')
+    expect(names(card)).toEqual(byName(['foo', 'foo*x', 'foo[b]', 'foo[b]*x', 'my_proj', 'member-only']))
+    // The project and its temp and wt groups stay together.
+    expect(names(card).slice(0, 4).every(name => name.startsWith('foo'))).toBe(true)
+    expect(rows(card)[0]).toBe(row('foo', 'Codex·工作订阅 · 已运行 2m'))
+    expect(rows(card).find(block => block.includes('member-only'))).toContain('Codex·备用')
     // Membership is only asked for the sessions ownership did not already cover.
     expect(h.memberChecks).toEqual([
       ['oc_foo_bar', REQUESTER], ['oc_elsewhere', REQUESTER], ['oc_member_only', REQUESTER],
     ])
     expect(h.calls.filter(call => call === 'listChatOwners')).toHaveLength(1)
-    expect(elementIds(card)).toEqual(['console_projects', 'console_host', 'console_usage', undefined])
+    expect(elementIds(card)).toEqual(['console_projects', 'console_usage', 'console_host', undefined])
     expect(JSON.stringify(card)).toContain('GLM Coding Plan')
     expect(JSON.stringify(card)).not.toContain(P2P_LOOKUP_FAILED_NOTE)
   })
@@ -293,12 +305,12 @@ describe('1:1 panel builder', () => {
     })
     const card = await buildP2pPanelCard(REQUESTER, RESTRICTED, h.deps) as any
 
-    expect(rows(card)).toEqual(['　· 🟢 `foo` · 闲 · 2m', '　· 🟢 `bar` · 闲 · 2m'])
+    expect(rows(card)).toEqual([row('bar', '已运行 2m'), row('foo', '已运行 2m')])
     expect(elementIds(card)).toEqual(['console_projects', undefined])
     expect(h.calls).not.toContain('readAllAccountUsage')
     expect(h.calls).not.toContain('readSysInfo')
     const body = JSON.stringify(card)
-    for (const hidden of ['工作订阅', '备用', 'Codex·', 'Claude·', '主机', '全部账号额度', 'GLM']) expect(body).not.toContain(hidden)
+    for (const hidden of ['工作订阅', '备用', 'Codex·', 'Claude·', '主机', '账号额度', 'GLM']) expect(body).not.toContain(hidden)
     expect(unexpected).toEqual([])
   })
 
@@ -363,7 +375,7 @@ describe('1:1 panel builder', () => {
 
     expect(rows(card)).toEqual([])
     expect(card.body.elements[0].header.title.content).toBe('🗂 活跃项目 (0)')
-    expect(card.body.elements[0].elements[0].content).toBe('_无_')
+    expect(card.body.elements[0].elements[0].content).toBe(EMPTY_PROJECTS)
     expect(h.calls).not.toContain('listChatOwners')
     expect(h.calls).not.toContain('isChatMember')
   })
@@ -432,7 +444,7 @@ describe('1:1 reply', () => {
 
     expect(h.cards).toHaveLength(1)
     expect(elementIds(h.cards[0])).toEqual(['console_projects', undefined])
-    expect(rows(h.cards[0])).toEqual(['　· 🟢 `foo` · 闲 · 2m'])
+    expect(rows(h.cards[0])).toEqual([row('foo', '已运行 2m')])
     expect(h.calls).not.toContain('readAllAccountUsage')
     expect(h.calls).not.toContain('readSysInfo')
   })
@@ -571,7 +583,7 @@ describe('1:1 panel with the Feishu helpers', () => {
 
     expect(chatMemberChecks).toEqual([['oc_bar', REQUESTER], ['oc_baz', REQUESTER], ['oc_qux', REQUESTER]])
     expect(sentCards).toHaveLength(1)
-    expect(names(sentCards[0])).toEqual(['foo[b]', 'bar'])
+    expect(names(sentCards[0])).toEqual(['bar', 'foo[b]'])
     expect((sentCards[0] as any).body.elements[0].content).toBe(P2P_LOOKUP_FAILED_NOTE)
     expect(sentRawTexts).toEqual([])
   })
@@ -593,7 +605,7 @@ describe('1:1 panel modules', () => {
   // Only types and pure helpers may be imported, so the panel cannot reach sessions, Feishu or state.
   test.each([
     ['src/p2p-panel.ts', ['./cards/p2p', './feishu-errors', './log', './session-name']],
-    ['src/cards/p2p.ts', ['./console']],
+    ['src/cards/p2p.ts', ['../session-name', './account-usage', './console', './elements', './task-kind']],
   ])('%s imports nothing stateful', (file, allowed) => {
     const text = readFileSync(join(root, file), 'utf8')
     const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true)

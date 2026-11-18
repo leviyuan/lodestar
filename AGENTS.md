@@ -30,7 +30,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 ## 模块边界
 
 - 一个群只有一个 Session 和一个当前主进程。Codex 使用 app-server JSON-RPC，Claude Code 及其第三方来源使用 Agent SDK streaming input，DSH 使用独立 Node 子进程和 Cordis stdio 桥接；不引入 tmux、JSONL 队列或旁路进程控制。
-- 单聊（p2p）不对应项目：不建 Session、不写状态、不启动任何东西，任何消息只回只读面板（`p2p-panel.ts`），没有按钮，操作都留在群里。细节见 `src/AGENTS.md`。
+- 单聊（p2p）不对应项目：不建 Session、不写状态、不启动任何东西，任何消息只回只读面板（`p2p-panel.ts`），没有按钮，操作都留在群里。全局总览（全部活跃项目、全部账号额度、主机）只在单聊面板，群里的 `hi` 只显示本项目的状态、模型、实际账号及其额度。细节见 `src/AGENTS.md`。
 - DSH 的 `deepseek-harness` 与 Claude 兼容的 `deepseek` 共用 DeepSeek 凭据和平台地址；`dsh-glm` 与 `glm` 共用 GLM Coding Plan 账号，前者通过原生 pi-ai 适配器接入。共享凭据只存一份，模型、effort 和可见性按 Agent 保留；旧配置冲突必须明确报错，任一 setup 入口均更新共享账号。运行时经更新器选择 latest，子进程需要 Node 22.19+（22.x）或 24+；`src/dsh-bridge.ts` 仅在该子进程加载。启动补丁按实际安装的 profile 判断是否已自带 ask-user 工具，避免重复注册；模型接入链需要的 credentials 服务保持启用，凭据仍只由环境变量注入。
 - Agent 运行时更新（`agent-updates.ts`）：
   - 按 `[runtime.agent_auto_update]` 的 `codex`、`claude`、`dsh` 三个独立开关每 6 小时更新对应 Agent，首次检查也在 6 小时后；三项默认关闭，各自防止重叠执行，失败互不阻塞。旧布尔总开关按原值兼容转换并提示迁移，不与新表混用。
@@ -64,7 +64,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
   - Codex 只展示接口实际返回的窗口，成功响应未返回短窗时不补造 5h、满额或重置时间；查询失败和已返回窗口缺值仍保留错误或 MISS。
   - 仅剩积分的账号排在有订阅余量的账号后，按积分余额降序。Plus 未返回短窗时按实际周额度评分，可参与 Ultra 自动选择，无需消费积分；返回短窗的 Plus 仍需本计量桶可用积分才能参与 Ultra，无积分排除、积分未知显示 MISS。有积分的 Pro 不受 Ultra 的 0.5 份周余量门槛限制。
   - 不据积分绕过模型权限或强制计费来源；`ordinaryUsageAllowed=false` 与 `rate_limit_reached` 仅表示套餐内额度不可用，有本计量桶积分时仍可选；工作区积分/用量限制、消费限制和真实请求耗尽仍有效。
-  - OpenRouter 用 `/credits` 查账户余额，以实际响应判断权限。中转站余额只来自可选 `balance_script`，同一站点的各 Agent 视图在 hi 合并为一个余额账号；未配置脚本时不适用，脚本失败显示 MISS。
+  - OpenRouter 用 `/credits` 查账户余额，以实际响应判断权限。中转站余额只来自可选 `balance_script`，同一站点的各 Agent 视图合并为一个余额账号（单聊面板只列一次）；未配置脚本时不适用，脚本失败显示 MISS。
 - Lodestar Agent 不支持调用 Claude 订阅，遵守 Claude 用户协议；中转站等第三方来源的 Claude 模型仍可调用。reclaude 运行在订阅登录上，与 Claude 订阅一样排除。身份目录与新建/续跑入口仅按来源 ID 与类型排除 Claude 订阅与 reclaude，不按模型名称或显示名限制。此限制只作用于 Lodestar Agent，不影响主会话的 Claude 订阅/reclaude 能力或原生委派工具。
 - `AgentService` 的委派进程与主会话共用启动入口。主 Agent、委派 Agent 和原生子 Agent 均可继续派工，不设置 Lodestar 委派层数上限，保留原生委派工具；独立服务/软件的项目调用不提供提问或回答接口，新建和续跑均须自主执行、验证直至完整完成目标，不能以索取输入、计划或部分工作结束；真实阻断和故障须如实报告；后续委派继承项目、对话 ID（`chat_id`）和交互约定，并纳入父任务的取消树。会话委派与 `--project` 项目调用都只返回结果和本地文件路径，由调用方处理交付；不注入主会话交付提示词，不执行结果中的交付标记，新建与续跑一致。具体生命周期约束见 `src/AGENTS.md`。
 - Agent 执行任务中的调用必须绑定会话，不得通过 `--project`、清除环境或借用项目凭据脱离会话；独立服务/软件调用必须显式 `--project`，每次在绑定对话 ID 下显示独立卡。对话 ID（`chat_id`）标识调用绑定对象；原生 `session_id` 是后端会话唯一 ID，与对话 ID 不同，`run_id` 仅标识一次调用。恢复限同一项目、同一对话 ID，允许会话/项目两种绑定之间续跑；未知归属、跨项目和跨对话 ID 均报错。会话委派与项目调用均不设置本地并发或任务数量上限，上游限制与启动失败按实际错误报告。
@@ -82,9 +82,9 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
   - 云空间卡只列本轮云空间文件，管理按钮打开本群全部历史云空间交付文件的原生飞书目录；交付发起人获 full_access、群获 view，不转移所有权或开放公网分享。超过 20 MB 分片上传，限额由上游判断，失败不自动切换通道。
   - 原附件/图片通道保留，旧聊天附件不删除、不自动迁移。记录由 `paths.ts` 定义，远端文件不自动清理，模板不读取文件。
 - Codex 生图超过 30 MB 时自动转云空间交付；其余图片与提示词默认放在同一个折叠面板，提示词包含完成事件补回的内容，不在折叠标题中展开。图片成功嵌入后不再单发；无法嵌入时按用户要求单独发图。关闭或换卡前等待所属图片上传和写入完成。
-- `hi` 展示全部已配置账号，一账号一行；DeepSeek、GLM 不按 Agent 重复展示。Codex 只显示主额度，不显示 Spark/gpt-reserve；Codex 账号可用的重置卡次数来自 `account/rateLimits/read` 的 `rateLimitResetCredits.availableCount`，简写为“重置”，这不是飞书换卡计数，也不加入回复 footer。GLM 月工具只显示百分比，无底部说明。
-- Claude 订阅账号行末显示到登录最早可能结束的倒计时（`凭据 23.2d`），只来自原生 `claude auth status --json` 的 `loginExpiresAt`，不读取钥匙串、凭据文件或令牌，也不改用其他来源；按原生口径取最晚到期前 3 天为最早结束，倒计时格式同距重置，显示不超过 7.0d 橙色，显示为小时或分钟（`凭据 21.6h`）或已过最早结束（`凭据 可能已到期`）红色；缺失或原生输出无法识别为 `凭据 MISS`，不加入回复 footer。实现约束见 `src/AGENTS.md`。
-- `hi` 活跃项目与 `bl` 在会话状态后追加仍在运行的子 Agent 与后台进程数，写法同运行任务卡预览（`闲 · 子Agent2·后台1`，0 省略），使主线程空闲但后台仍在工作的会话不再只显示「闲/空闲」；后台进程优先取后端实时集合（Claude SDK 电平、Codex 后台终端），读取失败显示 `后台MISS`，不当作 0。实现约束见 `src/AGENTS.md`。
+- 单聊面板的账号额度展示全部已配置账号，一账号一块（首行账号名，每个窗口一行，如 `5h　▰▰▱▱▱▱ 34%　4.1h 后重置`）；DeepSeek、GLM 不按 Agent 重复展示。群里 `hi` 只显示本项目进程实际使用的那一个账号的额度。Codex 只显示主额度，不显示 Spark/gpt-reserve；Codex 账号可用的重置卡次数来自 `account/rateLimits/read` 的 `rateLimitResetCredits.availableCount`，写作 `重置卡 N`，这不是飞书换卡计数，也不加入回复 footer。GLM 月工具只显示百分比，无底部说明。
+- Claude 订阅账号的额度明细显示到登录最早可能结束的剩余时间（`凭据剩余 23.2d`；单聊面板跟在账号名后，群里 `hi` 为额度面板首行），只来自原生 `claude auth status --json` 的 `loginExpiresAt`，不读取钥匙串、凭据文件或令牌，也不改用其他来源；按原生口径取最晚到期前 3 天为最早结束，倒计时格式同距重置，显示不超过 7.0d 橙色，显示为小时或分钟（`凭据剩余 21.6h`）或已过最早结束（`凭据可能已到期`）红色；缺失或原生输出无法识别为 `凭据 MISS`，额度查询失败时不显示，不加入回复 footer。实现约束见 `src/AGENTS.md`。
+- 群里 `hi` 的状态行、单聊面板的活跃项目与 `bl` 在会话状态后追加仍在运行的子 Agent 与后台进程数，写法同运行任务卡预览（`空闲 · 子Agent2·后台1`，0 省略），使主线程空闲但后台仍在工作的会话不再只显示「空闲」；后台进程优先取后端实时集合（Claude SDK 电平、Codex 后台终端），读取失败显示 `后台MISS`，不当作 0。实现约束见 `src/AGENTS.md`。
 - `codex-reset [备注]` 显式使用一次账号重置卡；省略备注只取当前运行账号，账号未知时要求指定。调用原生 `account/rateLimitResetCredit/consume`，同一消息及其网络重试复用幂等标识；按四种原生 outcome 展示结果，之后重新读额度，不能推算卡数或掩盖已扣卡后的刷新/关闭失败。
 
 ## 运行中的 daemon

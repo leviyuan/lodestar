@@ -581,22 +581,23 @@ test('hi rows get each account login end from the background usage refresh, in t
     const { buildTokenSourcesFromConfig } = await import('./src/token-source-builtins')
     buildTokenSourcesFromConfig()
     const source = registry.getTokenSource('claude-sub')
-    const { accountUsageRow } = await import('./src/cards/account-usage')
+    const { accountUsageBlock } = await import('./src/cards/account-usage')
     try {
       await (await import('./src/token-source-cache')).refreshTokenSourceUsage(source)
       const background = probes.length
       const row = async id => {
         const view = source.forAccount(id)
         const usage = await view.readUsage()
-        return { usage, content: accountUsageRow({ id, label: view.usageAccount.label, usage }).content }
+        return { usage, content: accountUsageBlock({ id, label: view.usageAccount.label, usage }) }
       }
       const native = await row('default'), named = await row(account.id)
       // hi reads only the committed snapshot: rendering rows starts no native status command.
       assert.equal(probes.length, background)
       assert.equal(native.usage.credentialExpiresAt, ends.get('default'))
       assert.equal(named.usage.credentialExpiresAt, ends.get(account.id))
-      assert.equal(native.content, '**Claude·默认**　周 17%/6.9d · 凭据 24.3d')
-      assert.equal(named.content, "**Claude·named**　周 17%/6.9d · <font color='red'>凭据 可能已到期</font>")
+      const weekly = "周　<font color='green'>▰▱▱▱▱▱</font> 17%　<font color='grey'>6.9d 后重置</font>"
+      assert.equal(native.content, '**Claude·默认**　凭据剩余 24.3d\\n' + weekly)
+      assert.equal(named.content, "**Claude·named**　<font color='red'>凭据可能已到期</font>\\n" + weekly)
       assert.deepEqual([...new Set(probes.map(probe => probe.accountId))].sort(), [account.id, 'default'].sort())
       const { claudeSubscriptionSettings } = await import('./src/token-source-claude')
       const { buildClaudeSpawnPath } = await import('./src/claude-spawn-path')

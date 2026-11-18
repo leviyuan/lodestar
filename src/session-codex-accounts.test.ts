@@ -658,6 +658,64 @@ describe('bare Codex account commands', () => {
     proc.alive = true
   })
 
+  test('group hi and the 1:1 rows follow the live process\'s own source, not the next-start selection', async () => {
+    const balance = { state: 'ok' as const, kind: 'balance' as const, balance: { remaining: 42, currency: 'USD' }, windows: [] }
+    const relay: TokenSource = { ...source(), id: 'relay:site:codex', kind: 'relay-openai-codex', display: 'Site',
+      usageAccount: { id: 'relay:site', label: 'Site' }, readUsage: async () => balance,
+      codexApiProvider: { id: 'relay-site', name: 'Site', baseUrl: 'https://relay.example.test/v1', envKey: 'RELAY_KEY' } as any }
+    registerTokenSource(relay)
+    const s = session()
+    s.selectedTokenSourceId = relay.id
+    // A plain Codex API process: never bound to a subscription account.
+    const proc = new Proc() as any; procs.push(proc)
+    proc.tokenSourceId = relay.id
+    s.proc = proc
+    const onRelay = { id: 'relay:site', label: 'Site', usage: balance }
+    expect(await s.consoleAccount()).toEqual(onRelay)
+    // `codex-account 备注` switches only the next start; the running relay process still decides.
+    s.selectedTokenSourceId = 'codex-sub'
+    expect(await s.consoleAccount()).toEqual(onRelay)
+    expect(s.peerSnapshot().codexAccountName).toBeUndefined()
+    // The relay leaves the config while its process still runs: no subscription account stands in for it.
+    resetTokenSourceRegistry()
+    registerTokenSource(source())
+    s.selectedTokenSourceId = relay.id
+    expect(await s.consoleAccount()).toBeNull()
+    expect(s.peerSnapshot().codexAccountName).toBeUndefined()
+  })
+
+  test('group hi shows the cached quota of the account the live Codex process uses, not the next selection', async () => {
+    const active = store.ensure('实际账号')
+    const next = store.ensure('下次账号')
+    const s = session()
+    const proc = new Proc() as any; procs.push(proc)
+    s.proc = proc
+    // Not settled on an account yet: no account, and no other account's quota in its place.
+    proc.codexAccountSelectionMode = () => null
+    expect(await s.consoleAccount()).toBeNull()
+    proc.codexAccountSelectionMode = () => 'automatic'
+    bindProcessCodexAccount(proc, active.id)
+    store.select(s.sessionName, next.id)
+    await refreshUsageFromConnection(async () => ({ rateLimits: {
+      primary: { usedPercent: 34, windowDurationMins: 300 },
+      credits: { hasCredits: false, unlimited: false, balance: '0' },
+    } }), active.id)
+    try {
+      const account = await s.consoleAccount()
+      expect(account).toMatchObject({ id: `codex:${active.id}`, label: 'Codex·实际账号' })
+      expect(account.usage.windows.map((window: any) => [window.kind, window.percent])).toEqual([['fiveHour', 34]])
+      const opts = await s.buildConsoleOpts()
+      expect(opts.account).toEqual(account)
+      expect(opts).not.toHaveProperty('peers')
+      // Waiting for quota means no settled account either.
+      proc.turnRetry = { reason: 'quota', phase: 'waiting' }
+      expect(await s.consoleAccount()).toBeNull()
+    } finally {
+      proc.turnRetry = null
+      usageModule.invalidateCodexUsage(active.id)
+    }
+  })
+
   test('only codex-prefixed commands enter account management', async () => {
     const s = session()
     const dispatch = spyOn(accountCommands, 'runCodexAccountCommand').mockResolvedValue(undefined)
