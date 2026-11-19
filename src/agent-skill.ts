@@ -231,7 +231,7 @@ export function agentSkillBody(): string {
     '',
     '- Do not invoke provider CLIs or provider HTTP APIs directly for delegation.',
     '- Never expose `LODESTAR_AGENT_CAPABILITY` in prompts, output, logs, or args.',
-    '- Never read or copy daemon project-client credentials to bypass delegation restrictions.',
+    '- Never attempt to bypass delegation restrictions or reuse another caller\'s credentials.',
     '- A non-zero command exit is a real failure. Do not claim the child succeeded.',
     '- Scope the Agent task and authorized actions to the user request.',
     '- Both session-bound and project-bound Agents return results and local artifact paths to the caller.',

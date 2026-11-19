@@ -167,7 +167,7 @@ describe('notification text reply workflow', () => {
     expect(result.resolved).toBe(true)
     expect(result.response).toEqual({ type: 'text', ...h.delivered[0].response })
     expect(result.button).toBeUndefined()
-    expect(result.resolved_by).toBe('ou_owner')
+    expect(result.resolved_by).toBeUndefined()
     expect(result.reply.status).toBe('resolved')
   })
 

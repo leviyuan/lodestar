@@ -29,7 +29,7 @@ import { dirname } from 'node:path'
 import { Session } from './src/session'
 import { sessionActivity } from './src/session-activity'
 import * as feishu from './src/feishu'
-import { formatFeishuError, redactMemberIds } from './src/feishu-errors'
+import { feishuErrorDetails, formatFeishuError, redactMemberIds } from './src/feishu-errors'
 import * as cards from './src/cards'
 import { actionCardResponse } from './src/card-action'
 import { debugModelActionEvent, debugModelState } from './src/debug-model'
@@ -67,6 +67,9 @@ import { log, logError, logDiagnostic } from './src/log'
 import { startAgentAutoUpdates } from './src/agent-updates'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
 import { writeJsonStateAtomic } from './src/state-store'
+import { pruneStaleAttachmentDirs, removeAttachmentDir } from './src/attachments'
+import { scrubLegacyDeliveryReceipts } from './src/file-delivery-runtime'
+import { codexConfigFile, pruneLodestarProjectTrust } from './src/codex-config'
 import { clientEventDispatcher, createWsRetirement } from './src/ws-retire'
 import { checkPidGuard, writePidFile } from './src/pid-guard'
 import {
@@ -118,6 +121,8 @@ let shutdownExitCode = 0
 let stopAgentAutoUpdates: (() => Promise<void>) | undefined
 let stopFeishuWs: (() => void) | undefined
 const SHUTDOWN_DEADLINE_MS = 15_000
+/** Local debug injection is opt-in; npm installs never create the socket. */
+const debugSocketEnabled = process.env.LODESTAR_DEBUG_SOCKET === '1'
 const cleanup = () => {
   if (cleanupDone) return
   cleanupDone = true
@@ -126,6 +131,8 @@ const cleanup = () => {
   } catch (e) { logError('daemon.recovery_marker.write_failed', e) }
   try { unlinkSync(PID_FILE) } catch {}
   try { unlinkSync(DEBUG_SOCK_FILE) } catch {}
+  try { unlinkSync(DEBUG_CTX_FILE) } catch {}
+  removeAttachmentDir()
 }
 
 function requestShutdown(reason: string, exitCode: number): Promise<void> {
@@ -409,8 +416,10 @@ function extractPostMarkdown(
           break
         }
         case 'at': {
-          const name = String(el.user_name ?? el.user_id ?? '')
-          parts.push(`@${name}`)
+          // Never fall back to the raw open_id: a missing display name is not a
+          // reason to put a user identifier into the Agent prompt.
+          const name = typeof el.user_name === 'string' ? el.user_name : ''
+          parts.push(name ? `@${name}` : '@…')
           break
         }
         case 'code_inline':
@@ -512,14 +521,18 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   const debugTextRaw = (message.message_type === 'text' ? contentObjForDebug.text ?? '' : '')
   // 外部联系人的消息不写调试上下文（其中含发送者 open_id），按普通文本处理。
   if (shouldSeedDebugContext(requester, debugTextRaw)) {
-    try {
-      writeJsonStateAtomic(DEBUG_CTX_FILE, {
-        chat_id: chatId,
-        sender_open_id: userOpenId,
-        seeded_at: new Date().toISOString(),
-        seeded_msg_id: msgId ?? '',
-      })
-    } catch (e) { logError('daemon.debug_context.write_failed', e) }
+    // Never persist chat_id/open_id unless the loopback debug socket is
+    // explicitly enabled for local testing.
+    if (debugSocketEnabled) {
+      try {
+        writeJsonStateAtomic(DEBUG_CTX_FILE, {
+          chat_id: chatId,
+          sender_open_id: userOpenId,
+          seeded_at: new Date().toISOString(),
+          seeded_msg_id: msgId ?? '',
+        })
+      } catch (e) { logError('daemon.debug_context.write_failed', e) }
+    }
     const stripped = debugTextRaw.slice('[DEBUG]'.length)
     contentObjForDebug.text = stripped
     message.content = JSON.stringify(contentObjForDebug)
@@ -1240,6 +1253,77 @@ async function pushNotifyCallbackPhase2(
   }
 }
 
+// ── Group lifecycle events ──────────────────────────────────────────────
+/** Forget one dissolved chat: stop without announcing, drop the in-memory
+ * Session, clear conversation-scoped state and refresh the alive marker.
+ * Project directory, tasklist and cloud folder/files are intentionally left
+ * in place. Callers serialize through chatActor when they can. */
+async function forgetChatBinding(chatId: string, sessionName: string, reason: string): Promise<void> {
+  const session = sessions.get(chatId)
+  if (session) {
+    try { await session.stop(reason, { announce: false }) }
+    catch (e) { logError('daemon.chat.disbanded_stop_failed', e) }
+    sessions.delete(chatId)
+    session.dispose()
+  }
+  try { feishu.clearSessionConversationState(sessionName, chatId) }
+  catch (e) { logError('daemon.chat.disbanded_cleanup_failed', e) }
+  try { sessionRecovery.persist() }
+  catch (e) { logError('daemon.chat.disbanded_marker_failed', e) }
+  log('daemon.chat.disbanded')
+}
+
+/** Feishu `im.chat.disbanded_v1` entry; the event payload is flattened by the
+ * SDK in current versions, with an `event` fallback for older shapes. */
+function handleChatDisbanded(data: any): void {
+  const chatId = String(data?.chat_id ?? data?.event?.chat_id ?? '').trim()
+  const session = chatId ? sessions.get(chatId) : undefined
+  const sessionName = session?.sessionName
+    ?? (chatId ? [...feishu.preferredChatForSession].find(([, id]) => id === chatId)?.[0] : undefined)
+  if (!chatId || !sessionName) {
+    log('daemon.chat.disbanded_ignored')
+    return
+  }
+  void chatActor.enqueue(chatId, () => forgetChatBinding(chatId, sessionName, '群已解散'))
+    .catch(e => logError('daemon.chat.disbanded_failed', e))
+}
+
+/** Event subscription is best-effort on the Feishu side; reconcile bindings
+ * after startup so a missed disband event does not leave a dead conversation
+ * bound forever. Runs in the background and never blocks readiness. */
+function chatWasDissolved(chatId: string): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    feishu.client.im.chat.get({ path: { chat_id: chatId } }),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('chat.get timeout')), 8_000)
+    }),
+  ]).then(res => {
+    const response = res as any
+    const code = response?.code ?? response?.data?.code ?? 0
+    return code === 0 && response?.data?.chat_status === 'dissolved'
+  }, (error) => {
+    const code = feishuErrorDetails(error).code
+    return code === 232009 || code === 232006
+  }).finally(() => { if (timer) clearTimeout(timer) })
+}
+
+async function reconcileDissolvedChats(): Promise<void> {
+  const entries = [...feishu.preferredChatForSession]
+  let next = 0
+  const worker = async () => {
+    for (;;) {
+      const index = next++
+      if (index >= entries.length) return
+      const [sessionName, chatId] = entries[index]
+      if (!await chatWasDissolved(chatId)) continue
+      await chatActor.enqueue(chatId, () => forgetChatBinding(chatId, sessionName, '群已解散（启动核对）'))
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(4, entries.length) }, () => worker()))
+  log('daemon.chat.reconciled')
+}
+
 // ── WebSocket boot ─────────────────────────────────────────────────────
 
 // ── Debug message injection ─────────────────────────────────────────────
@@ -1248,6 +1332,7 @@ async function pushNotifyCallbackPhase2(
 // by a one-time `[DEBUG]<anything>` from the real Feishu user; from then
 // on the injector reuses that chat_id + sender_open_id.
 function startDebugSocket(): void {
+  if (!debugSocketEnabled) return
   if (process.platform === 'win32') {
     // Bun.serve({unix:...}) 在 Windows 上不支持,且 debug 注入是
     // dev-only 路径(scripts/test-inject.ts 用的),end user 不需要。
@@ -1355,6 +1440,19 @@ function startDebugSocket(): void {
 
 async function boot(): Promise<void> {
   log('daemon.started')
+  pruneStaleAttachmentDirs()
+  try {
+    if (pruneLodestarProjectTrust(codexConfigFile(), config.runtime.projects_root) > 0) {
+      log('codex.project_trust.pruned')
+    }
+  } catch (e) { logError('codex.project_trust.prune_failed', e) }
+  try {
+    if (scrubLegacyDeliveryReceipts() > 0) log('file_delivery.receipts_scrubbed')
+  } catch (e) { logError('file_delivery.receipts_scrub_failed', e) }
+  if (!debugSocketEnabled) {
+    try { unlinkSync(DEBUG_CTX_FILE) } catch {}
+    try { unlinkSync(DEBUG_SOCK_FILE) } catch {}
+  }
   sessionRecovery.load()
   // token source registry 先于 session 构建填充:session 构造会查 registry 推导 tokenSourceId。
   // config.toml [token_source.*] 在此落地为可用的 TokenSource。
@@ -1516,6 +1614,11 @@ async function boot(): Promise<void> {
       // slots before returning, then let the queued handler start next task.
       return acceptCardAction(d)
     },
+  })
+  dispatcher.register({
+    // A manual Feishu dissolution never reaches the message path, so cleanup
+    // must be driven by this event. The handler acks immediately.
+    'im.chat.disbanded_v1': (d: any) => { handleChatDisbanded(d) },
   })
 
   // Lifecycle callbacks only drive the current client. One fired by a replaced
@@ -1712,6 +1815,7 @@ async function boot(): Promise<void> {
   }, { enabled: config.runtime.agent_auto_update })
   startWs(ws, 'daemon.websocket.start_failed', 'initial start failed', false)
   log('daemon.ready')
+  void reconcileDissolvedChats().catch(e => logError('daemon.chat.reconcile_failed', e))
   startDebugSocket()
   for (const reg of recoveredCallbacks) {
     void trackCardActionWork(chatActor.enqueue(reg.chatId, () => notifyReplies.recover(reg)))

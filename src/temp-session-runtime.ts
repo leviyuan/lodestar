@@ -84,7 +84,7 @@ export interface TempSessionRuntimeDeps<TSession extends TempSessionHandle> {
   chatIdForSession(sessionName: string): string | null
   /** Drops a name → chat binding that a group rename left pointing at this chat. */
   unbindSessionChat?(sessionName: string): void
-  clearSessionConversationState(sessionName: string): void
+  clearSessionConversationState(sessionName: string, chatId?: string): void
   registerTempSessionLease(sessionName: string, chatId: string): void
   hasTempSessionLease(sessionName: string, chatId: string): boolean
   replaceTurnAnchors(sessionName: string, anchors: TurnAnchor[], base: ConversationBranchBase): void
@@ -230,7 +230,7 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
         try {
           deps.registry.delete(removed.chatId)
           tempSession?.dispose()
-          deps.clearSessionConversationState(opts.chatName)
+          deps.clearSessionConversationState(opts.chatName, removed.chatId)
         } catch (cleanupError) {
           const cleanupFailure = messageOf(cleanupError)
           deps.log(formatLogError('temp-session: local cleanup failed', cleanupFailure))
@@ -288,7 +288,7 @@ export function createTempSessionRuntime<TSession extends TempSessionHandle>(
     try {
       deps.registry.delete(removed.chatId)
       session?.dispose()
-      deps.clearSessionConversationState(chatName)
+      deps.clearSessionConversationState(chatName, knownChatId)
       return removed.left ? { ok: true, left: true } : { ok: true }
     } catch (cleanupError) {
       const failure = messageOf(cleanupError)

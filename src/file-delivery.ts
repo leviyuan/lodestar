@@ -14,6 +14,7 @@ export interface FileDeliveryDeps {
 export class FileDeliveryBatch implements FileDeliveryHandle {
   readonly snapshot: FileDeliverySnapshot
   private queue: Promise<void> = Promise.resolve()
+  private readonly managerOpenId: string
   private folderPromise?: Promise<DeliveryFolder>
   private finishPromise?: Promise<string[]>
   private persistenceError?: string
@@ -21,7 +22,11 @@ export class FileDeliveryBatch implements FileDeliveryHandle {
 
   constructor(context: FileDeliveryContext, private readonly deps: FileDeliveryDeps) {
     if (!context.chatId.trim() || !context.managerOpenId.trim()) throw new Error('无法确认交付群或本次交付发起人')
-    this.snapshot = { ...context, version: 1, id: randomUUID(), folderAccessReady: false, files: [] }
+    // The delivery receipt is long-lived local history; keep the delivery
+    // context's open_id out of it and use it only for the access grant.
+    const { managerOpenId, ...receiptContext } = context
+    this.managerOpenId = managerOpenId
+    this.snapshot = { ...receiptContext, version: 1, id: randomUUID(), folderAccessReady: false, files: [] }
   }
 
   add(path: string): void {
@@ -85,7 +90,7 @@ export class FileDeliveryBatch implements FileDeliveryHandle {
 
   private getFolder(): Promise<DeliveryFolder> {
     this.folderPromise ??= (async () => {
-      const folder = await this.deps.resolveFolder(this.snapshot, this.abort.signal)
+      const folder = await this.deps.resolveFolder({ ...this.snapshot, managerOpenId: this.managerOpenId }, this.abort.signal)
       this.snapshot.folder = folder
       this.snapshot.folderAccessReady = true
       this.save()

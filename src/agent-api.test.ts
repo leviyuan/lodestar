@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createServer, request, type Server } from 'node:http'
-import { handleAgentRequest } from './agent-api'
+import { agentVisibleText, handleAgentRequest } from './agent-api'
 import { buildAgentIdentityCatalog } from './agent-identities'
 import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, type TokenSource } from './token-source'
 
@@ -49,6 +49,44 @@ async function serve(onStart?: (request: any) => void, projectMode = false) {
   if (!address || typeof address === 'string') throw new Error('no address')
   return `http://127.0.0.1:${address.port}`
 }
+
+test('agent-visible diagnostics never carry emails, IM ids or absolute host paths', () => {
+  const result = agentVisibleText('401 for alice@corp.example at /Users/example/secret/chat oc_1234567890abcdef1234')
+  expect(result).toContain('<email>')
+  expect(result).toContain('<path>')
+  expect(result).toContain('<id>')
+  expect(result).not.toContain('alice@')
+  expect(result).not.toContain('/Users/')
+  expect(result).not.toContain('oc_1234567890abcdef1234')
+})
+
+test('identity catalog reasons are sanitized before reaching an Agent', async () => {
+  const previous = [...listTokenSources()]
+  resetTokenSourceRegistry()
+  registerTokenSource({
+    id: 'bad-source', kind: 'bad-source', agent: 'codex', display: 'Bad source', enabled: true,
+    models: [], defaultModel: 'm',
+    modelCatalogState: { status: 'failed', updatedAt: 1,
+      error: 'HTTP 401 for alice@corp.example at /Users/example/secret (oc_1234567890abcdef1234)' },
+    refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
+    readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+  })
+  try {
+    const base = await serve()
+    const response = await fetch(`${base}/agents/identities`, { headers: { authorization: 'Bearer secret' } })
+    expect(response.status).toBe(200)
+    const value = await response.json() as any
+    const reason = value.source_failures[0].reason as string
+    expect(reason).toContain('<email>')
+    expect(reason).toContain('<path>')
+    expect(reason).toContain('<id>')
+    expect(reason).not.toContain('alice@')
+    expect(reason).not.toContain('/Users/')
+  } finally {
+    resetTokenSourceRegistry()
+    for (const source of previous) registerTokenSource(source)
+  }
+})
 
 describe('delegated Agent HTTP API', () => {
   test('session-bound Agents can test a relay without saving or restarting the daemon', async () => {
@@ -243,7 +281,9 @@ describe('delegated Agent HTTP API', () => {
       method: 'POST', headers, body: JSON.stringify({ description: '任务说明', identity_ids: ['agent:a'], prompt: 'do it' }),
     })
     expect(created.status).toBe(202)
-    expect((await created.json() as any).run_id).toBe('agent_1')
+    const createdBody = await created.json() as any
+    expect(createdBody.run_id).toBe('agent_1')
+    expect(createdBody.session_name).toBeUndefined()
     expect((await fetch(`${base}/agents/runs/agent_1`, { headers })).status).toBe(200)
 
     const follow = await fetch(`${base}/agents/runs/agent_1/follow-up`, {

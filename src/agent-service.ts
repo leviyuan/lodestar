@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { AgentCards, type AgentCardsDeps } from './agent-cards'
 import { agentCardsDeps } from './agent-cards-runtime'
@@ -29,6 +29,24 @@ import type { AgentReasoningEffort } from './agent-process'
 export type { AgentPrincipal } from './agent-context'
 
 const MAX_CACHED_RUN_ARTIFACTS = 512
+/** Prompt/output bodies are user content; keep them for a bounded window. */
+export const RUN_TEXT_RETENTION_MS = 30 * 24 * 60 * 60_000
+export const PRUNED_RUN_TEXT = '[已清理：超过 30 天的运行正文已删除]'
+export const PRUNED_ARTIFACT_MANIFEST = 'pruned-artifacts.json'
+let prunedRunIds: Set<string> | null = null
+
+function loadPrunedRunIds(dir = AGENT_RUNS_DIR): Set<string> {
+  if (dir === AGENT_RUNS_DIR && prunedRunIds) return prunedRunIds
+  const ids = new Set<string>()
+  try {
+    const value = JSON.parse(readFileSync(join(dir, PRUNED_ARTIFACT_MANIFEST), 'utf8'))
+    if (Array.isArray(value?.runs)) {
+      for (const id of value.runs) if (typeof id === 'string' && id) ids.add(id)
+    }
+  } catch {}
+  if (dir === AGENT_RUNS_DIR) prunedRunIds = ids
+  return ids
+}
 const MAX_WORKER_STEPS = 50
 
 interface AgentRunRecord {
@@ -151,6 +169,7 @@ export class AgentService {
     const source = this.runs.get(runId)
     if (!source) throw new Error(`agent run not found: ${runId}`)
     this.assertResumeProject(principal, source)
+    if (!this.withinResumeScope(principal, source)) throw new Error(`agent run not found: ${runId}`)
     const worker = source.snapshot.workers.length === 1 ? source.snapshot.workers[0] : selectWorker(source.snapshot, request.identityId)
     if (source.handles.get(worker.identityId)?.isAlive?.()) {
       throw new Error('Agent process has not stopped; cannot start follow-up yet')
@@ -191,7 +210,7 @@ export class AgentService {
     try {
       return await this.createRun(context, {
         identityIds: [identity.id], description: request.description, prompt: request.prompt, effort, workDir,
-        requesterOpenId: request.requesterOpenId ?? (sameOwner ? history.run.snapshot.requesterOpenId : undefined),
+        requesterOpenId: request.requesterOpenId,
       }, {
         ...metadata,
         ...(principal.kind === 'worker' ? this.delegationParent(principal)
@@ -401,9 +420,8 @@ export class AgentService {
       chatId: owner.chatId,
       sessionWorkDir: owner.workDir,
       ...(options.requestId ? { requestId: options.requestId, requestHash: options.requestHash } : {}),
-      ...(owner.kind === 'project' ? {
-        ...(request.requesterOpenId ? { requesterOpenId: request.requesterOpenId } : {}),
-      } : {}),
+      // requester_open_id is request-hash input only; it is never persisted or
+      // exposed, so a leaked state file cannot attribute a run to a user.
       workDir,
       prompt: request.prompt,
       description: requireAgentDescription(request.description),
@@ -527,7 +545,6 @@ export class AgentService {
         hostEnv: {
           LODESTAR_AGENT_URL: agentApiUrl(config.notify.bind, config.notify.port),
           LODESTAR_AGENT_CAPABILITY: capability,
-          LODESTAR_AGENT_SESSION: run.snapshot.sessionName,
         },
         callbacks: {
           onNeedsInput: request => {
@@ -821,12 +838,16 @@ export class AgentService {
       .map(worker => ({ run, worker })))
     if (!matches.length) throw new Error('agent session ownership is unknown; only sessions registered under this project and conversation ID (chat_id) can be resumed')
     for (const { run } of matches) this.assertResumeProject(principal, run)
-    if (new Set(matches.map(({ worker }) => worker.provider)).size > 1) {
+    // A worker capability may only resume native sessions inside its own run
+    // subtree; siblings and ancestors stay invisible.
+    const accessible = matches.filter(({ run }) => this.withinResumeScope(principal, run))
+    if (!accessible.length) throw new Error('agent session is outside this worker capability')
+    if (new Set(accessible.map(({ worker }) => worker.provider)).size > 1) {
       throw new Error('native session id has conflicting backend records; its unique identity cannot be established')
     }
     // Session/project bindings can share a native id within one project and conversation ID (chat_id), without joining cancellation trees.
-    const parents = new Set(matches.flatMap(({ run }) => [run.snapshot.resumedFromRunId, run.snapshot.parentRunId]))
-    const latest = matches.filter(({ run }) => !parents.has(run.snapshot.runId))
+    const parents = new Set(accessible.flatMap(({ run }) => [run.snapshot.resumedFromRunId, run.snapshot.parentRunId]))
+    const latest = accessible.filter(({ run }) => !parents.has(run.snapshot.runId))
       .sort((a, b) => Date.parse(b.run.snapshot.createdAt) - Date.parse(a.run.snapshot.createdAt))[0]
     if (!latest) throw new Error(`agent session history has no latest run: ${sessionId}`)
     return latest
@@ -853,6 +874,20 @@ export class AgentService {
       throw new Error('worker capability cannot mutate its containing run')
     }
     return run
+  }
+
+  /** Resume/follow-up may cross session↔project bindings within the same
+   * conversation directory (checked by assertResumeProject). A worker
+   * capability, however, may only resume native sessions inside its own run
+   * subtree; siblings and ancestors stay invisible. */
+  private withinResumeScope(principal: AgentPrincipal, target: AgentRunRecord): boolean {
+    if (principal.kind !== 'worker') return true
+    let current: AgentRunRecord | undefined = target
+    while (current) {
+      if (current.snapshot.runId === principal.runId) return true
+      current = current.snapshot.parentRunId ? this.runs.get(current.snapshot.parentRunId) : undefined
+    }
+    return false
   }
 
   private canAccess(principal: AgentPrincipal, target: AgentRunRecord): boolean {
@@ -900,6 +935,7 @@ export class AgentService {
   }
 
   private loadDurableRuns(): void {
+    pruneExpiredRunArtifacts()
     for (const snapshot of this.deps.loadArtifacts()) {
       // Only a run this restart changes needs a new durable record: one that was still
       // active, or one stored before prompts and outputs moved to separate artifacts.
@@ -1038,7 +1074,7 @@ function cloneSnapshot(snapshot: AgentRunSnapshot): AgentRunSnapshot {
 function loadAgentRunArtifacts(): AgentRunSnapshot[] {
   if (!existsSync(AGENT_RUNS_DIR)) return []
   const snapshots: AgentRunSnapshot[] = []
-  for (const name of readdirSync(AGENT_RUNS_DIR).filter(name => name.endsWith('.json')).sort()) {
+  for (const name of readdirSync(AGENT_RUNS_DIR).filter(name => name.endsWith('.json') && name !== PRUNED_ARTIFACT_MANIFEST).sort()) {
     const path = join(AGENT_RUNS_DIR, name)
     let value: unknown
     try { value = JSON.parse(readFileSync(path, 'utf8')) }
@@ -1097,10 +1133,51 @@ function hydrateSnapshotArtifacts(
   snapshotPath: string,
   read: AgentServiceDeps['readTextArtifact'] = readTextArtifact,
 ): void {
+  if (loadPrunedRunIds().has(snapshot.runId)) {
+    snapshot.prompt = PRUNED_RUN_TEXT
+    for (const worker of snapshot.workers) {
+      if (worker.outputArtifact) worker.output = PRUNED_RUN_TEXT
+    }
+    return
+  }
   if (snapshot.promptArtifact) snapshot.prompt = read(snapshot.promptArtifact, `prompt for ${snapshotPath}`)
   for (const worker of snapshot.workers) {
     if (worker.outputArtifact) worker.output = read(worker.outputArtifact, `output for ${snapshotPath}`)
   }
+}
+
+/** Delete prompt/output bodies of terminal runs older than the retention
+ * window, keeping the lifecycle snapshot for status/ownership. Only artifact
+ * files are touched; the snapshot is not rewritten on every boot. */
+export function pruneExpiredRunArtifacts(dir = AGENT_RUNS_DIR, now = Date.now()): number {
+  if (!existsSync(dir)) return 0
+  const known = loadPrunedRunIds(dir)
+  const manifest = new Set(known)
+  const added = new Set<string>()
+  let pruned = 0
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.prompt.txt') && !name.endsWith('.output.txt')) continue
+    // Artifact names start with the run id, which never contains a dot.
+    const runId = name.slice(0, name.indexOf('.'))
+    const snapshotPath = join(dir, `${runId}.json`)
+    let snapshot: AgentRunSnapshot
+    try { snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as AgentRunSnapshot }
+    catch { continue }
+    if (!isAgentRunSnapshot(snapshot) || !isTerminal(snapshot.status)) continue
+    if (known.has(snapshot.runId)) continue
+    const finished = Date.parse(snapshot.finishedAt ?? snapshot.createdAt)
+    if (!Number.isFinite(finished) || now - finished < RUN_TEXT_RETENTION_MS) continue
+    try { unlinkSync(join(dir, name)); pruned++ } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+    }
+    manifest.add(snapshot.runId)
+    added.add(snapshot.runId)
+  }
+  if (added.size > 0) {
+    writeJsonStateAtomic(join(dir, PRUNED_ARTIFACT_MANIFEST), { version: 1, runs: [...manifest].sort() })
+    if (dir === AGENT_RUNS_DIR) prunedRunIds = manifest
+  }
+  return pruned
 }
 
 function readTextArtifact(name: string, label: string): string {

@@ -79,6 +79,25 @@ describe('Claude native initialization and shared writer ownership', () => {
     } finally { await first.kill(); await second?.kill(); sdk.spy.mockRestore(); d.cleanup() }
   })
 
+  test('scrubs host identity and internal paths from the SDK environment', async () => {
+    const sdk = sdkFixture(), d = directories()
+    const proc = new ClaudeAgentProcess({ workDir: d.root, effort: 'max', controlOnly: true, hostEnv: {
+      LODESTAR_RESTART_CONTINUE_CHAT_ID: 'oc_secret',
+      LODESTAR_DATA_DIR: '/tmp/secret-data',
+      LODESTAR_CONFIG: '/tmp/secret-config.toml',
+      FEISHU_APP_SECRET: 'secret',
+    }, transformEnv: env => ({ ...env, CLAUDE_CONFIG_DIR: d.a }) })
+    try {
+      await proc.initializationPromise()
+      const env = sdk.captures[0].env
+      expect(env.LODESTAR_AGENT_SESSION).toBeUndefined()
+      expect(env.LODESTAR_RESTART_CONTINUE_CHAT_ID).toBeUndefined()
+      expect(env.LODESTAR_DATA_DIR).toBeUndefined()
+      expect(env.LODESTAR_CONFIG).toBeUndefined()
+      expect(env.FEISHU_APP_SECRET).toBeUndefined()
+    } finally { await proc.kill(); sdk.spy.mockRestore(); d.cleanup() }
+  })
+
   test('control-only account/models/usage queries do not lock or accept model input', async () => {
     const sdk = sdkFixture(), d = directories()
     const writer = acquireClaudeSessionLease({ historyRoot: d.history, sessionId: 'owned-session' })

@@ -36,6 +36,18 @@ describe('notification HTTP input', () => {
     expect(JSON.stringify(result.sent)).not.toContain('\uFFFD')
   })
 
+  test('success response never echoes the bound conversation id', async () => {
+    const result = await invoke([Buffer.from(JSON.stringify({ project: 'ops', text: 'done',
+      buttons: [{ id: 'ok', text: 'OK' }] }))])
+    expect(result.status).toBe(200)
+    const body = JSON.parse(result.body)
+    expect(body.ok).toBe(true)
+    expect(body.message_id).toBe('om_test')
+    expect(body.chat_id).toBeUndefined()
+    expect(result.body).not.toContain('oc_test')
+    expect(typeof body.notify_id).toBe('string')
+  })
+
   test('rejects oversized input and malformed result IDs before sending cards', async () => {
     const oversized = await invoke([Buffer.from(JSON.stringify({ project: 'ops', text: 'x'.repeat(4 * 1024 * 1024) }))])
     expect(oversized.status).toBe(413)

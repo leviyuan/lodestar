@@ -136,7 +136,7 @@ describe('notify-callbacks store', () => {
     const recovered = loadCallbacks()
     expect(recovered.map(reg => reg.notifyId)).toEqual(['nf_test1'])
     expect(buildNotifyResult(get('nf_test1')!)).toMatchObject({
-      resolved: false, unknown: true, button: { id: 'approve' }, unknown_by: 'ou_operator',
+      resolved: false, unknown: true, button: { id: 'approve' },
     })
     expect(() => beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')).toThrow()
     __setStoreFileForTest(tempFile)
@@ -216,17 +216,17 @@ describe('buildNotifyResult (pull payload)', () => {
     expect(r.resolved_at).toBeUndefined()
   })
 
-  test('resolved ⇒ full verdict with button text/type + operator', () => {
+  test('resolved ⇒ full verdict with button text/type but no operator identity', () => {
     register(sampleReg({ notifyId: 'nf_done' }))
     markResolved('nf_done', 'approve', 'ou_op')
     const r = buildNotifyResult(get('nf_done')!) as any
     expect(r.resolved).toBe(true)
     expect(r.button).toEqual({ id: 'approve', text: '✅ 通过', type: 'primary' })
     expect(typeof r.resolved_at).toBe('number')
-    expect(r.resolved_by).toBe('ou_op')
+    expect(r.resolved_by).toBeUndefined()
   })
 
-  test('unknown ⇒ non-retryable ambiguous outcome with operator and reason', () => {
+  test('unknown ⇒ non-retryable ambiguous outcome with reason but no operator identity', () => {
     register(sampleReg({ notifyId: 'nf_unknown' }))
     __setStoreFileForTest(join(tempFile, 'child.json'), false)
     expect(recordCallbackSuccess('nf_unknown', 'approve', 'ou_op').state).toBe('unknown')
@@ -235,7 +235,7 @@ describe('buildNotifyResult (pull payload)', () => {
     expect(r.resolved).toBe(false)
     expect(r.unknown).toBe(true)
     expect(r.button).toEqual({ id: 'approve', text: '✅ 通过', type: 'primary' })
-    expect(r.unknown_by).toBe('ou_op')
+    expect(r.unknown_by).toBeUndefined()
     expect(r.unknown_reason).toContain('tombstone persistence')
   })
 })
@@ -282,7 +282,7 @@ describe('dispatchCallback', () => {
     expect(r.detail).toMatch(/ECONNREFUSED/)
   })
 
-  test('payload shape: notify_id / button / operator carried to the caller', async () => {
+  test('payload shape: notify_id / button carried, no chat or operator identity', async () => {
     let captured: any = null
     globalThis.fetch = (async (_input: any, init?: RequestInit) => {
       captured = JSON.parse(String(init?.body))
@@ -291,10 +291,10 @@ describe('dispatchCallback', () => {
     await dispatchCallback(sampleReg({ notifyId: 'nf_shape' }), { id: 'reject', text: '❌', type: 'danger' }, 'ou_op')
     expect(captured.notify_id).toBe('nf_shape')
     expect(captured.message_id).toBe('om_msg')
-    expect(captured.chat_id).toBe('oc_chat')
+    expect(captured.chat_id).toBeUndefined()
     expect(captured.project).toBe('feishu')
     expect(captured.button).toEqual({ id: 'reject', text: '❌', type: 'danger' })
-    expect(captured.operator).toEqual({ open_id: 'ou_op' })
+    expect(captured.operator).toBeUndefined()
     expect(typeof captured.timestamp).toBe('number')
   })
 
@@ -308,7 +308,7 @@ describe('dispatchCallback', () => {
     const result = await dispatchCallback(sampleReg(), response, 'ou_author')
     expect(captured.response).toEqual({ type: 'text', ...response })
     expect(captured.message_id).toBe('om_msg')
-    expect(captured.operator).toEqual({ open_id: 'ou_author' })
+    expect(captured.operator).toBeUndefined()
     expect(captured.button).toBeUndefined()
     expect(result.reply).toBe('收到回复')
   })

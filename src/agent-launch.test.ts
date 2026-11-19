@@ -200,3 +200,45 @@ test('a conversation kept in a launcher source cannot be continued from the shar
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('Codex spawn drops host identity, data paths and Feishu credentials', () => {
+  const script = `
+    import { mock } from 'bun:test'
+    import { EventEmitter } from 'node:events'
+    import assert from 'node:assert/strict'
+    let child, captured
+    const spawn = (bin, args, options) => {
+      captured = { args, options }
+      child = new EventEmitter()
+      child.stdin = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter()
+      child.stdin.write = () => true
+      return child
+    }
+    mock.module('cross-spawn', () => ({ default: spawn, spawn }))
+    const { registerTokenSource } = await import('./src/token-source')
+    const { createAgentProcess } = await import('./src/agent-launch')
+    registerTokenSource({ id: 'env-test', kind: 'env-test', agent: 'codex', enabled: true,
+      models: [{ model: 'm', display: 'M', efforts: ['high'], defaultEffort: 'high' }],
+      defaultModel: 'm', modelCatalogState: { status: 'ready', updatedAt: 1 },
+      spawnEnv: env => env, resolveSpawnModel: model => model })
+    process.env.LODESTAR_RESTART_CONTINUE_CHAT_ID = 'oc_secret'
+    process.env.LODESTAR_DATA_DIR = '/tmp/secret-data'
+    process.env.LODESTAR_CONFIG = '/tmp/secret-config.toml'
+    process.env.FEISHU_APP_SECRET = 'secret'
+    const { process: proc } = createAgentProcess({ provider: 'codex', tokenSourceId: 'env-test', workDir: '/repo',
+      model: 'm', effort: 'high' })
+    assert.equal(captured.options.env.LODESTAR_AGENT_SESSION, undefined)
+    const trustIndex = captured.args.indexOf('-c')
+    assert.ok(trustIndex >= 0)
+    assert.equal(captured.args[trustIndex + 1], 'projects."/repo".trust_level="trusted"')
+    assert.equal(captured.options.env.LODESTAR_RESTART_CONTINUE_CHAT_ID, undefined)
+    assert.equal(captured.options.env.LODESTAR_DATA_DIR, undefined)
+    assert.equal(captured.options.env.LODESTAR_CONFIG, undefined)
+    assert.equal(captured.options.env.FEISHU_APP_SECRET, undefined)
+    child.emit('exit', 0, null); child.emit('close', 0, null)
+  `
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+    cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+  })
+  expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+})

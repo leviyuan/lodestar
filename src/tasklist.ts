@@ -17,7 +17,6 @@ export interface TasklistBinding {
   name: string
   url: string
   projectName: string
-  ownerOpenId: string
   createdAt?: string
   deleting?: TasklistDeletionState
 }
@@ -86,7 +85,6 @@ export async function enableTasklist(projectName: string, chatId: string): Promi
       name: tasklist.name,
       url: tasklist.url,
       projectName,
-      ownerOpenId,
       createdAt: tasklist.createdAt,
     }
     commitBinding(projectName, binding)
@@ -167,7 +165,6 @@ function loadTasklistMap(): void {
         name: item.name,
         url: typeof item.url === 'string' ? item.url : '',
         projectName,
-        ownerOpenId: typeof item.ownerOpenId === 'string' ? item.ownerOpenId : '',
         createdAt: typeof item.createdAt === 'string' ? item.createdAt : undefined,
         deleting: readDeleting(item.deleting),
       }

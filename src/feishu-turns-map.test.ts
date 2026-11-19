@@ -31,6 +31,7 @@ function runFreshState(
       getSessionResumeRef,
       getPendingConversationLaunch,
       getTurnAnchors,
+      loadSessionChatMap,
       loadSessionModelMap,
       loadSessionResumeMap,
       loadSessionTurnsMap,
@@ -711,6 +712,28 @@ describe('session conversation state cleanup', () => {
     expect(output.error.length).toBeGreaterThan(0)
     expect(output.restored).toEqual({
       provider: 'codex', sessionId: 'target-thread', cwd: '/srv/target',
+    })
+  })
+
+  test('permanent cleanup also removes the conversation activity timestamp', () => {
+    const result = runFreshState(`
+      loadSessionChatMap()
+      loadSessionResumeMap()
+      loadSessionModelMap()
+      loadSessionTurnsMap()
+      clearSessionConversationState('target')
+      __out({
+        chat: __read('session-chat-map.json'),
+        activity: __read('session-activity.json'),
+      })
+    `, {
+      'session-chat-map.json': { target: 'oc_target', keep: 'oc_keep' },
+      'session-activity.json': { version: 1, chats: { oc_target: 123, oc_keep: 456 } },
+    })
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(extract(result)).toEqual({
+      chat: { keep: 'oc_keep' },
+      activity: { version: 1, chats: { oc_keep: 456 } },
     })
   })
 

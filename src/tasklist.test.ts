@@ -15,3 +15,23 @@ describe('basic tasklist lifecycle', () => {
       .rejects.toThrow('permission denied')
   })
 })
+
+test('legacy tasklist bindings never load the owner open_id', () => {
+  const script = `
+    import { writeFileSync } from 'node:fs'
+    import { TASKLIST_MAP_FILE } from './src/paths.ts'
+    writeFileSync(TASKLIST_MAP_FILE, JSON.stringify({ project: {
+      guid: 'guid', name: 'project[lodestar]', url: 'https://example/url', projectName: 'project',
+      ownerOpenId: 'ou_legacy_secret', createdAt: '2026-01-01T00:00:00.000Z',
+    } }))
+    const { getTasklistBinding } = await import('./src/tasklist.ts')
+    process.stdout.write(JSON.stringify(getTasklistBinding('project')))
+  `
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+    cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+  })
+  expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+  const binding = JSON.parse(result.stdout.toString())
+  expect(binding).toMatchObject({ guid: 'guid', name: 'project[lodestar]', projectName: 'project' })
+  expect(binding.ownerOpenId).toBeUndefined()
+})

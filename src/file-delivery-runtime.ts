@@ -1,5 +1,5 @@
 import { join } from 'node:path'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import * as feishu from './feishu'
 import { feishuDrive } from './feishu-drive'
 import { FileDeliveryBatch } from './file-delivery'
@@ -35,4 +35,24 @@ export function createFileDelivery(context: FileDeliveryContext): FileDeliveryHa
       if (!await feishu.sendText(context.chatId, message)) throw new Error(message)
     },
   })
+}
+
+/** One-time migration: old receipts persisted the initiator's open_id.
+ * New receipts omit it; strip it from existing files so local history carries
+ * no user identity. */
+export function scrubLegacyDeliveryReceipts(dir = FILE_DELIVERIES_DIR): number {
+  let names: string[]
+  try { names = readdirSync(dir).filter(name => name.endsWith('.json')) } catch { return 0 }
+  let scrubbed = 0
+  for (const name of names) {
+    const path = join(dir, name)
+    let value: any
+    try { value = JSON.parse(readFileSync(path, 'utf8')) }
+    catch { continue }
+    if (!value || typeof value !== 'object' || Array.isArray(value) || !('managerOpenId' in value)) continue
+    delete value.managerOpenId
+    writeJsonStateAtomic(path, value)
+    scrubbed++
+  }
+  return scrubbed
 }

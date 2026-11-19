@@ -29,7 +29,8 @@ export interface FileDeliverySnapshot {
   version: 1
   id: string
   chatId: string
-  managerOpenId: string
+  /** Legacy receipts only; new receipts do not persist the initiator. */
+  managerOpenId?: string
   projectName: string
   createdAt: number
   folder?: DeliveryFolder

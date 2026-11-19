@@ -220,7 +220,7 @@ export function log(msg: string): void {
       lastDayKey = key
       pruneOldLogs(DATA_DIR, now)
     }
-    appendFileSync(logFileForDate(now), line)
+    appendFileSync(logFileForDate(now), line, { mode: 0o600 })
   } catch {}
 }
 

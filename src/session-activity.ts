@@ -34,6 +34,18 @@ export class SessionActivityStore {
     return validTime(time) ? time : undefined
   }
 
+  /** Drop the timestamp for a permanently deleted conversation. */
+  forget(chatId: string): boolean {
+    if (!chatId.trim()) return false
+    const state = this.read()
+    if (!(chatId in state.chats)) return false
+    const chats = { ...state.chats }
+    delete chats[chatId]
+    writeJsonStateAtomic(this.file, { version: 1, chats })
+    this.state = { version: 1, chats }
+    return true
+  }
+
   /** Receipt time is captured before actor queueing; old/reordered events never move time backwards. */
   recordUserMessage(chatId: string, createdAt: number, receivedAt: number): void {
     if (!chatId.trim()) throw new Error('记录用户消息活跃时间需要 chatId')

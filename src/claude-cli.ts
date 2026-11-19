@@ -21,7 +21,7 @@ const usage = [
 
 /** Keep the same managed-context boundary as lodestar-agent --project. */
 function assertUserTerminal(): void {
-  if (['LODESTAR_AGENT_ROLE', 'LODESTAR_AGENT_URL', 'LODESTAR_AGENT_CAPABILITY', 'LODESTAR_AGENT_SESSION', 'DSH_LODESTAR_AGENT_CONTEXT']
+  if (['LODESTAR_AGENT_ROLE', 'LODESTAR_AGENT_URL', 'LODESTAR_AGENT_CAPABILITY', 'DSH_LODESTAR_AGENT_CONTEXT']
     .some(key => process.env[key] !== undefined)) {
     throw new Error('lodestar-claude 仅供用户本机终端使用；受管 Agent 任务须通过 lodestar-agent 绑定当前会话，不能绕过 Claude 订阅调用限制')
   }

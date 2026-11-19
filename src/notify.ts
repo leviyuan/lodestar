@@ -6,8 +6,8 @@
  * Default bind: 127.0.0.1:9876. No auth — the daemon trusts loopback
  * on the assumption that anything able to hit this port is already
  * owner-equivalent (same security tier as the bot's stdin and the
- * debug.sock). Do NOT bind 0.0.0.0 without adding your own front-end
- * auth.
+ * debug.sock). The listener refuses any non-loopback bind; remote access
+ * is not supported.
  *
  *   POST /notify
  *     Content-Type: application/json
@@ -24,13 +24,13 @@
  *     }
  *   For a text-reply card, omit buttons and set "allow_reply": true.
  *   For a plain notification, omit both. All three types support text/images.
- *   → 200 { ok: true, chat_id, message_id, notify_id? }
+ *   → 200 { ok: true, message_id, notify_id? }
  *   → 400 bad/empty json or missing/invalid field
  *   → 404 project not bound to any Feishu group
  *   → 502 feishu sendCard failed (network / API rejection)
  *
  *   GET /notify/result/<notify_id>
- *     → 200 {notify_id,project,message_id,resolved,button?,resolved_at?,resolved_by?}
+ *     → 200 {notify_id,project,message_id,resolved,button?,resolved_at?}
  *     → 404 unknown notify_id
  *
  * Buttons turn the one-shot card into a two-way control that stays on
@@ -56,7 +56,7 @@ import { randomUUID } from 'node:crypto'
 import { log, logError } from './log'
 import { isLoopback } from './network-proxy'
 import * as feishu from './feishu'
-import { formatFeishuError } from './feishu-errors'
+import { formatFeishuError, redactMemberIds } from './feishu-errors'
 import { FeishuRequestError } from './feishu-retry'
 import { downgradeExternalImagesForCardKit, sanitizeMarkdownForCardKit } from './cards/elements'
 import {
@@ -434,10 +434,8 @@ export async function handleNotifyRequest(
   if (req.method === 'GET' && url.pathname === '/') {
     return sendText(200,
       'lodestar notify\n' +
-      'POST /notify        body={project,text,title?,level?,images?,buttons?,allow_reply?,callback?}  → push card to the project\'s bound conversation ID (chat_id)\n' +
+      'POST /notify        body={project,text,title?,level?,images?,buttons?,allow_reply?,callback?}  → push card to the project\'s bound conversation\n' +
       'GET  /notify/result/<notify_id>  → poll a button choice or text reply (pull mode, no callback server)\n' +
-      'GET  /agents/identities; POST/GET/DELETE /agents/runs[/<id>]  → capability-protected delegated Agents\n' +
-      'POST /agents/relays/test|configure|reload  → capability-protected relay validation and hot reload\n' +
       'levels: info|warn|error (default info); images=[/abs/*.png] uploaded + embedded\n' +
       'card types: plain (neither field), selection (buttons), text reply (allow_reply:true); do not combine buttons and allow_reply:true\n' +
       'all types support text + images; callback=http://127.0.0.1:PORT/path optional for selection/reply (push) — omit to poll\n')
@@ -504,7 +502,7 @@ export async function handleNotifyRequest(
   if (!chatId) {
     log('notify.binding_missing')
     return sendText(404,
-      `project "${project}" has no conversation ID (chat_id) binding — send a message in the intended Feishu conversation, then retry`)
+      `project "${project}" has no bound conversation — send a message in the intended Feishu conversation, then retry`)
   }
 
   const imageInputs = Array.isArray(body.images) ? body.images : []
@@ -526,7 +524,7 @@ export async function handleNotifyRequest(
   const messageId = await transport.sendCard(chatId, card, error => { sendFailure = error })
   if (!messageId) {
     logError('notify.card.send_failed', sendFailure)
-    return sendText(502, `feishu sendCard failed: ${formatFeishuError(sendFailure)}`)
+    return sendText(502, `feishu sendCard failed: ${redactMemberIds(formatFeishuError(sendFailure))}`)
   }
 
   if (interactive && notifyId) {
@@ -547,9 +545,10 @@ export async function handleNotifyRequest(
     registerCallback(reg)
   }
 
+  // Never echo the conversation id: /notify is reachable by any local
+  // process, including a backend Agent.
   sendJson(200, {
     ok: true,
-    chat_id: chatId,
     message_id: messageId,
     ...(notifyId ? { notify_id: notifyId } : {}),
   })

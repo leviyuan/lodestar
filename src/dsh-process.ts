@@ -9,6 +9,7 @@ import type { BgTaskUpdatedEvent } from './claude-agent-process'
 import type { ConversationLaunch } from './conversation'
 import { validateConversationLaunch } from './conversation'
 import type { ProjectProfile } from './config'
+import { scrubAgentHostEnv } from './agent-env'
 import { DshRuntime, type DshRuntimeOptions } from './dsh-runtime'
 import type { DshModel, DshNotification } from './dsh-protocol'
 import { log } from './log'
@@ -103,7 +104,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
     const launch = opts.launch ?? { kind: 'fresh' }
     validateConversationLaunch(launch, 'dsh', opts.workDir)
     this.launchKind = launch.kind
-    const base = { ...process.env, ...opts.hostEnv }
+    const base = scrubAgentHostEnv({ ...process.env, ...opts.hostEnv })
     this.runtime = new DshRuntime({ cwd: opts.workDir,
       env: opts.transformEnv ? opts.transformEnv(base) : base,
       profile: opts.profile,

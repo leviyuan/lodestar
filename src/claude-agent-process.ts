@@ -22,6 +22,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk'
 import { agentPackagePath, loadClaudeSdk } from './agent-updates'
 import { config, type ProjectProfile } from './config'
+import { scrubAgentHostEnv } from './agent-env'
 import { logError, logDiagnostic } from './log'
 import {
   CLAUDE_EFFORT,
@@ -755,8 +756,8 @@ export class ClaudeAgentProcess extends EventEmitter {
     const mcpServers = profile?.loadProjectMcp !== false ? readProjectMcpServers(this.opts.workDir) : undefined
     try {
       const executable = resolveClaudeExecutableConfig()
-      const baseEnv: Record<string, string | undefined> = { ...(process.env as Record<string, string>), PATH: buildClaudeSpawnPath(),
-        ...config.claude.env, ...(this.opts.hostEnv ?? {}) }
+      const baseEnv: Record<string, string | undefined> = scrubAgentHostEnv({ ...(process.env as Record<string, string>), PATH: buildClaudeSpawnPath(),
+        ...config.claude.env, ...(this.opts.hostEnv ?? {}) })
       const env = this.opts.transformEnv ? this.opts.transformEnv(baseEnv) : baseEnv
       this.transcriptOptions = {
         configDir: env.CLAUDE_CONFIG_DIR ?? '',

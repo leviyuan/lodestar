@@ -1068,7 +1068,6 @@ export class Session {
     const hostEnv = {
       LODESTAR_AGENT_URL: agentApiUrl(config.notify.bind, config.notify.port),
       LODESTAR_AGENT_CAPABILITY: this.agentCapability,
-      LODESTAR_AGENT_SESSION: this.sessionName,
       LODESTAR_AGENT_ROLE: 'main',
     }
     const launch: ConversationLaunch = explicitLaunch ?? this.pendingConversationLaunch

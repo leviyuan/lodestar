@@ -175,13 +175,13 @@ function serializeCatalog(catalog: AgentIdentityCatalog): object {
       supported_efforts: identity.supportedEfforts,
       source_default: identity.sourceDefault,
       status: identity.status,
-      reason: identity.reason,
+      ...(identity.reason === undefined ? {} : { reason: agentVisibleText(identity.reason) }),
     })),
     source_failures: catalog.sourceFailures.map(failure => ({
       token_source_id: failure.tokenSourceId,
       display: failure.display,
       status: failure.status,
-      reason: failure.reason,
+      reason: agentVisibleText(failure.reason),
     })),
   }
 }
@@ -190,7 +190,7 @@ function serializeRun(run: AgentRunSnapshot): object {
   return {
     run_id: run.runId,
     binding: agentRunOwner(run).kind,
-    ...(agentRunOwner(run).kind === 'project' ? { project: agentRunOwner(run).name } : { session_name: run.sessionName }),
+    ...(agentRunOwner(run).kind === 'project' ? { project: agentRunOwner(run).name } : {}),
     ...(run.requestId ? { request_id: run.requestId } : {}),
     work_dir: run.workDir,
     prompt: run.prompt,
@@ -234,5 +234,17 @@ function serializeRun(run: AgentRunSnapshot): object {
 }
 
 function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+  return agentVisibleText(error instanceof Error ? error.message : String(error))
+}
+
+const AGENT_VISIBLE_LIMIT = 300
+
+/** Agent-facing diagnostics may quote upstream errors. Keep them useful but
+ * never hand over emails, IM identifiers or absolute host paths. */
+export function agentVisibleText(value: string): string {
+  const redacted = value
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '<email>')
+    .replace(/\b(?:ou|on|oc|om)_[0-9a-z]{12,}\b/g, '<id>')
+    .replace(/(?:[A-Za-z]:\\|\/(?:Users|home|private|var|tmp|opt|root)\/)[^\s'"),;]+/g, '<path>')
+  return redacted.length > AGENT_VISIBLE_LIMIT ? `${redacted.slice(0, AGENT_VISIBLE_LIMIT)}…` : redacted
 }

@@ -27,7 +27,7 @@ lodestar-setup
 | `lodestar-daemon` | 启动 daemon |
 | `lodestar-stop` | 停止 daemon |
 | `lodestar-update` | 升级 Lodestar，再更新 Codex、Claude Code/SDK、DSH；`--agents-only` 只立即更新 Agent，详见 [Agent 更新](#agent-更新) |
-| `lodestar-version` | 查看 Lodestar、实际 Agent 版本及运行目录 |
+| `lodestar-version` | 查看 Lodestar 与实际 Agent 版本；`--verbose` 才显示运行目录和运行时信息 |
 | `lodestar-claude <备注> [原生参数...]` | 用户终端入口，使用 Lodestar 管理的当前 Claude 安装和对应账号目录；例如 `lodestar-claude 工作号 auth login`，不自动收录账号或清理历史 |
 | `lodestar-agent` | 调用已配置模型执行任务；不支持 Claude 订阅，遵守 Claude 用户协议，中转站等第三方 Claude 模型仍可调用 |
 
@@ -62,6 +62,8 @@ Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`�
 | `im:chat` | 读取实际群名和群信息 |
 
 清单还包括原生附件的 `im:resource`、机器人发消息的 `im:message:send_as_bot`、Card Kit 权限，以及排障时读取租户和认证信息的权限。需要审批的权限应完成审批，再创建并发布飞书应用版本。取得应用访问凭据不代表业务权限已生效。
+
+事件订阅：在开放平台的「事件与回调 → 事件订阅」中订阅「群解散」（`im.chat.disbanded_v1`）。收到后 daemon 停止该会话并清理会话映射、租约和活跃时间；项目目录、任务清单和云空间文件保留。daemon 启动后还会在后台核对已绑定群的 `chat_status`，把已解散的绑定一并清理，作为事件丢失时的兜底。
 
 升级已有应用时也应补齐清单并发布应用版本。文件按大小自动交付：不超过 30 MB 发聊天附件，超过 30 MB 传云空间，无需切换命令。大文件交付缺少云空间权限时会明确报错。文件夹权限与实际文件的分享入口会分别处理，具体行为见[文件与生图](usage.md#文件与生图)。
 

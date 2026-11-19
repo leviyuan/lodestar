@@ -20,6 +20,7 @@ import { StringDecoder } from 'node:string_decoder'
 import type { Readable, Writable } from 'node:stream'
 import { spawn as crossSpawn } from 'cross-spawn'
 import { config } from './config'
+import { scrubAgentHostEnv } from './agent-env'
 import { logError, logDiagnostic } from './log'
 import { agentBin } from './agent-updates'
 import { prepareCodexInputPolicyCatalog, type CodexInputPolicyCatalog } from './codex-input-policy'
@@ -481,13 +482,16 @@ export class CodexProcess extends EventEmitter {
     const providerArgs = opts.apiProvider ? codexApiProviderArgs(opts.apiProvider)
         : [...(opts.tokenSourceId === 'codex-sub' ? ['-c', 'model_provider="openai"'] : []),
           ...codexAccounts.cliArgs(opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)]
-    const baseEnv = {
+    // Project trust is scoped to this launch; never write it to the shared
+    // ~/.codex/config.toml (the backend Agent reads that file).
+    const projectTrustArgs = ['-c', `projects.${JSON.stringify(opts.workDir)}.trust_level="trusted"`]
+    const baseEnv = scrubAgentHostEnv({
       ...(process.env as Record<string, string>),
       NPM_CONFIG_LOGLEVEL: 'error',
       PATH: buildSpawnPath(),
       ...config.codex.env,
       ...(opts.hostEnv ?? {}),
-    }
+    })
     const routedEnv = opts.transformEnv ? opts.transformEnv(baseEnv) : baseEnv
     const spawnEnv = opts.apiProvider
       ? { ...routedEnv, CODEX_HOME: codexAccounts.defaultHome }
@@ -495,7 +499,7 @@ export class CodexProcess extends EventEmitter {
     const start = (catalog?: CodexInputPolicyCatalog) => {
       if (this.expectedExit) throw new Error('Codex startup cancelled')
       this.inputPolicyCatalog = catalog ?? null
-      this.spawnNative(codexBin, [...codexAppServerArgs(), ...providerArgs,
+      this.spawnNative(codexBin, [...codexAppServerArgs(), ...providerArgs, ...projectTrustArgs,
         ...(catalog ? ['-c', `model_catalog_json=${JSON.stringify(catalog.path)}`,
           ...catalog.disabledFeatures.flatMap(feature => ['--disable', feature])] : []),
       ], spawnEnv)

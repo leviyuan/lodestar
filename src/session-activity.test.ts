@@ -37,6 +37,19 @@ test('real user timestamps persist privately across restart, preserve event time
   }
 })
 
+test('forget drops one conversation timestamp and persists the rest', () => {
+  const { activity, file } = fixture()
+  activity.recordUserMessage('a', now, now)
+  activity.recordUserMessage('b', now, now)
+  expect(activity.forget('a')).toBe(true)
+  expect(activity.forget('a')).toBe(false)
+  expect(activity.forget('')).toBe(false)
+  expect(activity.lastUserMessageAt('a')).toBeUndefined()
+  expect(activity.lastUserMessageAt('b')).toBe(now)
+  expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1, chats: { b: now } })
+  expect(new SessionActivityStore(file).lastUserMessageAt('a')).toBeUndefined()
+})
+
 test('invalid event time uses original receipt time, never the eventual queue execution time', () => {
   const { activity } = fixture()
   for (const [i, invalid] of [0, -1, NaN, Infinity].entries()) {

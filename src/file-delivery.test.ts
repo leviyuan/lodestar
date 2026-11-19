@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { FileDeliveryBatch, type FileDeliveryDeps } from './file-delivery'
+import { scrubLegacyDeliveryReceipts } from './file-delivery-runtime'
 import type { FileDeliverySnapshot } from './file-delivery-types'
 
 const folder = { token: 'folder', url: 'https://example.feishu.cn/drive/folder/folder' }
@@ -141,4 +145,28 @@ describe('cloud file delivery receipts', () => {
     expect(f.cards[0].files.map(item => item.status)).toEqual(['ready', 'failed', 'failed'])
     expect(f.cards[0].error).toContain('用户停止了任务')
   })
+})
+
+test('cloud file delivery receipts do not persist the initiator open_id', async () => {
+  const f = fixture()
+  f.batch.add('/tmp/report.pdf')
+  await f.batch.finish()
+  const receipt = f.saved.at(-1)!
+  expect('managerOpenId' in receipt).toBe(false)
+  // The grant still uses the live initiator from the delivery context.
+  expect(f.grants[0][2]).toBe('user')
+})
+
+test('legacy delivery receipts lose the persisted initiator open_id', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lodestar-delivery-receipts-'))
+  try {
+    writeFileSync(join(dir, 'old.json'), JSON.stringify({ version: 1, id: 'old', chatId: 'chat',
+      managerOpenId: 'ou_legacy', projectName: 'project', createdAt: 1 }))
+    writeFileSync(join(dir, 'broken.json'), '{')
+    expect(scrubLegacyDeliveryReceipts(dir)).toBe(1)
+    const receipt = JSON.parse(readFileSync(join(dir, 'old.json'), 'utf8'))
+    expect(receipt).toMatchObject({ id: 'old', chatId: 'chat', projectName: 'project' })
+    expect(receipt.managerOpenId).toBeUndefined()
+    expect(scrubLegacyDeliveryReceipts(dir)).toBe(0)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
 })

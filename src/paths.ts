@@ -98,7 +98,6 @@ export const NOTIFY_CALLBACKS_FILE = join(DATA_DIR, 'notify-callbacks.json')
  * The daemon also refreshes it on session lifecycle changes so rapid
  * repeated restarts do not lose the revive list. */
 export const ALIVE_MARKER_FILE = join(DATA_DIR, 'alive-on-shutdown.json')
-export const INBOX_DIR = join(DATA_DIR, 'inbox')
 /** One private receipt per cloud-file delivery; remote files are managed in their Feishu folder. */
 export const FILE_DELIVERIES_DIR = join(DATA_DIR, 'file-deliveries')
 /** Per-chat Drive folder bindings; legacy preferences are ignored during migration. */
@@ -108,6 +107,7 @@ export const FILE_DELIVERY_GROUPS_FILE = join(DATA_DIR, 'file-delivery-groups.js
  * a `[DEBUG]…` text once to seed `DEBUG_CTX_FILE` with chat_id +
  * sender_open_id; the injector then POSTs `{text}` here and the
  * daemon replays it through `handleMessage` as if WS had delivered
- * it. File mode 0600 — daemon-private, never network-exposed. */
+ * it. Created only for an explicit `LODESTAR_DEBUG_SOCKET=1` Bun run,
+ * removed on shutdown; never network-exposed. */
 export const DEBUG_SOCK_FILE = join(DATA_DIR, 'debug.sock')
 export const DEBUG_CTX_FILE = join(DATA_DIR, 'debug-context.json')

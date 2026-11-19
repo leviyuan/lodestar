@@ -955,6 +955,32 @@ describe('AgentService', () => {
     expect(starts).toBe(2)
   })
 
+  test('a worker cannot follow up or resume a sibling task', async () => {
+    const calls = new Map<string, { opts: Parameters<AgentServiceDeps['startWorker']>[0]; control: ReturnType<typeof controlledHandle> }>()
+    const { service, root } = harness({ startWorker: opts => {
+      const control = controlledHandle()
+      calls.set(opts.prompt, { opts, control })
+      return control.handle
+    } })
+    const request = { description: '并行任务', identityIds: ['agent:a'] }
+    const spawn = async (prompt: string) => {
+      const run = await service.startRun(root, { ...request, prompt })
+      await waitForCondition(() => calls.has(prompt))
+      const capability = calls.get(prompt)!.opts.hostEnv.LODESTAR_AGENT_CAPABILITY!
+      return { run, principal: service.principalForCapability(capability)! }
+    }
+    const a = await spawn('sibling-a')
+    const b = await spawn('sibling-b')
+    calls.get('sibling-a')!.control.resolve(result('sid-a'))
+    calls.get('sibling-b')!.control.resolve(result('sid-b'))
+    await waitFor(service, root, a.run.runId, 'completed')
+    await waitFor(service, root, b.run.runId, 'completed')
+    await expect(service.followUp(a.principal, b.run.runId, { description: '越权续跑', prompt: 'sibling' }))
+      .rejects.toThrow('not found')
+    await expect(service.startRun(a.principal, { description: '越权恢复', identityIds: [], sessionId: 'sid-b', prompt: 'sibling' }))
+      .rejects.toThrow('outside this worker capability')
+  })
+
   test.each(['session', 'project'] as const)('%s workers delegate and resume descendants without a depth limit', async kind => {
     const calls = new Map<string, { opts: Parameters<AgentServiceDeps['startWorker']>[0]; control: ReturnType<typeof controlledHandle> }>()
     const { service, root } = harness({ startWorker: opts => {
@@ -1860,4 +1886,20 @@ describe('project-owned session identity boundaries', () => {
         .rejects.toThrow('main Agent working directory')
     }
   })
+})
+
+
+test('project runs never persist or return the caller open_id', async () => {
+  const h = harness()
+  const principal = h.service.projectPrincipal({ owner: {
+    kind: 'project', name: session.sessionName, chatId: session.chatId, workDir: session.workDir,
+  } })
+  const run = await h.service.startRun(principal, {
+    identityIds: ['agent:a'], description: '任务说明', prompt: 'work', requesterOpenId: 'ou_secret_requester',
+  })
+  await waitFor(h.service, principal, run.runId, 'completed')
+  const persisted = h.artifacts.filter((value: any) => value.runId === run.runId).at(-1) as any
+  expect(persisted).toBeDefined()
+  expect(persisted.requesterOpenId).toBeUndefined()
+  expect(JSON.stringify(persisted)).not.toContain('ou_secret_requester')
 })

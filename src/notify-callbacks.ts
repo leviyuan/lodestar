@@ -401,10 +401,8 @@ export interface DispatchResult {
  *   {
  *     "notify_id": "nf_...",
  *     "message_id": "om_...",
- *     "chat_id": "oc_...",
  *     "project": "feishu",
  *     "button": { "id": "approve", "text": "✅ 通过", "type": "primary" },
- *     "operator": { "open_id": "ou_..." },
  *     "timestamp": 1700000000
  *   }
  *
@@ -414,17 +412,17 @@ export interface DispatchResult {
 export async function dispatchCallback(
   reg: NotifyRegistration,
   answer: NotifyButton | NotifyTextResponse,
-  operatorOpenId: string,
+  _operatorOpenId: string,
 ): Promise<DispatchResult> {
+  // The callback body stays minimal: the caller already knows the project it
+  // targeted, and chat_id/open_id must never leave the daemon's own state.
   const payload = {
     notify_id: reg.notifyId,
     message_id: reg.messageId,
-    chat_id: reg.chatId,
     project: reg.project,
     ...('id' in answer
       ? { button: { id: answer.id, text: answer.text, type: answer.type } }
       : { response: { type: 'text', ...answer } }),
-    operator: { open_id: operatorOpenId },
     timestamp: Math.floor(Date.now() / 1000),
   }
   const controller = new AbortController()
@@ -488,9 +486,9 @@ export function __setStoreFileForTest(file: string, clearMemory = true): void {
 /** Build the pull-result payload for `GET /notify/result/<id>`. Pure
  * function over a registration — extracted so the HTTP handler stays
  * thin and the shape is unit-testable. `resolved:false` while pending;
- * once frozen, the chosen button (id+text+type), resolve timestamp and
- * operator open_id are included so a stateless caller has the full
- * verdict without running a callback server. */
+ * once frozen, the chosen button (id+text+type) and resolve timestamp are
+ * included so a stateless caller has the verdict. The operator's open_id is
+ * deliberately not exposed: /notify is reachable by any local process. */
 export function buildNotifyResult(reg: NotifyRegistration): object {
   const resolved = !!reg.resolvedAt
   const unknown = !!reg.unknownAt
@@ -511,7 +509,6 @@ export function buildNotifyResult(reg: NotifyRegistration): object {
         status: resolved && buttonId === undefined ? 'resolved'
           : unknown && buttonId === undefined ? 'unknown' : reg.replyState.status,
         prompt_message_id: reg.replyState.promptMessageId,
-        operator: { open_id: reg.replyState.openId },
         ...(reg.replyState.cancelReason ? { cancel_reason: reg.replyState.cancelReason } : {}),
         ...(reg.replyState.error ? { error: reg.replyState.error } : {}),
       },
@@ -520,14 +517,12 @@ export function buildNotifyResult(reg: NotifyRegistration): object {
       ? {
           ...verdict,
           resolved_at: reg.resolvedAt,
-          resolved_by: reg.resolvedBy?.openId ?? null,
         }
       : {}),
     ...(unknown
       ? {
           ...verdict,
           unknown_at: reg.unknownAt,
-          unknown_by: reg.unknownBy?.openId ?? null,
           unknown_reason: reg.unknownReason,
         }
       : {}),

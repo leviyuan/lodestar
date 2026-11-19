@@ -8,7 +8,7 @@ import { ClaudeAccounts } from './claude-accounts'
 const temporary: string[] = []
 let bundleRoot: string
 let bundle: string
-const managedKeys = ['LODESTAR_AGENT_ROLE', 'LODESTAR_AGENT_URL', 'LODESTAR_AGENT_CAPABILITY', 'LODESTAR_AGENT_SESSION', 'DSH_LODESTAR_AGENT_CONTEXT']
+const managedKeys = ['LODESTAR_AGENT_ROLE', 'LODESTAR_AGENT_URL', 'LODESTAR_AGENT_CAPABILITY', 'DSH_LODESTAR_AGENT_CONTEXT']
 
 beforeAll(async () => {
   bundleRoot = mkdtempSync(join(tmpdir(), 'lodestar-claude-cli-bundle-'))

@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { AGENTS, agentRuntimeState } from './agent-updates'
 
 const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+const verbose = process.argv.includes('--verbose')
 console.log(`Lodestar v${manifest.version}`)
 for (const agent of AGENTS) {
   try {
@@ -20,7 +21,7 @@ for (const agent of AGENTS) {
       }
     }
     console.log(`${agent}: ${names.map(name => `${name}@${state.versions?.[name] ?? 'MISS'}`).join(', ')}`)
-    console.log(`  ${state.directory}`)
+    if (verbose) console.log(`  ${state.directory}`)
   } catch (error) { console.error(`${agent}: MISS（${error}）`); process.exitCode = 1 }
 }
-console.log(`Runtime: ${process.version} (${process.platform}-${process.arch})`)
+if (verbose) console.log(`Runtime: ${process.version} (${process.platform}-${process.arch})`)

@@ -175,6 +175,19 @@ describe('TOML scalar parsing', () => {
     expect(JSON.parse(result.stdout).feishu.app_secret).toBe('sec#ret')
   })
 
+  test('accepts only loopback notify binds', () => {
+    for (const [bind, expected] of [['127.0.0.1', '127.0.0.1'], ['::1', '::1'], ['[::1]', '::1'], ['localhost', 'localhost']] as const) {
+      const result = loadFreshConfig(`[notify]\nbind = "${bind}"`)
+      expect(result.exitCode, `${bind}: ${result.stderr}`).toBe(0)
+      expect(JSON.parse(result.stdout).notify.bind).toBe(expected)
+    }
+    for (const bind of ['0.0.0.0', '::', '192.168.1.10', 'example.com']) {
+      const result = loadFreshConfig(`[notify]\nbind = "${bind}"`)
+      expect(result.exitCode, bind).not.toBe(0)
+      expect(result.stderr).toContain('must be a loopback address')
+    }
+  })
+
   test('rejects a notify port with trailing junk', () => {
     const result = loadFreshConfig(`
       [notify]

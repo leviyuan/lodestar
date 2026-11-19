@@ -72,7 +72,7 @@ POST /agents/relays/configure
 }
 \`\`\`
 
-接口会校验模型目录、原子写入 \`[relay.<site_id>]\`、重建 Token Source registry，并立即刷新该站点的 Claude/Codex/DSH 视图。成功返回 \`sources\` 及每个来源的模型状态。不要再发送 restart。
+接口会校验模型目录、原子保存配置、重建 Token Source registry，并立即刷新该站点的 Claude/Codex/DSH 视图。成功返回 \`sources\` 及每个来源的模型状态。不要再发送 restart。
 
 只重新读取配置并刷新已保存的站点时，使用：
 

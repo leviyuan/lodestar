@@ -27,7 +27,7 @@ import { syncManagedSkill } from './managed-skills'
 export const NOTIFY_SKILL_NAME = 'feishu-notify'
 
 export function notifySkillBody(port: number): string {
-  const description = `Send a one-shot notification card to a project's bound Feishu / Lark conversation through the local Lodestar daemon. Use for "通知飞书", "推送到飞书", "推送到对话", "飞书推送", "发到飞书", "脚本跑完通知我", "进程完成发个消息", "send to feishu", "feishu notify", "lark notify", "发到 Lark", "lodestar notify", "post to lark conversation", or notifications from scripts, cron jobs, and services. POST http://127.0.0.1:${port}/notify accepts {project, text, level}; project is a name resolved to a conversation ID (chat_id). Supports local images, interactive buttons: supply buttons, and free-text replies: set allow_reply:true for a fixed 回复 button. Receive results through a loopback callback or GET /notify/result/NOTIFY_ID.`
+  const description = `Send a one-shot notification card to a project's bound Feishu / Lark conversation through the local Lodestar daemon. Use for "通知飞书", "推送到飞书", "推送到对话", "飞书推送", "发到飞书", "脚本跑完通知我", "进程完成发个消息", "send to feishu", "feishu notify", "lark notify", "发到 Lark", "lodestar notify", "post to lark conversation", or notifications from scripts, cron jobs, and services. POST http://127.0.0.1:${port}/notify accepts {project, text, level}; project is the project name and the daemon routes the card to that project's bound conversation. Supports local images, interactive buttons: supply buttons, and free-text replies: set allow_reply:true for a fixed 回复 button. Receive results through a loopback callback or GET /notify/result/NOTIFY_ID.`
   return `---
 name: ${NOTIFY_SKILL_NAME}
 description: ${JSON.stringify(description)}
@@ -36,11 +36,9 @@ description: ${JSON.stringify(description)}
 # feishu-notify
 
 Push a one-shot card into a Feishu / Lark conversation via the local lodestar
-daemon. The daemon resolves a project/session name to its bound conversation
-ID (\`chat_id\`); \`POST /notify\` with that project name routes a card to
-the conversation. The \`project\` request field remains a name, not a
-conversation ID. \`chat_id\` identifies the notification destination and
-is distinct from an Agent backend's native session ID (\`session_id\`).
+daemon. The daemon resolves a project/session name to that project's bound
+conversation; \`POST /notify\` with the project name routes the card there.
+Keep using the project name — never a conversation identifier.
 
 ## Three card types
 
@@ -66,7 +64,7 @@ Body (JSON):
 
 | field | required | meaning |
 |---|---|---|
-| \`project\` | ✅ | Project/session name used to resolve the bound conversation ID (\`chat_id\`); do not pass a \`chat_id\` here |
+| \`project\` | ✅ | Project/session name used to route the card to that project's bound conversation |
 | \`text\` | ✅ | Feishu / Lark Card JSON 2.0 markdown — \`**bold**\`, \`\` \`code\` \`\`, \`[link](url)\`, \`<font color='red'>…</font>\` |
 | \`title\` |   | Card header, defaults to \`project\` |
 | \`level\` |   | \`info\` (blue, default) / \`warn\` (yellow) / \`error\` (red) |
@@ -75,13 +73,13 @@ Body (JSON):
 | \`allow_reply\` |   | Boolean, default false. Selects the custom text reply type; cannot be combined with nonempty \`buttons\`. Only this type has a fixed 「回复」 button at the bottom. Clicking sends a separate 「等待用户输入」 card; the clicker's next text in that conversation is returned to the caller. |
 | \`callback\` |   | Optional loopback HTTP URL (e.g. \`http://127.0.0.1:9999/hook\`) — **push mode**: the daemon POSTs the button choice or submitted text here. Must be \`http://\` on \`127.0.0.1\` / \`localhost\` / \`::1\`. Omit for **pull mode** (see below). |
 
-Response: \`200 {ok, chat_id, message_id, notify_id?}\` (notify_id returned
+Response: \`200 {ok, message_id, notify_id?}\` (notify_id returned
 when buttons are present or allow_reply is true) / \`400\` bad params / \`404\` project not
-bound to a conversation ID / \`413\` JSON body exceeds 4 MiB / \`502\` Feishu / Lark API rejected.
+bound to a conversation / \`413\` JSON body exceeds 4 MiB / \`502\` Feishu / Lark API rejected.
 
 \`GET /notify/result/<notify_id>\` — pull the verdict with no callback
 server: \`{notify_id, project, message_id, resolved, unknown, button?,
-response?, reply?, resolved_at?, resolved_by?}\`. \`resolved:false\` while
+response?, reply?, resolved_at?}\`. \`resolved:false\` while
 pending. \`unknown:true\` means delivery cannot be safely confirmed: do
 not retry automatically. Interrupted button callbacks and text replies remain
 unknown after daemon restart; verify their outcome with the receiver.
@@ -129,10 +127,8 @@ or the click surfaces a 回调失败 toast and stays retryable):
 {
  "notify_id": "nf_...",
  "message_id": "om_...",
- "chat_id": "oc_...",
  "project": "ops",
  "button": {"id":"approve","text":"✅ 通过","type":"primary"},
- "operator": {"open_id":"ou_..."},
  "timestamp": 1700000000
 }
 \`\`\`
@@ -201,14 +197,14 @@ curl -sS http://127.0.0.1:${port}/notify/result/$NID
 # → {"notify_id":"nf_…","project":"ops","message_id":"om_…",
 #    "resolved":true,
 #    "button":{"id":"yes","text":"✅","type":"default"},
-#    "resolved_at":1783242381786,"resolved_by":"ou_…"}
+#    "resolved_at":1783242381786}
 \`\`\`
 
 Notes:
 - A second tap on an already-resolved card is idempotent (\"已处理过\"),
   so two members clicking at once records a single verdict.
-- Registrations survive a daemon restart (persisted to
-  \`~/.local/share/lodestar/notify-callbacks.json\`, pruned after 7 days).
+- Registrations survive a daemon restart (kept in private daemon state,
+  pruned after 7 days).
 
 ## Usage — receive a text reply
 
@@ -235,7 +231,6 @@ Text callback body (\`response\` replaces \`button\`):
 {
   "notify_id":"nf_...",
   "message_id":"om_original_notification",
-  "chat_id":"oc_...",
   "project":"ops",
   "response":{
     "type":"text",
@@ -243,13 +238,12 @@ Text callback body (\`response\` replaces \`button\`):
     "message_id":"om_user_message",
     "prompt_message_id":"om_waiting_card"
   },
-  "operator":{"open_id":"ou_..."},
   "timestamp":1700000000
 }
 \`\`\`
 
 In pull mode, the result contains the same \`response\`, plus
-\`resolved:true\`, \`resolved_at\`, and \`resolved_by\`. While waiting,
+\`resolved:true\` and \`resolved_at\`. While waiting,
 \`reply.status\` is \`waiting\`; a failed delivery is \`failed\` with
 \`reply.error\`. A callback can return the same optional acknowledgement
 body described above; it is displayed on the receipt card. That body
@@ -283,9 +277,9 @@ is the script's acknowledgement, distinct from the user's response.
 
 - For free-text input, use \`allow_reply:true\` as above; do not manufacture
   a caller-defined button named "reply" or ask users to type before clicking.
-- The project must have a known conversation ID (\`chat_id\`) binding.
-  The daemon records the binding from inbound messages. If you see
-  \`404\`, send a message in the intended conversation and retry.
+- The project must have a known conversation binding. The daemon records
+  the binding from inbound messages. If you see \`404\`, send a message in the
+  intended conversation and retry.
 - This skill is auto-installed by the lodestar daemon on every boot.
   Hand-edits will be overwritten — set
   \`LODESTAR_DISABLE_SKILL_SYNC=1\` and restart the daemon if you want

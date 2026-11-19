@@ -161,6 +161,13 @@ function expandTilde(v: string): string {
   return v.replace(/^~(?=\/|$)/, homedir())
 }
 
+/** /notify is an unauthenticated loopback API; reject any non-loopback bind. */
+function isLoopbackBind(bind: string): boolean {
+  const host = bind.replace(/^\[|\]$/g, '').toLowerCase()
+  if (host === 'localhost' || host.endsWith('.localhost') || host === '::1') return true
+  return /^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(host)
+}
+
 function parseToml(text: string): Record<string, Record<string, string>> {
   const out: Record<string, Record<string, string>> = { _: {} }
   let section = '_'
@@ -276,10 +283,16 @@ export function loadConfig(): LodestarConfig {
     )
   }
   const liveElapsed: LiveElapsedMode = liveElapsedRaw
-  const notifyBind = (t.notify?.bind ?? '127.0.0.1').trim()
+  // Accept the bracketed IPv6 spelling but listen with the bare address.
+  const notifyBind = (t.notify?.bind ?? '127.0.0.1').trim().replace(/^\[([^\]]+)\]$/, '$1')
   if (!notifyBind) {
     // An empty host makes the HTTP server listen on every interface.
-    throw new ConfigError('lodestar: [notify].bind must not be empty; use "127.0.0.1" for loopback or an explicit address such as "0.0.0.0"')
+    throw new ConfigError('lodestar: [notify].bind must not be empty; use "127.0.0.1"')
+  }
+  if (!isLoopbackBind(notifyBind)) {
+    // /notify has no authentication; listening beyond loopback would expose
+    // project routing, cards and results to the local network.
+    throw new ConfigError(`lodestar: [notify].bind must be a loopback address (127.0.0.1, ::1 or localhost); remote access is not supported, got "${notifyBind}"`)
   }
   const notifyPortRaw = t.notify?.port ?? '9876'
   if (!/^\d+$/.test(notifyPortRaw.trim())) {

@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 /**
- * 向运行中的 daemon 注入消息。先在目标群发送 `[DEBUG]hi` 保存群和发送者。
+ * 向运行中的 daemon 注入消息。daemon 需以 `LODESTAR_DEBUG_SOCKET=1` 在 Bun 下启动；
+ * 先在目标群发送 `[DEBUG]hi` 保存群和发送者。
  * 每次注入会向该群发送成员可见的测试消息，再交给正常消息处理流程。
  *
  * bun scripts/test-inject.ts [--delay <ms>] <text>...

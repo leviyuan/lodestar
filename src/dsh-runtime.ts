@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFile
 import spawn from 'cross-spawn'
 import type { ChildProcess } from 'node:child_process'
 import type { ProjectProfile } from './config'
+import { scrubAgentHostEnv } from './agent-env'
 import { DSH_HOME_DIR } from './paths'
 import { DSH_PROTOCOL_VERSION, type DshNotification } from './dsh-protocol'
 import { agentRuntimeRoot } from './agent-updates'
@@ -186,7 +187,7 @@ export class DshRuntime extends EventEmitter {
     const node = opts.env.LODESTAR_DSH_NODE || 'node'
     const args = [join(dirname(manifestPath), manifest.bin.dsh), '--profile', 'sdk', '--patch', patchPath,
       ...(opts.patches ?? []).flatMap(path => ['--patch', path])]
-    const childEnv = { ...opts.env }
+    const childEnv = scrubAgentHostEnv({ ...opts.env })
     // DSH rebuilds its own namespace for each shell execution. This context is
     // available only through our root-agent ShellEnv contributor below.
     if (childEnv.LODESTAR_AGENT_CAPABILITY && childEnv.LODESTAR_AGENT_URL) {
