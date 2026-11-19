@@ -1,6 +1,6 @@
 import { networkFetch } from './network'
 import { FeishuRecoveryWindow, FeishuRequestError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
-import { feishuErrorDetails, formatFeishuError, redactMemberIds } from './feishu-errors'
+import { feishuErrorDetails, formatFeishuError, redactMemberIds, redactPersonIdentifiers } from './feishu-errors'
 import { withChatMessageOrder } from './chat-message-order'
 import { AGENT_PROVIDERS, isAgentProvider, isDshReasoningEffort } from './agent-process'
 /**
@@ -702,6 +702,7 @@ export function loadSessionTurnsMap(): void {
     }
     turnsBySession.clear()
     let rejected = 0
+    let scrubbed = false
     for (const [name, value] of Object.entries(obj)) {
       let arr: unknown[]
       let base: ConversationBranchBase
@@ -749,8 +750,11 @@ export function loadSessionTurnsMap(): void {
       const clean: TurnAnchor[] = []
       for (const value of arr) {
         const anchor = parseTurnAnchor(value, legacyProvider)
-        if (anchor) clean.push(anchor)
-        else rejected++
+        if (anchor) {
+          const redacted = redactPersonIdentifiers(anchor.preview)
+          if (redacted !== anchor.preview) { anchor.preview = redacted; scrubbed = true }
+          clean.push(anchor)
+        } else rejected++
       }
       if (clean.length || base !== null || pendingLaunch) {
         turnsBySession.set(name, {
@@ -761,6 +765,7 @@ export function loadSessionTurnsMap(): void {
       }
     }
     if (rejected > 0) log('feishu malformed turn anchors rejected')
+    if (scrubbed) saveSessionTurnsMapChecked()
   } catch (e: any) {
     // ENOENT(首次启动无文件)静默;其他(JSON 损坏等)要暴露,符合 no-fallbacks。
     if (e?.code !== 'ENOENT') logError('feishu turn anchors load failed', e)

@@ -34,6 +34,9 @@ const SHARED_FILES = ['config.toml', 'AGENTS.md', 'AGENTS.override.md', 'hooks.j
 export class CodexAccounts {
   // Caches are process-local, so native login only needs a process-local epoch.
   private defaultLoginRevision: string | undefined
+  /** Native account emails are display data; keep them in memory only so the
+   * account registry never becomes a person-identifier store. */
+  private readonly loginEmails = new Map<string, string | null>()
 
   constructor(
     readonly defaultHome = resolve(process.env.CODEX_HOME || join(homedir(), '.codex')),
@@ -60,6 +63,16 @@ export class CodexAccounts {
     for (const id of Object.values(state.selections)) {
       if (id !== DEFAULT_CODEX_ACCOUNT && !ids.has(id)) throw new Error('Codex 账号选择指向不存在的账号')
     }
+    // Older registries stored the native email. Strip it (and rewrite the file)
+    // so no person identifier survives on disk.
+    let scrubbed = false
+    for (const account of state.accounts) {
+      if ('email' in account) { delete account.email; scrubbed = true }
+    }
+    if (scrubbed) {
+      try { writeJsonStateAtomic(this.stateFile, state) }
+      catch (e) { logError('codex-accounts: email scrub failed', e) }
+    }
     return state
   }
 
@@ -72,8 +85,13 @@ export class CodexAccounts {
   }
 
   list(): CodexAccount[] {
+    const emailOf = (id: string): { email?: string | null } => {
+      const email = this.loginEmails.get(id)
+      return email === undefined ? {} : { email }
+    }
     return [{ id: DEFAULT_CODEX_ACCOUNT, name: '默认',
-      ...(this.defaultLoginRevision ? { revision: this.defaultLoginRevision } : {}) }, ...this.read().accounts.map(a => ({ ...a }))]
+      ...(this.defaultLoginRevision ? { revision: this.defaultLoginRevision } : {}), ...emailOf(DEFAULT_CODEX_ACCOUNT) },
+    ...this.read().accounts.map(a => ({ ...a, ...emailOf(a.id) }))]
   }
   get(id: string): CodexAccount {
     const account = this.list().find(a => a.id === id)
@@ -118,6 +136,7 @@ export class CodexAccounts {
       try { rmSync(home, { recursive: true }) }
       catch (error) { throw new Error(`账号文件删除失败，账号记录已保留；${error}`) }
     }
+    this.loginEmails.delete(id)
     state.accounts = state.accounts.filter(a => a.id !== id)
     let clearedSelections = 0
     for (const [sessionName, selectedId] of Object.entries(state.selections)) {
@@ -150,6 +169,7 @@ export class CodexAccounts {
     writeJsonStateAtomic(this.stateFile, state)
   }
   recordLogin(id: string, account: { email?: string | null; planType?: string }): void {
+    this.loginEmails.set(id, account.email ?? null)
     const state = this.read()
     if (id === DEFAULT_CODEX_ACCOUNT) {
       this.defaultLoginRevision = randomUUID()
@@ -157,7 +177,7 @@ export class CodexAccounts {
     }
     const row = state.accounts.find(a => a.id === id)
     if (!row) throw new Error('登录完成时账号记录已不存在')
-    Object.assign(row, { email: account.email, planType: account.planType, revision: randomUUID() })
+    Object.assign(row, { planType: account.planType, revision: randomUUID() })
     writeJsonStateAtomic(this.stateFile, state)
   }
   home(id = DEFAULT_CODEX_ACCOUNT): string {

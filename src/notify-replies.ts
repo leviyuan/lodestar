@@ -3,7 +3,7 @@
 import { randomUUID } from 'node:crypto'
 import {
   get, findPendingReply, pendingRepliesForChat, hasReplyMessage, setReplyState, markResolved, markUnknown,
-  recordCallbackSuccess, markUnknownRecovered, isDispatching, setDispatching, clearDispatching,
+  recordCallbackSuccess, markUnknownRecovered, markRestartRecovered, isDispatching, setDispatching, clearDispatching,
   type NotifyRegistration, type NotifyReplyState, type NotifyTextResponse, type DispatchResult,
 } from './notify-callbacks'
 import { buildNotifyCardFromReg, buildNotifyReplyCard, type NotifyResolution } from './notify'
@@ -57,12 +57,20 @@ export function createNotifyReplyRuntime(deps: {
 
   return {
     async recover(reg: NotifyRegistration): Promise<void> {
+      if (reg.replyState?.status === 'cancelled' && reg.replyState.cancelReason === 'restart') {
+        const state = reg.replyState
+        const resolution: NotifyResolution = { kind: 'text', status: 'cancelled', text: '', operatorOpenId: '' }
+        await update(reg, state.promptMessageId, buildNotifyReplyCard(reg, state, resolution), '服务重启，回复已失效，请重新点击回复')
+        await update(reg, reg.messageId, buildNotifyCardFromReg(reg, resolution), '服务重启，回复已失效，请重新点击回复')
+        markRestartRecovered(reg.notifyId)
+        return
+      }
       if (reg.dispatchState && reg.unknownAt) {
         const state = reg.dispatchState
         const button = reg.buttons.find(button => button.id === state.buttonId)
         await update(reg, reg.messageId, buildNotifyCardFromReg(reg, {
           status: 'unknown', buttonId: state.buttonId, text: button?.text ?? state.buttonId,
-          operatorOpenId: state.openId, detail: reg.unknownReason,
+          operatorOpenId: '', detail: reg.unknownReason,
         }), '按钮回调送达状态未知')
         markUnknownRecovered(reg.notifyId)
         return
@@ -71,7 +79,7 @@ export function createNotifyReplyRuntime(deps: {
       if (!state || !reg.unknownAt) return
       const resolution: NotifyResolution = {
         kind: 'text', status: 'unknown', text: state.response?.text ?? '',
-        operatorOpenId: state.openId, detail: reg.unknownReason,
+        operatorOpenId: state.openId ?? '', detail: reg.unknownReason,
       }
       await update(reg, state.promptMessageId, buildNotifyReplyCard(reg, state, resolution), '回复送达状态未知')
       await update(reg, reg.messageId, buildNotifyCardFromReg(reg, resolution), '回复送达状态未知')
@@ -102,7 +110,8 @@ export function createNotifyReplyRuntime(deps: {
           await update(previous, cancelled.promptMessageId, buildNotifyReplyCard(previous, cancelled), '已放弃上一条回复并切换通知')
         }
         const state: NotifyReplyState = {
-          id: randomUUID(), openId, promptMessageId: '', openedAt: Date.now(), status: 'waiting',
+          id: randomUUID(), openId,
+          promptMessageId: '', openedAt: Date.now(), status: 'waiting',
         }
         let failure: unknown
         const messageId = await deps.sendCard(reg.chatId, buildNotifyReplyCard(reg, state), error => { failure = error })
@@ -195,7 +204,7 @@ export function createNotifyReplyRuntime(deps: {
             // The disk still says sending. Surface the uncertain local state
             // and freeze this notification instead of enabling a duplicate.
             const detail = `${result.detail}；失败状态保存失败：${detailOf(error)}`
-            try { markUnknown(reg.notifyId, undefined, openId, detail) }
+            try { markUnknown(reg.notifyId, undefined, detail) }
             catch (persistError) { deps.logError('notify.reply.unknown_persist_failed', persistError) }
             resolution = { ...resolution, status: 'unknown', detail }
           }

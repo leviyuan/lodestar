@@ -80,6 +80,15 @@ export function redactMemberIds(text: string): string {
     .replace(/\b(?:ou|on)_[0-9a-z]{28,}\b/g, '…')
 }
 
+/** Redact person identifiers from display-only summaries. This is for
+ * persisted previews, not for task content: the latter is user work product. */
+export function redactPersonIdentifiers(text: string): string {
+  return text
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '<email>')
+    .replace(/\b(?:ou|on|od)_[0-9a-z]{8,}\b/gi, '<id>')
+    .replace(/(\b(?:user|open|union|member|employee)[_ ]?ids?\s*[:：=]\s*)[^\s,;，；)\]]+/gi, '$1<id>')
+}
+
 /** Every displayed API failure names all three fields, even if Feishu omitted one. */
 export function formatFeishuError(raw: unknown): string {
   const details = feishuErrorDetails(raw)

@@ -76,7 +76,7 @@ import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { withChatMessageOrder } from './chat-message-order'
-import { formatFeishuError } from './feishu-errors'
+import { formatFeishuError, redactPersonIdentifiers } from './feishu-errors'
 import { logError, logDiagnostic } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { captureCodexUsageCache } from './usage'
@@ -2798,7 +2798,7 @@ export class Session {
     }
     const anchor: feishu.TurnAnchor = {
       checkpoint,
-      preview: this.lastTurnUserPreview.slice(0, 80),
+      preview: redactPersonIdentifiers(this.lastTurnUserPreview.slice(0, 80)),
       ts: Date.now(),
       writes: this.collectTurnWrites(),
     }

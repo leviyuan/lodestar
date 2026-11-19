@@ -12,6 +12,7 @@ import {
   get,
   isDispatching,
   loadCallbacks,
+  findPendingReply,
   markResolved,
   recordCallbackSuccess,
   recordCallbackFailure,
@@ -75,11 +76,33 @@ describe('notify-callbacks store', () => {
     markResolved('nf_test1', 'approve', 'ou_user1')
     const got = get('nf_test1')
     expect(got?.resolvedAt).toBeGreaterThan(0)
-    expect(got?.resolvedBy).toEqual({ buttonId: 'approve', openId: 'ou_user1' })
-    // Confirmed on disk after a fresh load.
+    expect(got?.resolvedBy).toEqual({ buttonId: 'approve' })
+    // The state file never contains the raw open_id; a fresh load has only
+    // the stable hash and can still match the person.
+    const disk = readFileSync(tempFile, 'utf8')
+    expect(disk).not.toContain('ou_user1')
+    expect(disk).not.toContain('openId')
     __setStoreFileForTest(tempFile)
     loadCallbacks()
-    expect(get('nf_test1')?.resolvedBy?.openId).toBe('ou_user1')
+    expect(get('nf_test1')?.resolvedBy).toEqual({ buttonId: 'approve' })
+  })
+
+  test('legacy raw openId is removed on load; the prompt cannot resume without an identity', () => {
+    register(sampleReg())
+    // Simulate an older store that still wrote the raw value.
+    const legacy = JSON.parse(readFileSync(tempFile, 'utf8'))
+    legacy.nf_test1.replyState = {
+      id: 'reply-1', openId: 'ou_legacy', promptMessageId: 'om_prompt', openedAt: Date.now(), status: 'waiting',
+    }
+    writeFileSync(tempFile, JSON.stringify(legacy))
+    __setStoreFileForTest(tempFile)
+    loadCallbacks()
+    expect(get('nf_test1')?.replyState?.openId).toBeUndefined()
+    expect(get('nf_test1')?.replyState?.status).toBe('cancelled')
+    expect(get('nf_test1')?.replyState?.cancelReason).toBe('restart')
+    expect(findPendingReply('oc_chat', 'ou_legacy')).toBeUndefined()
+    expect(readFileSync(tempFile, 'utf8')).not.toContain('ou_legacy')
+    expect(readFileSync(tempFile, 'utf8')).not.toContain('openId')
   })
 
   test('markResolved exposes persistence failure and rolls back the resolved flag', () => {
@@ -102,7 +125,7 @@ describe('notify-callbacks store', () => {
     expect(outcome.state).toBe('unknown')
     expect(get('nf_test1')?.resolvedAt).toBeUndefined()
     expect(get('nf_test1')?.unknownAt).toBeGreaterThan(0)
-    expect(get('nf_test1')?.unknownBy).toEqual({ buttonId: 'approve', openId: 'ou_user1' })
+    expect(get('nf_test1')?.unknownBy).toEqual({ buttonId: 'approve' })
     expect(get('nf_test1')?.unknownReason).toContain('tombstone persistence')
   })
 

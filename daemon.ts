@@ -123,6 +123,9 @@ let stopFeishuWs: (() => void) | undefined
 const SHUTDOWN_DEADLINE_MS = 15_000
 /** Local debug injection is opt-in; npm installs never create the socket. */
 const debugSocketEnabled = process.env.LODESTAR_DEBUG_SOCKET === '1'
+/** The seed sender is kept in memory only; the debug state file never writes
+ * a person identifier. Manual seeding falls back to this synthetic value. */
+let debugContextSenderOpenId = ''
 const cleanup = () => {
   if (cleanupDone) return
   cleanupDone = true
@@ -521,13 +524,13 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   const debugTextRaw = (message.message_type === 'text' ? contentObjForDebug.text ?? '' : '')
   // 外部联系人的消息不写调试上下文（其中含发送者 open_id），按普通文本处理。
   if (shouldSeedDebugContext(requester, debugTextRaw)) {
-    // Never persist chat_id/open_id unless the loopback debug socket is
-    // explicitly enabled for local testing.
+    // Keep the sender in memory only; the debug state file contains the
+    // target chat and message ids, never a person identifier.
     if (debugSocketEnabled) {
+      debugContextSenderOpenId = userOpenId
       try {
         writeJsonStateAtomic(DEBUG_CTX_FILE, {
           chat_id: chatId,
-          sender_open_id: userOpenId,
           seeded_at: new Date().toISOString(),
           seeded_msg_id: msgId ?? '',
         })
@@ -1330,9 +1333,20 @@ async function reconcileDissolvedChats(): Promise<void> {
 // Listens on a unix socket so scripts/test-inject.ts can replay messages
 // through the same `handleMessage` path that real WS events take. Seeded
 // by a one-time `[DEBUG]<anything>` from the real Feishu user; from then
-// on the injector reuses that chat_id + sender_open_id.
+// on the injector reuses the in-memory sender and target chat.
 function startDebugSocket(): void {
   if (!debugSocketEnabled) return
+  // Migrate a pre-change context file: keep the sender in memory, rewrite the
+  // file without it, and never put a person identifier back on disk.
+  try {
+    const saved = JSON.parse(readFileSync(DEBUG_CTX_FILE, 'utf8')) as Record<string, unknown>
+    if (typeof saved.sender_open_id === 'string' && saved.sender_open_id) debugContextSenderOpenId = saved.sender_open_id
+    if ('sender_open_id' in saved || 'seeded_name' in saved) {
+      writeJsonStateAtomic(DEBUG_CTX_FILE, {
+        chat_id: saved.chat_id, seeded_at: saved.seeded_at, seeded_msg_id: saved.seeded_msg_id,
+      })
+    }
+  } catch {}
   if (process.platform === 'win32') {
     // Bun.serve({unix:...}) 在 Windows 上不支持,且 debug 注入是
     // dev-only 路径(scripts/test-inject.ts 用的),end user 不需要。
@@ -1367,6 +1381,15 @@ function startDebugSocket(): void {
         try { ctx = JSON.parse(readFileSync(DEBUG_CTX_FILE, 'utf8')) } catch (e) {
           return new Response(`ctx read failed: ${e}`, { status: 500 })
         }
+        if (typeof ctx.sender_open_id === 'string' && ctx.sender_open_id) {
+          debugContextSenderOpenId = ctx.sender_open_id
+          try {
+            writeJsonStateAtomic(DEBUG_CTX_FILE, {
+              chat_id: ctx.chat_id, seeded_at: ctx.seeded_at, seeded_msg_id: ctx.seeded_msg_id,
+            })
+          } catch (e) { logError('daemon.debug_context.write_failed', e) }
+        }
+        ctx.sender_open_id = debugContextSenderOpenId || 'ou_debug'
         const target = readModelState ? url.searchParams.get('chat_id') : body.chat_id
         if ((target !== undefined && target !== ctx.chat_id) || (url.pathname !== '/' && !target)) {
           return new Response('explicit debug chat_id must match the seeded context', { status: 409 })

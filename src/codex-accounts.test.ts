@@ -103,6 +103,19 @@ describe('Codex native and named accounts', () => {
     expect(readFileSync(join(home, 'plugin-install-state.json'), 'utf8')).toBe('account installation state')
   })
 
+  test('native emails stay in memory and are scrubbed from the persisted registry', () => {
+    const accounts = fixture()
+    const named = accounts.ensure('work')
+    const state = JSON.parse(readFileSync(accounts.stateFile, 'utf8'))
+    state.accounts[0].email = 'legacy@example.test'
+    writeFileSync(accounts.stateFile, JSON.stringify(state))
+    expect(accounts.list().find(account => account.id === named.id)?.email).toBeUndefined()
+    expect(readFileSync(accounts.stateFile, 'utf8')).not.toContain('legacy@example.test')
+    accounts.recordLogin(named.id, { email: 'current@example.test', planType: 'pro' })
+    expect(accounts.get(named.id).email).toBe('current@example.test')
+    expect(readFileSync(accounts.stateFile, 'utf8')).not.toContain('current@example.test')
+  })
+
   test('each native login invalidates its cache revision without touching credentials or other accounts', () => {
     const accounts = fixture()
     const named = accounts.ensure('work')

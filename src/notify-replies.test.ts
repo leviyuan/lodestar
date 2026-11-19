@@ -407,13 +407,17 @@ describe('notification text reply workflow', () => {
     expect(findPendingReply('oc_group', 'ou_owner')?.replyState?.id).not.toBe(previous.id)
   })
 
-  test('waiting input survives reload; a completed input remains deduplicated after reload', async () => {
+  test('a waiting reply is cancelled on reload without a persisted identity; a completed input stays deduplicated', async () => {
     register(registration())
     const h = harness()
     await h.open()
     __setStoreFileForTest(file)
-    loadCallbacks()
-    expect((await h.open()).ok).toBe(false)
+    const interrupted = loadCallbacks()
+    expect(interrupted[0]?.replyState?.status).toBe('cancelled')
+    expect(interrupted[0]?.replyState?.openId).toBeUndefined()
+    // The old prompt is not silently reused for an unknown person; the user
+    // must click reply again, which opens a fresh prompt.
+    expect((await h.open()).ok).toBe(true)
     expect(await h.runtime.consume(incoming())).toBe(true)
     __setStoreFileForTest(file)
     loadCallbacks()
@@ -616,9 +620,12 @@ describe('notification text reply workflow', () => {
   test('a legacy UNKNOWN record without the recovery marker still loads and is recovered once', async () => {
     const legacy = registration({
       allowReply: false, buttons: [{ id: 'approve', text: '通过', type: 'primary' }],
-      dispatchState: { buttonId: 'approve', openId: 'ou_owner', startedAt: Date.now() },
-      unknownAt: Date.now(), unknownBy: { buttonId: 'approve', openId: 'ou_owner' }, unknownReason: '中断',
-    })
+    }) as any
+    // Simulate a pre-change store that still contains a raw open_id.
+    legacy.dispatchState = { buttonId: 'approve', openId: 'ou_owner', startedAt: Date.now() }
+    legacy.unknownAt = Date.now()
+    legacy.unknownBy = { buttonId: 'approve', openId: 'ou_owner' }
+    legacy.unknownReason = '中断'
     writeFileSync(file, JSON.stringify({ nf_reply: legacy }))
     __setStoreFileForTest(file)
     const first = loadCallbacks()

@@ -107,7 +107,7 @@ interface NotifyActionValue {
  *   - `done`: pull / display-only mode — no push, freeze on the verdict
  * `operatorOpenId` is carried in the callback payload for the caller's
  * audit; the card itself shows only the choice + status. */
-export type NotifyResolutionStatus = 'processing' | 'delivered' | 'failed' | 'unknown' | 'done'
+export type NotifyResolutionStatus = 'processing' | 'delivered' | 'failed' | 'cancelled' | 'unknown' | 'done'
 export interface NotifyResolution {
   status: NotifyResolutionStatus
   buttonId?: string
@@ -264,7 +264,8 @@ export function buildNotifyReplyCard(
   const elements: object[] = [{ tag: 'markdown', content: `通知：${sanitizeMarkdownForCardKit(reg.title)}` }]
   if (state.response) elements.push({ tag: 'markdown', content: sanitizeMarkdownForCardKit(state.response.text) })
   if (status === 'waiting') {
-    elements.push({ tag: 'markdown', content: `<at id=${state.openId}></at> 请在群里发送一条文字消息作为回复。\n你的下一条文字优先用于这条通知，完成后再回答 Agent 的提问。点击其他通知的「回复」会放弃本次回复；群控制命令仍然优先。` })
+    const mention = state.openId ? `<at id=${state.openId}></at> ` : ''
+    elements.push({ tag: 'markdown', content: `${mention}请在群里发送一条文字消息作为回复。\n你的下一条文字优先用于这条通知，完成后再回答 Agent 的提问。点击其他通知的「回复」会放弃本次回复；群控制命令仍然优先。` })
     elements.push({ tag: 'button', text: { tag: 'plain_text', content: '取消回复' }, type: 'default',
       behaviors: [{ type: 'callback', value: { kind: 'notify_reply_cancel', notify_id: reg.notifyId, reply_id: state.id } }],
     })
