@@ -203,7 +203,7 @@ lodestar-agent --project '<项目名>' status '<run-id>' --json
 
 项目任务的 `run` / `follow-up` 可用 `--request-id` 防止超时重试重复执行：同一归属、同一编号及相同输入返回原任务，输入不同则拒绝，daemon 重启后仍有效。重启不会自动重跑未完成任务；遗留非终态任务标为失败，已有原生会话可显式续跑。
 
-HTTP 使用原 `/agents/…` 路径并增加 `?project=<项目名>`，Bearer 凭据由 daemon 启动时生成并保存在私有状态目录（仅本机同用户可读，重启后轮换）。CLI 自动读取，无需配置或输出凭据。项目凭据只用于显式项目路由，会话和 worker 凭据不能用来调用项目路由。请求体可增加 `request_id`；`requester_open_id`（CLI `--requester`）保留为调用方记录，不触发文件交付或授权。响应中的 `binding: "project"`、`project` 标明归属。旧会话接口保持原调用方式。
+HTTP 使用原 `/agents/…` 路径并增加 `?project=<项目名>`，Bearer 凭据由 daemon 启动时生成，CLI 自动读取，无需配置或输出凭据；凭据仅在本机使用，重启后轮换。项目凭据只用于显式项目路由，会话和 worker 凭据不能用来调用项目路由。请求体可增加 `request_id`；`requester_open_id`（CLI `--requester`）只作为同请求去重输入，不持久化、不触发文件交付或授权。响应中的 `binding: "project"`、`project` 标明归属。旧会话接口保持原调用方式。
 
 ## 飞书任务清单
 
