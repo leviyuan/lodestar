@@ -29,6 +29,10 @@ interface Manifest {
   peerDependencies?: Record<string, string>
   optionalDependencies?: Record<string, string>
 }
+/** Optional transitive packages may be skipped by npm on platforms their
+ * manifest excludes; they still belong in the version snapshot/overrides. */
+const OPTIONAL_PACKAGES = Symbol('optionalPackages')
+type ResolvedAgentPackages = Record<string, string> & { [OPTIONAL_PACKAGES]?: ReadonlySet<string> }
 export interface AgentRuntimeState {
   directory?: string
   versions?: Record<string, string>
@@ -129,6 +133,7 @@ export async function resolveAgentPackages(agent: UpdatedAgent, read: (name: str
   const main = await read('@deepseek-ai/dsh', 'latest')
   const pending = new Set(PACKAGES.dsh)
   const seen = new Set<string>()
+  const optional = new Set<string>()
   while (pending.size) {
     const batch = [...pending].slice(0, 12)
     for (const name of batch) { pending.delete(name); seen.add(name) }
@@ -136,11 +141,14 @@ export async function resolveAgentPackages(agent: UpdatedAgent, read: (name: str
     for (const row of rows) {
       if (row.version !== main.version) throw new Error(`DSH release package mismatch: ${row.name}@${row.version}, expected ${main.version}`)
       dependencies[row.name] = row.version
+      for (const name of Object.keys(row.optionalDependencies ?? {})) optional.add(name)
       for (const name of Object.keys({ ...row.dependencies, ...row.peerDependencies, ...row.optionalDependencies })) {
         if (name.startsWith('@deepseek-ai/dsh') && !seen.has(name)) pending.add(name)
       }
     }
   }
+  for (const name of PACKAGES.dsh) optional.delete(name)
+  Object.defineProperty(dependencies, OPTIONAL_PACKAGES, { value: optional, enumerable: false })
   return dependencies
 }
 
@@ -191,9 +199,20 @@ async function validateClaudeNativeBinary(directory: string): Promise<void> {
   throw new Error(`Invalid Agent runtime at ${directory}: @anthropic-ai/claude-agent-sdk@${installed.version} is missing its ${process.platform}-${process.arch} native CLI binary; reinstall with optional dependencies`)
 }
 
-async function validateInstalledPackages(agent: UpdatedAgent, directory: string, versions: Record<string, string>): Promise<void> {
+async function validateInstalledPackages(
+  agent: UpdatedAgent,
+  directory: string,
+  versions: Record<string, string>,
+  optional: ReadonlySet<string> = new Set(),
+): Promise<void> {
   for (const [name, version] of Object.entries(versions)) {
-    const installed = JSON.parse(await readFile(join(directory, 'node_modules', name, 'package.json'), 'utf8'))
+    let installed: Manifest
+    try {
+      installed = JSON.parse(await readFile(join(directory, 'node_modules', name, 'package.json'), 'utf8')) as Manifest
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT' && optional.has(name)) continue
+      throw error
+    }
     if (installed.name !== name || installed.version !== version) {
       throw new Error(`Invalid Agent runtime at ${directory}: expected ${name}@${version}, found ${installed.name}@${installed.version}`)
     }
@@ -445,6 +464,7 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
     const previous = readState(agent, root)
     options.report?.(`${agent}: 检查 upstream latest`)
     const versions = await resolveAgentPackages(agent, options.metadata ?? ((name, version) => metadata(name, version, options.signal)))
+    const optional = (versions as ResolvedAgentPackages)[OPTIONAL_PACKAGES]
     options.signal?.throwIfAborted()
     const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
     // Fixes for one Agent's runtime stay in that Agent's own dependency tree; they are
@@ -464,7 +484,7 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
         dependencies: Object.fromEntries(PACKAGES[agent].map(name => [name, versions[name]])),
         overrides: { ...security, ...(agent === 'dsh' ? versions : {}) } }) + '\n', { mode: 0o600 })
       await (options.install ?? installAgentPackages)(staging, options.signal)
-      await validateInstalledPackages(agent, staging, versions)
+      await validateInstalledPackages(agent, staging, versions, optional)
       options.signal?.throwIfAborted()
       const completedInstall = staging
       await retryAgentFileOperation(() => rename(completedInstall, destination))
@@ -472,7 +492,7 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
     } else {
       // An existing fingerprint is not proof that its installation is intact.
       // Never activate a damaged directory or overwrite files a process may use.
-      await validateInstalledPackages(agent, destination, versions)
+      await validateInstalledPackages(agent, destination, versions, optional)
     }
     const state = { directory: destination, versions, checkedAt: Date.now() }
     const unchanged = previous?.directory === destination
