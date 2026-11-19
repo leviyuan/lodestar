@@ -24,7 +24,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - 后端 Agent 边界：三后端 spawn 前必须经 `src/agent-env.ts` 清洗环境，删除 `LODESTAR_CONFIG*`、`LODESTAR_DATA_DIR`、`LODESTAR_RESTART_CONTINUE_CHAT_ID`、`FEISHU_*` 等宿主变量，只保留 `LODESTAR_AGENT_*`、`LODESTAR_DSH_*`、`LODESTAR_RELAY_*`；不得注入 `LODESTAR_AGENT_SESSION`（受管上下文由 `LODESTAR_AGENT_ROLE/URL/CAPABILITY` 判定），清洗器对该键显式丢弃。收件附件落 `src/attachments.ts` 的临时私有目录，不得写入或指向状态目录。本机调试注入只在 `LODESTAR_DEBUG_SOCKET=1` 且 Bun 下启用，`debug-context.json` 不随普通运行写盘并在停机删除。
 - 本机通知响应与回调不回传 `chat_id`/操作者 `open_id`（只保留 `notify_id`、`message_id`、`project` 与按钮/回复），`feishu-notify` Skill 不写数据目录路径或状态文件名；Agent 侧错误回显先经 `redactMemberIds` 脱敏,`formatFeishuError` 只输出 code/message/log_id 等诊断字段。
 - Agent 可见的 `/agents` 诊断只保留脱敏文本（邮箱、IM ID、绝对路径替换为占位符）；`serializeRun` 不返回会话名。
-- Codex 项目信任通过启动参数 `-c projects.<path>.trust_level="trusted"` 逐次下发，不得写入共享 `~/.codex/config.toml`；启动时清理 Lodestar 写入的直接子目录 trust 项（`src/codex-config.ts`）。永久删除群后清理会话映射/租约/活跃时间，不删项目级任务清单；`agent-runs` 正文保留 30 天后标记 `prunedAt` 并删除正文，快照保留。`lodestar-version` 默认不输出运行目录，`--verbose` 才输出。
+- Codex 项目信任通过启动参数 `-c projects.<path>.trust_level="trusted"` 逐次下发，不得写入共享 `~/.codex/config.toml`；启动时只清理当前会话绑定对应的直接子目录 trust 项（`src/codex-config.ts`），保留用户自建的其他信任。永久删除群后清理会话映射/租约/活跃时间，不删项目级任务清单；`agent-runs` 正文保留 30 天（启动与每日清理），已清理 run 记入 `pruned-artifacts.json` 并显示「已清理」，快照保留。`lodestar-version` 默认不输出运行目录，`--verbose` 才输出。
 - API、模型目录、额度、上传和进程启动失败必须记录并向调用方显示；缺失数据用 `MISS`，不能伪造成功或偷偷更换来源。仅允许对已知瞬态错误有限重试。Codex 自动选号成功时，其他账号的缓存过期、模型不支持、查询或认证失败等诊断仅保留在日志和主动查询面板，不单独推送警告；无法启动或继续任务的失败仍须明确提示。
 - 保留已有改动。依赖变化用 Bun 同步 `bun.lock`，不手改锁文件。
 - 禁止在 daemon 启动时检查、安装或更新 Agent，自动更新默认关闭。手动或显式开启的定期更新选择上游 `latest`，不等待 Lodestar 发版，不设置兼容版本白名单或旧版本上限。用户接受新版可能不兼容；发生不兼容时明确报错，由后续 Lodestar 更新适配，不能为规避适配而锁旧、降级、回退或恢复“先兼容验收才更新”的门槛。开发锁文件只记录测试依赖快照，不限制生产 Agent 更新。

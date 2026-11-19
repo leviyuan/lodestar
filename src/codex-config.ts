@@ -11,7 +11,7 @@
  */
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { writeStateFileAtomic } from './state-store'
 
 const HEADER = /^\[projects\.("(?:[^"\\]|\\.)*")\]\s*$/
@@ -34,7 +34,9 @@ function isDirectProjectChild(path: string, projectsRoot: string): boolean {
  * and (b) contain nothing but `trust_level = "trusted"`. Returns how many were
  * removed; the file is only rewritten when at least one matched.
  */
-export function pruneLodestarProjectTrust(file: string, projectsRoot: string): number {
+export function pruneLodestarProjectTrust(
+  file: string, projectsRoot: string, knownSessionNames?: ReadonlySet<string>,
+): number {
   let text: string
   try {
     text = readFileSync(file, 'utf8')
@@ -62,7 +64,11 @@ export function pruneLodestarProjectTrust(file: string, projectsRoot: string): n
       index = end - 1
       continue
     }
-    if (body.length === 1 && body[0] === TRUST_ONLY && isDirectProjectChild(path, projectsRoot)) {
+    // The caller can restrict removal to directories bound to a Lodestar
+    // session; without that guard a user-created trust entry for an unrelated
+    // direct child would be removed too.
+    const known = !knownSessionNames || knownSessionNames.has(basename(resolve(path)))
+    if (body.length === 1 && body[0] === TRUST_ONLY && isDirectProjectChild(path, projectsRoot) && known) {
       removed++
       index = end - 1
       continue

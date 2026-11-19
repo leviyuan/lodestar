@@ -7,7 +7,7 @@ import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, type T
 let server: Server | null = null
 afterEach(() => { server?.close(); server = null })
 
-async function serve(onStart?: (request: any) => void, projectMode = false) {
+async function serve(onStart?: (request: any) => void, projectMode = false, runOverrides: any = {}) {
   const session = { sessionName: 'project', chatId: 'chat', workDir: '/repo', codexAccountId: () => 'default' } as any
   let current: any = null
   const service = {
@@ -18,7 +18,9 @@ async function serve(onStart?: (request: any) => void, projectMode = false) {
       current = {
         ...(principal.kind === 'project' ? { owner: principal.context.owner } : {}),
         runId: 'agent_1', sessionName: 'project', chatId: 'chat', workDir: request.workDir ?? '/repo', description: request.description, prompt: request.prompt,
-        depth: 0, status: 'running', createdAt: new Date().toISOString(), workers: [{
+        depth: 0, status: 'running', createdAt: new Date().toISOString(),
+        ...runOverrides,
+        workers: runOverrides.workers ?? [{
           identityId: 'agent:a', status: 'running', sessionId: request.sessionId, output: request.prompt, steps: [],
         }],
       }
@@ -51,13 +53,45 @@ async function serve(onStart?: (request: any) => void, projectMode = false) {
 }
 
 test('agent-visible diagnostics never carry emails, IM ids or absolute host paths', () => {
-  const result = agentVisibleText('401 for alice@corp.example at /Users/example/secret/chat oc_1234567890abcdef1234')
+  const result = agentVisibleText('401 for alice@corp.example at /Users/example/My Project/secret/chat\nid oc_1234567890abcdef1234')
   expect(result).toContain('<email>')
   expect(result).toContain('<path>')
   expect(result).toContain('<id>')
   expect(result).not.toContain('alice@')
   expect(result).not.toContain('/Users/')
+  expect(result).not.toContain('My Project')
   expect(result).not.toContain('oc_1234567890abcdef1234')
+  const otherPaths = agentVisibleText('~/work/项目\n/Volumes/Disk/Repo\n/Applications/App.app\nC:\\Users\\example\\My Project')
+  expect(otherPaths).not.toContain('~/work')
+  expect(otherPaths).not.toContain('/Volumes')
+  expect(otherPaths).not.toContain('/Applications')
+  expect(otherPaths).not.toContain('C:\\Users')
+  expect(otherPaths.match(/<path>/g)?.length).toBeGreaterThanOrEqual(4)
+})
+
+test('run snapshots redact diagnostics and omit card message ids', async () => {
+  const base = await serve(undefined, false, {
+    error: 'failed at /Users/example/My Project (oc_1234567890abcdef1234)',
+    presentationErrors: ['card om_1234567890abcdef1234 at /Volumes/Disk/Repo'],
+    cardMessageId: 'om_1234567890abcdef1234',
+    workers: [{
+      identityId: 'agent:a', status: 'failed', sessionId: 'sid', output: 'out', steps: [
+        { at: '2026-01-01T00:00:00Z', phase: 'info', tool: 'Read', detail: '/Users/example/My Project/file' },
+      ], error: 'worker at /Users/example/My Project',
+    }],
+  })
+  const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' }
+  expect((await fetch(`${base}/agents/runs`, { method: 'POST', headers, body: JSON.stringify({
+    description: '任务说明', identity_ids: ['agent:a'], prompt: 'do it',
+  }) })).status).toBe(202)
+  const value = await (await fetch(`${base}/agents/runs/agent_1`, { headers })).json() as any
+  expect(value.card_message_id).toBeUndefined()
+  expect(value.error).toContain('<path>')
+  expect(value.presentation_errors[0]).toContain('<path>')
+  expect(value.workers[0].error).toContain('<path>')
+  expect(value.workers[0].steps[0].detail).toContain('<path>')
+  expect(JSON.stringify(value)).not.toContain('/Users/')
+  expect(JSON.stringify(value)).not.toContain('om_1234567890abcdef1234')
 })
 
 test('identity catalog reasons are sanitized before reaching an Agent', async () => {

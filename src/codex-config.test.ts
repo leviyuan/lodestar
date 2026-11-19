@@ -69,3 +69,23 @@ describe('Codex project-trust pruning', () => {
     } finally { f.cleanup() }
   })
 })
+
+test('known session names preserve unrelated direct-child trust entries', () => {
+  const f = fixture()
+  try {
+    const userOwn = join(f.root, 'user-own-repo')
+    mkdirSync(userOwn, { recursive: true })
+    writeFileSync(f.config, [
+      '[projects."' + join(f.root, 'group-a') + '"]',
+      'trust_level = "trusted"',
+      '',
+      '[projects."' + userOwn + '"]',
+      'trust_level = "trusted"',
+      '',
+    ].join('\n'))
+    expect(pruneLodestarProjectTrust(f.config, f.root, new Set(['group-a']))).toBe(1)
+    const text = readFileSync(f.config, 'utf8')
+    expect(text).not.toContain(`[projects."${join(f.root, 'group-a')}"]`)
+    expect(text).toContain(`[projects."${userOwn}"]`)
+  } finally { f.cleanup() }
+})

@@ -218,8 +218,8 @@ function serializeRun(run: AgentRunSnapshot): object {
         questions: worker.pendingInput.questions,
       },
       queued_reason: worker.queuedReason,
-      steps: worker.steps,
-      error: worker.error,
+      steps: worker.steps.map(step => ({ ...step, detail: agentVisibleText(step.detail) })),
+      error: worker.error === undefined ? undefined : agentVisibleText(worker.error),
       started_at: worker.startedAt,
       finished_at: worker.finishedAt,
       duration_ms: worker.durationMs,
@@ -227,9 +227,8 @@ function serializeRun(run: AgentRunSnapshot): object {
     })),
     created_at: run.createdAt,
     finished_at: run.finishedAt,
-    error: run.error,
-    presentation_errors: run.presentationErrors,
-    card_message_id: run.cardMessageId,
+    error: run.error === undefined ? undefined : agentVisibleText(run.error),
+    presentation_errors: run.presentationErrors?.map(agentVisibleText),
   }
 }
 
@@ -245,6 +244,9 @@ export function agentVisibleText(value: string): string {
   const redacted = value
     .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '<email>')
     .replace(/\b(?:ou|on|oc|om)_[0-9a-z]{12,}\b/g, '<id>')
-    .replace(/(?:[A-Za-z]:\\|\/(?:Users|home|private|var|tmp|opt|root)\/)[^\s'"),;]+/g, '<path>')
+    // Paths can contain spaces, so consume until a real delimiter. This is
+    // deliberately over-eager: a diagnostic may lose trailing text, but must
+    // not leave a partial project name after the first space.
+    .replace(/(?:[A-Za-z]:\\|\/(?:Users|Volumes|Applications|Library|usr|private|var|tmp|opt|root|etc|System|srv|mnt|media)\/|~\/)[^\n"'`()\[\]]*/g, '<path>')
   return redacted.length > AGENT_VISIBLE_LIMIT ? `${redacted.slice(0, AGENT_VISIBLE_LIMIT)}…` : redacted
 }

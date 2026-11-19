@@ -1441,8 +1441,11 @@ function startDebugSocket(): void {
 async function boot(): Promise<void> {
   log('daemon.started')
   pruneStaleAttachmentDirs()
+  // Load bindings first: trust cleanup is limited to directories that belong
+  // to a known session, so a user's own Codex trust entry is not removed.
+  feishu.loadSessionChatMap()
   try {
-    if (pruneLodestarProjectTrust(codexConfigFile(), config.runtime.projects_root) > 0) {
+    if (pruneLodestarProjectTrust(codexConfigFile(), config.runtime.projects_root, new Set(feishu.preferredChatForSession.keys())) > 0) {
       log('codex.project_trust.pruned')
     }
   } catch (e) { logError('codex.project_trust.prune_failed', e) }

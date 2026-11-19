@@ -33,6 +33,7 @@ const MAX_CACHED_RUN_ARTIFACTS = 512
 export const RUN_TEXT_RETENTION_MS = 30 * 24 * 60 * 60_000
 export const PRUNED_RUN_TEXT = '[已清理：超过 30 天的运行正文已删除]'
 export const PRUNED_ARTIFACT_MANIFEST = 'pruned-artifacts.json'
+const RUN_RETENTION_SWEEP_MS = 24 * 60 * 60_000
 let prunedRunIds: Set<string> | null = null
 
 function loadPrunedRunIds(dir = AGENT_RUNS_DIR): Set<string> {
@@ -112,10 +113,18 @@ export class AgentService {
   private readonly pendingRunCreations = new Set<Promise<AgentRunSnapshot>>()
   private readonly requests = new Map<string, { hash: string; promise: Promise<AgentRunSnapshot> }>()
   private shuttingDown = false
+  private retentionSweep: ReturnType<typeof setInterval> | null = null
 
   constructor(private readonly deps: AgentServiceDeps = DEFAULT_DEPS) {
     this.presentation = new AgentCards(deps)
     this.loadDurableRuns()
+    // Prompt/output retention must also advance while the daemon stays up for
+    // more than 30 days; boot alone only catches restarts.
+    this.retentionSweep = setInterval(() => {
+      try { pruneExpiredRunArtifacts() }
+      catch (e) { logError('agent-service: retention sweep failed', e) }
+    }, RUN_RETENTION_SWEEP_MS)
+    this.retentionSweep.unref?.()
   }
 
   rootPrincipal(session: Session): Extract<AgentPrincipal, { kind: 'session' }> {
@@ -319,6 +328,7 @@ export class AgentService {
   }
 
   async shutdown(reason: string): Promise<void> {
+    if (this.retentionSweep) { clearInterval(this.retentionSweep); this.retentionSweep = null }
     // Close admission before the first await, including runs still opening a
     // card that have not entered the durable run registry yet.
     this.shuttingDown = true
