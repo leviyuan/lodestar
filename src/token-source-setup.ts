@@ -74,9 +74,8 @@ export async function onTokenSourceEnable(s: Session, sourceId: string): Promise
 /** `<source>-setup <args>` generic:解析 → 校验候选凭据 → 写 config + 全量刷新 models。
  *  commandSuffix 不匹配 / 无 setup → 报错(订阅登录无此命令)。 */
 export async function runTokenSourceSetup(s: Session, sourceId: string, args: string): Promise<void> {
-  const def = tokenSourceFactories().find(d => d.setup?.commandSuffix === sourceId || d.usageSetup?.commandSuffix === sourceId)
-  const usageOnly = def?.usageSetup?.commandSuffix === sourceId
-  const setup = usageOnly ? def?.usageSetup : def?.setup
+  const def = tokenSourceFactories().find(d => d.setup?.commandSuffix === sourceId)
+  const setup = def?.setup
   if (!def || !setup || !def.configSectionId) {
     await feishu.sendText(s.chatId, `❌ 未知或不可配置的 source: ${sourceId}`)
     return
@@ -93,12 +92,7 @@ export async function runTokenSourceSetup(s: Session, sourceId: string, args: st
     saved = true
     const ts = getTokenSource(def.configSectionId)
     const related = sharedAccountSourceIds(def.configSectionId).map(id => getTokenSource(id))
-    const failed = related.find(source => (!usageOnly || source?.enabled) && source?.modelCatalogState?.status !== 'ready')
-    if (usageOnly) {
-      const diagnostic = failed ? `\n模型目录仍为 MISS：${tokenSourceErrorMessage(failed.modelCatalogState?.error ?? '尚未就绪', [parsed.config.management_token])}` : ''
-      await feishu.sendText(s.chatId, `✅ ${ts?.display ?? sourceId} 真实余额校验通过，配置已保存。发送 hi 查看；回复页脚使用同一账户余额。${diagnostic}`)
-      return
-    }
+    const failed = related.find(source => source?.modelCatalogState?.status !== 'ready')
     if (failed?.modelCatalogState?.status === 'failed' || related.some(source => !source)) {
       const reason = tokenSourceErrorMessage(failed?.modelCatalogState?.error ?? '模型目录尚未就绪', [parsed.config.api_key, parsed.config.auth_token])
       await feishu.sendText(s.chatId, `❌ ${ts?.display ?? sourceId} 凭据校验通过、配置已保存，但暂不可用：${reason}\n处理后等待后台刷新，发送 md 查看状态。`)
@@ -108,7 +102,7 @@ export async function runTokenSourceSetup(s: Session, sourceId: string, args: st
     await feishu.sendText(s.chatId, `✅ ${ts!.display} 校验通过，配置已保存。${agents.length > 1 ? `${agents.join(' 和 ')} 共用该账号。` : ''}目录与额度在后台刷新；发送 md 查看模型。`)
   } catch (e: any) {
     const state = saved || e instanceof TokenSourceSetupError && e.saved ? '配置已保存，但后续处理失败' : '配置失败，未保存，原配置保持不变'
-    const reason = tokenSourceErrorMessage(e, [parsed.config.api_key, parsed.config.auth_token, parsed.config.management_token])
+    const reason = tokenSourceErrorMessage(e, [parsed.config.api_key, parsed.config.auth_token])
     await feishu.sendText(s.chatId, `❌ ${state}：${reason}`)
   }
 }

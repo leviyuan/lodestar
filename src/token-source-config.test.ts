@@ -72,44 +72,35 @@ test('updates credentials without losing slots or adjacent sections without wait
   `)
 })
 
-test('batch migration saves both Packy keys and the OpenRouter shortlist without duplicating shared secrets', () => {
+test('batch save writes both Agent views of a shared account without duplicating secrets', () => {
   runConfigUpdate(`
     saveTokenSourceConfigs({
-      packy: { api_key: 'primary-private-test', model: 'MiniMax-M3', management_token: 'balance-private-test', management_user_id: '123', management_url: 'https://www.packyapi.ai' },
-      'packy-secondary': { api_key: 'secondary-private-test', model: 'qwen3.8-max-0902', billing_source: 'packy' },
-      'packy-codex': { model: 'kimi-k3', effort: 'medium' },
+      deepseek: { api_key: 'deepseek-private-test', model: 'deepseek-v4-flash', base_url: 'https://api.deepseek.com/anthropic' },
       openrouter: { models: 'tencent/hy4-preview,xiaomi/mimo-v2.5-pro,meta/muse-spark-1.2,bytedance-seed/seed-2-1-turbo,meituan/longcat-2.0' },
     })
     const saved = readFileSync(configFile, 'utf8')
-    assert.equal(saved.split('primary-private-test').length - 1, 1)
-    assert.equal(saved.split('secondary-private-test').length - 1, 1)
-    assert.equal(saved.split('balance-private-test').length - 1, 1)
+    assert.equal(saved.split('deepseek-private-test').length - 1, 1)
+    assert.ok(saved.includes('[token_source.deepseek]'))
+    assert.ok(saved.includes('[token_source.deepseek-harness]'))
     assert.ok(saved.includes('[notify]\\nport = 9876'))
     assert.ok(saved.includes('auth_token = "old-token"'))
     const { loadConfig } = await import(${JSON.stringify(join(import.meta.dir, 'config.ts'))})
     const result = loadConfig().token_sources
+    assert.equal(result.deepseek.api_key, 'deepseek-private-test')
+    assert.equal(result['deepseek-harness'].api_key, undefined)
     assert.equal(result.openrouter.models.split(',').length, 5)
-    assert.equal(result['packy-codex'].api_key, undefined)
-    assert.equal(result['packy-codex'].model, 'kimi-k3')
-    assert.equal(result['packy-codex'].management_token, undefined)
-    assert.equal(result['packy-secondary'].management_token, undefined)
-    assert.equal(result['packy-secondary'].billing_source, 'packy')
-    assert.equal(result.packy.management_user_id, '123')
-    assert.equal(result.packy.management_url, 'https://www.packyapi.ai')
     assert.equal(rebuilds, 0)
     assert.equal(refreshes, 0)
   `)
 })
 
-test('invalid billing references fail before atomic save', () => {
+test('conflicting shared-account credentials are rejected', () => {
   runConfigUpdate(`
-    const before = readFileSync(configFile, 'utf8')
-    assert.throws(() => saveTokenSourceConfigs({ packy: { billing_source: 'openrouter' } }), /不存在/)
-    assert.equal(readFileSync(configFile, 'utf8'), before)
-    assert.throws(() => saveTokenSourceConfigs({
-      packy: { billing_source: 'packy-secondary' }, 'packy-secondary': { billing_source: 'packy' },
-    }), /循环/)
-    assert.equal(readFileSync(configFile, 'utf8'), before)
+    const { sharedTokenSourceConfigs } = await import(${JSON.stringify(join(import.meta.dir, 'token-source-accounts.ts'))})
+    assert.throws(() => sharedTokenSourceConfigs({
+      deepseek: { api_key: 'primary-private-test' },
+      'deepseek-harness': { api_key: 'secondary-private-test' },
+    }), /旧账号配置冲突/)
   `)
 })
 

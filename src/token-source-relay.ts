@@ -135,7 +135,7 @@ export function buildRelayTokenSource(siteId: string, cfg: RelayConfig, agent: R
       }
       if (agent === 'codex') {
         const env = scrubDshEnv(baseEnv)
-        for (const name of ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN', 'LODESTAR_PACKY_API_KEY']) delete env[name]
+        for (const name of ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN']) delete env[name]
         env.LODESTAR_RELAY_API_KEY = key
         return env
       }

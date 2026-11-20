@@ -163,7 +163,7 @@ OpenRouter 余额来自 `/api/v1/credits`，按 `total_credits - total_usage` �
 
 ## 通用中转站
 
-中转站不绑定具体厂商，每个站点一节 `[relay.<site_id>]`，只配置站点标识、API Key、地址和协议类型。PackyAPI 等中转服务都按这种方式接入；旧版 `[token_source.packy]`、`[token_source.packy-secondary]`、`[token_source.packy-codex]` 不再读取，升级后需按本节格式重新配置。
+中转站不绑定具体厂商，每个站点一节 `[relay.<site_id>]`，只配置站点标识、API Key、地址和协议类型。PackyAPI 等中转服务都按这种方式接入；旧版 `[token_source.packy]`、`[token_source.packy-secondary]`、`[token_source.packy-codex]` 来源已从 Lodestar 移除，配置里残留的这几节不会再被读取，升级后需按本节格式重新配置。
 
 ```toml
 [relay.my-relay]

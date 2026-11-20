@@ -120,7 +120,7 @@ function restoreCatalog(source: TokenSource, previous: TokenSource, cfg: TokenSo
   const upstream = (previous.modelSelection?.availableModels ?? previous.models)
     .filter(model => model.origin !== 'custom').map(model => ({ ...model, efforts: [...model.efforts] }))
   const custom = [...new Set([...modelList(cfg.custom_models),
-    ...(selection?.mode === 'catalog' || source.kind.startsWith('packy') ? modelList(cfg.models) : [])])]
+    ...(selection?.mode === 'catalog' ? modelList(cfg.models) : [])])]
   const catalog: TokenSourceModel[] = [...upstream]
   for (const id of custom) {
     if (!catalog.some(model => model.model.toLowerCase() === id.toLowerCase())) {

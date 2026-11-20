@@ -85,7 +85,6 @@ export const ANTHROPIC_ENV_KEYS = [
 export function scrubAnthropicEnv(base: Env): Env {
   const out: Env = { ...base }
   for (const k of ANTHROPIC_ENV_KEYS) delete out[k]
-  delete out.LODESTAR_PACKY_API_KEY
   return out
 }
 
@@ -211,8 +210,6 @@ export interface TokenSourceFactoryDef {
   build: (cfg: TokenSourceConfig, detected?: Partial<TokenSourceConfig> | null) => TokenSource
   /** 飞书 setup 命令接入(可选;订阅登录无独立 setup)。 */
   setup?: TokenSourceSetup
-  /** 独立的余额凭据配置，校验通过后才保存；不改变推理凭据。 */
-  usageSetup?: TokenSourceSetup
   /** 本机 settings.json 探测(可选;订阅无)—— 命中 host 则自动启用。 */
   detect?: TokenSourceDetection
 }

@@ -48,7 +48,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - Token Source 统一管理账号、凭据、模型目录、启动环境和额度。内置来源通过 factory 注册（`token-source-builtins.ts`）；模型与 Agent 身份动态读取来源目录，沿用目录声明的 effort；来源禁用或刷新失败显示 `MISS`。
   - Claude Code 订阅（`claude-sub`）独立复用本机原生登录态，可与第三方来源共存。
   - reclaude（来源 id 与类型均为 `reclaude`，Agent 为 Claude Code）是第三方 Claude Code 启动器：登录态、组织绑定和网络路由归 reclaude 管理，Lodestar 只经它启动 Claude Code，不读取、不保存其凭据。PATH 或 `~/.local/bin` 中找到 `reclaude` 命令（或 `[token_source.reclaude].bin` 指定）即自动启用，`enabled = false` 关闭；`org` 固定组织，省略时跟随 `reclaude org use` 的当前组织。进程以 `reclaude --org <组织 ID> cli <Claude Code 参数>` 启动。reclaude 的会话记录保存在各组织自己的绑定目录，与其他 Claude 来源共用的原生目录相互独立：`rs` 只列当前来源的目录，跨目录续接明确报错，不交给原生报找不到会话。细节见 `src/AGENTS.md`。
-  - 通用中转站按 `[relay.<site_id>]` 配置，由 `token-source-relay.ts` 生成来源（id `relay:<site_id>:<agent>`）：`anthropic` 类型只提供 Claude Code，`openai` 类型同时生成 Codex 与 DeepSeek Harness 两个来源。站点只保存 API Key、地址、协议类型和可选余额脚本，不绑定具体厂商。旧 `packy`、`packy-secondary`、`packy-codex` 配置节不再参与生产 Token Source 注册，也不阻断启动。
+  - 通用中转站按 `[relay.<site_id>]` 配置，由 `token-source-relay.ts` 生成来源（id `relay:<site_id>:<agent>`）：`anthropic` 类型只提供 Claude Code，`openai` 类型同时生成 Codex 与 DeepSeek Harness 两个来源。站点只保存 API Key、地址、协议类型和可选余额脚本，不绑定具体厂商。旧 `packy`、`packy-secondary`、`packy-codex` 来源与其配置已移除，残留在配置里的这些节不再读取，也不阻断启动。
 - MD 首页与模型目录：
   - 首页按 Claude Code、Codex、DeepSeek Harness 分组，底层 Agent id 仍为 `claude`、`codex`、`dsh`；reclaude 列在 Claude Code 组；各组的中转站站点收在一行「中转站」下，点开后再选站点。两个 DeepSeek 来源都显示为 DeepSeek。
   - 模型行右侧窄按钮用单字（选、显、隐、删），补录模型、显示模型、返回和翻页等宽按钮保留完整文案；模型行之间加分隔线，文字和按钮垂直居中。只有一个 effort 档位（含原生 default）时直接应用，多个档位才进入选择。
