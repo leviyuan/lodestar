@@ -1134,6 +1134,24 @@ describe('other tool card rendering', () => {
     expect(body).not.toContain('"todos"')
   })
 
+  test('TodoWrite 超过 12 条时已完成的先隐藏,未完成的优先显示', () => {
+    const input = {
+      todos: [
+        ...Array.from({ length: 5 }, (_, k) => ({ content: `完成${k}`, status: 'completed' })),
+        ...Array.from({ length: 10 }, (_, k) => ({ content: `待办${k}`, status: 'pending' })),
+      ],
+    }
+    const el = toolCallElement(10, 'TodoWrite', input, null, '✅') as any
+    const body: string = el.elements[0].content
+    // 10 个待办全部可见,完成项只保留最早的 2 个,其余 3 个完成被隐藏。
+    expect(body).toContain('- 待办: 待办0')
+    expect(body).toContain('- 待办: 待办9')
+    expect(body).toContain('- 完成: 完成0')
+    expect(body).toContain('- 完成: 完成1')
+    expect(body).not.toContain('- 完成: 完成2')
+    expect(body).toContain('还有 3 项已完成未显示')
+  })
+
   test('renders Claude Code Task descriptions before prompt details', () => {
     const input = {
       description: '审查卡片 UI',

@@ -238,6 +238,31 @@ function upsertCreate(board: TaskBoardEntry[], id: string, subject: string, src:
   return [...board, { id: key, subject, status: 'pending', ...extra }]
 }
 
+/**
+ * 待办列表展示的优先截断(与 tool.ts 的 TodoWrite 面板共用):条目不超过 limit
+ * 时保持原顺序原样返回;超过 limit 时未完成项(进行中/待办)优先占位,已完成的
+ * 排到最后先隐藏 —— 位置不够先藏已完成的,不藏还没做的。组内保持原顺序。
+ */
+export function prioritizeVisibleSlice<T>(
+  items: T[],
+  limit: number,
+  isLowPriority: (item: T) => boolean,
+): { items: T[]; hiddenCount: number; hiddenAllLowPriority: boolean } {
+  if (items.length <= limit) {
+    return { items, hiddenCount: 0, hiddenAllLowPriority: false }
+  }
+  const high: T[] = []
+  const low: T[] = []
+  for (const item of items) (isLowPriority(item) ? low : high).push(item)
+  const prioritized = [...high, ...low]
+  const hidden = prioritized.slice(limit)
+  return {
+    items: prioritized.slice(0, limit),
+    hiddenCount: hidden.length,
+    hiddenAllLowPriority: hidden.every(isLowPriority),
+  }
+}
+
 /** 渲染当前 board 的统计摘要,用作面板 header —— 与 codex TodoWrite 的
  * summarizeTodoInput 输出格式对齐("N 项 · 进行中 X · 待办 Y")。 */
 export function summarizeTaskBoard(board: TaskBoardEntry[]): string {
@@ -260,7 +285,8 @@ export function summarizeTaskBoard(board: TaskBoardEntry[]): string {
 function renderTaskBoardBody(board: TaskBoardEntry[], resolvedNote?: string): string {
   const visible = board.filter(t => t.status !== 'deleted')
   const lines: string[] = [`**待办**: ${visible.length} 项`]
-  // 始终按 #N(创建顺序)排列 —— 不按状态重排,否则 #1 一旦完成就沉底,顺序乱。
+  // 条目放得下时按 #N(创建顺序)排列 —— 不按状态重排,否则 #1 一旦完成就沉底,
+  // 顺序乱;超过 12 条时未完成(进行中/待办)优先占位,已完成的先隐藏,组内仍按创建顺序。
   const numId = (id: string): number => {
     const n = parseInt(id, 10)
     return Number.isNaN(n) ? Number.MAX_SAFE_INTEGER : n
@@ -269,13 +295,18 @@ function renderTaskBoardBody(board: TaskBoardEntry[], resolvedNote?: string): st
     const d = numId(a.id) - numId(b.id)
     return d !== 0 ? d : a.id.localeCompare(b.id)
   })
-  for (const t of ordered.slice(0, 12)) {
+  const shown = prioritizeVisibleSlice(ordered, 12, t => t.status === 'completed')
+  for (const t of shown.items) {
     const emoji = STATUS_EMOJI[t.status]
     // 进行中时优先用 activeForm(更"正在进行"的语气),其余用 subject。
     const content = (t.status === 'in_progress' && t.activeForm) ? t.activeForm : t.subject
     lines.push(`- ${emoji} ${content || '(空)'}`)
   }
-  if (ordered.length > 12) lines.push(`- 还有 ${ordered.length - 12} 项未显示`)
+  if (shown.hiddenCount > 0) {
+    lines.push(shown.hiddenAllLowPriority
+      ? `- 还有 ${shown.hiddenCount} 项已完成未显示`
+      : `- 还有 ${shown.hiddenCount} 项未显示`)
+  }
   if (resolvedNote) {
     lines.push('')
     lines.push(resolvedNote)
