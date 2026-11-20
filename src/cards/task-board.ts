@@ -7,6 +7,11 @@
 
 import { ELEMENTS } from './elements'
 
+/** 待办列表在卡片里最多显示的条目数。整块待办是单个 markdown 元素，条目数不增加
+ * 卡片元素数；上限按整卡约 30KB 的 JSON 预算与可读长度取值 —— 每条中文待办约 66
+ * 字节，50 条约 3KB。Codex 的实时计划面板不做截断，这里也只在超长任务板上压缩。 */
+export const TASK_LIST_VISIBLE_LIMIT = 50
+
 /** 一条任务在板上的累积视图。status 含 'deleted' —— 删除先标记,供渲染层过滤;
  * 真正移除由 TaskList 全量替换自然回收。 */
 export interface TaskBoardEntry {
@@ -269,13 +274,15 @@ function renderTaskBoardBody(board: TaskBoardEntry[], resolvedNote?: string): st
     const d = numId(a.id) - numId(b.id)
     return d !== 0 ? d : a.id.localeCompare(b.id)
   })
-  for (const t of ordered.slice(0, 12)) {
+  for (const t of ordered.slice(0, TASK_LIST_VISIBLE_LIMIT)) {
     const emoji = STATUS_EMOJI[t.status]
     // 进行中时优先用 activeForm(更"正在进行"的语气),其余用 subject。
     const content = (t.status === 'in_progress' && t.activeForm) ? t.activeForm : t.subject
     lines.push(`- ${emoji} ${content || '(空)'}`)
   }
-  if (ordered.length > 12) lines.push(`- 还有 ${ordered.length - 12} 项未显示`)
+  if (ordered.length > TASK_LIST_VISIBLE_LIMIT) {
+    lines.push(`- 还有 ${ordered.length - TASK_LIST_VISIBLE_LIMIT} 项未显示`)
+  }
   if (resolvedNote) {
     lines.push('')
     lines.push(resolvedNote)

@@ -14,6 +14,7 @@ import {
   planLiveElement,
 } from './turn'
 import { editBatchElement, readBatchElement, summarizeToolInput, toolCallElement, toolCallPermissionElement } from './tool'
+import { TASK_LIST_VISIBLE_LIMIT } from './task-board'
 
 describe('main conversation card rendering', () => {
   test('narrow model row buttons use one character while wide actions keep full labels', () => {
@@ -1132,6 +1133,16 @@ describe('other tool card rendering', () => {
     expect(body).toContain('- 进行中: 审查 Claude 卡片')
     expect(body).toContain('- 待办: 补测试')
     expect(body).not.toContain('"todos"')
+  })
+
+  test('TodoWrite 超过上限时截断并提示', () => {
+    const todos = Array.from({ length: TASK_LIST_VISIBLE_LIMIT + 2 }, (_, k) => ({ content: `项${k}`, status: 'pending' }))
+
+    const el = toolCallElement(10, 'TodoWrite', { todos }, null, '✅') as any
+    const body: string = el.elements[0].content
+
+    expect(body).toContain(`- 待办: 项${TASK_LIST_VISIBLE_LIMIT - 1}`)
+    expect(body).toContain('还有 2 项未显示')
   })
 
   test('renders Claude Code Task descriptions before prompt details', () => {
