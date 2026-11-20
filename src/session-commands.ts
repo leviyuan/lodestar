@@ -68,7 +68,7 @@ async function restartWithStatus(
   }
 }
 
-/** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
+/** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`)
  * plus their two-letter aliases where applicable.
  * Returns true if the command was consumed (don't forward to Codex).
  * Exact match, case-insensitive, ignores trailing whitespace.
@@ -143,10 +143,6 @@ export async function runCommand(
     // 只展示选择卡；真正的 stop→fork 在点击具体锚点并通过 owner/provider/cwd
     // 校验之后发生，避免用户看完不点也被提前终止。
     await s.showBackList(userOpenId)
-    return true
-  }
-  if (raw.trim().toLowerCase() === 'task') {
-    await s.showTasklistPanel()
     return true
   }
   if (raw.trim().match(/^(?:agents|agent)$/i)) {

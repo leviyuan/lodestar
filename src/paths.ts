@@ -51,7 +51,6 @@ export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
 export const SESSION_ACTIVITY_FILE = join(DATA_DIR, 'session-activity.json')
 /** Exact chats created by the temporary-session runtime; required before `bye` may delete. */
 export const TEMP_SESSION_LEASES_FILE = join(DATA_DIR, 'temp-session-leases.json')
-export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')
 /** Durable delegated-agent runs. Every state transition is written so completed
  * native sessions remain follow-up capable across daemon restarts. */
 export const AGENT_RUNS_DIR = join(DATA_DIR, 'agent-runs')

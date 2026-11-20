@@ -102,14 +102,12 @@ import {
   type LifecycleProgressOpts,
   type ModelActionResult,
   type StatusCardHandle,
-  type TasklistActionResult,
   type WorktreeActionResult,
 } from './session-util'
 import * as sessionCommands from './session-commands'
 import * as sessionCompact from './session-compact'
 import * as sessionModel from './session-model'
 import * as sessionAgentIdentities from './session-agent-identities'
-import * as sessionTasklist from './session-tasklist'
 import { createFileDelivery } from './file-delivery-runtime'
 import type { FileDeliveryHandle } from './file-delivery-types'
 import * as sessionWorktree from './session-worktree'
@@ -2893,28 +2891,12 @@ export class Session {
     return sessionWorktree.showWorktrees(this)
   }
 
-  showTasklistPanel(): Promise<void> {
-    return sessionTasklist.showTasklistPanel(this)
-  }
-
   showAgentIdentityPanel(userOpenId = ''): Promise<void> {
     return sessionAgentIdentities.showAgentIdentityPanel(this, userOpenId)
   }
 
   onAgentIdentityPage(panelId: string, page: unknown, userOpenId: string): ModelActionResult {
     return sessionAgentIdentities.onAgentIdentityPage(panelId, page, userOpenId)
-  }
-
-  onTasklistEnable(): Promise<TasklistActionResult> {
-    return sessionTasklist.onTasklistEnable(this)
-  }
-
-  onTasklistDeletePrompt(guidRaw: string): TasklistActionResult {
-    return sessionTasklist.onTasklistDeletePrompt(this, guidRaw)
-  }
-
-  onTasklistDeleteConfirm(guidRaw: string): Promise<TasklistActionResult> {
-    return sessionTasklist.onTasklistDeleteConfirm(this, guidRaw)
   }
 
   runCompactCommand(): Promise<void> {

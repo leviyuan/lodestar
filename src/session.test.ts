@@ -4648,64 +4648,6 @@ describe('Session card size capacity', () => {
   })
 })
 
-describe('Session project tasklist', () => {
-  test('main, multiple worktrees and temporary groups share the project tasklist throughout its lifecycle', async () => {
-    const tasklist = await import('./tasklist')
-    const projectName = 'task-project'
-    const shared = {
-      projectName, guid: 'shared-tasklist', name: `${projectName}[lodestar]`,
-      url: 'https://example.com/tasks/shared', ownerOpenId: 'owner',
-    }
-    let enabled = false
-    let creations = 0
-    const reads: string[] = []
-    const enableCalls: Array<[string, string]> = []
-    const deleteCalls: Array<[string, string]> = []
-    const get = spyOn(tasklist, 'getTasklistBinding').mockImplementation(name => {
-      reads.push(name)
-      return name === projectName && enabled ? shared : null
-    })
-    const enable = spyOn(tasklist, 'enableTasklist').mockImplementation(async (name, chatId) => {
-      enableCalls.push([name, chatId])
-      if (name !== projectName) throw new Error('unexpected project')
-      if (!enabled) creations++
-      enabled = true
-      return shared
-    })
-    const remove = spyOn(tasklist, 'deleteTasklist').mockImplementation(async (name, guid) => {
-      deleteCalls.push([name, guid])
-      if (name !== projectName || guid !== shared.guid) throw new Error('unexpected tasklist')
-      enabled = false
-      return shared
-    })
-    const sessions = [
-      'task-project', 'task-project[feature-a]', 'task-project[feature-b]',
-      'task-project*0917-1234', 'task-project[feature-b]*0917-1234',
-    ].map((name, index) => new Session(name, `task-chat-${index}`))
-    try {
-      expect(new Set(sessions.map(session => session.workDir)).size).toBe(3)
-      // Creating from WT must attach to the project's shared list as well.
-      expect((await sessions[1].onTasklistEnable()).ok).toBe(true)
-      for (const session of sessions) {
-        expect((await session.onTasklistEnable()).ok).toBe(true)
-        await session.runCommand('task')
-        expect(session.onTasklistDeletePrompt(shared.guid).ok).toBe(true)
-      }
-      expect(creations).toBe(1)
-      expect(enableCalls.map(([name]) => name)).toEqual(Array(6).fill(projectName))
-      expect((await sessions[4].onTasklistDeleteConfirm(shared.guid)).ok).toBe(true)
-      expect(deleteCalls).toEqual([[projectName, shared.guid]])
-      for (const session of sessions) {
-        expect(session.onTasklistDeletePrompt(shared.guid).ok).toBe(false)
-      }
-      expect([...new Set(reads)]).toEqual([projectName])
-    } finally {
-      get.mockRestore(); enable.mockRestore(); remove.mockRestore()
-      for (const session of sessions) session.dispose()
-    }
-  })
-})
-
 describe('Session workDir project profile override', () => {
   test('uses profile cwd when present', () => {
     projectProfiles.set('withoverride', { cwd: '/abs/custom/dir' })

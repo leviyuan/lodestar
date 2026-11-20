@@ -35,10 +35,10 @@ async function runIsolated(script: string): Promise<void> {
   expect(code, stdout + stderr).toBe(0)
 }
 
-test('SDK diagnostics preserve header request IDs, HTTP response messages and task permission scopes', async () => {
+test('SDK diagnostics preserve header request IDs and HTTP response messages', async () => {
   await runIsolated(`
     const body = { code: 99991672, msg: 'missing application permission', error: {
-      permission_violations: [{ scope: 'task:tasklist:write' }],
+      permission_violations: [{ scope: 'im:message:send_as_bot' }],
     } }
     const response = await feishu.client.httpInstance.request({
       url: 'https://example.invalid/diagnostics',
@@ -66,21 +66,6 @@ test('SDK diagnostics preserve header request IDs, HTTP response messages and ta
       assert.match(error.message, /log_id=sdk-business-log/)
       return true
     })
-
-    const failure = Object.assign(new Error('Request failed with status code 403'), {
-      response: { status: 403, data: { code: body.code, msg: body.msg, error: body.error }, headers: { 'x-tt-logid': 'sdk-http-log' } },
-    })
-    feishu.client.task.v2.tasklist.create = () => feishu.client.httpInstance.request({
-      url: 'https://example.invalid/diagnostics', adapter: async () => { throw failure },
-    })
-    await assert.rejects(feishu.createTasklistWithOwner('project', 'owner'), error => {
-      assert.match(error.message, /code=99991672/)
-      assert.match(error.message, /message=missing application permission/)
-      assert.match(error.message, /log_id=sdk-http-log/)
-      assert.match(error.message, /missing_scopes=task:tasklist:write/)
-      return true
-    })
-    assert.equal(failure.response.data.error.permission_violations[0].scope, 'task:tasklist:write')
   `)
 })
 

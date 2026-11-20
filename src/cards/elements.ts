@@ -56,8 +56,6 @@ export const ELEMENTS = {
   /** In-place status for codex-login/account/accounts command replies. */
   codexAccountPanel: 'codex_account_panel',
   modelAgentGroup: (agent: string) => `model_agent_${agent}`,
-  /** Basic project tasklist binding panel. */
-  tasklistPanel: 'tasklist_panel',
   /** Independent receipt for one turn's delivered cloud files. */
   fileDeliveryList: 'file_delivery_list',
   /** Global delegated-agent identity catalog and run status. */

@@ -8,8 +8,8 @@ export type ActorEnqueueResult<T> =
 export const SUPPORTED_CARD_ACTION_KINDS = new Set([
   'permission', 'menu', 'provider_select', 'relay_site_select', 'model_select', 'model_custom_prompt',
   'model_panel_cancel', 'model_effort_select', 'ask', 'worktree_disband',
-  'temp_fork_select', 'temp_back_select', 'temp_resume_select', 'tasklist_enable',
-  'tasklist_delete_prompt', 'tasklist_delete_confirm', 'token_source_enable',
+  'temp_fork_select', 'temp_back_select', 'temp_resume_select',
+  'token_source_enable',
   'agent_identity_page', 'model_page', 'notify_callback', 'notify_reply', 'notify_reply_cancel',
   'model_list_open', 'model_add', 'model_remove', 'model_custom_remove', 'agent_project_cancel',
 ])
@@ -192,9 +192,6 @@ function cardActionSemanticKey(data: any): string {
     case 'temp_fork_select':
     case 'temp_back_select':
     case 'temp_resume_select': resource = { panel_id: value.panel_id }; break
-    case 'tasklist_delete_prompt':
-    case 'tasklist_delete_confirm': resource = { guid: value.guid }; break
-    case 'tasklist_enable': resource = { guid: value.guid, project: value.project, panel_id: value.panel_id }; break
     case 'token_source_enable': resource = { source_id: value.source_id }; break
     case 'agent_project_cancel': resource = { run_id: value.run_id }; break
     case 'agent_identity_page': resource = { panel_id: value.panel_id, page: value.page }; break

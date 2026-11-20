@@ -90,11 +90,6 @@ export {
   writeLogEntriesFromToolInput,
 } from './cards/temp'
 export {
-  type TasklistPanelNotice,
-  type TasklistPanelOpts,
-  tasklistPanelCard,
-} from './cards/task'
-export {
   type AgentIdentityListCardOpts,
   agentIdentityListCard,
   agentRunCard,

@@ -20,7 +20,6 @@ export type LifecycleProgressOpts = {
 }
 
 export type WorktreeActionResult = { ok: boolean; message: string; card: object }
-export type TasklistActionResult = { ok: boolean; message: string; card: object }
 export type ModelActionResult = {
   ok: boolean
   message: string

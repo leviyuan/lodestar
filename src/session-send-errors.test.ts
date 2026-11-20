@@ -1,10 +1,8 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { resetFeishuMock, sentRawTexts } from './feishu-test-mock'
 import * as feishu from './feishu'
-import * as tasklist from './tasklist'
 import * as worktree from './worktree'
 import { codexLogins } from './codex-login'
-import { showTasklistPanel } from './session-tasklist'
 import { showAgentIdentityPanel } from './session-agent-identities'
 import { runCodexAccountCommand } from './session-codex-accounts'
 import { runCommand } from './session-commands'
@@ -28,12 +26,6 @@ beforeEach(() => {
 afterEach(() => { for (const spy of spies.splice(0).reverse()) spy.mockRestore() })
 
 describe('session card delivery diagnostics', () => {
-  test('task panel failure retains the existing notice and includes API details', async () => {
-    spies.push(spyOn(tasklist, 'getTasklistBinding').mockReturnValue(null))
-    await showTasklistPanel({ chatId: 'oc_diag', worktreeProjectName: () => 'diag' } as unknown as Session)
-    expect(sentRawTexts).toEqual([`❌ task 面板发送失败\n${diagnostics}`])
-  })
-
   test('agents panel failure includes API details in the existing notice', async () => {
     await showAgentIdentityPanel({ chatId: 'oc_diag', codexAccountId: () => 'default' } as unknown as Session, 'ou_owner')
     expect(sentRawTexts).toEqual([`❌ agents 面板发送失败\n${diagnostics}`])

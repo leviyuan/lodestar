@@ -659,8 +659,7 @@ function cardActionLabel(kind: string): string {
     model_panel_cancel: '取消模型补录', model_effort_select: '模型 effort 选择',
     ask: '问题回答', worktree_disband: 'worktree 解散', temp_fork_select: '会话分叉',
     temp_back_select: '会话回滚', temp_resume_select: '会话恢复',
-    tasklist_enable: '启用任务清单', tasklist_delete_prompt: '删除任务清单',
-    tasklist_delete_confirm: '确认删除任务清单', token_source_enable: '启用账号',
+    token_source_enable: '启用账号',
     agent_identity_page: 'Agent 身份翻页',
     notify_callback: '通知反馈', notify_reply: '通知回复', notify_reply_cancel: '取消通知回复',
     agent_project_cancel: '停止项目任务',
@@ -1038,18 +1037,6 @@ async function handleCardAction(data: any): Promise<any> {
         ok: result.ok,
       })), result.ok, result.message)
     }
-    case 'tasklist_enable': {
-      const result = await session.onTasklistEnable()
-      return withBusinessOutcome(actionCardResponse(result.card), result.ok)
-    }
-    case 'tasklist_delete_prompt': {
-      const result = session.onTasklistDeletePrompt(String(value.guid ?? ''))
-      return withBusinessOutcome(actionCardResponse(result.card), result.ok)
-    }
-    case 'tasklist_delete_confirm': {
-      const result = await session.onTasklistDeleteConfirm(String(value.guid ?? ''))
-      return withBusinessOutcome(actionCardResponse(result.card), result.ok)
-    }
     case 'token_source_enable': {
       const { onTokenSourceEnable } = await import('./src/token-source-setup')
       await onTokenSourceEnable(session, String(value.source_id ?? ''))
@@ -1259,7 +1246,7 @@ async function pushNotifyCallbackPhase2(
 // ── Group lifecycle events ──────────────────────────────────────────────
 /** Forget one dissolved chat: stop without announcing, drop the in-memory
  * Session, clear conversation-scoped state and refresh the alive marker.
- * Project directory, tasklist and cloud folder/files are intentionally left
+ * Project directory and cloud folder/files are intentionally left
  * in place. Callers serialize through chatActor when they can. */
 async function forgetChatBinding(chatId: string, sessionName: string, reason: string): Promise<void> {
   const session = sessions.get(chatId)
@@ -1505,14 +1492,6 @@ async function boot(): Promise<void> {
   // 群名解析靠 chatNameCache,但新群/改名走 fetchChatName 点查,不依赖这里全量刷。
   // 5min 全量 chat.list 是纯空转(IM API 计入免费版配额),拉长到 30min 足够保持缓存新鲜。
   setInterval(() => { void feishu.refreshChatList() }, 30 * 60 * 1000)
-  const { reconcileTasklistDeletions } = await import('./src/tasklist')
-  if (shutdownRequested) return
-  try {
-    await reconcileTasklistDeletions()
-  } catch (e) {
-    logError('daemon.tasklist_reconcile.failed', e)
-  }
-  if (shutdownRequested) return
 
   // Lark WSClient sends pings every ~120s but doesn't verify pongs by default.
   // On a half-open TCP (NAT idle-kill, network blip) the socket stays OPEN and

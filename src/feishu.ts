@@ -1683,8 +1683,6 @@ export async function fetchChatName(chatId: string): Promise<string | null> {
   }
 }
 
-export * from './feishu-task'
-
 // ── Outbound: text + card ──────────────────────────────────────────────
 async function sendViaSdkWithRetry(
   what: 'Text' | 'Card' | 'Image' | 'File',
