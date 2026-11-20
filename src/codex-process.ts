@@ -24,6 +24,7 @@ import { scrubAgentHostEnv } from './agent-env'
 import { logError, logDiagnostic } from './log'
 import { agentBin } from './agent-updates'
 import { prepareCodexInputPolicyCatalog, type CodexInputPolicyCatalog } from './codex-input-policy'
+import { terminateProcessTree } from './process-tree'
 import {
   contextCompactionNoticeFromMessage,
   contextCompactionNoticeFromNotification,
@@ -2377,6 +2378,9 @@ export class CodexProcess extends EventEmitter {
   }
 
   private sendSignal(signal: NodeJS.Signals, errors: string[]): void {
+    // Windows starts the `.cmd` shim through cmd.exe; signalling the shell would
+    // orphan the native app-server holding this account and the stdout pipe.
+    if (this.proc && terminateProcessTree(this.proc, signal, error => errors.push(`taskkill failed: ${error.message}`))) return
     try {
       if (!this.proc?.kill(signal) && this.alive) errors.push(`${signal} was not delivered`)
     } catch (e) {

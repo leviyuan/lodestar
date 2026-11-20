@@ -10,6 +10,7 @@ import type { ChildProcessByStdio } from 'node:child_process'
 import { spawn } from 'cross-spawn'
 import type { Readable, Writable } from 'node:stream'
 import { resolveCodexBin } from './codex-process'
+import { terminateProcessTree } from './process-tree'
 import { log, logError, logDiagnostic } from './log'
 import { EventEmitter } from 'node:events'
 import { StringDecoder } from 'node:string_decoder'
@@ -168,6 +169,7 @@ export class AppServerOnce extends EventEmitter {
   private proc: ChildProcessByStdio<Writable, Readable, Readable>
   private buf = ''
   private decoder = new StringDecoder('utf8')
+  private flushedTail = false
   private nextId = 1
   private alive = true
   private exitPromise: Promise<void>
@@ -195,33 +197,51 @@ export class AppServerOnce extends EventEmitter {
     this.proc.stdout.on('data', (chunk: Buffer) => this.onStdout(chunk))
     // Native stderr may contain account data; protocol/exit failures retain safe diagnostics.
     this.proc.stderr.resume()
-    const finish = (error: Error) => {
-      if (!this.alive) return
-      this.alive = false
-      for (const [id, p] of this.pending) {
-        clearTimeout(p.timer)
-        p.reject(new Error(`${error.message}; pending ${p.method} id=${id}`))
-      }
-      this.pending.clear()
-      this.resolveExit()
-      this.emit('exit')
-      this.emit('closed', error)
-    }
-    this.proc.on('error', error => finish(new Error(`codex app-server spawn failed: ${error.message}`)))
+    this.proc.on('error', error => this.finish(new Error(`codex app-server spawn failed: ${error.message}`)))
     this.proc.stdin.on('error', error => {
       logError('codex control input failed', error)
       this.emit('protocolError', error)
     })
     // Drain stdout before rejecting requests; exit can precede buffered JSON-RPC responses.
     this.proc.on('close', (code, signal) => {
-      finish(new Error(`codex app-server exited code=${code} signal=${signal}`))
+      this.finish(new Error(`codex app-server exited code=${code} signal=${signal}`))
     })
     // Quota/model probes can refresh auth too; deletion must wait for their native process to close.
     bindProcessCodexAccount(this, accountId)
   }
 
+  private finish(error: Error): void {
+    if (!this.alive) return
+    // Child `close` guarantees stdio has drained, but the final JSON record is
+    // not required to end with a newline (CodexProcess flushes the same tail).
+    // Settle it before rejecting whatever is left.
+    this.flushStdoutTail()
+    this.alive = false
+    for (const [id, p] of this.pending) {
+      clearTimeout(p.timer)
+      p.reject(new Error(`${error.message}; pending ${p.method} id=${id}`))
+    }
+    this.pending.clear()
+    this.resolveExit()
+    this.emit('exit')
+    this.emit('closed', error)
+  }
+
   private onStdout(chunk: Buffer): void {
-    this.buf += this.decoder.write(chunk)
+    this.onStdoutText(this.decoder.write(chunk))
+  }
+
+  /** Feed the decoder's remaining bytes and one synthetic delimiter so a final
+   * record without a trailing newline is still parsed once. */
+  private flushStdoutTail(): void {
+    if (this.flushedTail) return
+    this.flushedTail = true
+    this.onStdoutText(this.decoder.end())
+    this.onStdoutText('\n')
+  }
+
+  private onStdoutText(text: string): void {
+    this.buf += text
     let nl: number
     while ((nl = this.buf.indexOf('\n')) >= 0) {
       const line = this.buf.slice(0, nl).trim()
@@ -301,10 +321,14 @@ export class AppServerOnce extends EventEmitter {
       if (!await this.waitForExit(timeoutMs)) throw new Error('codex app-server stdio did not close after exit')
       return
     }
-    if (!this.proc.kill('SIGTERM')) throw new Error('codex app-server rejected SIGTERM')
+    if (!terminateProcessTree(this.proc, 'SIGTERM') && !this.proc.kill('SIGTERM')) {
+      throw new Error('codex app-server rejected SIGTERM')
+    }
     const exited = await this.waitForExit(timeoutMs)
     if (exited) return
-    if (!this.proc.kill('SIGKILL')) throw new Error('codex app-server rejected SIGKILL')
+    if (!terminateProcessTree(this.proc, 'SIGKILL') && !this.proc.kill('SIGKILL')) {
+      throw new Error('codex app-server rejected SIGKILL')
+    }
     const killed = await this.waitForExit(timeoutMs)
     if (!killed) throw new Error(`codex app-server did not exit after SIGKILL (${timeoutMs}ms)`)
   }

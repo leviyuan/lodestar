@@ -12,7 +12,7 @@ import type { ProjectProfile } from './config'
 import { scrubAgentHostEnv } from './agent-env'
 import { DshRuntime, type DshRuntimeOptions } from './dsh-runtime'
 import type { DshModel, DshNotification } from './dsh-protocol'
-import { log } from './log'
+import { log, logError } from './log'
 
 export interface DshSpawnOptions {
   workDir: string
@@ -98,6 +98,10 @@ export class DshProcess extends EventEmitter implements AgentProcess {
 
   constructor(private readonly opts: DshSpawnOptions) {
     super()
+    // `fail()` emits `error` before it can terminate the child; without a
+    // listener that emit throws and would skip the kill. Codex and Claude keep
+    // the same no-op listener for the window before Session attaches.
+    this.on('error', () => {})
     this.tokenSourceId = opts.tokenSourceId
     this.lastModel = opts.model
     this.lastEffort = opts.effort
@@ -113,6 +117,8 @@ export class DshProcess extends EventEmitter implements AgentProcess {
     this.runtime.on('notification', (notification: DshNotification) => {
       if (!this.sessionId && notification.method !== 'failure') { this.earlyNotifications.push(notification); return }
       if (this.terminalError) return
+      // A malformed native event must still fail the session. Host listener
+      // exceptions are contained inside `onNotification` via safeEmit.
       try { this.onNotification(notification) }
       catch (error) { this.fail(error) }
     })
@@ -164,14 +170,22 @@ export class DshProcess extends EventEmitter implements AgentProcess {
     if (!this.isAlive() || this.closing) throw new Error('DSH process is closed')
     if (files.some(file => !isAbsolute(file))) throw new Error('DSH file inputs must use absolute paths')
     if (this.terminalError) throw this.terminalError
+    const generation = this.inputGeneration
     this.pendingInputs++
     void this.initializationPromise().then(async () => {
+      // A stop bumps the generation and clears the turn. A prompt that was only
+      // waiting for session/open must not start the turn the user cancelled.
+      if (this.closing || generation !== this.inputGeneration) return
       const content = await this.inputContent(text, files)
+      if (this.closing || generation !== this.inputGeneration) return
       await this.runtime.request('session/prompt', {
         mode: 'auto', content,
       })
-      this.pendingInputs--
-    }).catch(error => this.fail(error))
+    }).catch(error => {
+      // Cancellation during startup is the user's stop, not a backend failure.
+      if (this.closing || generation !== this.inputGeneration) return
+      this.fail(error)
+    }).finally(() => { this.pendingInputs-- })
   }
   async steerUserText(text: string, files: string[] = [], inputId: string = randomUUID()): Promise<boolean> {
     if (!this.isAlive() || this.closing) throw new Error('DSH process is closed')
@@ -200,7 +214,16 @@ export class DshProcess extends EventEmitter implements AgentProcess {
     this.inputGeneration++
     this.activeTurnId = null
     this.steeringInputs.clear()
-    void this.runtime.request('session/cancel').catch(error => this.fail(error))
+    // The bridge only accepts session/cancel after session/open completed.
+    // Sending it while the session is still starting rejects with
+    // "DSH not initialized", which would report a startup failure instead of
+    // the stop the user asked for.
+    if (this.closing || !this.sessionId) return
+    void this.runtime.request('session/cancel').catch(error => {
+      // A stop that lands while the transport is already closing is expected.
+      if (this.closing) return
+      this.fail(error)
+    })
   }
   sendPermissionResponse(requestId: string | number, decision: 'allow' | 'deny', payload?: { updatedInput?: Record<string, unknown>; denyMessage?: string }): void {
     const id = String(requestId)
@@ -247,27 +270,36 @@ export class DshProcess extends EventEmitter implements AgentProcess {
     if (this.terminalError) return
     this.failedUnexpectedly = !this.closing
     this.terminalError = error
-    this.emit('error', error)
+    // safeEmit keeps a host listener from skipping the remaining reports and the
+    // kill below, which would leave a live native child with no `exit` event.
+    this.safeEmit('error', error)
     for (const child of this.children) {
       if (this.settledChildren.has(child)) continue
       this.settledChildren.add(child)
-      this.emit('bg_task_settled', { task_id: child, status: 'failed', summary: error.message })
+      this.safeEmit('bg_task_settled', { task_id: child, status: 'failed', summary: error.message })
     }
     if (this.busy || this.pendingInputs > 0) {
       this.busy = false
       this.lastResult = { ...emptyResult(), is_error: true, subtype: 'error' }
-      this.emit('result', { errors: [error.message], error: error.message, ...this.lastResult })
+      this.safeEmit('result', { errors: [error.message], error: error.message, ...this.lastResult })
     }
-    void this.kill().catch(closeError => this.emit('error', closeError))
+    void this.kill().catch(closeError => this.safeEmit('error', closeError))
+  }
+  /** Native event validation must still end the session; a host listener
+   * throwing must not. `CodexProcess` isolates per-message dispatch the same
+   * way after the 2026-08-18 card-listener incident. */
+  private safeEmit(event: string, ...args: any[]): void {
+    try { this.emit(event, ...args) }
+    catch (error) { logError('dsh-process: notification dispatch failed', error) }
   }
   private onNotification({ method, params }: DshNotification): void {
     const sub = params.sessionId !== this.sessionId
     switch (method) {
       case 'failure': this.fail(new Error(params.message)); return
-      case 'agent.error': this.emit('error', new Error(params.message)); return
+      case 'agent.error': this.safeEmit('error', new Error(params.message)); return
       case 'subagent.started':
         this.children.add(params.sessionId)
-        this.emit('bg_task_started', {
+        this.safeEmit('bg_task_started', {
           task_id: params.sessionId,
           description: this.childTitles.get(params.sessionId) ?? this.pendingSubagentTitles.shift() ?? 'DeepSeek Harness 子 Agent',
           task_type: 'agent',
@@ -276,7 +308,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         return
       case 'subagent.disposed':
         if (this.children.has(params.sessionId) && !this.settledChildren.has(params.sessionId)) {
-          this.emit('bg_task_settled', { task_id: params.sessionId, status: 'stopped', summary: this.childText.get(params.sessionId) ?? '' })
+          this.safeEmit('bg_task_settled', { task_id: params.sessionId, status: 'stopped', summary: this.childText.get(params.sessionId) ?? '' })
         }
         this.children.delete(params.sessionId)
         this.settledChildren.delete(params.sessionId)
@@ -289,13 +321,13 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         const input = { questions: params.questions.map((q: any) => ({ ...q, question: q.detail ? `${q.question}\n\n${q.detail}` : q.question })) }
         // Keep the exact displayed question as the answer key used by Session.
         this.questionInputs.set(params.id, input.questions)
-        this.emit('tool_use', { id: params.id, name: 'AskUserQuestion', input, parentToolUseId: null })
-        this.emit('can_use_tool', { request_id: params.id, tool_use_id: params.id, tool_name: 'AskUserQuestion', input })
+        this.safeEmit('tool_use', { id: params.id, name: 'AskUserQuestion', input, parentToolUseId: null })
+        this.safeEmit('can_use_tool', { request_id: params.id, tool_use_id: params.id, tool_name: 'AskUserQuestion', input })
         return
       }
       case 'question.cancelled':
         this.questionInputs.delete(params.id)
-        this.emit('tool_result', { tool_use_id: params.id, content: 'Question cancelled', is_error: true, parentToolUseId: null })
+        this.safeEmit('tool_result', { tool_use_id: params.id, content: 'Question cancelled', is_error: true, parentToolUseId: null })
         return
       case 'assistant.frame': {
         const frame = params.frame
@@ -304,7 +336,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
           this.frames.set(key, { revision: frame.revision, nextIndex: 0 })
           // request/header is omitted when the route stays unchanged. Every
           // model attempt still marks the end of its preceding user batch.
-          if (!sub) this.emit('input_batch_end', { itemId: frame.attemptId })
+          if (!sub) this.safeEmit('input_batch_end', { itemId: frame.attemptId })
           return
         }
         const state = this.frames.get(key)
@@ -312,7 +344,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         state.revision = frame.revision
         if (frame.type === 'end') {
           this.frames.delete(key)
-          if (!sub) this.emit('assistant_block_stop', { parentToolUseId: null })
+          if (!sub) this.safeEmit('assistant_block_stop', { parentToolUseId: null })
           return
         }
         if (frame.type !== 'chunk') throw new Error(`unknown DSH assistant frame: ${frame.type}`)
@@ -320,9 +352,9 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         const chunk = frame.chunk
         if (chunk.type === 'text-delta') {
           if (sub) this.childText.set(params.sessionId, (this.childText.get(params.sessionId) ?? '') + chunk.text)
-          this.emit('assistant_text', { text: chunk.text, parentToolUseId: sub ? params.sessionId : null })
+          this.safeEmit('assistant_text', { text: chunk.text, parentToolUseId: sub ? params.sessionId : null })
         } else if (chunk.type === 'block-end' && chunk.block.type === 'text' && !sub) {
-          this.emit('assistant_block_stop', { parentToolUseId: null })
+          this.safeEmit('assistant_block_stop', { parentToolUseId: null })
         } else if (chunk.type === 'usage' && !sub) this.observeUsage(chunk.usage)
         return
       }
@@ -335,24 +367,24 @@ export class DshProcess extends EventEmitter implements AgentProcess {
           // created so its header names the task instead of the bridge default.
           const label = data.label.trim()
           this.childTitles.set(params.sessionId, label)
-          this.emit('bg_task_updated', { task_id: params.sessionId, patch: { title: label } } satisfies BgTaskUpdatedEvent)
+          this.safeEmit('bg_task_updated', { task_id: params.sessionId, patch: { title: label } } satisfies BgTaskUpdatedEvent)
         } else if (e.type === 'turn/start' && !sub) {
           this.busy = true; this.startedAt = Date.now(); this.lastUsage = null
           this.activeTurnId = String(data.turn)
           this.lastResult = emptyResult()
-          this.emit('scheduled_turn_input', { text: 'DeepSeek Harness 继续执行', promptId: `dsh-turn-${data.turn}` })
-          this.emit('turn_started', { turn_id: String(data.turn), thread_id: this.sessionId })
+          this.safeEmit('scheduled_turn_input', { text: 'DeepSeek Harness 继续执行', promptId: `dsh-turn-${data.turn}` })
+          this.safeEmit('turn_started', { turn_id: String(data.turn), thread_id: this.sessionId })
         } else if (e.type === 'turn/start' && sub && this.settledChildren.delete(params.sessionId)) {
-          this.emit('bg_task_started', {
+          this.safeEmit('bg_task_started', {
             task_id: params.sessionId,
             description: this.childTitles.get(params.sessionId) ?? 'DeepSeek Harness 子 Agent',
             task_type: 'agent',
             tool_use_id: params.sessionId,
           })
         } else if (e.type === 'user/message' && !sub && typeof params.inputId === 'string') {
-          if (this.steeringInputs.delete(params.inputId)) this.emit('user_input_consumed', { inputId: params.inputId })
+          if (this.steeringInputs.delete(params.inputId)) this.safeEmit('user_input_consumed', { inputId: params.inputId })
         } else if (e.type === 'request/header' && !sub) {
-          this.emit('input_batch_end', { itemId: String(e.seq) })
+          this.safeEmit('input_batch_end', { itemId: String(e.seq) })
           if (data.header?.config) {
             this.lastModel = data.header.config.model; this.lastEffort = data.header.config.reasoningEffort
             this.lastContextWindow = this.models.find(m => m.model === this.lastModel)?.contextWindow ?? null
@@ -364,7 +396,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
           const name = toolAliases[data.name] ?? data.name
           if (['read', 'write', 'edit'].includes(data.name) && input.path) input.file_path = input.path
           if (!sub && data.name === 'subagent') this.rememberSubagentTitle(input)
-          this.emit('tool_use', { id: data.callId, name, input, parentToolUseId: sub ? params.sessionId : null })
+          this.safeEmit('tool_use', { id: data.callId, name, input, parentToolUseId: sub ? params.sessionId : null })
         } else if (e.type === 'tool/result') {
           const message = data.message
           // Native tool-role messages carry correlation directly; the earlier
@@ -377,23 +409,23 @@ export class DshProcess extends EventEmitter implements AgentProcess {
             || (result.isError !== undefined && typeof result.isError !== 'boolean')) {
             throw new Error('invalid DSH tool result')
           }
-          this.emit('tool_result', { tool_use_id: result.toolCallId, content: result.content,
+          this.safeEmit('tool_result', { tool_use_id: result.toolCallId, content: result.content,
             is_error: result.isError === true, parentToolUseId: sub ? params.sessionId : null })
         } else if (e.type === 'todo/write' && !sub) {
-          this.emit('turn_plan_updated', { threadId: this.sessionId, explanation: null,
+          this.safeEmit('turn_plan_updated', { threadId: this.sessionId, explanation: null,
             plan: data.todos.map((item: any) => ({ step: item.content, status: item.status === 'in_progress' ? 'inProgress' : item.status })) })
         } else if (e.type === 'compaction/start' && !sub) {
-          this.emit('context_compacted', { threadId: this.sessionId, phase: 'start', sourceType: 'dsh' })
+          this.safeEmit('context_compacted', { threadId: this.sessionId, phase: 'start', sourceType: 'dsh' })
         } else if (e.type === 'compaction/end' && !sub) {
-          if (data.error) this.emit('error', new Error(`DSH compaction: ${data.error}`))
-          else this.emit('context_compacted', { threadId: this.sessionId, phase: 'end', sourceType: 'dsh' })
+          if (data.error) this.safeEmit('error', new Error(`DSH compaction: ${data.error}`))
+          else this.safeEmit('context_compacted', { threadId: this.sessionId, phase: 'end', sourceType: 'dsh' })
         } else if (e.type === 'goal/change' && !sub) {
-          if (data.operation === 'clear') this.emit('thread_goal_cleared', { threadId: this.sessionId })
-          else this.emit('thread_goal_updated', { threadId: this.sessionId, objective: data.goal.objective,
+          if (data.operation === 'clear') this.safeEmit('thread_goal_cleared', { threadId: this.sessionId })
+          else this.safeEmit('thread_goal_updated', { threadId: this.sessionId, objective: data.goal.objective,
             status: data.goal.phase, tokenBudget: null, tokensUsed: Number.NaN, timeUsedSeconds: Number.NaN })
         } else if (e.type === 'turn/end' && sub && this.children.has(params.sessionId)) {
           this.settledChildren.add(params.sessionId)
-          this.emit('bg_task_settled', { task_id: params.sessionId,
+          this.safeEmit('bg_task_settled', { task_id: params.sessionId,
             status: data.reason.kind === 'completed' ? 'completed' : data.reason.kind === 'aborted' ? 'stopped' : 'failed',
             summary: this.childText.get(params.sessionId) ?? '' })
           this.childText.delete(params.sessionId)
@@ -409,7 +441,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         this.lastCompletedTurnId = String(event.seq)
         this.lastResult = { ...emptyResult(), duration_ms: Date.now() - this.startedAt, num_turns: 1,
           usage: this.lastUsage, subtype: reason.kind, is_error: reason.kind !== 'completed' }
-        this.emit('result', { ...this.lastResult,
+        this.safeEmit('result', { ...this.lastResult,
           ...(reason.kind !== 'completed' ? { error: reason.error?.message ?? `DSH turn ended: ${reason.kind}`,
             errors: [reason.error?.message ?? `DSH turn ended: ${reason.kind}`] } : {}),
           checkpoint: { provider: 'dsh', kind: 'event', id: String(event.seq),

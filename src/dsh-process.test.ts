@@ -335,6 +335,65 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(proc.isAlive()).toBe(false)
   }, 15_000)
 
+  test('a stop during startup is a clean stop, not a backend failure', async () => {
+    const f = await fixture(() => completion({ content: 'still running' }))
+    const proc = f.processFor()
+    const errors: Error[] = []
+    proc.on('error', error => errors.push(error))
+    // `hi` opens the boot card before start() finishes, so stop can arrive while
+    // session/open is still pending. The bridge only accepts session/cancel after
+    // open; sending it early used to fail the backend instead of stopping it.
+    proc.sendInterrupt()
+    await proc.initializationPromise()
+    expect(errors).toEqual([])
+    expect(proc.isAlive()).toBe(true)
+    const done = nextResult(proc)
+    proc.sendUserText('the session is still usable')
+    expect(await done).toMatchObject({ is_error: false })
+  }, 15_000)
+
+  test('a prompt waiting for startup is not submitted after a stop', async () => {
+    const f = await fixture(() => completion({ content: 'must not run' }))
+    const proc = f.processFor()
+    const errors: Error[] = []
+    proc.on('error', error => errors.push(error))
+    proc.sendUserText('queued before startup')
+    proc.sendInterrupt()
+    await proc.initializationPromise()
+    await Bun.sleep(150)
+    expect(f.requests).toHaveLength(0)
+    expect(errors).toEqual([])
+    expect(proc.isAlive()).toBe(true)
+  }, 15_000)
+
+  test('a throwing host listener does not end the DSH session', async () => {
+    const f = await fixture(() => completion({ content: 'survived a listener bug' }))
+    const proc = f.processFor()
+    proc.on('assistant_text', () => { throw new Error('card render bug') })
+    await proc.initializationPromise()
+    const done = nextResult(proc)
+    proc.sendUserText('keep the session alive')
+    expect(await done).toMatchObject({ is_error: false })
+    expect(proc.isAlive()).toBe(true)
+  }, 15_000)
+
+  test('a throwing failure listener still terminates the native runtime', async () => {
+    const f = await fixture(() => completion({ content: 'unused' }))
+    const proc = f.processFor()
+    proc.on('error', () => { throw new Error('host listener bug') })
+    await proc.initializationPromise()
+    const exited = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('DSH runtime was not terminated after a failure')), 8_000)
+      proc.once('exit', () => { clearTimeout(timer); resolve() })
+    })
+    // A missing attachment rejects inside sendUserText's submission chain, which
+    // reports the failure; `fail()` must still kill the child even though the
+    // error listener throws.
+    proc.sendUserText('read a missing attachment', ['/nonexistent/lodestar-attachment.png'])
+    await exited
+    expect(proc.isAlive()).toBe(false)
+  }, 15_000)
+
   test('streams multiple turns, persists and resumes exact history, and forks a checkpoint', async () => {
     const f = await fixture((_body, count) => completion({ content: `native reply ${count}` }))
     const proc = f.processFor()

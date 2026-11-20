@@ -1209,7 +1209,13 @@ export class ClaudeAgentProcess extends EventEmitter {
 
   private async readLoop(q: Query): Promise<void> {
     try {
-      for await (const message of q) this.handleMessage(message)
+      for await (const message of q) {
+        // A host listener (session card/render) throwing is a dispatch bug, not
+        // an SDK/transport failure: Codex isolates the same case. Keep the
+        // process and the turn alive; only the iterator itself may end it.
+        try { this.handleMessage(message) }
+        catch (error) { logError('claude-agent-process: message dispatch failed', error) }
+      }
       this.finishExit(null, null)
     } catch (e) {
       if (this.expectedExit && this.abortController.signal.aborted) {

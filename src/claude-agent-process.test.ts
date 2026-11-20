@@ -1919,6 +1919,53 @@ describe('Claude project profile overrides', () => {
 })
 
 
+describe('Claude message dispatch isolation', () => {
+  test('a throwing host listener does not end the Claude turn', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'claude-dispatch-'))
+    const logged = spyOn(logModule, 'logError').mockImplementation(() => {})
+    const spy = spyOn(agentUpdates, 'loadClaudeSdk').mockResolvedValue({
+      query() {
+        let finish!: () => void
+        const ended = new Promise<void>(resolve => { finish = resolve })
+        return {
+          accountInfo: async () => ({ subscriptionType: 'max' }),
+          supportedModels: async () => [],
+          close() { finish() },
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'system', subtype: 'init', session_id: 'dispatch-session' }
+            yield { type: 'assistant', session_id: 'dispatch-session', uuid: 'dispatch-1',
+              message: { model: 'claude-sonnet-4-5-20250929', content: [{ type: 'text', text: 'proof' }] } }
+            yield { type: 'result', subtype: 'success', session_id: 'dispatch-session',
+              usage: { input_tokens: 3, output_tokens: 1 }, duration_ms: 5, num_turns: 1 }
+            await ended
+          },
+        }
+      },
+    } as any)
+    const proc = new ClaudeAgentProcess({ workDir: root, effort: 'max' })
+    const errors: Error[] = []
+    proc.on('error', error => errors.push(error))
+    // A card/render bug in one streamed event used to look like an SDK failure
+    // and end a healthy process; Codex contains the same class of exception.
+    proc.on('assistant_text', () => { throw new Error('card render bug') })
+    const result = new Promise<any>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('result was never emitted')), 5_000)
+      proc.once('result', value => { clearTimeout(timer); resolve(value) })
+    })
+    try {
+      await proc.initializationPromise()
+      expect(await result).toMatchObject({ is_error: false })
+      expect(errors).toEqual([])
+      expect(proc.isAlive()).toBe(true)
+    } finally {
+      await proc.kill().catch(() => {})
+      spy.mockRestore()
+      logged.mockRestore()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('Claude safety refusal fallback', () => {
   const explanation = 'Cyber safeguards flagged this message. private-user /private/source.ts'
   function capture() {

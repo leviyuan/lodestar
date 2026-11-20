@@ -2,6 +2,7 @@ import { spawn } from 'cross-spawn'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { terminateProcessTree } from './process-tree'
 
 /** Native Codex registers these tools from model metadata, independently of
  * tools.experimental_request_user_input.enabled. Restrict only the per-process
@@ -68,8 +69,12 @@ async function runNativePolicyQuery(options: NativePolicyOptions, command: strin
     if (failure) return
     failure ??= error
     if (child.pid) {
-      child.kill('SIGTERM')
-      killTimer = setTimeout(() => { child.kill('SIGKILL') }, 3000)
+      // Windows `.cmd` shims run under cmd.exe; end the tree so the native
+      // Codex process cannot outlive its shell.
+      if (!terminateProcessTree(child, 'SIGTERM')) child.kill('SIGTERM')
+      killTimer = setTimeout(() => {
+        if (!terminateProcessTree(child, 'SIGKILL')) child.kill('SIGKILL')
+      }, 3000)
     }
   }
   const abort = () => stop(options.signal.reason instanceof Error ? options.signal.reason : new Error('Codex model catalog preparation cancelled'))

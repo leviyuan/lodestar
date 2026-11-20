@@ -89,3 +89,30 @@ test('incomplete RPC frames produce a protocol error instead of an undefined suc
   app.onStdout(Buffer.from('null\n{"id":1}\nnot json\n'))
   expect(errors).toHaveLength(3)
 })
+
+test('a final JSON-RPC frame without a trailing newline is settled before close', () => {
+  const app: any = Object.create(AppServerOnce.prototype)
+  EventEmitter.call(app)
+  app.buf = ''; app.decoder = new StringDecoder('utf8'); app.flushedTail = false
+  app.alive = true
+  app.proc = { stdin: { write: () => {} } }
+  app.resolveExit = () => {}
+  const resolved: any[] = []
+  const rejected: Error[] = []
+  const timer = setTimeout(() => {}, 1000)
+  app.pending = new Map([[11, {
+    resolve: (value: any) => resolved.push(value), reject: (error: Error) => rejected.push(error),
+    method: 'account/read', timer,
+  }]])
+  try {
+    // The native answer is already in the buffer, but the process exits without
+    // closing the record: only the flush in `finish` can settle it.
+    app.onStdout(Buffer.from('{"jsonrpc":"2.0","id":11,"result":{"authenticated":true}}'))
+    expect(resolved).toEqual([])
+    app.finish(new Error('codex app-server exited code=0 signal=null'))
+    expect(resolved).toEqual([{ authenticated: true }])
+    expect(rejected).toEqual([])
+    expect(app.pending.size).toBe(0)
+  } finally { clearTimeout(timer) }
+})
+
