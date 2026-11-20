@@ -19,6 +19,20 @@ describe('delegated-agent request parsing', () => {
     })
   })
 
+  test('carries an explicit card display and leaves the default to the owner kind', () => {
+    const run = { description: '项目调用', prompt: 'work', identity_ids: ['a'] }
+    expect(parseAgentRunRequest(run)).not.toHaveProperty('display')
+    expect(parseAgentRunRequest({ ...run, display: 'card' })).toMatchObject({ display: 'card' })
+    expect(parseAgentRunRequest({ ...run, display: 'silent' })).toMatchObject({ display: 'silent' })
+    const followUp = { description: '续跑', prompt: 'next' }
+    expect(parseAgentFollowUpRequest(followUp)).not.toHaveProperty('display')
+    expect(parseAgentFollowUpRequest({ ...followUp, display: 'card' })).toMatchObject({ display: 'card' })
+    for (const display of ['CARD', 'group', '', 1, null, {}]) {
+      expect(() => parseAgentRunRequest({ ...run, display })).toThrow('agent display must be "card" or "silent"')
+      expect(() => parseAgentFollowUpRequest({ ...followUp, display })).toThrow('agent display must be "card" or "silent"')
+    }
+  })
+
   test('preserves task text beyond the former character limit for new runs and continuations', () => {
     const prompt = `  开始\n${'字'.repeat(800_001)}\n结束  `
     const request = { description: '完整任务正文', prompt }

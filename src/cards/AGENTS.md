@@ -23,7 +23,7 @@
 - 临时会话选择卡只携带 `panel_id`、opaque `choice_id`。provider、cwd、source、owner、launch 保存在 Session 短期状态，不能信任回调传入的可执行 id、数组下标或路径。rs 历史列表可额外展示会话短标签（`…` + 末 6 位，与状态卡和结果卡一致）、首句（🚩）和最后一条用户输入（🏁，只取用户消息，缺失时省略）；结果卡的「所选历史」同样显示首/末句。这些字段仅供人眼区分，不进入回调。
 - 公式段使用固定 id 的单个顶层 `column_set`，按源码顺序替换内部 markdown/image。小图可用 `crop_center` 和精确 `size`；宽图用 `fit_horizontal`，不传 `size`，由容器缩放。
 - Card action 立即换卡返回 `{ card: { type: 'raw', data: card } }`。异步更新先返回 toast ACK，再调用 `feishu.updateCard()`；不用 callback-token 的 `/interactive/v1/card/update`，该端点会让 schema 2.0 卡片空白。`notify_callback` 在 Session 存在性检查前分流。
-- 项目独立 Agent 调用在 `agent-cards.ts` 使用专属卡，一次 run 一张，不复用共享群尾卡；模板显示“项目任务”；项目调用不支持交互提问，不提供调用方回答指引。取消按钮通过 `agent_project_cancel` 路由，不依赖活跃 Session。
+- 项目独立 Agent 调用默认静默（`AgentRunSnapshot.display = 'silent'`），此时不进入 `agent-cards.ts`，群里没有卡片、进度或失败提示；调用方显式请求 `--card` / `display: "card"` 时才使用专属卡，一次 run 一张，不复用共享群尾卡；模板显示“项目任务”；项目调用不支持交互提问，不提供调用方回答指引。取消按钮通过 `agent_project_cancel` 路由，不依赖活跃 Session。
 
 ## 验证
 

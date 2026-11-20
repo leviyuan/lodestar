@@ -69,13 +69,13 @@ describe('lodestar-agent CLI args', () => {
     expect(parsePromptArgs([
       '--description', '任务说明', '--identity', 'a', '--identity', 'b', '--identity', 'a', '--effort', 'max', '--stdin', '--no-wait',
     ], true)).toEqual({
-      description: '任务说明', identityIds: ['a', 'b'], identityId: '', sessionId: '', workDir: '', effort: 'max', prompt: '', noWait: true, readStdin: true, json: false,
+      description: '任务说明', identityIds: ['a', 'b'], identityId: '', sessionId: '', workDir: '', effort: 'max', prompt: '', noWait: true, readStdin: true, json: false, card: false,
     })
   })
 
   test('parses a single-session follow-up', () => {
     expect(parsePromptArgs(['--description', '任务说明', '--identity', 'a', 'continue here'], false)).toEqual({
-      description: '任务说明', identityIds: [], identityId: 'a', sessionId: '', workDir: '', effort: '', prompt: 'continue here', noWait: false, readStdin: false, json: false,
+      description: '任务说明', identityIds: [], identityId: 'a', sessionId: '', workDir: '', effort: '', prompt: 'continue here', noWait: false, readStdin: false, json: false, card: false,
     })
   })
 
@@ -83,9 +83,18 @@ describe('lodestar-agent CLI args', () => {
     expect(() => parsePromptArgs(['task'], true)).toThrow('--identity')
   })
 
+  test('parses the explicit card flag for runs and follow-ups', () => {
+    expect(parsePromptArgs(['--description', '任务说明', '--identity', 'a', '--card', '--prompt', 'work'], true))
+      .toMatchObject({ card: true })
+    expect(parsePromptArgs(['--description', '任务说明', '--card', '--prompt', 'work'], false))
+      .toMatchObject({ card: true })
+    expect(parsePromptArgs(['--description', '任务说明', '--identity', 'a', '--prompt', 'work'], true))
+      .toMatchObject({ card: false })
+  })
+
   test('accepts session continuation without a new identity and rejects ambiguous session options', () => {
     expect(parsePromptArgs(['--description', '任务说明', '--session', 'sid', '--prompt', 'next turn', '--json'], true)).toEqual({
-      description: '任务说明', identityIds: [], identityId: '', sessionId: 'sid', workDir: '', effort: '', prompt: 'next turn', noWait: false, readStdin: false, json: true,
+      description: '任务说明', identityIds: [], identityId: '', sessionId: 'sid', workDir: '', effort: '', prompt: 'next turn', noWait: false, readStdin: false, json: true, card: false,
     })
     expect(() => parsePromptArgs(['--session', 'sid', '--identity', 'a', '--identity', 'b'], true)).toThrow('at most one')
     expect(() => parsePromptArgs(['--session', 'sid', '--session', 'other'], true)).toThrow('only be specified once')
@@ -189,6 +198,12 @@ test('explicit project CLI uses the private daemon endpoint and preserves projec
     expect(result.out).toContain("lodestar-agent --project 'repo' run --session 'native'")
     expect(requests[0]).toMatchObject({ token: 'Bearer test-project-key', body: { prompt: '--project', request_id: 'job-1' } })
     expect(new URL(requests[0].url).searchParams.get('project')).toBe('repo')
+    // External project calls carry no display field unless --card is passed (daemon default: silent).
+    expect(requests[0].body.display).toBeUndefined()
+    const carded = await exec(['run', '--project', 'repo', '--identity', 'agent:a', '--description', '任务', '--prompt', 'card', '--request-id', 'job-2', '--card'])
+    expect(carded.code, carded.error).toBe(0)
+    const posts = requests.filter(item => item.body)
+    expect(posts[1]).toMatchObject({ body: { prompt: 'card', request_id: 'job-2', display: 'card' } })
     const answer = await exec(['--project', 'repo', 'answer', 'agent_cli_project', '--request', 'q', '--stdin'])
     expect(answer.code).toBe(1)
     expect(answer.error).toContain('non-interactive')
@@ -206,7 +221,7 @@ test('explicit project CLI uses the private daemon endpoint and preserves projec
       expect(agent.code).toBe(1)
       expect(agent.error).toContain('must remain session-bound')
     }
-    expect(requests).toHaveLength(2)
+    expect(requests.filter(item => item.body)).toHaveLength(2)
     const duplicate = await exec(['--project', 'repo', 'identities', '--project', 'repo'])
     expect(duplicate.code).toBe(1)
     expect(duplicate.error).toContain('only be specified once')

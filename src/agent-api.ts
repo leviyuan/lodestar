@@ -198,6 +198,7 @@ function serializeRun(run: AgentRunSnapshot): object {
     parent_run_id: run.parentRunId,
     resumed_from_run_id: run.resumedFromRunId,
     parent_kind: run.parentKind,
+    ...(run.display ? { display: run.display } : {}),
     depth: run.depth,
     status: run.status,
     workers: run.workers.map(worker => ({

@@ -69,6 +69,25 @@ test('agent-visible diagnostics never carry emails, IM ids or absolute host path
   expect(otherPaths.match(/<path>/g)?.length).toBeGreaterThanOrEqual(4)
 })
 
+test('run requests carry an optional card display and responses echo the silent mode', async () => {
+  const started: any[] = []
+  const base = await serve(request => started.push(request), false, { display: 'silent' })
+  const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' }
+  const post = (body: object) => fetch(`${base}/agents/runs`, { method: 'POST', headers, body: JSON.stringify({
+    description: '任务说明', identity_ids: ['agent:a'], prompt: 'do it', ...body,
+  }) })
+  expect((await post({})).status).toBe(202)
+  expect(started[0].display).toBeUndefined()
+  expect((await post({ display: 'card' })).status).toBe(202)
+  expect(started[1].display).toBe('card')
+  const rejected = await post({ display: 'group' })
+  expect(rejected.status).toBe(409)
+  expect((await rejected.json() as any).error).toContain('agent display must be "card" or "silent"')
+  expect(started).toHaveLength(2)
+  const value = await (await fetch(`${base}/agents/runs/agent_1`, { headers })).json() as any
+  expect(value.display).toBe('silent')
+})
+
 test('run snapshots redact diagnostics and omit card message ids', async () => {
   const base = await serve(undefined, false, {
     error: 'failed at /Users/example/My Project (oc_1234567890abcdef1234)',

@@ -1068,7 +1068,8 @@ describe('AgentService', () => {
     const owner = kind === 'session' ? root : service.projectPrincipal({
       owner: { kind: 'project', name: session.sessionName, chatId: session.chatId, workDir: session.workDir },
     })
-    const request = { description: '开卡期间取消', identityIds: ['agent:a'], prompt: 'task' }
+    // Project calls are silent by default; this race needs the card path in both modes.
+    const request = { description: '开卡期间取消', identityIds: ['agent:a'], prompt: 'task', ...(kind === 'project' ? { display: 'card' as const } : {}) }
     try {
       const parent = await service.startRun(owner, request)
       await waitForCondition(() => calls.length === 1)
@@ -1521,18 +1522,21 @@ describe('project-owned Agent runs', () => {
     const projectRun = await h.service.startRun(project, request)
     await waitFor(h.service, project, projectRun.runId, 'running')
     await waitForCondition(() => calls.length === 2)
-    expect(calls[0].codexAccountId).toBe('default')
-    expect(calls[1].codexAccountId).toBeUndefined()
-    expect(calls[1].projectBound).toBe(true)
-    expect(calls[1].developerInstructions).toBeUndefined()
+    // Silent project runs skip card creation, so start order is not an ordering guarantee.
+    const projectCall = calls.findIndex(call => call.projectBound)
+    const sessionCall = calls.findIndex(call => !call.projectBound)
+    expect(sessionCall).toBeGreaterThanOrEqual(0)
+    expect(calls[sessionCall].codexAccountId).toBe('default')
+    expect(calls[projectCall].codexAccountId).toBeUndefined()
+    expect(calls[projectCall].developerInstructions).toBeUndefined()
     expect(() => h.service.getRun(h.root, projectRun.runId)).toThrow('not found')
     expect(() => h.service.getRun(project, sessionRun.runId)).toThrow('not found')
-    const worker = h.service.principalForCapability(calls[1].hostEnv.LODESTAR_AGENT_CAPABILITY!)!
+    const worker = h.service.principalForCapability(calls[projectCall].hostEnv.LODESTAR_AGENT_CAPABILITY!)!
     expect(h.service.getRun(worker, projectRun.runId).runId).toBe(projectRun.runId)
     await h.service.cancelSessionRuns(session.sessionName, session.chatId, 'stop session')
     expect(h.service.getRun(h.root, sessionRun.runId).status).toBe('cancelled')
     expect(h.service.getRun(project, projectRun.runId).status).toBe('running')
-    controls[1].resolve(result('project-native', 'independent output'))
+    controls[projectCall].resolve(result('project-native', 'independent output'))
     expect((await waitFor(h.service, project, projectRun.runId, 'completed')).workers[0].output).toBe('independent output')
   })
 
@@ -1605,12 +1609,75 @@ describe('project-owned Agent runs', () => {
     await expect(h.service.answer(principal, run.runId, { requestId: input.requestId, answers: { q: 'first' } })).rejects.toThrow('non-interactive')
   })
 
+  test('project calls render no card by default, opt in with display=card, and keep session delegation carded', async () => {
+    let cards = 0
+    const notices: string[] = []
+    const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
+    const h = harness({
+      sendCard: async () => `card-${++cards}`,
+      sendTextRaw: async (_chatId, text) => { notices.push(text); return true },
+      startWorker: opts => { calls.push(opts); return resolvedHandle(result(opts.resumeSessionId ?? 'native-sid', 'agent output')) },
+    })
+    const project = h.service.projectPrincipal(context())
+    const silent = await h.service.startRun(project, request)
+    expect(silent).toMatchObject({ display: 'silent' })
+    expect(silent.cardMessageId).toBeUndefined()
+    expect(h.service.getRun(project, silent.runId).cardMessageId).toBeUndefined()
+    const silentDone = await waitFor(h.service, project, silent.runId, 'completed')
+    expect(silentDone.workers[0]!.output).toBe('agent output')
+    expect(cards).toBe(0)
+    expect(notices).toEqual([])
+
+    const carded = await h.service.startRun(project, { ...request, display: 'card' })
+    await waitFor(h.service, project, carded.runId, 'completed')
+    expect(carded).not.toHaveProperty('display')
+    expect(h.service.getRun(project, carded.runId).cardMessageId).toBe('card-1')
+    expect(cards).toBe(1)
+
+    const delegated = await h.service.startRun(h.root, request)
+    await waitFor(h.service, h.root, delegated.runId, 'completed')
+    expect(delegated).not.toHaveProperty('display')
+    expect(h.service.getRun(h.root, delegated.runId).cardMessageId).toBe('card-2')
+    expect(cards).toBe(2)
+
+    await expect(h.service.startRun(h.root, { ...request, display: 'silent' }))
+      .rejects.toThrow('silent agent display is only supported for project calls')
+    expect(calls).toHaveLength(3)
+
+    const silentFollowUp = await h.service.followUp(project, silent.runId, { description: '续跑静默', prompt: 'next' })
+    expect(silentFollowUp).toMatchObject({ display: 'silent', resumedFromRunId: silent.runId })
+    await waitFor(h.service, project, silentFollowUp.runId, 'completed')
+    const cardedFollowUp = await h.service.followUp(project, carded.runId, { description: '续跑带卡', prompt: 'next' })
+    expect(cardedFollowUp.display).toBeUndefined()
+    await waitFor(h.service, project, cardedFollowUp.runId, 'completed')
+    expect(cards).toBe(3)
+  })
+
+  test('silent runs keep worker failures in the run record without posting to the chat', async () => {
+    const notices: string[] = []
+    const h = harness({
+      sendTextRaw: async (_chatId, text) => { notices.push(text); return true },
+      startWorker: opts => ({
+        done: Promise.reject(new AgentWorkerFailure(new Error(`${opts.identity.displayName} failed`), '', null)),
+        pendingInput: () => null, answer: () => {}, cancel: async () => {},
+      }),
+    })
+    const principal = h.service.projectPrincipal(context())
+    const run = await h.service.startRun(principal, request)
+    const failed = await waitFor(h.service, principal, run.runId, 'failed')
+    expect(failed.error).toBe('一个或多个 Agent 失败')
+    expect(failed.workers[0]!.status).toBe('failed')
+    expect(failed.workers[0]!.error).toBeTruthy()
+    expect(notices).toEqual([])
+  })
+
   test('project card cancellation validates the stored chat, message and project ownership', async () => {
     const control = controlledHandle()
     const h = harness({ startWorker: () => control.handle })
     const principal = h.service.projectPrincipal(context())
-    const run = await h.service.startRun(principal, request)
+    const run = await h.service.startRun(principal, { ...request, display: 'card' })
     await waitFor(h.service, principal, run.runId, 'running')
+    expect(run.cardMessageId).toBe('message-1')
     await expect(h.service.cancelProjectRunFromCard(run.runId, 'other', run.cardMessageId!, 'user')).rejects.toThrow('当前对话 ID（chat_id）')
     await expect(h.service.cancelProjectRunFromCard(run.runId, run.chatId, 'forged', 'user')).rejects.toThrow('当前对话 ID（chat_id）')
     await expect(h.service.cancelProjectRunFromCard(run.runId, run.chatId, run.cardMessageId!, '')).rejects.toThrow('当前对话 ID（chat_id）')
@@ -1623,7 +1690,7 @@ describe('project-owned Agent runs', () => {
     const gate = new Promise<void>(resolve => { open = resolve })
     const h = harness({ sendCard: async () => { await gate; return 'project-card' } })
     const principal = h.service.projectPrincipal(context())
-    const started = h.service.startRun(principal, request)
+    const started = h.service.startRun(principal, { ...request, display: 'card' })
     await h.service.cancelSessionRuns(session.sessionName, session.chatId, 'stop')
     open()
     const run = await started

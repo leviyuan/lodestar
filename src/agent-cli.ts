@@ -23,6 +23,8 @@ interface PromptArgs {
   noWait: boolean
   readStdin: boolean
   json: boolean
+  /** Project calls render no card unless this flag is set. */
+  card: boolean
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
@@ -80,6 +82,7 @@ async function runCommand(context: CliContext, argv: string[]): Promise<void> {
     ...(parsed.workDir ? { work_dir: parsed.workDir } : {}),
     ...(parsed.requestId ? { request_id: parsed.requestId } : {}),
     ...(parsed.requesterOpenId ? { requester_open_id: parsed.requesterOpenId } : {}),
+    ...(parsed.card ? { display: 'card' } : {}),
   }
   const started = await requestJson(context, 'POST', '/agents/runs', body)
   await presentStartedRun(context, started, parsed.noWait, parsed.json)
@@ -97,6 +100,7 @@ async function followUpCommand(context: CliContext, argv: string[]): Promise<voi
     ...(parsed.workDir ? { work_dir: parsed.workDir } : {}),
     ...(parsed.requestId ? { request_id: parsed.requestId } : {}),
     ...(parsed.requesterOpenId ? { requester_open_id: parsed.requesterOpenId } : {}),
+    ...(parsed.card ? { display: 'card' } : {}),
   }
   const started = await requestJson(context, 'POST', `/agents/runs/${encodeURIComponent(runId)}/follow-up`, body)
   await presentStartedRun(context, started, parsed.noWait, parsed.json)
@@ -146,7 +150,8 @@ async function answerCommand(context: CliContext, argv: string[]): Promise<void>
 
 export function parsePromptArgs(argv: string[], identitiesRequired: boolean): PromptArgs {
   const out: PromptArgs = {
-    identityIds: [], identityId: '', sessionId: '', workDir: '', effort: '', description: '', prompt: '', noWait: false, readStdin: false, json: false,
+    identityIds: [], identityId: '', sessionId: '', workDir: '', effort: '', description: '', prompt: '',
+    noWait: false, readStdin: false, json: false, card: false,
   }
   const positional: string[] = []
   for (let i = 0; i < argv.length; i++) {
@@ -176,6 +181,7 @@ export function parsePromptArgs(argv: string[], identitiesRequired: boolean): Pr
       case '--prompt': next(); out.prompt = argv[i]!; break
       case '--stdin': out.readStdin = true; break
       case '--no-wait': out.noWait = true; break
+      case '--card': out.card = true; break
       case '--json': out.json = true; break
       default:
         if (arg.startsWith('-')) throw new Error(`unknown option: ${arg}`)
@@ -329,6 +335,7 @@ function formatRun(run: any): string {
     `- Description: ${run.description ?? 'MISS'}`,
     `- Work directory: ${run.work_dir ?? 'MISS'}`,
     ...(run.parent_run_id ? [`- Parent: ${run.parent_run_id} (${run.parent_kind ?? 'delegate'})`] : []),
+    ...(run.display === 'silent' ? ['- Display: silent (no group card)'] : []),
   ]
   if (run.error) lines.push(`- Error: ${run.error}`)
   for (const worker of run.workers ?? []) {
@@ -377,9 +384,9 @@ function usage(): string {
     'Usage:',
     '  lodestar-agent --project <project-or-worktree> <command> [options]',
     '  lodestar-agent identities [--json]',
-    '  lodestar-agent run --identity <id> [--identity <id>...] --description <summary> [--workdir <path>] [--effort <level>] [--json] --stdin',
-    '  lodestar-agent run --session <session_id> [--identity <id>] --description <summary> [--workdir <path>] [--effort <level>] [--json] --stdin',
-    '  lodestar-agent follow-up <run_id> [--identity <id>] --description <summary> [--workdir <path>] [--effort <level>] [--json] --stdin',
+    '  lodestar-agent run --identity <id> [--identity <id>...] --description <summary> [--workdir <path>] [--effort <level>] [--card] [--json] --stdin',
+    '  lodestar-agent run --session <session_id> [--identity <id>] --description <summary> [--workdir <path>] [--effort <level>] [--card] [--json] --stdin',
+    '  lodestar-agent follow-up <run_id> [--identity <id>] --description <summary> [--workdir <path>] [--effort <level>] [--card] [--json] --stdin',
     '  lodestar-agent answer <run_id> [--identity <id>] --request <id> (--answer key=value | --stdin)',
     '  lodestar-agent status <run_id> [--json]',
     '  lodestar-agent cancel <run_id>',
@@ -389,6 +396,8 @@ function usage(): string {
     'Agent task calls must use the managed-session context. --project is only for independent services and applications.',
     'Without --project, the existing managed-session context is required; invalid contexts never switch modes.',
     'Project run/follow-up: --request-id <unique-key> deduplicates retries; --requester <open_id> records the requester only.',
+    'Project calls render no card by default; add --card to post the independent 项目任务 card in the bound conversation.',
+    'Session-bound delegation always renders its card; --card is a no-op there and silent display is rejected.',
     'Project calls are non-interactive and never wait for answers. The answer command is only for session-bound delegation.',
     'Agent results and local artifact paths return to the caller. File-delivery markers are not executed.',
     '--session resumes the unique native session ID only within its registered project and conversation ID (chat_id).',
@@ -398,7 +407,7 @@ function usage(): string {
     '--workdir defaults to the managed-session or explicit-project directory; relative paths are resolved from it.',
     'New conversations and resumes stay within that project root. Resumes otherwise reuse the recorded directory.',
     'session_id is the stable native session ID, distinct from the binding conversation ID (chat_id); run_id identifies one invocation.',
-    '--description is required for every run/follow-up: one short line, at most 60 characters, shown on the collapsed card.',
+    '--description is required for every run/follow-up: one short line, at most 60 characters, shown on the collapsed card when one is rendered.',
     'Each turn has a new run_id; workers[].session_id identifies the native Agent session.',
   ].join('\n')
 }

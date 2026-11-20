@@ -183,9 +183,11 @@ Agent 在执行任务中调用其他 Agent 或模型时，必须绑定当前会�
 # desc: 查询项目可用身份并发起独立任务
 lodestar-agent --project '<项目名>' identities --json
 lodestar-agent --project '<项目名>' run --identity '<identity-id>' --description '检查项目' --prompt '检查代码并报告结果' --request-id '<本次业务调用唯一编号>' --no-wait
+# desc: 需要群内可见时加 --card
+lodestar-agent --project '<项目名>' run --identity '<identity-id>' --description '检查项目' --card --stdin
 ```
 
-每次项目调用在绑定对话 ID 下新建独立的“项目任务”卡，后续进度和结果更新原卡。它不复用会话委派卡，不读取或修改主会话的模型、账号和上下文；停止、重启、切换主会话不影响项目任务。可点击任务卡的“停止本次任务”，或使用同一 `--project` 下的 `cancel <run-id>`。两类任务仍共享实际工作目录。
+每次项目调用默认**不在群里展示**：结果与本地文件路径只回到调用方，群内没有卡片、也没有进度或失败提示。需要群内可见时显式加 `--card`（HTTP 请求体 `display: "card"`），此时在绑定对话 ID 下新建独立的“项目任务”卡，后续进度和结果更新原卡；可点击任务卡的“停止本次任务”，或使用同一 `--project` 下的 `cancel <run-id>`。静默任务没有卡，只能用 `cancel <run-id>` 取消。项目卡不复用会话委派卡，不读取或修改主会话的模型、账号和上下文；停止、重启、切换主会话不影响项目任务。两类任务仍共享实际工作目录。
 
 项目入口面向传统软件，执行约定是不给调用方提问、不等待回答。调用方给出目标后，Agent 自行查明上下文、作出任务范围内的实现决策、持续执行并验证，直至完整完成目标；不能以计划、部分工作、索取输入或要求调用方安排更多 Agent 作为完成结果。真实阻断或底层故障仍须如实报告，不能伪造完成。`answer` 用于会话归属的各层委派，不支持 `--project`。
 
@@ -202,7 +204,7 @@ lodestar-agent --project '<项目名>' status '<run-id>' --json
 
 项目任务的 `run` / `follow-up` 可用 `--request-id` 防止超时重试重复执行：同一归属、同一编号及相同输入返回原任务，输入不同则拒绝，daemon 重启后仍有效。重启不会自动重跑未完成任务；遗留非终态任务标为失败，已有原生会话可显式续跑。
 
-HTTP 使用原 `/agents/…` 路径并增加 `?project=<项目名>`，Bearer 凭据由 daemon 启动时生成，CLI 自动读取，无需配置或输出凭据；凭据仅在本机使用，重启后轮换。项目凭据只用于显式项目路由，会话和 worker 凭据不能用来调用项目路由。请求体可增加 `request_id`；`requester_open_id`（CLI `--requester`）只作为同请求去重输入，不持久化、不触发文件交付或授权。响应中的 `binding: "project"`、`project` 标明归属。旧会话接口保持原调用方式。
+HTTP 使用原 `/agents/…` 路径并增加 `?project=<项目名>`，Bearer 凭据由 daemon 启动时生成，CLI 自动读取，无需配置或输出凭据；凭据仅在本机使用，重启后轮换。项目凭据只用于显式项目路由，会话和 worker 凭据不能用来调用项目路由。请求体可增加 `request_id`、`display`（`"card"` 建卡 / `"silent"` 静默，项目调用缺省静默）；`requester_open_id`（CLI `--requester`）只作为同请求去重输入，不持久化、不触发文件交付或授权。响应中的 `binding: "project"`、`project` 标明归属，静默任务另带 `display: "silent"`。旧会话接口保持原调用方式。
 
 ## 本机通知
 

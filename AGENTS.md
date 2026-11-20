@@ -71,7 +71,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
   - OpenRouter 用 `/credits` 查账户余额，以实际响应判断权限。中转站余额只来自可选 `balance_script`，同一站点的各 Agent 视图合并为一个余额账号（单聊面板只列一次）；未配置脚本时不适用，脚本失败显示 MISS。
 - Lodestar Agent 不支持调用 Claude 订阅，遵守 Claude 用户协议；中转站等第三方来源的 Claude 模型仍可调用。reclaude 运行在订阅登录上，与 Claude 订阅一样排除。身份目录与新建/续跑入口仅按来源 ID 与类型排除 Claude 订阅与 reclaude，不按模型名称或显示名限制。此限制只作用于 Lodestar Agent，不影响主会话的 Claude 订阅/reclaude 能力或原生委派工具。
 - `AgentService` 的委派进程与主会话共用启动入口。主 Agent、委派 Agent 和原生子 Agent 均可继续派工，不设置 Lodestar 委派层数上限，保留原生委派工具；独立服务/软件的项目调用不提供提问或回答接口，新建和续跑均须自主执行、验证直至完整完成目标，不能以索取输入、计划或部分工作结束；真实阻断和故障须如实报告；后续委派继承项目、对话 ID（`chat_id`）和交互约定，并纳入父任务的取消树。会话委派与 `--project` 项目调用都只返回结果和本地文件路径，由调用方处理交付；不注入主会话交付提示词，不执行结果中的交付标记，新建与续跑一致。具体生命周期约束见 `src/AGENTS.md`。
-- Agent 执行任务中的调用必须绑定会话，不得通过 `--project`、清除环境或借用项目凭据脱离会话；独立服务/软件调用必须显式 `--project`，每次在绑定对话 ID 下显示独立卡。对话 ID（`chat_id`）标识调用绑定对象；原生 `session_id` 是后端会话唯一 ID，与对话 ID 不同，`run_id` 仅标识一次调用。恢复限同一项目、同一对话 ID，允许会话/项目两种绑定之间续跑；未知归属、跨项目和跨对话 ID 均报错。会话委派与项目调用均不设置本地并发或任务数量上限，上游限制与启动失败按实际错误报告。
+- Agent 执行任务中的调用必须绑定会话，不得通过 `--project`、清除环境或借用项目凭据脱离会话；独立服务/软件调用必须显式 `--project`。项目调用默认不建卡（结果只回调用方），需要群内可见时由调用方显式请求：CLI `--card`、HTTP `display: "card"`；会话委派始终使用自己的卡片，`display: "silent"` 对会话调用报错。对话 ID（`chat_id`）标识调用绑定对象；原生 `session_id` 是后端会话唯一 ID，与对话 ID 不同，`run_id` 仅标识一次调用。恢复限同一项目、同一对话 ID，允许会话/项目两种绑定之间续跑；未知归属、跨项目和跨对话 ID 均报错。会话委派与项目调用均不设置本地并发或任务数量上限，上游限制与启动失败按实际错误报告。
 - `managed-skills.ts` 同源生成 Codex/Claude standalone Skill 和 Claude 本地插件。GLM/DeepSeek 通过插件加载 Skill，不为此重新引入 user settings 和凭据。
 - 同 provider/source 调用 `setModelSettings`；Claude 后续 turn 生效，Codex 持久设置在重启后生效。跨 provider/source 只在空闲时换进程，resume id 按 provider 隔离。
 - 保留 Claude 的原生 resume/fork、提问、project profile、MCP/Skill、主动压缩和 SDK 后台任务；保留 Codex 的权限、提问、plan/goal、compaction、usage 和 collab 事件。共享接口须表达后端差异。

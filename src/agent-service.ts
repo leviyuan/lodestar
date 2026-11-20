@@ -3,7 +3,7 @@ import { existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSy
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { AgentCards, type AgentCardsDeps } from './agent-cards'
 import { agentCardsDeps } from './agent-cards-runtime'
-import { agentOwnerKey, agentRunOwner, requireAgentDescription, requireAgentWorkDir, PROJECT_AGENT_INPUT_ERROR } from './agent-run-types'
+import { agentOwnerKey, agentRunOwner, isSilentAgentRun, requireAgentDescription, requireAgentWorkDir, PROJECT_AGENT_INPUT_ERROR } from './agent-run-types'
 import * as feishu from './feishu'
 import { config } from './config'
 import { assertAgentIdentityIdAllowed, assertAgentSourceAllowed, getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
@@ -13,6 +13,7 @@ import { workspaceKey } from './workspace'
 import type {
   AgentAnswerRequest,
   AgentFollowUpRequest,
+  AgentRunDisplay,
   AgentRunRequest,
   AgentRunSnapshot,
   AgentRunStatus,
@@ -215,11 +216,15 @@ export class AgentService {
     const sameOwner = agentOwnerKey(agentRunOwner(history.run.snapshot)) === agentOwnerKey(context.owner)
     const effort = request.effort ?? (history.worker.identityId === identity.id ? history.worker.effort : undefined)
     const workDir = request.workDir ?? history.run.snapshot.workDir
+    // A continuation keeps the chain's display, but only a project-owned run may stay silent:
+    // a session-owned continuation of a silent project run still returns its own card.
+    const silentSource = isSilentAgentRun(history.run.snapshot) && context.owner.kind === 'project'
+    const display = request.display ?? (silentSource ? 'silent' : 'card')
     const releaseSession = this.reserveNativeSession({ provider: identity.provider, sessionId: request.sessionId! })
     try {
       return await this.createRun(context, {
         identityIds: [identity.id], description: request.description, prompt: request.prompt, effort, workDir,
-        requesterOpenId: request.requesterOpenId,
+        requesterOpenId: request.requesterOpenId, display,
       }, {
         ...metadata,
         ...(principal.kind === 'worker' ? this.delegationParent(principal)
@@ -306,7 +311,8 @@ export class AgentService {
     const key = JSON.stringify([ownerKey, request.requestId])
     const hash = createHash('sha256').update(JSON.stringify({ operation,
       prompt: request.prompt, description: request.description, effort: request.effort, workDir: request.workDir,
-      requesterOpenId: request.requesterOpenId, identityIds: 'identityIds' in request ? request.identityIds : undefined,
+      requesterOpenId: request.requesterOpenId, display: request.display,
+      identityIds: 'identityIds' in request ? request.identityIds : undefined,
       identityId: 'identityId' in request ? request.identityId : undefined,
       sessionId: 'sessionId' in request ? request.sessionId : undefined,
     })).digest('hex')
@@ -416,6 +422,8 @@ export class AgentService {
     })
     // No worker would ever report a state, so the run and its card would stay queued forever.
     if (!identities.length) throw new Error('agent run requires at least one identity')
+    const display = resolveRunDisplay(request.display, owner.kind)
+    const silent = display === 'silent'
     const workers = identities.map(identity => workerSnapshot(
       identity,
       resolveEffort(identity, request.effort),
@@ -438,6 +446,7 @@ export class AgentService {
       ...(options.parentRunId ? { parentRunId: options.parentRunId } : {}),
       ...(options.parentKind ? { parentKind: options.parentKind } : {}),
       ...(options.resumedFromRunId ? { resumedFromRunId: options.resumedFromRunId } : {}),
+      ...(silent ? { display: 'silent' as const } : {}),
       depth: options.depth,
       status: 'queued',
       workers,
@@ -460,22 +469,24 @@ export class AgentService {
       persistedArtifacts: new Set(),
       artifactsUnloaded: false,
     }
-    try {
-      await this.presentation.add(snapshot)
-    } catch (error) {
-      this.runs.set(runId, run)
-      if (options.parentRunId) parent?.children.add(runId)
-      const reason = `Agent 卡片初始化失败，Agent 未启动: ${messageOf(error)}`
-      for (const worker of workers) {
-        worker.status = 'failed'
-        worker.error = reason
+    if (!silent) {
+      try {
+        await this.presentation.add(snapshot)
+      } catch (error) {
+        this.runs.set(runId, run)
+        if (options.parentRunId) parent?.children.add(runId)
+        const reason = `Agent 卡片初始化失败，Agent 未启动: ${messageOf(error)}`
+        for (const worker of workers) {
+          worker.status = 'failed'
+          worker.error = reason
+        }
+        // The caller must receive the card error, not a secondary bookkeeping or notice failure.
+        await this.finalizeRun(run, 'failed', reason)
+          .catch(finalizeError => logError('agent-service: card init failure finalization failed', finalizeError))
+        await this.deps.sendTextRaw(owner.chatId, `❌ ${reason}`)
+          .catch(noticeError => logError('agent-service: card init failure notice failed', noticeError))
+        throw error
       }
-      // The caller must receive the card error, not a secondary bookkeeping or notice failure.
-      await this.finalizeRun(run, 'failed', reason)
-        .catch(finalizeError => logError('agent-service: card init failure finalization failed', finalizeError))
-      await this.deps.sendTextRaw(owner.chatId, `❌ ${reason}`)
-        .catch(noticeError => logError('agent-service: card init failure notice failed', noticeError))
-      throw error
     }
     this.runs.set(runId, run)
     if (options.parentRunId) parent?.children.add(runId)
@@ -689,6 +700,7 @@ export class AgentService {
       run.snapshot.status = 'failed'
       run.snapshot.error = `Agent terminal persistence failed: ${messageOf(error)}`
       logError('agent-service: terminal finalization failed', error)
+      if (isSilentAgentRun(run.snapshot)) return
       void this.deps.sendTextRaw(run.snapshot.chatId, `❌ agent ${run.snapshot.runId} 收尾失败: ${messageOf(error)}`)
         .catch(deliveryError => logError('agent-service: terminal failure delivery failed', deliveryError))
     })
@@ -727,8 +739,10 @@ export class AgentService {
       run.snapshot.status = 'failed'
       run.snapshot.error = error.message
       this.persist(run)
-      await this.deps.sendTextRaw(run.snapshot.chatId, `❌ Agent 取消未完成: ${error.message}`)
-        .catch(deliveryError => logError('agent-service: cancellation failure notice failed', deliveryError))
+      if (!isSilentAgentRun(run.snapshot)) {
+        await this.deps.sendTextRaw(run.snapshot.chatId, `❌ Agent 取消未完成: ${error.message}`)
+          .catch(deliveryError => logError('agent-service: cancellation failure notice failed', deliveryError))
+      }
       throw error
     }
     const cancelledWorkers: AgentWorkerResult[] = []
@@ -752,10 +766,12 @@ export class AgentService {
     run.snapshot.status = status
     run.snapshot.finishedAt = new Date().toISOString()
     if (error) run.snapshot.error = error
-    try {
-      await this.presentation.update(run.snapshot, true)
-    } catch (presentationError) {
-      this.recordPresentationError(run, `agent card finalization failed: ${messageOf(presentationError)}`)
+    if (!isSilentAgentRun(run.snapshot)) {
+      try {
+        await this.presentation.update(run.snapshot, true)
+      } catch (presentationError) {
+        this.recordPresentationError(run, `agent card finalization failed: ${messageOf(presentationError)}`)
+      }
     }
     run.finalizing = false
     this.persist(run)
@@ -776,7 +792,7 @@ export class AgentService {
     worker: AgentWorkerResult,
     purpose: 'state' | 'progress' = 'state',
   ): Promise<void> {
-    if (run.finalized) return
+    if (run.finalized || isSilentAgentRun(run.snapshot)) return
     const previousMessageId = run.snapshot.cardMessageId
     try {
       await this.presentation.update(run.snapshot, false, purpose === 'progress')
@@ -1050,6 +1066,18 @@ function workerSnapshot(
   }
 }
 
+/**
+ * Project (external) calls stay silent unless a card is explicitly requested;
+ * session-owned delegation keeps its card. Silent runs never render, so they
+ * cannot be interactive and cannot be cancelled from a card.
+ */
+function resolveRunDisplay(requested: AgentRunDisplay | undefined, ownerKind: 'session' | 'project'): AgentRunDisplay {
+  if (requested === 'silent' && ownerKind !== 'project') {
+    throw new Error('silent agent display is only supported for project calls')
+  }
+  return requested ?? (ownerKind === 'project' ? 'silent' : 'card')
+}
+
 function resolveEffort(identity: AgentIdentity, raw: string | undefined): AgentReasoningEffort {
   const effort = raw ?? identity.defaultEffort
   if (!effort) throw new Error(`${identity.displayName} default effort MISS; specify effort explicitly`)
@@ -1110,6 +1138,7 @@ function isAgentRunSnapshot(value: unknown): value is AgentRunSnapshot {
     && (run.resumedFromRunId === undefined || typeof run.resumedFromRunId === 'string')
     && (run.requestId === undefined || typeof run.requestId === 'string' && typeof run.requestHash === 'string')
     && (run.deliveryMode === undefined || run.deliveryMode === 'chat' || run.deliveryMode === 'drive')
+    && (run.display === undefined || run.display === 'silent')
     && (run.sessionWorkDir === undefined || typeof run.sessionWorkDir === 'string')
     && typeof run.prompt === 'string'
     && (run.description === undefined || typeof run.description === 'string')
