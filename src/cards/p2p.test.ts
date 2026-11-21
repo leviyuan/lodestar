@@ -46,10 +46,12 @@ describe('1:1 read-only panel card', () => {
     const projects = section(card, 'console_projects')
     expect(projects.expanded).toBe(true)
     expect(projects.header.title.content).toBe('🗂 活跃项目 (2)')
-    // Sorted by name, so a group's temp and wt groups sit next to it; the status dot leads each block.
+    // Sorted by name, so a group's temp and wt groups sit next to it; the status dot leads each block
+    // and already says idle/working, so the row carries no status words; the counts, the uptime and the
+    // account each keep their own line instead of one long row.
     expect(blocks(card)).toEqual([
-      "⚙️ **`foo`**　工作中 · 子Agent1·后台2\n<font color='grey'>Codex·工作订阅 · 已运行 1m</font>",
-      "🟢 **`foo*x`**　空闲\n<font color='grey'>Claude·备用账号</font>",
+      "⚙️ **`foo`**\n<font color='grey'>🤖1·⏳2 · 已运行 1m</font>\n<font color='grey'>Codex·工作订阅</font>",
+      "🟢 **`foo*x`**\n<font color='grey'>Claude·备用账号</font>",
     ])
     const usage = section(card, 'console_usage')
     expect(usage.expanded).toBe(true)
@@ -57,8 +59,9 @@ describe('1:1 read-only panel card', () => {
     expect(usage.elements).toEqual([{ tag: 'markdown', content:
       "**DeepSeek**　余额 ¥12.34\n\n**GLM**\n月工具　<font color='green'>▰▰▰▱▱▱</font> 50%" }])
     const host = section(card, 'console_host')
-    expect(host.expanded).toBe(false)
-    expect(host.header.title.content).toBe('🖥 主机 · 负载 0.42 · 内存 63% · 服务 1')
+    // The host opens with the card: load is given as a share of the core count.
+    expect(host.expanded).toBe(true)
+    expect(host.header.title.content).toBe('🖥 主机 · 负载 5% · 内存 63% · 服务 1')
     expect(card.body.elements.at(-1)).toEqual({ tag: 'markdown', text_size: 'notation', content: P2P_CONSOLE_HINT })
     const body = JSON.stringify(card)
     expect(body).not.toContain('当前')
@@ -71,8 +74,8 @@ describe('1:1 read-only panel card', () => {
     const card = p2pConsoleCard({ peers, restricted: true, sysinfo: failed, accountUsages }) as any
     expect(ids(card)).toEqual(['console_projects', undefined])
     expect(blocks(card)).toEqual([
-      "⚙️ **`foo`**　工作中 · 子Agent1·后台2\n<font color='grey'>已运行 1m</font>",
-      '🟢 **`foo*x`**　空闲',
+      "⚙️ **`foo`**\n<font color='grey'>🤖1·⏳2 · 已运行 1m</font>",
+      '🟢 **`foo*x`**',
     ])
     const body = JSON.stringify(card)
     for (const hidden of ['工作订阅', '备用账号', 'Codex·', 'Claude·', '主机', '账号额度', 'DeepSeek', 'codex-probe-runner', '服务失败']) {
@@ -92,8 +95,8 @@ describe('1:1 read-only panel card', () => {
     expect(card.header.text_tag_list.map((tag: any) => [tag.text.content, tag.color])).toEqual([
       ['等审批 1', 'orange'], ['工作中 1', 'blue'], ['服务失败 1', 'red'],
     ])
-    expect(blocks(card)[0]).toBe("🔐 **`bar`**　<font color='orange'>等审批</font>\n<font color='grey'>已运行 8s</font>")
-    expect(section(card, 'console_host').header.title.content).toBe('🖥 主机 · 负载 0.42 · 内存 63% · 服务 2 · ❌ 失败 1')
+    expect(blocks(card)[0]).toBe("🔐 **`bar`**\n<font color='grey'>已运行 8s</font>")
+    expect(section(card, 'console_host').header.title.content).toBe('🖥 主机 · 负载 5% · 内存 63% · 服务 2 · ❌ 失败 1')
     expect(section(card, 'console_usage').elements[0].content).toBe("<font color='grey'>暂无已配置账号</font>")
   })
 
@@ -125,6 +128,29 @@ describe('1:1 read-only panel card', () => {
     expect(card.header.subtitle).toBeUndefined()
     expect(card.header.text_tag_list).toBeUndefined()
     expect(card.header.template).toBe('green')
+  })
+
+  test('failed accounts keep only MISS inline and their reasons fold into a collapsed panel', () => {
+    const failed: AccountUsage = { id: 'glm', label: 'GLM', usage: { state: 'network', reason: 'upstream <offline>', windows: [] } }
+    const ok: AccountUsage = { id: 'deepseek', label: 'DeepSeek', usage: { state: 'ok', kind: 'balance', balance: { remaining: 1, currency: 'CNY' }, windows: [] } }
+    const card = p2pConsoleCard({ peers: [], restricted: false, accountUsages: [ok, failed] }) as any
+    const usage = section(card, 'console_usage')
+    expect(usage.elements[0].content).toBe("**DeepSeek**　余额 ¥1.00\n\n**GLM**　<font color='red'>MISS</font>")
+    const details = usage.elements[1]
+    expect(details.tag).toBe('collapsible_panel')
+    expect(details.expanded).toBe(false)
+    expect(details.header.title.content).toBe('⚠️ 额度读取失败 (1)')
+    // 原因完整放进折叠面板，并且按行内文本转义，不注入卡片标签。
+    expect(details.elements[0].content).toContain('GLM')
+    expect(details.elements[0].content).toContain('upstream &#60;offline&#62;')
+    // 主机读不到服务列表时也只留 MISS，原因折叠。
+    const hostCard = p2pConsoleCard({ peers: [], restricted: false, accountUsages: [], sysinfo: { ...sysinfo, servicesError: 'launchctl MISS' } }) as any
+    const host = section(hostCard, 'console_host')
+    expect(host.elements[0].content).toContain("<font color='red'>MISS</font>")
+    expect(host.elements[0].content).not.toContain('launchctl MISS')
+    expect(host.elements[1].expanded).toBe(false)
+    expect(host.elements[1].header.title.content).toBe('⚠️ 主机读取失败')
+    expect(host.elements[1].elements[0].content).toBe('服务列表：launchctl MISS')
   })
 
   test('many projects and accounts stay well inside the card component limit', () => {

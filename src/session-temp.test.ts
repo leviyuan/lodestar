@@ -533,7 +533,7 @@ describe('session-temp Codex btw/fork', () => {
 
     expect(await runCommand(h.session, 'bl', 'ou_owner')).toBe(true)
 
-    expect(cardJson(sentCards.at(-1))).toContain('🟢 空闲 · 子Agent2·后台1')
+    expect(cardJson(sentCards.at(-1))).toContain('🟢 空闲 · 🤖2·⏳1')
   })
 
   test('bl 卡片发送失败时回退原文并保留飞书诊断', async () => {

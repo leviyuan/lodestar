@@ -5776,7 +5776,9 @@ describe('Session usage cache cross-backend isolation', () => {
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'fable')).toBe('  |  [6.9d·17%]')
       snapshot = { state: 'network', windows: [], reason: 'query failed' }
       await session.patchConsoleUsage('quota-card')
-      expect(content()).toContain('MISS · query failed')
+      // 行内只留 MISS，完整原因在默认折叠的错误详情面板里。
+      expect(content()).toBe("<font color='red'>MISS</font>")
+      expect(JSON.stringify(replaceSpy.mock.calls.at(-1)?.[2])).toContain('query failed')
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null)).toBe('  |  额度 MISS')
       expect(await session.footerUsageSuffix('codex', null, source.id, source, null)).toBe('  |  额度 MISS')
       expect(await session.footerUsageSuffix('claude', null, 'other-source', undefined, null)).toBe('  |  额度 MISS')
@@ -6125,7 +6127,7 @@ describe('Session background tasks in shared delegation cards', () => {
       expect(session.backgroundTasks).toHaveLength(1)
       expect(session.backgroundTasks[0].status).toBe('failed')
       const rendered = calls.filter(call => call.method === 'PUT').map(call => String(call.body.element)).join('\n')
-      expect(rendered).toContain('子 Agent失败')
+      expect(rendered).toContain('🤖失败')
       expect(rendered).toContain('无法启动子 Agent')
     } finally {
       session.stopFooterStatus(session.currentTurn)

@@ -5,7 +5,7 @@ import { agentProviderLabel } from '../agent-process'
  * src/cards.ts.
  */
 
-import { SERVICE_LABEL, type SysInfo } from '../sysinfo'
+import { SERVICE_LABEL, type CpuInfo, type SysInfo } from '../sysinfo'
 import type { UsageSnapshot } from '../usage'
 import type { UsageSnapshotUnified, TokenSourceModelCatalogState } from '../token-source'
 import type { AgentProvider } from '../agent-process'
@@ -13,7 +13,7 @@ import { ELEMENTS } from './elements'
 import { formatDuration } from './duration'
 import { codexCreditsSummary, fmtCountdown, fmtResetIn } from './usage'
 import type { AccountUsage } from '../account-usage'
-import { accountUsageLines, escapeInlineMarkdown } from './account-usage'
+import { accountUsageError, accountUsageLines, escapeInlineMarkdown } from './account-usage'
 import { sessionWorkloadLabel, type SessionWorkload } from './task-kind'
 
 export { fmtResetIn } from './usage'
@@ -244,10 +244,19 @@ export function failedServiceCount(sysinfo?: SysInfo): number {
   return sysinfo && !sysinfo.servicesError ? sysinfo.services.filter(service => service.active === 'failed').length : 0
 }
 
-/** 主机面板默认折叠：标题用文字写出负载、内存和服务数，有服务挂掉时直接写出数量，不必展开。 */
+/** 负载按核数归一成百分比：1 分钟平均负载 / 核数，超过 100% 说明有任务在等 CPU；核数无效时 MISS。 */
+function loadPercent(cpu: CpuInfo): number | null {
+  if (!(cpu.cores > 0) || !Number.isFinite(cpu.load1)) return null
+  return Math.round((cpu.load1 / cpu.cores) * 100)
+}
+
+/** 主机面板的标题用文字写出负载、内存和服务数，有服务挂掉时直接写出数量，不必展开。 */
 function hostSummary(sysinfo?: SysInfo): string[] {
   const parts: string[] = []
-  if (sysinfo?.cpu) parts.push(`负载 ${sysinfo.cpu.load1.toFixed(2)}`)
+  if (sysinfo?.cpu) {
+    const percent = loadPercent(sysinfo.cpu)
+    parts.push(percent === null ? '负载 MISS' : `负载 ${percent}%`)
+  }
   if (sysinfo?.mem) parts.push(`内存 ${sysinfo.mem.percent}%`)
   if (sysinfo && !sysinfo.servicesError) {
     parts.push(`服务 ${sysinfo.services.length}`)
@@ -255,6 +264,23 @@ function hostSummary(sysinfo?: SysInfo): string[] {
     if (failed) parts.push(`${SERVICE_STATUS_EMOJI.failed} 失败 ${failed}`)
   }
   return parts
+}
+
+/** 默认折叠的错误详情：错误文本再长也不挤坏版面，需要时再展开。 */
+export function errorDetailsElement(title: string, lines: string[]): object {
+  return {
+    tag: 'collapsible_panel',
+    expanded: false,
+    header: { title: { tag: 'plain_text', content: `⚠️ ${title}` }, background_color: 'grey-50' },
+    border: { color: 'grey-100', corner_radius: '6px' },
+    padding: '6px',
+    elements: [{ tag: 'markdown', text_size: 'notation', content: lines.join('\n\n') }],
+  }
+}
+
+/** 主机区要折叠的错误：服务列表整体读不到时把原因收起来。 */
+function hostErrorDetails(sysinfo?: SysInfo): string[] {
+  return sysinfo?.servicesError ? [`服务列表：${escapeInlineMarkdown(sysinfo.servicesError)}`] : []
 }
 
 export function consoleHostContent(sysinfo?: SysInfo): string {
@@ -269,7 +295,10 @@ export function consoleHostContent(sysinfo?: SysInfo): string {
   const lines: string[] = []
   if (sysinfo.cpu) {
     const { cores, load1, load5, load15 } = sysinfo.cpu
-    lines.push(`**负载**　${load1.toFixed(2)} / ${load5.toFixed(2)} / ${load15.toFixed(2)} (${cores}核)`)
+    const percent = loadPercent(sysinfo.cpu)
+    // 百分比是归一后的占用，后面保留原生 1m/5m/15m 三个负载值和核数。
+    lines.push(percent === null ? '**负载**　MISS'
+      : `**负载**　${percent}% · ${load1.toFixed(2)} / ${load5.toFixed(2)} / ${load15.toFixed(2)} (${cores}核)`)
   } else {
     lines.push('**负载**　MISS')
   }
@@ -281,7 +310,8 @@ export function consoleHostContent(sysinfo?: SysInfo): string {
   }
 
   if (sysinfo.servicesError) {
-    lines.push(`**服务** ${SERVICE_LABEL}　_${sysinfo.servicesError}_`)
+    // 完整原因进默认折叠的错误详情，行内只留 MISS。
+    lines.push(`**服务** ${SERVICE_LABEL}　<font color='red'>MISS</font>`)
   } else if (sysinfo.services.length === 0) {
     lines.push(`**服务** ${SERVICE_LABEL}　_无_`)
   } else {
@@ -356,7 +386,7 @@ export function consoleProjectElement(
   }
 }
 
-/** 单聊面板的主机区：默认折叠，标题用文字写出负载、内存、服务数与失败数。 */
+/** 单聊面板的主机区：默认展开，标题用文字写出负载百分比、内存、服务数与失败数。 */
 export function consoleHostElement(sysinfo?: SysInfo, elementId = ELEMENTS.consoleHost): object {
   const summary = hostSummary(sysinfo)
   return {
@@ -371,8 +401,11 @@ export function consoleHostElement(sysinfo?: SysInfo, elementId = ELEMENTS.conso
     },
     border: { color: 'grey-100', corner_radius: '8px' },
     padding: '8px',
-    expanded: false,
-    elements: [{ tag: 'markdown', content: consoleHostContent(sysinfo) }],
+    expanded: true,
+    elements: [
+      { tag: 'markdown', content: consoleHostContent(sysinfo) },
+      ...(hostErrorDetails(sysinfo).length ? [errorDetailsElement('主机读取失败', hostErrorDetails(sysinfo))] : []),
+    ],
   }
 }
 
@@ -411,11 +444,16 @@ export function consoleUsageElement(opts: ConsoleOpts): object {
   const content = opts.account === undefined ? '加载中…'
     : opts.account === null ? `<font color='grey'>${opts.status === 'stopped' ? '未启动' : '账号未确定'}</font>`
     : consoleUnifiedUsageContent(opts.account.usage)
+  const reason = opts.account ? accountUsageError(opts.account.usage) : null
   return {
     tag: 'collapsible_panel', element_id: ELEMENTS.consoleUsage, expanded: true,
     header: { title: { tag: 'plain_text', content: '📊 账号额度' }, background_color: 'blue-50' },
     border: { color: 'blue-100', corner_radius: '8px' }, padding: '8px',
-    elements: [{ tag: 'markdown', content }],
+    elements: [
+      { tag: 'markdown', content },
+      // 失败原因默认折叠，行内只留 MISS。
+      ...(reason ? [errorDetailsElement('额度读取失败', [escapeInlineMarkdown(reason)])] : []),
+    ],
   }
 }
 

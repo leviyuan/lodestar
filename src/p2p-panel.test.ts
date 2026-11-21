@@ -109,7 +109,7 @@ function harness(opts: {
 
 const EMPTY_PROJECTS = "<font color='grey'>暂无运行中的项目</font>"
 
-/** Project blocks as displayed: sorted by name, two lines each, blank-line separated. */
+/** Project blocks as displayed: sorted by name, one fact per line, blank-line separated. */
 function rows(card: any): string[] {
   const projects = card.body.elements.find((element: any) => element.element_id === 'console_projects')
   return projects.elements.flatMap((element: any) => element.content === EMPTY_PROJECTS ? [] : element.content.split('\n\n'))
@@ -125,7 +125,11 @@ function byName(names: string[]): string[] {
     || a.localeCompare(b, 'zh-Hans-CN'))
 }
 
-const row = (name: string, details: string) => `🟢 **\`${name}\`**　空闲\n<font color='grey'>${details}</font>`
+/** One project block: the status dot and the name first, then the running counts with the uptime, then the account. */
+const row = (name: string, ...details: string[]) => [
+  `🟢 **\`${name}\`**`,
+  ...details.map(line => `<font color='grey'>${line}</font>`),
+].join('\n')
 
 function elementIds(card: any): unknown[] {
   return card.body.elements.map((element: any) => element.element_id)
@@ -244,7 +248,7 @@ describe('1:1 panel builder', () => {
     expect(names(card)).toEqual(byName(['foo', 'foo*x', 'foo[b]', 'foo[b]*x', 'my_proj', 'member-only']))
     // The project and its temp and wt groups stay together.
     expect(names(card).slice(0, 4).every(name => name.startsWith('foo'))).toBe(true)
-    expect(rows(card)[0]).toBe(row('foo', 'Codex·工作订阅 · 已运行 2m'))
+    expect(rows(card)[0]).toBe(row('foo', '已运行 2m', 'Codex·工作订阅'))
     expect(rows(card).find(block => block.includes('member-only'))).toContain('Codex·备用')
     // Membership is only asked for the sessions ownership did not already cover.
     expect(h.memberChecks).toEqual([

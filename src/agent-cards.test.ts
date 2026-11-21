@@ -107,7 +107,7 @@ describe('shared delegation card lifecycle', () => {
     terminal(delegated)
     await h.cards.update(delegated, true)
     expect(h.settings.get('message-1').config.streaming_mode).toBe(true)
-    expect(h.settings.get('message-1').config.summary.content).toBe('⏳ 后台1')
+    expect(h.settings.get('message-1').config.summary.content).toBe('⏳1')
     const failedShell = { ...shell, status: 'failed' as const, error: '构建失败', endTime: Date.now() }
     await h.cards.syncBackground('chat', 'session', [completedChild, failedShell])
     expect(h.settings.get('message-1').config.streaming_mode).toBe(false)

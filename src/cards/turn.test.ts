@@ -272,10 +272,10 @@ describe('main conversation card rendering', () => {
 
   test('the status line counts background work right after the status, then the uptime', () => {
     const status = (opts: object) => consoleProjectContent({ sessionName: 'probe', status: 'idle', ...opts }).split('\n')[0]
-    expect(status({ uptimeMs: 65_000, workload: { background: 2, subagents: 1 } })).toBe('**状态**　🟢 空闲 · 子Agent1·后台2 · 已运行 1m')
+    expect(status({ uptimeMs: 65_000, workload: { background: 2, subagents: 1 } })).toBe('**状态**　🟢 空闲 · 🤖1·⏳2 · 已运行 1m')
     // Nothing running beside the main turn adds nothing.
     expect(status({ workload: { background: 0, subagents: 0 } })).toBe('**状态**　🟢 空闲')
-    expect(status({ status: 'working', workload: { background: null, subagents: 0 } })).toBe('**状态**　⚙️ 工作中 · 后台MISS')
+    expect(status({ status: 'working', workload: { background: null, subagents: 0 } })).toBe('**状态**　⚙️ 工作中 · ⏳MISS')
     expect(status({ status: 'awaiting_permission' })).toBe("**状态**　🔐 <font color='orange'>等审批</font>")
     expect(status({ status: 'stopped' })).toBe('**状态**　⚪ 未运行')
     // Uptimes share the quota countdown format: seconds, whole minutes, then one decimal hours or days (never "3d 0h").

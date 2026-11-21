@@ -13,7 +13,7 @@ import type {
 import { sanitizeMarkdownForCardKit } from './elements'
 import { formatDuration } from './duration'
 import { shellCommandDescription } from './shell-command'
-import { agentCardTaskKindLabel, type AgentCardTaskKind } from './task-kind'
+import { agentCardTaskKindLabel, agentCardTaskKindName, type AgentCardTaskKind } from './task-kind'
 import { boundedResultContent, compactTaskContent } from './task-content'
 
 export type { BgTaskStatus }
@@ -442,6 +442,16 @@ const TYPE_LABEL: Record<BgTaskType, string> = {
   unknown: '任务',
 }
 
+/** 任务行标题的状态前缀：[图标, 说明]。后台进程的图标与「进行中」同为 ⏳，标题里只写一次。 */
+const TASK_STATE_LABEL: Readonly<Record<string, readonly [string, string]>> = {
+  running: ['⏳', '正在执行'],
+  pending: ['⏳', '等待执行'],
+  paused: ['⏸️', '已暂停'],
+  completed: ['✅', '完成'],
+  failed: ['❌', '失败'],
+  killed: ['🛑', '已终止'],
+}
+
 /** Native children and background processes share a card, but keep distinct
  * user-facing categories so a child Agent is never presented as a process. */
 export function backgroundTaskKind(t: BgTaskEntry): AgentCardTaskKind {
@@ -520,10 +530,13 @@ function terminalElapsed(t: BgTaskEntry): number {
 }
 
 function renderDetailBody(t: BgTaskEntry): string {
-  const kindLabel = agentCardTaskKindLabel(backgroundTaskKind(t))
+  const kind = backgroundTaskKind(t)
+  // 类别用图标，具体任务类型（后台命令 / 监控 / 工作流）仍写中文；与类别同名时不再重复。
+  const kindLabel = agentCardTaskKindLabel(kind)
+  const kindName = agentCardTaskKindName(kind)
   const typeLabel = TYPE_LABEL[t.type]
   const lines: string[] = [
-    `**${kindLabel}${typeLabel !== kindLabel ? ` · ${typeLabel}` : ''}**${ownerOf(t) !== typeLabel ? ` · ${ownerOf(t)}` : ''}${isBgTerminal(t) ? ` · 用时 ${formatDuration(terminalElapsed(t) / 1000)}` : ''}`,
+    `**${kindLabel}${typeLabel !== kindName ? ` · ${typeLabel}` : ''}**${ownerOf(t) !== typeLabel ? ` · ${ownerOf(t)}` : ''}${isBgTerminal(t) ? ` · 用时 ${formatDuration(terminalElapsed(t) / 1000)}` : ''}`,
     t.description || '说明 MISS',
   ]
   if (t.error) lines.push(`⚠ ${t.error}`)
@@ -544,10 +557,9 @@ function renderDetailBody(t: BgTaskEntry): string {
 
 export function backgroundTaskSummary(t: BgTaskEntry): string {
   const kindLabel = agentCardTaskKindLabel(backgroundTaskKind(t))
-  const status = {
-    running: `⏳ ${kindLabel}正在执行`, pending: `⏳ ${kindLabel}等待执行`, paused: `⏸️ ${kindLabel}已暂停`,
-    completed: `✅ ${kindLabel}完成`, failed: `❌ ${kindLabel}失败`, killed: `🛑 ${kindLabel}已终止`,
-  }[t.status]
+  const [stateEmoji, stateText] = TASK_STATE_LABEL[t.status] ?? ['⏳', '运行中']
+  // 后台进程的图标就是「进行中」的 ⏳：同一个图标只写一次，避免 `⏳ ⏳正在执行`。
+  const status = stateEmoji === kindLabel ? `${kindLabel}${stateText}` : `${stateEmoji} ${kindLabel}${stateText}`
   const description = (t.title || t.description).replace(/\s+/g, ' ').trim() || '说明 MISS'
   return `${status} · ${description.length <= 40 ? description : `${description.slice(0, 39)}…`}`
 }

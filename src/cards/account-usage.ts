@@ -110,10 +110,12 @@ function resetCardCount(count: unknown): string {
 
 /** 一个账号的额度明细。 */
 export interface AccountUsageDetail {
-  /** 与账号名同一行：单值结果（余额、令牌额度、失败原因、加载中、无额度查询），或积分、重置卡、凭据等账号级事实；可能为空。 */
+  /** 与账号名同一行：单值结果（余额、令牌额度、加载中、无额度查询），或积分、重置卡、凭据等账号级事实；可能为空。失败只写 `MISS`。 */
   summary: string
   /** 每个额度窗口一行；单值结果时为空。 */
   windows: string[]
+  /** 读取失败时的完整原因，供默认折叠的错误详情使用；正常、加载中与不适用时为 undefined。 */
+  error?: string
 }
 
 /** 额度快照里有中转站脚本原样转入的数据：任何格式问题都只让这一个账号显示 MISS，不能让整个面板生成失败。 */
@@ -121,7 +123,7 @@ export function accountUsageDetail(snapshot: UsageSnapshotUnified | undefined): 
   try {
     return usageDetail(snapshot)
   } catch {
-    return { summary: "<font color='red'>MISS · 额度数据格式无效</font>", windows: [] }
+    return { summary: "<font color='red'>MISS</font>", windows: [], error: '额度数据格式无效' }
   }
 }
 
@@ -133,7 +135,8 @@ function usageDetail(snapshot: UsageSnapshotUnified | undefined): AccountUsageDe
     const reason = snapshot.state === 'no_credentials' ? '未登录或未配置'
       : snapshot.state === 'rate_limited' ? 'API 限频'
       : String(snapshot.reason ?? '查询失败').replace(/^Claude 原生额度接口未返回 rate_limits 数据$/, '原生接口未返回额度')
-    return single(`<font color='red'>MISS · ${escape(reason.slice(0, 100))}</font>`)
+    // 行内只留 MISS：原因放进默认折叠的错误详情，长错误不挤坏版面。
+    return { summary: "<font color='red'>MISS</font>", windows: [], error: reason.slice(0, 300) }
   }
   if (snapshot.kind === 'balance') {
     return single(`余额 ${snapshot.balance ? money(snapshot.balance.remaining, snapshot.balance.currency) : 'MISS'}`)
@@ -152,6 +155,11 @@ function usageDetail(snapshot: UsageSnapshotUnified | undefined): AccountUsageDe
   if (snapshot.resetCredits !== undefined && snapshot.resetCredits !== 0) facts.push(`重置卡 ${resetCardCount(snapshot.resetCredits)}`)
   if (snapshot.credentialExpiresAt !== undefined) facts.push(credentialFact(snapshot.credentialExpiresAt))
   return { summary: facts.join(' · '), windows }
+}
+
+/** 失败原因（供折叠的错误详情）；正常、加载中或不适用时为 null。 */
+export function accountUsageError(snapshot: UsageSnapshotUnified | undefined): string | null {
+  return accountUsageDetail(snapshot).error ?? null
 }
 
 /** 群里 hi 的本项目账号（账号名已在上方）：摘要在前，其后每个窗口一行。 */

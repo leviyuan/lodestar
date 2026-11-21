@@ -133,14 +133,14 @@ describe('shared card chat-list summary', () => {
   })
 
   test('keeps the ~15 character preview focused on the running kinds', () => {
-    expect(delegationCardSummary([task('background')])).toBe('⏳ 后台1')
-    expect(delegationCardSummary([task('subagent'), task('background')])).toBe('⏳ 子Agent1·后台1')
+    expect(delegationCardSummary([task('background')])).toBe('⏳1')
+    expect(delegationCardSummary([task('subagent'), task('background')])).toBe('🤖1·⏳1')
     expect(delegationCardSummary([task('delegated'), task('subagent'), task('background')])).toBe('⏳ 3项进行中')
   })
 
   test('marks the real end instead of reusing the running sentence', () => {
     expect(delegationCardSummary([task('subagent', 'completed'), task('background', 'completed')]))
-      .toBe('✅ 子Agent1·后台1')
+      .toBe('✅ 🤖1·⏳1')
     expect(delegationCardSummary([task('subagent', 'completed'), task('background', 'failed')]))
       .toBe('❌ 1失败·1完成')
   })
@@ -157,16 +157,16 @@ describe('shared card chat-list summary', () => {
 
 describe('session status workload label', () => {
   test('uses the task-card preview notation and omits kinds with nothing running', () => {
-    expect(sessionWorkloadLabel({ background: 2, subagents: 1 })).toBe('子Agent1·后台2')
-    expect(sessionWorkloadLabel({ background: 1, subagents: 0 })).toBe('后台1')
-    expect(sessionWorkloadLabel({ background: 0, subagents: 3 })).toBe('子Agent3')
+    expect(sessionWorkloadLabel({ background: 2, subagents: 1 })).toBe('🤖1·⏳2')
+    expect(sessionWorkloadLabel({ background: 1, subagents: 0 })).toBe('⏳1')
+    expect(sessionWorkloadLabel({ background: 0, subagents: 3 })).toBe('🤖3')
     expect(sessionWorkloadLabel({ background: 0, subagents: 0 })).toBe('')
     expect(sessionWorkloadLabel(null)).toBe('')
     expect(sessionWorkloadLabel(undefined)).toBe('')
   })
 
   test('shows an unreadable background set as MISS instead of zero', () => {
-    expect(sessionWorkloadLabel({ background: null, subagents: 0 })).toBe('后台MISS')
-    expect(sessionWorkloadLabel({ background: null, subagents: 2 })).toBe('子Agent2·后台MISS')
+    expect(sessionWorkloadLabel({ background: null, subagents: 0 })).toBe('⏳MISS')
+    expect(sessionWorkloadLabel({ background: null, subagents: 2 })).toBe('🤖2·⏳MISS')
   })
 })

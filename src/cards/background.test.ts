@@ -425,7 +425,7 @@ describe('任务面板：标题简洁，详情折叠', () => {
     expect(panel.tag).toBe('collapsible_panel')
     expect(panel.expanded).toBe(false)
     expect(panel.element_id).toBe(BG_ELEMENTS.panel('t1'))
-    expect(panel.header.title.content).toBe('⏳ 子 Agent正在执行 · 搜索认证')
+    expect(panel.header.title.content).toBe('⏳ 🤖正在执行 · 搜索认证')
     expect(panel.elements[0].content).toContain('Explore')
     expect(panel.elements[0].content).not.toContain('<1m')
   })
@@ -472,13 +472,18 @@ describe('任务面板：标题简洁，详情折叠', () => {
     expect(body.content).toContain('找 auth 代码')
   })
 
-  test('标题明确区分后台进程和子 Agent', () => {
+  test('标题用 ⏳ 和 🤖 区分后台进程与子 Agent', () => {
     const processPanel = backgroundTaskPanel(mk({ id: 'shell', type: 'shell', description: '构建', status: 'failed' })) as any
     const childPanel = backgroundTaskPanel(mk({ id: 'child', type: 'subagent', description: '检查', status: 'failed' })) as any
-    expect(processPanel.header.title.content).toContain('❌ 后台进程失败')
-    expect(childPanel.header.title.content).toContain('❌ 子 Agent失败')
-    expect(processPanel.elements[0].content).toContain('后台进程')
-    expect(childPanel.elements[0].content).toContain('子 Agent')
+    expect(processPanel.header.title.content).toContain('❌ ⏳失败')
+    expect(childPanel.header.title.content).toContain('❌ 🤖失败')
+    // 后台进程的图标就是「进行中」的 ⏳：同一个图标只写一次。
+    const runningProcessPanel = backgroundTaskPanel(mk({ id: 'run', type: 'shell', description: '构建', status: 'running' })) as any
+    expect(runningProcessPanel.header.title.content).toBe('⏳正在执行 · 构建')
+    // 详情里的类别同样用图标，具体类型（后台命令）仍写中文。
+    expect(processPanel.elements[0].content).toContain('⏳ · 后台命令')
+    expect(childPanel.elements[0].content).toContain('🤖')
+    expect(childPanel.elements[0].content).not.toContain('子 Agent')
   })
 
   test('终态结果完整展示，任务说明只显示精简摘要', () => {

@@ -1,14 +1,14 @@
 /**
  * 单聊（1:1）只读面板：全局总览，以清晰为先。群里的 `hi` 只看本项目，全部项目、主机与全部账号额度都在这里。
- * 标题副标题写运行中的项目数，标签写出等审批、工作中的项目数和挂掉的服务数；活跃项目每个两行，
+ * 标题副标题写运行中的项目数，标签写出等审批、工作中的项目数和挂掉的服务数；活跃项目每个多行，
  * 账号额度每个账号一块、每个窗口一行。模板不判断可见性，只渲染调用方给的行；
  * 受限（外部联系人）时自己去掉账号名，并且不放主机与额度。
  */
 import type { AccountUsage } from '../account-usage'
 import { mainSessionName } from '../session-name'
 import type { SysInfo } from '../sysinfo'
-import { accountUsageBlock, escapeInlineMarkdown } from './account-usage'
-import { consoleHostElement, failedServiceCount, fmtUptime, sessionStatusEmoji, sessionStatusLabel, type ConsolePeer } from './console'
+import { accountUsageBlock, accountUsageError, escapeInlineMarkdown } from './account-usage'
+import { consoleHostElement, errorDetailsElement, failedServiceCount, fmtUptime, sessionStatusEmoji, type ConsolePeer } from './console'
 import { ELEMENTS } from './elements'
 import { sessionWorkloadLabel } from './task-kind'
 
@@ -48,19 +48,23 @@ function byName(a: ConsolePeer, b: ConsolePeer): number {
     || a.name.localeCompare(b.name, 'zh-Hans-CN')
 }
 
-/** 项目一块两行：首行状态圆点打头（各行对齐，一眼扫完）、项目名、状态与后台计数；次行灰字写实际账号与运行时长。
- * 受限时没有账号。 */
+/** 项目一块多行，一行只放一类信息：首行状态圆点打头（各行对齐，一眼扫完），只写项目名——
+ * 空闲、工作中、等审批这些状态已经由圆点表达，不再重复文字；其下灰字一行写仍在运行的子 Agent
+ * 与后台进程数、运行时长，再一行写实际账号。项目名再长也只在首行换行，不会把后面的计数与账号
+ * 挤成回绕的长句。受限时没有账号。 */
 function projectBlock(peer: ConsolePeer, restricted: boolean): string {
-  // 「空闲」只说明主线程空着；后台进程和子 Agent 仍在跑时紧跟状态写出数量。
+  const head = `${sessionStatusEmoji(peer.status)} **\`${peer.name}\`**`
+  // 圆点只说明主线程的状态；后台进程和子 Agent 仍在跑时写出数量，读不到后台集合时写 MISS。
   const workload = sessionWorkloadLabel(peer.workload)
-  const head = `${sessionStatusEmoji(peer.status)} **\`${peer.name}\`**　${sessionStatusLabel(peer.status)}${workload ? ` · ${workload}` : ''}`
+  const uptime = peer.uptimeMs != null && peer.uptimeMs > 0 ? `已运行 ${fmtUptime(peer.uptimeMs)}` : ''
+  const running = [workload, uptime].filter(Boolean).join(' · ')
   const account = restricted ? null
     : peer.claudeAccountName !== undefined ? `Claude·${escapeInlineMarkdown(peer.claudeAccountName)}`
     : peer.codexAccountName !== undefined ? `Codex·${escapeInlineMarkdown(peer.codexAccountName)}`
     : null
-  const uptime = peer.uptimeMs != null && peer.uptimeMs > 0 ? `已运行 ${fmtUptime(peer.uptimeMs)}` : null
-  const details = [account, uptime].filter((part): part is string => part !== null)
-  return details.length ? `${head}\n${grey(details.join(' · '))}` : head
+  return [head, running ? grey(running) : null, account ? grey(account) : null]
+    .filter((line): line is string => line !== null)
+    .join('\n')
 }
 
 function section(elementId: string, title: string, elements: object[]): object {
@@ -79,10 +83,16 @@ function projectsSection(peers: ConsolePeer[], restricted: boolean): object {
 }
 
 function usageSection(rows: AccountUsage[] | undefined): object {
-  return section(ELEMENTS.consoleUsage, '📊 账号额度',
-    rows === undefined ? [{ tag: 'markdown', content: '加载中…' }]
-      : rows.length ? blockElements(rows.map(accountUsageBlock), ACCOUNTS_PER_MARKDOWN)
-      : [{ tag: 'markdown', content: grey('暂无已配置账号') }])
+  const elements: object[] = rows === undefined ? [{ tag: 'markdown', content: '加载中…' }]
+    : rows.length ? blockElements(rows.map(accountUsageBlock), ACCOUNTS_PER_MARKDOWN)
+    : [{ tag: 'markdown', content: grey('暂无已配置账号') }]
+  // 失败账号行内只留 MISS，原因收进默认折叠的错误详情，长错误不挤坏版面。
+  const failures = (rows ?? []).flatMap(row => {
+    const reason = accountUsageError(row.usage)
+    return reason ? [`**${escapeInlineMarkdown(row.label)}**　${escapeInlineMarkdown(reason)}`] : []
+  })
+  if (failures.length) elements.push(errorDetailsElement(`额度读取失败 (${failures.length})`, failures))
+  return section(ELEMENTS.consoleUsage, '📊 账号额度', elements)
 }
 
 function textTag(content: string, color: string): object {
