@@ -244,26 +244,11 @@ export function failedServiceCount(sysinfo?: SysInfo): number {
   return sysinfo && !sysinfo.servicesError ? sysinfo.services.filter(service => service.active === 'failed').length : 0
 }
 
-/** 负载按核数归一成百分比：1 分钟平均负载 / 核数，超过 100% 说明有任务在等 CPU；核数无效时 MISS。 */
-function loadPercent(cpu: CpuInfo): number | null {
-  if (!(cpu.cores > 0) || !Number.isFinite(cpu.load1)) return null
-  return Math.round((cpu.load1 / cpu.cores) * 100)
-}
-
-/** 主机面板的标题用文字写出负载、内存和服务数，有服务挂掉时直接写出数量，不必展开。 */
-function hostSummary(sysinfo?: SysInfo): string[] {
-  const parts: string[] = []
-  if (sysinfo?.cpu) {
-    const percent = loadPercent(sysinfo.cpu)
-    parts.push(percent === null ? '负载 MISS' : `负载 ${percent}%`)
-  }
-  if (sysinfo?.mem) parts.push(`内存 ${sysinfo.mem.percent}%`)
-  if (sysinfo && !sysinfo.servicesError) {
-    parts.push(`服务 ${sysinfo.services.length}`)
-    const failed = failedServiceCount(sysinfo)
-    if (failed) parts.push(`${SERVICE_STATUS_EMOJI.failed} 失败 ${failed}`)
-  }
-  return parts
+/** 原生 1m/5m/15m 三个平均负载配核数才能判断轻重，不做百分比折算；核数或数值无效时 MISS。 */
+function loadLine(cpu: CpuInfo): string {
+  const { cores, load1, load5, load15 } = cpu
+  if (!(cores > 0) || ![load1, load5, load15].every(n => Number.isFinite(n))) return '**负载**　MISS'
+  return `**负载**　${load1.toFixed(2)} / ${load5.toFixed(2)} / ${load15.toFixed(2)} (${cores}核)`
 }
 
 /** 默认折叠的错误详情：错误文本再长也不挤坏版面，需要时再展开。 */
@@ -292,16 +277,7 @@ export function consoleHostContent(sysinfo?: SysInfo): string {
     ].join('\n')
   }
 
-  const lines: string[] = []
-  if (sysinfo.cpu) {
-    const { cores, load1, load5, load15 } = sysinfo.cpu
-    const percent = loadPercent(sysinfo.cpu)
-    // 百分比是归一后的占用，后面保留原生 1m/5m/15m 三个负载值和核数。
-    lines.push(percent === null ? '**负载**　MISS'
-      : `**负载**　${percent}% · ${load1.toFixed(2)} / ${load5.toFixed(2)} / ${load15.toFixed(2)} (${cores}核)`)
-  } else {
-    lines.push('**负载**　MISS')
-  }
+  const lines: string[] = [sysinfo.cpu ? loadLine(sysinfo.cpu) : '**负载**　MISS']
 
   if (sysinfo.mem) {
     lines.push(`**内存**　${sysinfo.mem.percent}% (${fmtBytes(sysinfo.mem.usedBytes)}/${fmtBytes(sysinfo.mem.totalBytes)})`)
@@ -386,16 +362,15 @@ export function consoleProjectElement(
   }
 }
 
-/** 单聊面板的主机区：默认展开，标题用文字写出负载百分比、内存、服务数与失败数。 */
+/** 单聊面板的主机区：默认展开，标题只写「主机」，负载、内存和服务数都在正文里。 */
 export function consoleHostElement(sysinfo?: SysInfo, elementId = ELEMENTS.consoleHost): object {
-  const summary = hostSummary(sysinfo)
   return {
     tag: 'collapsible_panel',
     element_id: elementId,
     header: {
       title: {
         tag: 'plain_text',
-        content: summary.length > 0 ? `🖥 主机 · ${summary.join(' · ')}` : '🖥 主机',
+        content: '🖥 主机',
       },
       background_color: 'grey-50',
     },

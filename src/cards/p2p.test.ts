@@ -59,9 +59,9 @@ describe('1:1 read-only panel card', () => {
     expect(usage.elements).toEqual([{ tag: 'markdown', content:
       "**DeepSeek**　余额 ¥12.34\n\n**GLM**\n月工具　<font color='green'>▰▰▰▱▱▱</font> 50%" }])
     const host = section(card, 'console_host')
-    // The host opens with the card: load is given as a share of the core count.
+    // The host opens with the card, titled by its section name; the values are in the body.
     expect(host.expanded).toBe(true)
-    expect(host.header.title.content).toBe('🖥 主机 · 负载 5% · 内存 63% · 服务 1')
+    expect(host.header.title.content).toBe('🖥 主机')
     expect(card.body.elements.at(-1)).toEqual({ tag: 'markdown', text_size: 'notation', content: P2P_CONSOLE_HINT })
     const body = JSON.stringify(card)
     expect(body).not.toContain('当前')
@@ -96,7 +96,7 @@ describe('1:1 read-only panel card', () => {
       ['等审批 1', 'orange'], ['工作中 1', 'blue'], ['服务失败 1', 'red'],
     ])
     expect(blocks(card)[0]).toBe("🔐 **`bar`**\n<font color='grey'>已运行 8s</font>")
-    expect(section(card, 'console_host').header.title.content).toBe('🖥 主机 · 负载 5% · 内存 63% · 服务 2 · ❌ 失败 1')
+    expect(section(card, 'console_host').header.title.content).toBe('🖥 主机')
     expect(section(card, 'console_usage').elements[0].content).toBe("<font color='grey'>暂无已配置账号</font>")
   })
 

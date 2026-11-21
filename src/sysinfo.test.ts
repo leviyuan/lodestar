@@ -129,23 +129,23 @@ describe('macOS host snapshot', () => {
       mem: parseMacMemory(vmStat, 16 * 1024 ** 3), disks: [], services, servicesError: error,
     }
     const content = consoleHostContent(snapshot)
-    // Load is normalised to a share of the cores; the raw 1m/5m/15m averages stay beside it.
-    expect(content).toContain('**负载**　19% · 1.50 / 2.00 / 2.50 (8核)')
+    // The raw 1m/5m/15m averages stay as the system reports them, with the core count for scale.
+    expect(content).toContain('**负载**　1.50 / 2.00 / 2.50 (8核)')
     expect(content).toContain('37%')
     // The dot and 已运行 / 已停 / 已挂 already carry running, stopped and failed: no repeated English state.
     expect(content).toContain('🟢 `cc-running` · 已运行 2m')
     expect(content).toContain('⚪ `cc-scheduled` · 上次活跃 MISS · 退出码 0')
     expect(content).toContain('❌ `codex-failed` · 上次活跃 MISS · 退出码 1')
     expect(content).not.toMatch(/ · (active|inactive|failed) · /)
-    // The host panel spells out load, memory and services in words, failed services included.
-    expect((consoleHostElement(snapshot) as any).header.title.content).toBe('🖥 主机 · 负载 19% · 内存 37% · 服务 4 · ❌ 失败 2')
+    // The section title is just the section name; load, memory and services live in the body.
+    expect((consoleHostElement(snapshot) as any).header.title.content).toBe('🖥 主机')
     expect(content).toContain('退出码 1')
     expect(content).toContain('终止信号 15')
     expect(content).not.toContain('从未启动')
-    // A service list that could not be read gives no count in the title; the body keeps only MISS and
+    // A service list that could not be read keeps the plain title; the body keeps only MISS and
     // folds the reason into a collapsed panel, so a long error never breaks the layout.
     const unreadable = consoleHostElement({ ...snapshot, servicesError: 'launchctl MISS' }) as any
-    expect(unreadable.header.title.content).toBe('🖥 主机 · 负载 19% · 内存 37%')
+    expect(unreadable.header.title.content).toBe('🖥 主机')
     expect(unreadable.elements[0].content).toContain("<font color='red'>MISS</font>")
     expect(unreadable.elements[0].content).not.toContain('launchctl MISS')
     expect(unreadable.elements[1].expanded).toBe(false)
