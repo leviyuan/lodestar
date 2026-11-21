@@ -15,11 +15,22 @@ assert.equal(installed.version, expected.version)
 assert.ok(!Object.keys(installed.dependencies).some(name => name.startsWith('@deepseek-ai/') || name.startsWith('@anthropic-ai/') || name === '@openai/codex'),
   'Agent 不应作为固定发布依赖安装')
 
-for (const command of ['lodestar-agent', 'lodestar-claude']) {
-  const help = Bun.spawnSync({ cmd: [join(prefix, 'node_modules/.bin', command), '--help'], stdout: 'pipe', stderr: 'pipe' })
-  assert.equal(help.exitCode, 0, help.stderr.toString())
-  assert.ok(help.stdout.toString().includes(command), `${command} npm 命令链接没有执行 CLI`)
+const commandPath = (name: string) => join(prefix, 'node_modules/.bin', name)
+assert.deepEqual(Object.keys(installed.bin), ['lodestar'], '发布包只应暴露 lodestar 一个命令')
+const help = Bun.spawnSync({ cmd: [commandPath('lodestar'), '--help'], stdout: 'pipe', stderr: 'pipe' })
+assert.equal(help.exitCode, 0, help.stderr.toString())
+assert.ok(help.stdout.toString().includes('lodestar agent'), 'lodestar npm 命令链接没有执行 CLI')
+
+// 版本命令必须只输出版本号且以 0 退出；stop 的 --help 不能产生副作用。
+const version = Bun.spawnSync({ cmd: [commandPath('lodestar'), '--version'], stdout: 'pipe', stderr: 'pipe' })
+assert.equal(version.exitCode, 0, version.stderr.toString())
+assert.equal(version.stdout.toString().trim(), installed.version, 'lodestar --version 与安装包版本不一致')
+for (const args of [['stop', '--help'], ['update', '--help'], ['version', '--help'], ['setup', '--help'], ['agent', '--help'], ['claude', '--help']]) {
+  const help = Bun.spawnSync({ cmd: [commandPath('lodestar'), ...args], stdout: 'pipe', stderr: 'pipe' })
+  assert.equal(help.exitCode, 0, `${args.join(' ')}: ${help.stderr.toString()}`)
+  assert.ok(help.stdout.toString().includes('lodestar'), `${args.join(' ')} 没有打印帮助`)
 }
+
 
 const scratch = mkdtempSync(join(tmpdir(), 'lodestar-installed-check-'))
 const entry = join(scratch, 'probe.ts')

@@ -1,6 +1,6 @@
 {
   "name": "@leviyuan/lodestar",
-  "version": "0.24.4",
+  "version": "0.25.0",
   "publishConfig": {
     "access": "public"
   },
@@ -36,26 +36,14 @@
     "ci": "bun run audit:production && bun run typecheck && bun run test && bun run test:randomized && bun run build",
     "audit:production": "bun audit --production",
     "build:daemon": "bun build cli.ts --target=node --packages=external --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar.js",
-    "build:setup": "bun build src/setup-cli.ts --target=node --external undici --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-setup.js",
-    "build:stop": "bun build src/stop-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-stop.js",
-    "build:update": "bun build src/update-cli.ts --target=node --external undici --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-update.js",
-    "build:version": "bun build src/version-cli.ts --target=node --external undici --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-version.js",
-    "build:agent": "bun build src/agent-cli.ts --target=node --external undici --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-agent.js",
-    "build:claude": "bun build src/claude-cli.ts --target=node --external undici --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-claude.js",
-    "build": "bun run build:daemon && bun run build:setup && bun run build:stop && bun run build:update && bun run build:version && bun run build:agent && bun run build:claude && bun run build:dsh && bun run build:obfuscate",
+    "build": "bun run build:daemon && bun run build:dsh && bun run build:obfuscate",
     "prepublishOnly": "bun run ci",
     "postinstall": "node scripts/postinstall.cjs",
     "build:dsh": "bun build src/dsh-bridge.ts --target=node --packages=external --minify --outfile=dist/dsh-bridge.js",
     "build:obfuscate": "node scripts/obfuscate-dist.mjs"
   },
   "bin": {
-    "lodestar-daemon": "./dist/lodestar.js",
-    "lodestar-setup": "./dist/lodestar-setup.js",
-    "lodestar-stop": "./dist/lodestar-stop.js",
-    "lodestar-update": "./dist/lodestar-update.js",
-    "lodestar-version": "./dist/lodestar-version.js",
-    "lodestar-agent": "./dist/lodestar-agent.js",
-    "lodestar-claude": "./dist/lodestar-claude.js"
+    "lodestar": "./dist/lodestar.js"
   },
   "files": [
     "dist/",

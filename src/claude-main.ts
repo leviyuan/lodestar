@@ -1,38 +1,45 @@
-/** User-terminal entry for a named native Claude account; no login or enrollment automation. */
+/** `lodestar claude` 的实现：用指定账号目录运行原生 Claude Code，不做登录或收录自动化。 */
 import { spawn } from 'cross-spawn'
-import { realpathSync } from 'node:fs'
 import { constants } from 'node:os'
-import { fileURLToPath } from 'node:url'
 import { claudeAccounts } from './claude-accounts'
 import { agentBin } from './agent-updates'
+import { lodestarVersion } from './version'
 
-const usage = [
-  '用法：lodestar-claude <备注名|default> [Claude 原生参数...]',
-  '  lodestar-claude 工作号',
-  '  lodestar-claude 工作号 auth login',
-  '  lodestar-claude default --help',
+export const usage = [
+  '用法：lodestar claude <备注名|default> [-- <Claude 原生参数...>]',
+  '  lodestar claude 工作号',
+  '  lodestar claude 工作号 auth login',
+  '  lodestar claude default --help',
   '',
   '使用 Lodestar 当前选中的 Claude 原生运行时，保留当前终端的 HOME、工作目录和其他环境。',
   '额外账号使用 ~/.claude-accounts/备注名；首次登录前准备共享配置，但不代办登录或收录账号。',
   '账号目录只保留登录状态，其余以全局配置为准并链接共享，备注账号的旧内容会被替换。',
   'default 保留当前终端 CLAUDE_CONFIG_DIR 的未设置状态或原始路径，不读取 Lodestar 的 [claude.env]。',
-  '仅供用户本机终端使用；受管 Agent 任务请使用 lodestar-agent。',
+  '仅供用户本机终端使用；受管 Agent 任务请使用 lodestar agent。',
 ].join('\n')
 
-/** Keep the same managed-context boundary as lodestar-agent --project. */
+/** Keep the same managed-context boundary as lodestar agent --project. */
 function assertUserTerminal(): void {
   if (['LODESTAR_AGENT_ROLE', 'LODESTAR_AGENT_URL', 'LODESTAR_AGENT_CAPABILITY', 'DSH_LODESTAR_AGENT_CONTEXT']
     .some(key => process.env[key] !== undefined)) {
-    throw new Error('lodestar-claude 仅供用户本机终端使用；受管 Agent 任务须通过 lodestar-agent 绑定当前会话，不能绕过 Claude 订阅调用限制')
+    throw new Error('lodestar claude 仅供用户本机终端使用；受管 Agent 任务须通过 lodestar agent 绑定当前会话，不能绕过 Claude 订阅调用限制')
   }
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
+  if (argv[0] === '--version' || argv[0] === '-V') {
+    process.stdout.write(`${lodestarVersion()}\n`)
+    return
+  }
   if (argv[0] === '--help' || argv[0] === '-h') {
     process.stdout.write(`${usage}\n`)
     return
   }
-  const [name, ...args] = argv
+  // `--` 之后的参数原样交给原生 Claude Code，避免与 lodestar 的选项冲突。
+  const separator = argv.indexOf('--')
+  const head = separator >= 0 ? argv.slice(0, separator) : argv
+  const args = separator >= 0 ? argv.slice(separator + 1) : argv.slice(1)
+  const [name] = head
   if (!name?.trim()) throw new Error(usage)
   assertUserTerminal()
   const env = claudeAccounts.nativeCliEnv(name, process.env)
@@ -43,7 +50,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     const handlers = signals.map(signal => {
       const forward = () => {
         try { child.kill(signal) }
-        catch (error) { process.stderr.write(`lodestar-claude: 转发 ${signal} 失败：${error instanceof Error ? error.message : String(error)}\n`) }
+        catch (error) { process.stderr.write(`lodestar claude: 转发 ${signal} 失败：${error instanceof Error ? error.message : String(error)}\n`) }
       }
       process.on(signal, forward)
       return { signal, forward }
@@ -59,10 +66,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   } else process.exitCode = result.code ?? 1
 }
 
-// npm command symlinks must work just like a direct source/bundle invocation.
-if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
-  main().catch(error => {
-    process.stderr.write(`lodestar-claude: ${error instanceof Error ? error.message : String(error)}\n`)
-    process.exitCode = 1
-  })
+/** 统一入口与旧 bin 共用的错误出口。 */
+export function reportClaudeError(error: unknown): void {
+  process.stderr.write(`lodestar claude: ${error instanceof Error ? error.message : String(error)}\n`)
+  process.exitCode = 1
 }

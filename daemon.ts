@@ -61,7 +61,7 @@ import { handleAgentRequest } from './src/agent-api'
 import { ensureLodestarAgentSkill } from './src/agent-skill'
 import { ensureRelaySkill } from './src/relay-skill'
 import { removeManagedSkill } from './src/managed-skills'
-import { ensureLodestarAgentCommand } from './src/managed-commands'
+import { ensureLodestarCommand } from './src/managed-commands'
 import { config } from './src/config'
 import { log, logError, logDiagnostic } from './src/log'
 import { startAgentAutoUpdates } from './src/agent-updates'
@@ -105,7 +105,7 @@ import { readSysInfo } from './src/sysinfo'
 {
   const guard = checkPidGuard(PID_FILE)
   if (guard.state === 'exit') {
-    console.error('lodestar-daemon: already running')
+    console.error('lodestar: 已经有一个 daemon 在运行（用 lodestar stop 停止）')
     process.exit(1)
   }
   if (existsSync(PID_FILE)) { try { unlinkSync(PID_FILE) } catch {} }
@@ -1798,7 +1798,7 @@ async function boot(): Promise<void> {
   // Source checkouts execute the TS entry through Bun; release installs execute
   // the sibling Node bundle. Missing entries fail boot instead of shipping a
   // Skill whose first command is guaranteed to fail.
-  ensureLodestarAgentCommand()
+  ensureLodestarCommand()
 
   // Sync the feishu-notify skill into ~/.codex/skills (idempotent).
   // Lets the user's main Codex session push to bound groups via

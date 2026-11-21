@@ -85,8 +85,8 @@ export function agentRuntimeRoot(agent: UpdatedAgent): string {
     return process.env.LODESTAR_TEST_AGENT_RUNTIME_ROOT
   }
   const state = readState(agent)
-  if (!state?.directory) throw new Error(`${agent} runtime 未安装，请运行 lodestar-update --agents-only`)
-  if (!existsSync(state.directory)) throw new Error(`${agent} runtime 安装目录不存在: ${state.directory}；请运行 lodestar-update --agents-only`)
+  if (!state?.directory) throw new Error(`${agent} runtime 未安装，请运行 lodestar update --agents-only`)
+  if (!existsSync(state.directory)) throw new Error(`${agent} runtime 安装目录不存在: ${state.directory}；请运行 lodestar update --agents-only`)
   return state.directory
 }
 

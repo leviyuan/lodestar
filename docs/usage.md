@@ -127,7 +127,7 @@ WT 群与临时群按同一规则决定是内部群还是外部群：在内部�
 
 ## 多模型任务
 
-主 Agent 按任务和可用能力自行选择原生 subagent 或 `lodestar-agent`，也可通过 `lodestar-agent` 调用自身的模型或 Agent，但不能使用 Claude 订阅来源。使用 `lodestar-agent` 时先查询实时身份，再把任务交给一个或多个模型。同一个任务选择多个身份时并发执行；后续追问可继续使用各模型的原生会话。
+主 Agent 按任务和可用能力自行选择原生 subagent 或 `lodestar agent`，也可通过 `lodestar agent` 调用自身的模型或 Agent，但不能使用 Claude 订阅来源。使用 `lodestar agent` 时先查询实时身份，再把任务交给一个或多个模型。同一个任务选择多个身份时并发执行；后续追问可继续使用各模型的原生会话。
 
 Lodestar Agent 不支持调用 Claude 订阅，遵守 Claude 用户协议；中转站等第三方来源的 Claude 模型仍可调用。限制只按来源判断，不按模型名称判断；主会话的 Claude 订阅能力和原生委派工具保持可用。
 
@@ -137,7 +137,7 @@ Lodestar Agent 不支持调用 Claude 订阅，遵守 Claude 用户协议；中�
 
 ```bash
 # desc: 在项目子目录中委派任务
-lodestar-agent run --identity '<identity-id>' --description '检查应用代码' --workdir 'packages/app' --prompt '检查当前应用的代码并报告结果' --json
+lodestar agent run --identity '<identity-id>' --description '检查应用代码' --workdir 'packages/app' --prompt '检查当前应用的代码并报告结果' --json
 ```
 
 每次 `run` 和 `follow-up` 必须填写 `--description`（不超过 60 字的单行说明）。委派任务、原生子 Agent 和后台任务统一收在委派卡里，每项只显示状态和一句说明，展开可看任务类型、正文、结果、错误和最近三步动作。子 Agent 启动即展示，普通前台命令不会额外生成任务项；任务结束后显示实际耗时。
@@ -150,21 +150,21 @@ lodestar-agent run --identity '<identity-id>' --description '检查应用代码'
 
 ```bash
 # desc: 首轮调用并返回 JSON 结果
-lodestar-agent run --identity '<identity-id>' --description '完成第一步' --prompt '完成第一步' --json
+lodestar agent run --identity '<identity-id>' --description '完成第一步' --prompt '完成第一步' --json
 ```
 
 ```bash
 # desc: 沿用历史会话继续第二轮
-lodestar-agent run --session '<session-id>' --description '继续第二步' --prompt '根据上面的结果继续第二步' --json
+lodestar agent run --session '<session-id>' --description '继续第二步' --prompt '根据上面的结果继续第二步' --json
 ```
 
-第二轮及后续轮次恢复同一个后端原生会话，每轮产生新的 `run_id`。已有 Lodestar 历史时，省略 `--identity` 会沿用最新记录的身份和 effort；也可显式选择原后端下的其他身份、模型来源及 `--effort`。切换身份且不指定 effort 时，使用新身份的默认档位。多模型首轮分别返回各 worker 的会话 ID，续跑时一次选择一个会话。也可使用 `lodestar-agent follow-up '<run-id>' --description '继续下一步' --prompt '下一步'`；原 run 包含多个 Agent 时需用 `--identity` 选择原 worker，若还需换模型，使用该 worker 的原生会话 ID 加新身份恢复。
+第二轮及后续轮次恢复同一个后端原生会话，每轮产生新的 `run_id`。已有 Lodestar 历史时，省略 `--identity` 会沿用最新记录的身份和 effort；也可显式选择原后端下的其他身份、模型来源及 `--effort`。切换身份且不指定 effort 时，使用新身份的默认档位。多模型首轮分别返回各 worker 的会话 ID，续跑时一次选择一个会话。也可使用 `lodestar agent follow-up '<run-id>' --description '继续下一步' --prompt '下一步'`；原 run 包含多个 Agent 时需用 `--identity` 选择原 worker，若还需换模型，使用该 worker 的原生会话 ID 加新身份恢复。
 
 `session_id` 是原生会话唯一且不变的 ID；`run_id` 只是一次调用记录，不是另一套会话 ID。对话 ID（`chat_id`）标识调用的绑定对象，与原生会话 ID 不同；同一对话 ID 可以拥有多个原生会话。原生会话归属项目和对话 ID，`run --session` 与 `follow-up` 只允许恢复同一项目、同一对话 ID 下的已登记会话，不要求与原调用使用相同的会话绑定或项目绑定。禁止跨项目、跨对话 ID；未知或归属不明的原生会话 ID 即使指定 `--identity` 也会报错。
 
 ```bash
 # desc: 在当前会话中恢复同项目同对话 ID 的原生会话
-lodestar-agent run --session '<原生会话 ID>' --identity '<identity-id>' --workdir 'packages/app' --description '继续已有工作' --prompt '继续上一轮任务' --json
+lodestar agent run --session '<原生会话 ID>' --identity '<identity-id>' --workdir 'packages/app' --description '继续已有工作' --prompt '继续上一轮任务' --json
 ```
 
 恢复时 `--workdir` 可选择本项目内的其他现有目录，省略则沿用历史执行目录；相对路径以当前项目目录解析。项目以规范工作目录识别，对话 ID 对应 `chat_id`；子目录不改变所属项目。新调用依照调用场景绑定当前会话或项目，旧记录不迁移。同项目同对话 ID 下切换绑定方式时，旧调用的取消不会连带停止新调用。原生会话 ID 和所属后端保持不变，模型、来源与 effort 可以在原后端支持且不使用 Claude 订阅来源的范围内调整。
@@ -181,10 +181,10 @@ Agent 在执行任务中调用其他 Agent 或模型时，必须绑定当前会�
 
 ```bash
 # desc: 查询项目可用身份并发起独立任务
-lodestar-agent --project '<项目名>' identities --json
-lodestar-agent --project '<项目名>' run --identity '<identity-id>' --description '检查项目' --prompt '检查代码并报告结果' --request-id '<本次业务调用唯一编号>' --no-wait
+lodestar agent --project '<项目名>' identities --json
+lodestar agent --project '<项目名>' run --identity '<identity-id>' --description '检查项目' --prompt '检查代码并报告结果' --request-id '<本次业务调用唯一编号>' --no-wait
 # desc: 需要群内可见时加 --card
-lodestar-agent --project '<项目名>' run --identity '<identity-id>' --description '检查项目' --card --stdin
+lodestar agent --project '<项目名>' run --identity '<identity-id>' --description '检查项目' --card --stdin
 ```
 
 每次项目调用默认**不在群里展示**：结果与本地文件路径只回到调用方，群内没有卡片、也没有进度或失败提示。需要群内可见时显式加 `--card`（HTTP 请求体 `display: "card"`），此时在绑定对话 ID 下新建独立的“项目任务”卡，后续进度和结果更新原卡；可点击任务卡的“停止本次任务”，或使用同一 `--project` 下的 `cancel <run-id>`。静默任务没有卡，只能用 `cancel <run-id>` 取消。项目卡不复用会话委派卡，不读取或修改主会话的模型、账号和上下文；停止、重启、切换主会话不影响项目任务。两类任务仍共享实际工作目录。
@@ -197,7 +197,7 @@ lodestar-agent --project '<项目名>' run --identity '<identity-id>' --descript
 
 ```bash
 # desc: 查询项目任务状态和执行结果
-lodestar-agent --project '<项目名>' status '<run-id>' --json
+lodestar agent --project '<项目名>' status '<run-id>' --json
 ```
 
 对话 ID 下的普通消息仍交给主会话。会话委派和项目任务均只向调用方返回结果与本地文件路径，由主 Agent 或调用程序处理交付。`--project` 不注入主会话的文件交付规则，也不上传附件、设置权限或执行输出中的交付标记；新建任务和续跑旧会话都遵循此规则。

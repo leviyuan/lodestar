@@ -224,7 +224,7 @@ export function loadConfig(): LodestarConfig {
   } catch (e) {
     process.stderr.write(
       'lodestar: cannot read configuration\n' +
-      `  → 运行 \`lodestar-setup\` 走交互式向导生成 (Feishu / Codex / 工作目录)\n` +
+      `  → 运行 \`lodestar setup\` 走交互式向导生成 (Feishu / Codex / 工作目录)\n` +
       `  → 或手写: 设 LODESTAR_CONFIG=/path/to/config.toml 覆盖默认路径\n` +
       `    [feishu]\n    app_id = "cli_xxx"\n    app_secret = "xxx"\n\n`,
     )

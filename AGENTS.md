@@ -24,7 +24,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - 后端 Agent 边界：三后端 spawn 前必须经 `src/agent-env.ts` 清洗环境，删除 `LODESTAR_CONFIG*`、`LODESTAR_DATA_DIR`、`LODESTAR_RESTART_CONTINUE_CHAT_ID`、`FEISHU_*` 等宿主变量，只保留 `LODESTAR_AGENT_*`、`LODESTAR_DSH_*`、`LODESTAR_RELAY_*`；不得注入 `LODESTAR_AGENT_SESSION`（受管上下文由 `LODESTAR_AGENT_ROLE/URL/CAPABILITY` 判定），清洗器对该键显式丢弃。收件附件落 `src/attachments.ts` 的临时私有目录，不得写入或指向状态目录。本机调试注入只在 `LODESTAR_DEBUG_SOCKET=1` 且 Bun 下启用，`debug-context.json` 不随普通运行写盘并在停机删除。
 - 本机通知响应与回调不回传 `chat_id`/操作者 `open_id`（只保留 `notify_id`、`message_id`、`project` 与按钮/回复），`feishu-notify` Skill 不写数据目录路径或状态文件名；Agent 侧错误回显先经 `redactMemberIds` 脱敏,`formatFeishuError` 只输出 code/message/log_id 等诊断字段。
 - Agent 可见的 `/agents` 诊断只保留脱敏文本（邮箱、IM ID、绝对路径替换为占位符）；`serializeRun` 不返回会话名。
-- Codex 项目信任通过启动参数 `-c projects.<path>.trust_level="trusted"` 逐次下发，不得写入共享 `~/.codex/config.toml`；启动时只清理当前会话绑定对应的直接子目录 trust 项（`src/codex-config.ts`），保留用户自建的其他信任。永久删除群后清理会话映射/租约/活跃时间；`agent-runs` 正文保留 30 天（启动与每日清理），已清理 run 记入 `pruned-artifacts.json` 并显示「已清理」，快照保留。`lodestar-version` 默认不输出运行目录，`--verbose` 才输出。
+- Codex 项目信任通过启动参数 `-c projects.<path>.trust_level="trusted"` 逐次下发，不得写入共享 `~/.codex/config.toml`；启动时只清理当前会话绑定对应的直接子目录 trust 项（`src/codex-config.ts`），保留用户自建的其他信任。永久删除群后清理会话映射/租约/活跃时间；`agent-runs` 正文保留 30 天（启动与每日清理），已清理 run 记入 `pruned-artifacts.json` 并显示「已清理」，快照保留。`lodestar version` 默认不输出运行目录，`--verbose` 才输出。
 - API、模型目录、额度、上传和进程启动失败必须记录并向调用方显示；缺失数据用 `MISS`，不能伪造成功或偷偷更换来源。仅允许对已知瞬态错误有限重试。Codex 自动选号成功时，其他账号的缓存过期、模型不支持、查询或认证失败等诊断仅保留在日志和主动查询面板，不单独推送警告；无法启动或继续任务的失败仍须明确提示。
 - 保留已有改动。依赖变化用 Bun 同步 `bun.lock`，不手改锁文件。
 - 禁止在 daemon 启动时检查、安装或更新 Agent，自动更新默认关闭。手动或显式开启的定期更新选择上游 `latest`，不等待 Lodestar 发版，不设置兼容版本白名单或旧版本上限。用户接受新版可能不兼容；发生不兼容时明确报错，由后续 Lodestar 更新适配，不能为规避适配而锁旧、降级、回退或恢复“先兼容验收才更新”的门槛。开发锁文件只记录测试依赖快照，不限制生产 Agent 更新。
@@ -38,11 +38,11 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - DSH 的 `deepseek-harness` 与 Claude 兼容的 `deepseek` 共用 DeepSeek 凭据和平台地址；`dsh-glm` 与 `glm` 共用 GLM Coding Plan 账号，前者通过原生 pi-ai 适配器接入。共享凭据只存一份，模型、effort 和可见性按 Agent 保留；旧配置冲突必须明确报错，任一 setup 入口均更新共享账号。运行时经更新器选择 latest，子进程需要 Node 22.19+（22.x）或 24+；`src/dsh-bridge.ts` 仅在该子进程加载。启动补丁按实际安装的 profile 判断是否已自带 ask-user 工具，避免重复注册；模型接入链需要的 credentials 服务保持启用，凭据仍只由环境变量注入。
 - Agent 运行时更新（`agent-updates.ts`）：
   - 按 `[runtime.agent_auto_update]` 的 `codex`、`claude`、`dsh` 三个独立开关每 6 小时更新对应 Agent，首次检查也在 6 小时后；三项默认关闭，各自防止重叠执行，失败互不阻塞。旧布尔总开关按原值兼容转换并提示迁移，不与新表混用。
-  - `lodestar-update --agents-only` 在当前进程立即安装/更新。不带参数的 `lodestar-update`（`update-run.ts`）先安装新版 Lodestar 包，再以子进程运行新装入口的 `--agents-only`，让新版自带的安装逻辑执行本次 Agent 更新。
+  - `lodestar update --agents-only` 在当前进程立即安装/更新。不带参数的 `lodestar update`（`update-run.ts`）先安装新版 Lodestar 包，再以子进程运行新装入口的 `--agents-only`，让新版自带的安装逻辑执行本次 Agent 更新。
   - 实际程序和 SDK 从独立版本目录加载；安装成功直接启用，新进程使用新版，已有进程保留其运行目录。更新成功后只保留当前与最近两个版本目录，并清理中断或取消安装遗留的 `.install-*` 临时目录与过期锁目录；仍被运行中进程使用的目录不删除，无法核对进程的平台跳过清理，清理问题不使更新失败。遗留临时目录须同时满足没有进程引用、安装时记录的安装器 PID 已确认退出才删除，没有 PID 记录的满 24 小时才删除。
   - 缺 PID 文件的锁目录超过 30 秒即回收，过期锁先改名再核对，避免两个等待者误删对方刚取得的锁。
   - Windows 不覆盖或删除使用中的 EXE/DLL；安装取消按精确 PID 终止安装器进程树，未确认退出不得清理其临时目录。文件占用有限重试，最终错误必须显示。
-  - 安装或查询失败只记录更新日志并向手动更新调用方返回失败，不修改当前安装记录，不影响已有安装的启动和 `lodestar-version`；已开启自动更新的 Agent 在下一个 6 小时周期再试。旧状态中的更新错误不参与启动判断或版本展示。首次未安装、安装损坏或旧版已清掉选择记录时按实际安装状态报错，不扫描目录猜测版本。
+  - 安装或查询失败只记录更新日志并向手动更新调用方返回失败，不修改当前安装记录，不影响已有安装的启动和 `lodestar version`；已开启自动更新的 Agent 在下一个 6 小时周期再试。旧状态中的更新错误不参与启动判断或版本展示。首次未安装、安装损坏或旧版已清掉选择记录时按实际安装状态报错，不扫描目录猜测版本。
   - 自动更新 Agent 不重启 daemon；daemon 停机在 15 秒期限内等待进行中的更新结算。
 - 飞书与 Lark 是两套独立的开放平台云。`[feishu].domain` 缺省为飞书（`open.feishu.cn`，与历史行为逐字节一致），`lark` 切换 `open.larksuite.com`，也可填 https 源站；REST 基址、Card Kit、云空间、SDK `Client` 和 `WSClient` 全部经 `feishu-endpoint.ts` 与 `feishu.sdkDomain()` 解析，不得再硬编码 `open.feishu.cn`。安装向导先探测所选区域，失败后才尝试另一侧，保证可用的飞书应用不会被切走。
 - Token Source 统一管理账号、凭据、模型目录、启动环境和额度。内置来源通过 factory 注册（`token-source-builtins.ts`）；模型与 Agent 身份动态读取来源目录，沿用目录声明的 effort；来源禁用或刷新失败显示 `MISS`。

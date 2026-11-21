@@ -21,10 +21,10 @@ AI 不是帮手，是倍率。它放大的不是体力，是你 —— 你的直
 
 ```bash
 npm i -g @leviyuan/lodestar
-lodestar-setup
+lodestar
 ```
 
-按向导完成配置，把机器人拉进以项目目录命名的群，发消息即可开始工作。[安装要求与详细配置](https://github.com/leviyuan/lodestar/blob/main/docs/configuration.md)
+首次运行会自动进入配置向导（也可显式执行 `lodestar setup`）；完成后，把机器人拉进以项目目录命名的群，发消息即可开始工作。[安装要求与详细配置](https://github.com/leviyuan/lodestar/blob/main/docs/configuration.md)
 
 ## 常用指令
 

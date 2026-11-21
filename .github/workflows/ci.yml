@@ -57,12 +57,6 @@ jobs:
       - name: Smoke-check Node.js bundles
         run: |
           node --check dist/lodestar.js
-          node --check dist/lodestar-setup.js
-          node --check dist/lodestar-stop.js
-          node --check dist/lodestar-update.js
-          node --check dist/lodestar-version.js
-          node --check dist/lodestar-claude.js
-          node --check dist/lodestar-agent.js
           node --check dist/dsh-bridge.js
           node -e "Promise.all([import('@anthropic-ai/claude-agent-sdk'), import('@larksuiteoapi/node-sdk'), import('cross-spawn')])"
 

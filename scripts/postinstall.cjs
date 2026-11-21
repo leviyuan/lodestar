@@ -7,8 +7,8 @@
 // 而父进程 npm 又 wait 在向导退出上 → npm 和向导互相卡死, 终端冻住 (文件
 // 其实早装好了); 杀掉还会触发 npm 回滚删文件。
 //
-// 稳的做法是 trigger-on-first-run: 用户在真终端首跑 lodestar-daemon 时,
-// cli.ts 发现没 config + isTTY 就自动进入向导 (真 TTY, readline 一定正常)。
+// 稳的做法是 trigger-on-first-run: 用户在真终端首跑 lodestar 时,
+// 统一入口发现没 config + isTTY 就自动进入向导 (真 TTY, readline 一定正常)。
 // 迁移与清理仅操作本地插件和 Skill 文件，不读凭据，也不启动子进程。
 
 const fs = require('fs')
@@ -35,10 +35,10 @@ async function main () {
   removeManagedSkill('lodestar-files')
 
   termWrite('\n  \x1b[1m\x1b[36m✓ Lodestar 已安装\x1b[0m\n')
-  termWrite('\n  \x1b[2m下一步: 在终端跑 \x1b[32mlodestar-daemon\x1b[0m\x1b[2m 进入配置向导\x1b[0m')
-  termWrite('\n  \x1b[2m(首次运行会自动拉起向导; 也可直接跑 \x1b[32mlodestar-setup\x1b[0m\x1b[2m)\x1b[0m\n\n')
+  termWrite('\n  \x1b[2m下一步: 在终端跑 \x1b[32mlodestar\x1b[0m\x1b[2m 进入配置向导\x1b[0m')
+  termWrite('\n  \x1b[2m(首次运行会自动拉起向导; 也可直接跑 \x1b[32mlodestar setup\x1b[0m\x1b[2m)\x1b[0m\n\n')
   termWrite('  启动时不检查或更新 Agent，自动更新默认关闭。\n')
-  termWrite('  安装/更新 Agent: lodestar-update --agents-only；定期更新可在 [runtime.agent_auto_update] 中分别开启 codex、claude、dsh。\n\n')
+  termWrite('  安装/更新 Agent: lodestar update --agents-only；定期更新可在 [runtime.agent_auto_update] 中分别开启 codex、claude、dsh。\n\n')
 }
 
 main().catch(error => {

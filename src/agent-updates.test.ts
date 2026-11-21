@@ -509,7 +509,7 @@ test('a failed first install or a legacy error without a selected directory neve
       metadata: async () => { throw new Error('TLS disconnected') },
     }), /TLS disconnected/)
     assert.equal(agentRuntimeState('codex'), null)
-    assert.throws(() => agentRuntimeRoot('codex'), /runtime 未安装.*lodestar-update --agents-only/)
+    assert.throws(() => agentRuntimeRoot('codex'), /runtime 未安装.*lodestar update --agents-only/)
     await writeFile(join(process.env.LODESTAR_DATA_DIR, 'agent-runtimes/codex/current.json'), JSON.stringify({ checkedAt: 1, error: 'TLS disconnected' }))
     // Old releases erased the selected path on failure. An unrelated directory is not a selection record.
     const unrelated = join(process.env.LODESTAR_DATA_DIR, 'agent-runtimes/codex/unselected/node_modules/@openai/codex')
@@ -521,14 +521,14 @@ test('a failed first install or a legacy error without a selected directory neve
   expect({ code, stderr }).toEqual({ code: 0, stderr: '' })
 })
 
-test('lodestar-version displays only the selected installation, without update diagnostics or a failed exit code', async () => {
+test('lodestar version displays only the selected installation, without update diagnostics or a failed exit code', async () => {
   const root = await scratch()
   const runtimeRoot = join(root, 'agent-runtimes')
   const selected = await updateAgentRuntime('codex', { root: runtimeRoot, install, metadata: async name => ({ name, version: '1.0.0' }) })
   await expect(updateAgentRuntime('codex', { root: runtimeRoot, metadata: async () => { throw new Error('TLS disconnected') } })).rejects.toThrow('TLS disconnected')
   await writeFile(join(runtimeRoot, 'codex/current.json'), JSON.stringify({ ...selected, error: 'legacy TLS disconnected' }))
   const run = async (args: string[]) => {
-    const child = Bun.spawn([process.execPath, 'src/version-cli.ts', ...args], {
+    const child = Bun.spawn([process.execPath, 'cli.ts', 'version', ...args], {
       cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'production', LODESTAR_DATA_DIR: root }, stdout: 'pipe', stderr: 'pipe',
     })
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
@@ -547,13 +547,13 @@ test('lodestar-version displays only the selected installation, without update d
   expect(verbose.stdout).not.toContain('codex: MISS')
 })
 
-test.each(['missing', 'mismatched'])('lodestar-version reports a %s installed package instead of a successful recorded version', async damage => {
+test.each(['missing', 'mismatched'])('lodestar version reports a %s installed package instead of a successful recorded version', async damage => {
   const root = await scratch()
   const selected = await updateAgentRuntime('codex', { root: join(root, 'agent-runtimes'), install, metadata: async name => ({ name, version: '1.0.0' }) })
   const manifest = join(selected.directory!, 'node_modules/@openai/codex/package.json')
   if (damage === 'missing') await rm(manifest)
   else await writeFile(manifest, JSON.stringify({ name: '@openai/codex', version: '0.0.0' }))
-  const child = Bun.spawn([process.execPath, 'src/version-cli.ts'], {
+  const child = Bun.spawn([process.execPath, 'cli.ts', 'version'], {
     cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'production', LODESTAR_DATA_DIR: root }, stdout: 'pipe', stderr: 'pipe',
   })
   const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])

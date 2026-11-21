@@ -18,7 +18,7 @@ test('all API key setup commands validate before saving and report post-save run
         const source = build(...args)
         source.refreshModels = async () => {
           source.modelCatalogState = { status: unavailable && source.id === 'dsh-glm' ? 'failed' : 'ready', updatedAt: 0,
-            ...(unavailable && source.id === 'dsh-glm' ? { error: 'dsh runtime 未安装，请运行 lodestar-update --agents-only' } : {}) }
+            ...(unavailable && source.id === 'dsh-glm' ? { error: 'dsh runtime 未安装，请运行 lodestar update --agents-only' } : {}) }
         }
         return source
       }

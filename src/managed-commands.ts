@@ -4,7 +4,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { log, logError } from './log'
 import { writeExecutableFileAtomic } from './state-store'
 
-export interface AgentCliLaunch {
+export interface LodestarLaunch {
   runtime: string
   entry: string
 }
@@ -15,26 +15,26 @@ interface ResolveLaunchOptions {
   exists?: (path: string) => boolean
 }
 
-/** Resolve the source entry under Bun or the sibling release bundle under
- * Node. A missing command is a boot error: the Skill must never be installed
- * with a command that can only fail later. */
-export function resolveAgentCliLaunch(opts: ResolveLaunchOptions = {}): AgentCliLaunch {
-  // npm bin commands are symlinks. argv[1] retains the bin path, so locate
-  // bundled companions beside the actual entry, not beside the command link.
+/** Resolve the unified `lodestar` entry under Bun or the sibling release
+ * bundle under Node. A missing command is a boot error: the Skill must never be
+ * installed with a command that can only fail later. */
+export function resolveLodestarLaunch(opts: ResolveLaunchOptions = {}): LodestarLaunch {
+  // npm bin commands are symlinks. argv[1] retains the bin path, so locate the
+  // actual bundle beside the real daemon entry, not beside the command link.
   const daemonEntry = realpathSync(resolve(opts.daemonEntry ?? process.argv[1] ?? ''))
   const runtime = opts.runtime ?? process.execPath
   const exists = opts.exists ?? existsSync
   const root = dirname(daemonEntry)
-  const source = join(root, 'src', 'agent-cli.ts')
-  const siblingBundle = join(root, 'lodestar-agent.js')
-  const rootBundle = join(root, 'dist', 'lodestar-agent.js')
+  const source = join(root, 'cli.ts')
+  const siblingBundle = join(root, 'lodestar.js')
+  const rootBundle = join(root, 'dist', 'lodestar.js')
   const runtimeIsBun = /^bun(?:\.exe)?$/i.test(basename(runtime))
   const candidates = runtimeIsBun
     ? [source, siblingBundle, rootBundle]
     : [siblingBundle, rootBundle]
   const entry = candidates.find(exists)
   if (!entry) {
-    throw new Error(`lodestar-agent entry not found beside daemon: ${candidates.join(', ')}`)
+    throw new Error(`lodestar entry not found beside daemon: ${candidates.join(', ')}`)
   }
   return { runtime, entry }
 }
@@ -42,16 +42,17 @@ export function resolveAgentCliLaunch(opts: ResolveLaunchOptions = {}): AgentCli
 interface SyncCommandOptions {
   platform?: NodeJS.Platform
   targetDir?: string
-  launch?: AgentCliLaunch
+  launch?: LodestarLaunch
   env?: NodeJS.ProcessEnv
   homeDir?: string
   localAppData?: string
 }
 
-/** Install/update the bare `lodestar-agent` command before managed Skills
- * and sessions are revived. The wrapper contains paths only, never capability
- * or provider credentials. */
-export function ensureLodestarAgentCommand(opts: SyncCommandOptions = {}): string {
+/** Install/update the bare `lodestar` command before managed Skills and
+ * sessions are revived, so Agents can run `lodestar agent ...` even when the
+ * npm bin directory is not on their PATH. The wrapper contains paths only,
+ * never capability or provider credentials. */
+export function ensureLodestarCommand(opts: SyncCommandOptions = {}): string {
   const platform = opts.platform ?? process.platform
   const env = opts.env ?? process.env
   const targetDir = opts.targetDir ?? managedBinDir(
@@ -59,8 +60,8 @@ export function ensureLodestarAgentCommand(opts: SyncCommandOptions = {}): strin
     opts.homeDir ?? homedir(),
     opts.localAppData ?? process.env.LOCALAPPDATA,
   )
-  const launch = opts.launch ?? resolveAgentCliLaunch()
-  const target = join(targetDir, platform === 'win32' ? 'lodestar-agent.cmd' : 'lodestar-agent')
+  const launch = opts.launch ?? resolveLodestarLaunch()
+  const target = join(targetDir, platform === 'win32' ? 'lodestar.cmd' : 'lodestar')
   const body = platform === 'win32'
     ? `@"${windowsQuote(launch.runtime)}" "${windowsQuote(launch.entry)}" %*\r\n`
     : `#!/bin/sh\nexec ${shellQuote(launch.runtime)} ${shellQuote(launch.entry)} "$@"\n`
@@ -72,16 +73,18 @@ export function ensureLodestarAgentCommand(opts: SyncCommandOptions = {}): strin
     chmodSync(target, 0o700)
   }
   prependPath(env, targetDir, platform)
-  removeLegacyConsultCommand(targetDir, platform)
+  removeObsoleteCommand(targetDir, platform, 'lodestar-consult', ['lodestar-consult', 'consult-cli'])
+  removeObsoleteCommand(targetDir, platform, 'lodestar-agent', ['agent-cli.ts', 'lodestar-agent.js'])
   return target
 }
 
-function removeLegacyConsultCommand(targetDir: string, platform: NodeJS.Platform): void {
-  const legacy = join(targetDir, platform === 'win32' ? 'lodestar-consult.cmd' : 'lodestar-consult')
+/** Delete an obsolete wrapper only when its body proves Lodestar wrote it. */
+function removeObsoleteCommand(targetDir: string, platform: NodeJS.Platform, name: string, markers: string[]): void {
+  const legacy = join(targetDir, platform === 'win32' ? `${name}.cmd` : name)
   if (!existsSync(legacy)) return
   try {
     const body = readFileSync(legacy, 'utf8')
-    if (!body.includes('lodestar-consult') && !body.includes('consult-cli')) {
+    if (!markers.some(marker => body.includes(marker))) {
       log('command: obsolete command preserved because ownership is unclear')
       return
     }

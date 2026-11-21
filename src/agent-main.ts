@@ -1,8 +1,8 @@
 import { localFetch } from './network'
-import { realpathSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
 import { requireAgentDescription, PROJECT_AGENT_INPUT_ERROR } from './agent-run-types'
 import { readAgentProjectClient } from './agent-project-client'
+import { HelpRequest, UsageError } from './cli-errors'
+import { lodestarVersion } from './version'
 
 interface CliContext {
   baseUrl: string
@@ -28,6 +28,10 @@ interface PromptArgs {
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
+  if (argv[0] === '--version' || argv[0] === '-V') {
+    process.stdout.write(`${lodestarVersion()}\n`)
+    return
+  }
   const selected = extractProjectOption(argv)
   argv = selected.argv
   const command = argv.shift() ?? ''
@@ -35,6 +39,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     process.stdout.write(`${usage()}\n`)
     return
   }
+  // 子命令帮助要在读取会话上下文之前返回，否则 `lodestar agent run --help`
+  // 会先因缺少受管上下文而失败。
+  if (argv[0] === '--help' || argv[0] === '-h') throw new HelpRequest(usage())
   const context = cliContext(selected.project)
   switch (command) {
     case 'identities': {
@@ -66,7 +73,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       return
     }
     default:
-      throw new Error(usage())
+      throw new UsageError(usage())
   }
 }
 
@@ -122,24 +129,25 @@ async function answerCommand(context: CliContext, argv: string[]): Promise<void>
       case '--answer': {
         const pair = next()
         const split = pair.indexOf('=')
-        if (split <= 0) throw new Error('--answer must be question-or-id=value')
+        if (split <= 0) throw new UsageError('--answer must be question-or-id=value')
         answers[pair.slice(0, split)] = pair.slice(split + 1)
         break
       }
       case '--stdin': readStdinFlag = true; break
-      default: throw new Error(`unknown answer option: ${arg}`)
+      case '--help': case '-h': throw new HelpRequest(usage())
+      default: throw new UsageError(`unknown answer option: ${arg}`)
     }
   }
   if (readStdinFlag) {
     const raw = (await readStdin()).trim()
     let parsed: unknown
     try { parsed = JSON.parse(raw) }
-    catch { throw new Error('answer stdin must be a JSON object') }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('answer stdin must be a JSON object')
+    catch { throw new UsageError('answer stdin must be a JSON object') }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new UsageError('answer stdin must be a JSON object')
     for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) answers[key] = String(value)
   }
-  if (!requestId) throw new Error('answer requires --request')
-  if (Object.keys(answers).length === 0) throw new Error('answer requires --answer or --stdin')
+  if (!requestId) throw new UsageError('answer requires --request')
+  if (Object.keys(answers).length === 0) throw new UsageError('answer requires --answer or --stdin')
   const run = await requestJson(context, 'POST', `/agents/runs/${encodeURIComponent(runId)}/answer`, {
     request_id: requestId,
     answers,
@@ -157,6 +165,11 @@ export function parsePromptArgs(argv: string[], identitiesRequired: boolean): Pr
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     const next = () => requiredArg(argv[++i], `${arg} requires a value`)
+    // `--` 之后的全部内容按位置参数处理，供正文以 `-` 开头时透传。
+    if (arg === '--') {
+      positional.push(...argv.slice(i + 1))
+      break
+    }
     switch (arg) {
       case '--identity': case '-i':
         if (identitiesRequired) out.identityIds.push(next())
@@ -164,18 +177,18 @@ export function parsePromptArgs(argv: string[], identitiesRequired: boolean): Pr
         break
       case '--effort': out.effort = next(); break
       case '--request-id':
-        if (out.requestId) throw new Error('--request-id may only be specified once')
+        if (out.requestId) throw new UsageError('--request-id may only be specified once')
         out.requestId = next(); break
       case '--requester':
-        if (out.requesterOpenId) throw new Error('--requester may only be specified once')
+        if (out.requesterOpenId) throw new UsageError('--requester may only be specified once')
         out.requesterOpenId = next(); break
       case '--description': out.description = next(); break
       case '--workdir':
-        if (out.workDir) throw new Error('--workdir may only be specified once')
+        if (out.workDir) throw new UsageError('--workdir may only be specified once')
         next(); out.workDir = argv[i]!; break
       case '--session':
-        if (!identitiesRequired) throw new Error('--session is only supported by run; follow-up accepts a run_id')
-        if (out.sessionId) throw new Error('--session may only be specified once')
+        if (!identitiesRequired) throw new UsageError('--session is only supported by run; follow-up accepts a run_id')
+        if (out.sessionId) throw new UsageError('--session may only be specified once')
         out.sessionId = next()
         break
       case '--prompt': next(); out.prompt = argv[i]!; break
@@ -183,15 +196,20 @@ export function parsePromptArgs(argv: string[], identitiesRequired: boolean): Pr
       case '--no-wait': out.noWait = true; break
       case '--card': out.card = true; break
       case '--json': out.json = true; break
+      case '--help': case '-h': throw new HelpRequest(usage())
       default:
-        if (arg.startsWith('-')) throw new Error(`unknown option: ${arg}`)
+        if (arg.startsWith('-')) throw new UsageError(`unknown option: ${arg}`)
         positional.push(arg)
     }
   }
   out.identityIds = [...new Set(out.identityIds)]
-  if (out.sessionId && out.identityIds.length > 1) throw new Error('--session accepts at most one --identity')
-  if (identitiesRequired && !out.sessionId && out.identityIds.length === 0) throw new Error('run requires at least one --identity')
-  out.description = requireAgentDescription(out.description)
+  if (out.sessionId && out.identityIds.length > 1) throw new UsageError('--session accepts at most one --identity')
+  if (identitiesRequired && !out.sessionId && out.identityIds.length === 0) throw new UsageError('run requires at least one --identity')
+  try {
+    out.description = requireAgentDescription(out.description)
+  } catch (error) {
+    throw new UsageError(error instanceof Error ? error.message : String(error))
+  }
   if (!out.prompt && positional.length) out.prompt = positional.join(' ')
   if (!out.prompt) out.readStdin = true
   return out
@@ -200,7 +218,7 @@ export function parsePromptArgs(argv: string[], identitiesRequired: boolean): Pr
 async function resolvePrompt(parsed: PromptArgs): Promise<string> {
   const stdin = parsed.readStdin ? await readStdin() : ''
   const prompt = parsed.prompt || stdin
-  if (!prompt.trim()) throw new Error('agent prompt is empty')
+  if (!prompt.trim()) throw new UsageError('agent prompt is empty')
   return prompt
 }
 
@@ -222,7 +240,7 @@ async function waitAndPrintRun(context: CliContext, runId: string, json = false)
     cancelling = true
     void requestJson(context, 'DELETE', `/agents/runs/${encodeURIComponent(runId)}`)
       .then(() => process.exit(130), error => {
-        process.stderr.write(`lodestar-agent: cancellation failed: ${messageOf(error)}\n`)
+        process.stderr.write(`lodestar agent: cancellation failed: ${messageOf(error)}\n`)
         process.exit(1)
       })
   }
@@ -251,8 +269,13 @@ export function extractProjectOption(argv: string[]): { project?: string; argv: 
     '--request', '--answer', '--request-id', '--requester'])
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
+    // `--` 之后保持原样交给子命令解析，避免把正文里的 --project 当成全局选项。
+    if (arg === '--') {
+      remaining.push(...argv.slice(i))
+      break
+    }
     if (arg === '--project') {
-      if (project !== undefined) throw new Error('--project may only be specified once')
+      if (project !== undefined) throw new UsageError('--project may only be specified once')
       project = requiredArg(argv[++i], '--project requires a project name')
     } else {
       remaining.push(arg)
@@ -280,7 +303,7 @@ function cliContext(project?: string): CliContext {
   const baseUrl = String(process.env.LODESTAR_AGENT_URL ?? '').replace(/\/+$/, '')
   const capability = String(process.env.LODESTAR_AGENT_CAPABILITY ?? '')
   if (!baseUrl || !capability) {
-    throw new Error('lodestar-agent must run inside a Lodestar-managed Agent session (missing capability)')
+    throw new Error('lodestar agent must run inside a Lodestar-managed Agent session (missing capability)')
   }
   return { baseUrl, capability }
 }
@@ -326,7 +349,7 @@ function printRun(run: any, json: boolean): void {
 }
 
 function formatRun(run: any): string {
-  const command = `lodestar-agent${run.binding === 'project' ? ` --project ${shellQuote(String(run.project))}` : ''}`
+  const command = `lodestar agent${run.binding === 'project' ? ` --project ${shellQuote(String(run.project))}` : ''}`
   const lines = [
     `# Lodestar agent ${run.run_id ?? 'MISS'}`,
     '',
@@ -375,21 +398,21 @@ async function readStdin(): Promise<string> {
 }
 
 function requiredArg(value: string | undefined, message: string): string {
-  if (!value?.trim()) throw new Error(message)
+  if (!value?.trim()) throw new UsageError(message)
   return value.trim()
 }
 
-function usage(): string {
+export function usage(): string {
   return [
     'Usage:',
-    '  lodestar-agent --project <project-or-worktree> <command> [options]',
-    '  lodestar-agent identities [--json]',
-    '  lodestar-agent run --identity <id> [--identity <id>...] --description <summary> [--workdir <path>] [--effort <level>] [--card] [--json] --stdin',
-    '  lodestar-agent run --session <session_id> [--identity <id>] --description <summary> [--workdir <path>] [--effort <level>] [--card] [--json] --stdin',
-    '  lodestar-agent follow-up <run_id> [--identity <id>] --description <summary> [--workdir <path>] [--effort <level>] [--card] [--json] --stdin',
-    '  lodestar-agent answer <run_id> [--identity <id>] --request <id> (--answer key=value | --stdin)',
-    '  lodestar-agent status <run_id> [--json]',
-    '  lodestar-agent cancel <run_id>',
+    '  lodestar agent --project <project-or-worktree> <command> [options]',
+    '  lodestar agent identities [--json]',
+    '  lodestar agent run --identity <id> [--identity <id>...] --description <summary> [--workdir <path>] [--effort <level>] [--card] [--json] --stdin',
+    '  lodestar agent run --session <session_id> [--identity <id>] --description <summary> [--workdir <path>] [--effort <level>] [--card] [--json] --stdin',
+    '  lodestar agent follow-up <run_id> [--identity <id>] --description <summary> [--workdir <path>] [--effort <level>] [--card] [--json] --stdin',
+    '  lodestar agent answer <run_id> [--identity <id>] --request <id> (--answer key=value | --stdin)',
+    '  lodestar agent status <run_id> [--json]',
+    '  lodestar agent cancel <run_id>',
     '',
     "Lodestar Agent does not support Claude subscription calls; comply with Claude's user agreement. Third-party Claude sources remain supported.",
     'Use --prompt <text> instead of --stdin for inline input. --no-wait returns the started run as JSON.',
@@ -416,10 +439,12 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-// npm preserves the command symlink in argv[1]; compare the actual files.
-if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
-  main().catch(error => {
-    process.stderr.write(`lodestar-agent: ${messageOf(error)}\n`)
-    process.exitCode = 1
-  })
+/** 统一入口与旧 bin 共用的错误出口：--help 走 stdout，用法错误退出 2。 */
+export function reportAgentError(error: unknown): void {
+  if (error instanceof HelpRequest) {
+    process.stdout.write(error.text.endsWith('\n') ? error.text : `${error.text}\n`)
+    return
+  }
+  process.stderr.write(`lodestar agent: ${messageOf(error)}\n`)
+  process.exitCode = error instanceof UsageError ? 2 : 1
 }

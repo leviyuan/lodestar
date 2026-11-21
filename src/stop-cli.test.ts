@@ -11,7 +11,16 @@ function stopWithRecord(record: string, inspect: string) {
     process.kill = (pid, signal) => { signals.push([pid, signal]); return true }
     process.on('exit', () => console.log('SIGNALS=' + JSON.stringify(signals)))
     mock.module('./src/pid-guard', () => ({ parseDaemonPid, isOurDaemon: () => { ${inspect} } }))
-    await import('./src/stop-cli')
+    const { stopDaemon } = await import('./src/stop-command')
+    try {
+      process.exitCode = await stopDaemon({
+        out: text => process.stdout.write(text),
+        err: text => process.stderr.write(text),
+      })
+    } catch (error) {
+      process.stderr.write('lodestar stop: ' + (error instanceof Error ? error.message : String(error)) + '\\n')
+      process.exitCode = 1
+    }
   `
   return Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
     cwd: process.cwd(), stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: 10_000,

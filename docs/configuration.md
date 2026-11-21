@@ -10,7 +10,7 @@ DeepSeek Harness 子进程沿用同一 Node 要求（22.19+ 或 24+）；可通�
 
 ```bash
 npm i -g @leviyuan/lodestar
-lodestar-setup
+lodestar
 ```
 
 向导会配置 Claude Code、可选的 GLM API key、飞书应用和项目目录，并启动 daemon；也可以同时配置 Codex 登录。GLM Key 不是安装必填项，Codex 订阅也不依赖它。
@@ -23,23 +23,39 @@ lodestar-setup
 
 | 命令 | 作用 |
 | --- | --- |
-| `lodestar-setup` | 配置向导 |
-| `lodestar-daemon` | 启动 daemon |
-| `lodestar-stop` | 停止 daemon |
-| `lodestar-update` | 升级 Lodestar，再更新 Codex、Claude Code/SDK、DSH；`--agents-only` 只立即更新 Agent，详见 [Agent 更新](#agent-更新) |
-| `lodestar-version` | 查看 Lodestar 与实际 Agent 版本；`--verbose` 才显示运行目录和运行时信息 |
-| `lodestar-claude <备注> [原生参数...]` | 用户终端入口，使用 Lodestar 管理的当前 Claude 安装和对应账号目录；例如 `lodestar-claude 工作号 auth login`，不自动收录账号或清理历史 |
-| `lodestar-agent` | 调用已配置模型执行任务；不支持 Claude 订阅，遵守 Claude 用户协议，中转站等第三方 Claude 模型仍可调用 |
+| `lodestar` / `lodestar start` | 启动 daemon；首次运行且没有配置时进入配置向导 |
+| `lodestar setup` | 配置向导 |
+| `lodestar stop` | 停止 daemon |
+| `lodestar update [--agents-only]` | 升级 Lodestar，再更新 Codex、Claude Code/SDK、DSH；`--agents-only` 只立即更新 Agent，详见 [Agent 更新](#agent-更新) |
+| `lodestar version [--verbose] [--json]` | 查看 Lodestar 与实际 Agent 版本；`--verbose` 显示运行目录和运行时信息 |
+| `lodestar agent <command>` | 调用已配置模型执行任务；不支持 Claude 订阅，遵守 Claude 用户协议，中转站等第三方 Claude 模型仍可调用 |
+| `lodestar claude <备注> [-- <原生参数>...]` | 用户终端入口，使用 Lodestar 管理的当前 Claude 安装和对应账号目录；例如 `lodestar claude 工作号 auth login`，不自动收录账号或清理历史 |
 
-启动和停止命令会核对 PID 对应的实际入口，读取进程信息失败时明确报错。无法识别的运行时选项、macOS 无法区分边界的含空格入口、Windows 相对入口也会拒绝操作，请通过对应服务管理器处理。旧式单行 PID 文件缺少入口标识，`lodestar-stop` 会拒绝发送信号；请先核对该 PID 的完整命令行，再通过服务管理器或精确 PID 停止。停止命令以进程退出为准，删除 PID 文件不会被当作停止成功。
+所有命令都支持 `-h` / `--help`（只打印帮助，不读配置、不启动进程）和 `-V` / `--version`（只输出 Lodestar 版本号）；`--no-color` 与 `NO_COLOR` 关闭 ANSI 颜色。退出码为 0 成功、1 运行失败、2 用法错误、130 中断；`lodestar help <命令>` 查看单条命令帮助。旧版分散的 `lodestar-*` 命令已移除，对应用 `lodestar <子命令>`。
+
+启动和停止命令会核对 PID 对应的实际入口，读取进程信息失败时明确报错。无法识别的运行时选项、macOS 无法区分边界的含空格入口、Windows 相对入口也会拒绝操作，请通过对应服务管理器处理。旧式单行 PID 文件缺少入口标识，`lodestar stop` 会拒绝发送信号；请先核对该 PID 的完整命令行，再通过服务管理器或精确 PID 停止。停止命令以进程退出为准，删除 PID 文件不会被当作停止成功。
 
 长期运行可交给 Linux `systemd --user`、macOS `launchd` 或 Windows 任务计划程序。daemon 重启后会恢复上次活跃的会话。
 
+### 部署为系统服务后的更新
+
+正确顺序是**先装新版本，再重启服务，然后等待服务重新上线**，不要在服务仍在运行时反复启停或接管进程：
+
+```bash
+npm i -g @leviyuan/lodestar                           # 1. 只替换磁盘上的文件
+systemctl --user restart <your-unit>                  # 2a. systemd --user
+launchctl kickstart -k gui/$(id -u)/<your-label>      # 2b. macOS launchd
+schtasks /End /TN <task> && schtasks /Run /TN <task>  # 2c. Windows 任务计划
+lodestar version                                      # 3. 确认新版本已生效
+```
+
+`lodestar update` 只安装新包并更新 Agent 运行时，不会重启服务；重启前服务继续运行旧代码。前台手动运行时使用 `lodestar stop && lodestar start`。这几个步骤与 `lodestar --help` 中「更新」一节一致。
+
 ## Agent 更新
 
-`lodestar-update` 先用 npm 全局安装最新的 Lodestar，再以子进程运行**新装版本**的 `lodestar-update --agents-only` 更新 Agent，因此新版本对安装逻辑的修改在这次更新中就会生效；`lodestar-update --agents-only` 直接在当前进程内更新。命令不会重启 daemon：检测到 daemon 仍在运行时会提示用对应服务管理器重启，旧进程重启前继续运行旧版 Lodestar。
+`lodestar update` 先用 npm 全局安装最新的 Lodestar，再以子进程运行**新装版本**的 `lodestar update --agents-only` 更新 Agent，因此新版本对安装逻辑的修改在这次更新中就会生效；`lodestar update --agents-only` 直接在当前进程内更新。命令不会重启 daemon：检测到 daemon 仍在运行时会提示用对应服务管理器重启，旧进程重启前继续运行旧版 Lodestar。
 
-daemon 启动时不检查 Agent 版本，也不安装或更新 Agent。自动更新默认关闭；首次安装缺少运行文件或需要更新时，运行 `lodestar-update --agents-only`。手动更新和显式开启的自动更新都选择上游 `latest`，独立于 Lodestar 发版，不设置兼容版本白名单。
+daemon 启动时不检查 Agent 版本，也不安装或更新 Agent。自动更新默认关闭；首次安装缺少运行文件或需要更新时，运行 `lodestar update --agents-only`。手动更新和显式开启的自动更新都选择上游 `latest`，独立于 Lodestar 发版，不设置兼容版本白名单。
 
 Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`、`claude`、`dsh` 开关，未设置的项均为 `false`。设为 `true` 的 Agent 在 daemon 运行满 6 小时后首次检查，之后每 6 小时独立检查，启动阶段仍不检查；一个 Agent 更新较慢或失败不阻塞其他 Agent。daemon 停止时在停机时限内等待进行中的自动更新结束。旧版布尔总开关按原值兼容映射为三项并提示迁移，不可与新配置表混用。
 
@@ -47,7 +63,7 @@ Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`�
 
 中断或取消的安装留下的临时目录（`.install-*`）和失效的更新锁，由该 Agent 下一次成功更新时一并清理，仍被运行中进程使用的目录保留；临时目录在安装进程确认退出后才删除，无法确认的满 24 小时后删除；无法读取进程列表的平台跳过清理。清理失败只在更新输出中提示，不影响更新结果。更新程序在创建锁后、写入 PID 前退出时，该锁 30 秒后可被回收，不会阻塞之后的更新。
 
-后台更新失败只记日志，继续使用当前安装；已开启自动更新的 Agent 会在下一个 6 小时检查周期再试。启动和 `lodestar-version` 不提示历史更新错误，版本查询只显示当前安装。手动更新命令仍如实返回本次更新结果。尚未安装或本地安装损坏时无法启动。旧版若已因失败清除了安装选择记录，需要一次成功的 `lodestar-update --agents-only` 恢复记录，不会自动猜测目录中的版本。文件占用只做有限重试，最终失败仍显示。显式配置的 `[claude].bin` 按该路径执行。
+后台更新失败只记日志，继续使用当前安装；已开启自动更新的 Agent 会在下一个 6 小时检查周期再试。启动和 `lodestar version` 不提示历史更新错误，版本查询只显示当前安装。手动更新命令仍如实返回本次更新结果。尚未安装或本地安装损坏时无法启动。旧版若已因失败清除了安装选择记录，需要一次成功的 `lodestar update --agents-only` 恢复记录，不会自动猜测目录中的版本。文件占用只做有限重试，最终失败仍显示。显式配置的 `[claude].bin` 按该路径执行。
 
 ## 飞书应用权限
 

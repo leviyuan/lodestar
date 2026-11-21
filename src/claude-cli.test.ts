@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ClaudeAccounts } from './claude-accounts'
@@ -12,9 +12,12 @@ const managedKeys = ['LODESTAR_AGENT_ROLE', 'LODESTAR_AGENT_URL', 'LODESTAR_AGEN
 
 beforeAll(async () => {
   bundleRoot = mkdtempSync(join(tmpdir(), 'lodestar-claude-cli-bundle-'))
-  const built = await Bun.build({ entrypoints: [join(import.meta.dir, 'claude-cli.ts')], outdir: bundleRoot, target: 'node' })
+  // 发布包只保留统一入口；这里用临时入口包住 claude-main，继续验证原生透传与退出码。
+  const entry = join(bundleRoot, 'entry.ts')
+  writeFileSync(entry, `import { main, reportClaudeError } from ${JSON.stringify(join(import.meta.dir, 'claude-main.ts'))}\nmain().catch(reportClaudeError)\n`)
+  const built = await Bun.build({ entrypoints: [entry], outdir: bundleRoot, target: 'node' })
   if (!built.success) throw new Error(built.logs.join('\n'))
-  bundle = join(bundleRoot, 'claude-cli.js')
+  bundle = join(bundleRoot, 'entry.js')
   writeFileSync(join(bundleRoot, 'package.json'), '{"type":"module"}\n')
 })
 afterEach(() => { for (const dir of temporary.splice(0)) rmSync(dir, { recursive: true, force: true }) })
@@ -143,7 +146,7 @@ test('compiled terminal CLI passes native arguments and stdio exactly without ne
   expect(existsSync(f.env.LODESTAR_CONFIG!)).toBe(false)
 })
 
-test('compiled CLI preserves default namespace, native exit status and npm-style symlink entry', () => {
+test('compiled CLI preserves default namespace and native exit status', () => {
   const f = fixture()
   const implicit = f.run(['default'])
   expect(implicit.status, implicit.stderr).toBe(0)
@@ -153,23 +156,17 @@ test('compiled CLI preserves default namespace, native exit status and npm-style
   const explicit = f.run(['default', '--exit', '37'])
   expect(explicit.status, explicit.stderr).toBe(37)
   expect(JSON.parse(explicit.stdout)).toMatchObject({ configDir: f.env.CLAUDE_CONFIG_DIR, secureDir: f.env.CLAUDE_CONFIG_DIR })
-  if (process.platform !== 'win32') {
-    const alias = join(f.root, 'lodestar-claude')
-    symlinkSync(bundle, alias)
-    const linked = f.run(['default'], '', alias)
-    expect(linked.status, linked.stderr).toBe(0)
-  }
 })
 
 test('help is independent of installation, while missing runtimes and invalid names fail explicitly', () => {
   const f = fixture(false)
-  expect(f.run(['--help']).stdout).toContain('lodestar-claude 工作号 auth login')
+  expect(f.run(['--help']).stdout).toContain('lodestar claude 工作号 auth login')
   expect(f.run(['--help']).status).toBe(0)
   expect(f.run([]).status).toBe(1)
   const missing = f.run(['工作号'])
   expect(missing.status).toBe(1)
   expect(missing.stderr).toContain('claude runtime 未安装')
-  expect(missing.stderr).toContain('lodestar-update --agents-only')
+  expect(missing.stderr).toContain('lodestar update --agents-only')
   const invalid = f.run(['../escape'])
   expect(invalid.status).toBe(1)
   expect(invalid.stderr).toContain('备注名')
@@ -182,7 +179,7 @@ test('all inherited managed-context markers reject native launches without clear
     f.env[key] = ''
     const result = f.run(['default'])
     expect(result.status).toBe(1)
-    expect(result.stderr).toContain('受管 Agent 任务须通过 lodestar-agent')
+    expect(result.stderr).toContain('受管 Agent 任务须通过 lodestar agent')
     expect(result.stdout).toBe('')
     delete f.env[key]
   }
@@ -217,7 +214,7 @@ test('forwarded terminal signals retain the exact native status and remove all h
     for (const key of ${JSON.stringify(managedKeys)}) delete process.env[key]
     const before = new Map(['SIGINT', 'SIGTERM', 'SIGHUP'].map(signal => [signal, process.listenerCount(signal)]))
     process.kill = (pid, signal) => { terminated.push([pid, signal]); return true }
-    const { main } = await import('./src/claude-cli')
+    const { main } = await import('./src/claude-main')
     const pending = main(['default'])
     process.emit('SIGTERM')
     await pending
