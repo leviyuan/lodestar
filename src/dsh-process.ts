@@ -80,6 +80,9 @@ export class DshProcess extends EventEmitter implements AgentProcess {
   private closing = false
   private startedAt = 0
   private questionInputs = new Map<string, any[]>()
+  /** 原生 `ask_user_question` 的 callId —— 这些调用的 tool_use/tool_result 由桥接
+   * 的 AskUserQuestion 面板接管，不再重复转发到卡片。 */
+  private askToolCalls = new Set<string>()
   private frames = new Map<string, { revision: number; nextIndex: number }>()
   private children = new Set<string>()
   private settledChildren = new Set<string>()
@@ -396,6 +399,13 @@ export class DshProcess extends EventEmitter implements AgentProcess {
           const name = toolAliases[data.name] ?? data.name
           if (['read', 'write', 'edit'].includes(data.name) && input.path) input.file_path = input.path
           if (!sub && data.name === 'subagent') this.rememberSubagentTitle(input)
+          // 提问由桥接的 AskUserQuestion 面板独占渲染。原生调用若也转发，同一个
+          // 问题会在卡片里出现两块(原生 JSON dump 常驻 + 交互面板)；用户看到
+          // 「🔧 ask_user_question」那块永远是 JSON，容易以为提问还没结束。
+          if (!sub && data.name === 'ask_user_question') {
+            if (typeof data.callId === 'string') this.askToolCalls.add(data.callId)
+            return
+          }
           this.safeEmit('tool_use', { id: data.callId, name, input, parentToolUseId: sub ? params.sessionId : null })
         } else if (e.type === 'tool/result') {
           const message = data.message
@@ -409,6 +419,8 @@ export class DshProcess extends EventEmitter implements AgentProcess {
             || (result.isError !== undefined && typeof result.isError !== 'boolean')) {
             throw new Error('invalid DSH tool result')
           }
+          // 原生提问调用的结果已由 AskUserQuestion 面板呈现，这里不再重复渲染。
+          if (!sub && this.askToolCalls.delete(result.toolCallId)) return
           this.safeEmit('tool_result', { tool_use_id: result.toolCallId, content: result.content,
             is_error: result.isError === true, parentToolUseId: sub ? params.sessionId : null })
         } else if (e.type === 'todo/write' && !sub) {

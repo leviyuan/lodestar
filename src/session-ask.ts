@@ -11,7 +11,7 @@ import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
-import { logError } from './log'
+import { logDiagnostic, logError } from './log'
 import { findPendingReply } from './notify-callbacks'
 
 function currentAsk(s: Session) {
@@ -206,7 +206,16 @@ export function advanceAsk(
       nextIdx === undefined ? '✅' : '🤔',
       { currentIdx: nextIdx, answered: pending.answered },
     )
-    void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
+    // 终态面板只靠这一次写入落地：答案已经交给后端(回合会继续)，写入丢了
+    // 卡片就会永远停在「等你确认」。写入改成可确认 + 一次重试，失败留固定
+    // 类别诊断，不再 fire-and-forget。
+    const elementId = cards.ELEMENTS.tool(meta.i)
+    void (async () => {
+      const write = () => cardkit.replaceElementChecked(turn.cardId, elementId, el, { notifyCardFailure: false })
+      if (await write()) return
+      if (await write()) return
+      logDiagnostic('session-ask: answer panel repaint failed')
+    })().catch(error => logError('session-ask: answer panel repaint failed', error))
   }
 
   if (nextIdx === undefined) {
