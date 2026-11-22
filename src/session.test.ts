@@ -5701,7 +5701,7 @@ describe('Session usage cache cross-backend isolation', () => {
   test('额度后缀保留原紧凑倒计时与百分比格式，缺失值显示 MISS', () => {
     const session = new Session('probe', 'chat_id') as any
     const h = (ms: number) => new Date(Date.now() + ms)
-    // 4.1h 后重置 5h 额度、已用 7%;6.9d 后重置周额度、已用 17%。
+    // 5h 额度距重置 4.1h、已用 7%;周额度距重置 6.9d、已用 17%。
     const fiveHour = { percent: 7, resetsAt: h(4.1 * 3600_000) }
     const weekly = { percent: 17, resetsAt: h(6.9 * 24 * 3600_000) }
     expect(session.fmtDualWindowSuffix(fiveHour, weekly)).toBe('  |  4.1h·7%·[6.9d·17%]')
@@ -5754,8 +5754,8 @@ describe('Session usage cache cross-backend isolation', () => {
       expect(panel.element_id).toBe('console_usage')
       expect(panel.elements).toHaveLength(1)
       expect(content().split('\n')).toEqual([
-        `5h　${bar(0)} 7%　${grey('4.1h 后重置')}`,
-        `周　${bar(1)} 17%　${grey('6.9d 后重置')}`,
+        `5h　${bar(0)} 7%　${grey('4.1h')}`,
+        `周　${bar(1)} 17%　${grey('6.9d')}`,
         `Fable 周　${bar(3)} 42%　${grey('重置时间 MISS')}`,
       ])
       expect(readAllSpy).not.toHaveBeenCalled()
@@ -5771,7 +5771,7 @@ describe('Session usage cache cross-backend isolation', () => {
         seven_day: { utilization: 17, resets_at: new Date(Date.now() + 6.9 * 86400_000).toISOString() },
       } })
       await session.patchConsoleUsage('quota-card')
-      expect(content()).toBe(`周　${bar(1)} 17%　${grey('6.9d 后重置')}`)
+      expect(content()).toBe(`周　${bar(1)} 17%　${grey('6.9d')}`)
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'opus')).toBe('  |  [6.9d·17%]')
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'fable')).toBe('  |  [6.9d·17%]')
       snapshot = { state: 'network', windows: [], reason: 'query failed' }

@@ -595,7 +595,7 @@ test('hi rows get each account login end from the background usage refresh, in t
       assert.equal(probes.length, background)
       assert.equal(native.usage.credentialExpiresAt, ends.get('default'))
       assert.equal(named.usage.credentialExpiresAt, ends.get(account.id))
-      const weekly = "周　<font color='green'>▰▱▱▱▱▱</font> 17%　<font color='grey'>6.9d 后重置</font>"
+      const weekly = "周　<font color='green'>▰▱▱▱▱▱</font> 17%　<font color='grey'>6.9d</font>"
       assert.equal(native.content, '**Claude·默认**　凭据剩余 24.3d\\n' + weekly)
       assert.equal(named.content, "**Claude·named**　<font color='red'>凭据可能已到期</font>\\n" + weekly)
       assert.deepEqual([...new Set(probes.map(probe => probe.accountId))].sort(), [account.id, 'default'].sort())

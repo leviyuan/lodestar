@@ -21,7 +21,7 @@ describe('clear account quota detail', () => {
       credits: { hasCredits: false, unlimited: false, balance: '0' },
     }, rateLimitResetCredits: { availableCount: 0 } })
     const usage = codexUsageToUnified(raw)
-    expect(consoleUnifiedUsageContent(usage)).toBe(`周　${bar(1)} 24%　${grey('3.0d 后重置')}`)
+    expect(consoleUnifiedUsageContent(usage)).toBe(`周　${bar(1)} 24%　${grey('3.0d')}`)
     expect(consoleUsageContent(raw)).not.toMatch(/5h|满窗/)
     expect(unifiedUsageSummary(usage)).not.toMatch(/5h|满窗/)
   })
@@ -35,8 +35,8 @@ describe('clear account quota detail', () => {
     const render = (primary: object) => consoleUnifiedUsageContent(codexUsageToUnified(snapshotFromReadResponse({
       rateLimits: { ...main, primary }, rateLimitResetCredits: { availableCount: 0 },
     }))).split('\n')
-    const weekly = `周　${bar(1)} 24%　${grey('3.0d 后重置')}`
-    expect(render(main.primary)).toEqual([`5h　${bar(0)} 0%　${grey('1.0h 后重置')}`, weekly])
+    const weekly = `周　${bar(1)} 24%　${grey('3.0d')}`
+    expect(render(main.primary)).toEqual([`5h　${bar(0)} 0%　${grey('1.0h')}`, weekly])
     expect(render({ usedPercent: 0, windowDurationMins: 300 })).toEqual([`5h　${bar(0)} 0%　${grey('重置时间 MISS')}`, weekly])
     // A wholly unknown window says MISS once.
     expect(render({ windowDurationMins: 300 })).toEqual(['5h　MISS', weekly])
@@ -75,7 +75,7 @@ describe('clear account quota detail', () => {
       { kind: 'fiveHour', label: '5h 窗口', percent: 11, resetsAt: new Date(Date.now() + 3600_000) },
       { kind: 'weekly', label: '周配额', percent: 24, resetsAt: new Date(Date.now() + 3 * 86400_000) },
     ] }
-    const lines = [`5h　${bar(1)} 11%　${grey('1.0h 后重置')}`, `周　${bar(1)} 24%　${grey('3.0d 后重置')}`]
+    const lines = [`5h　${bar(1)} 11%　${grey('1.0h')}`, `周　${bar(1)} 24%　${grey('3.0d')}`]
     const panel = consoleUsageElement({ sessionName: 'test', status: 'idle',
       account: { id: 'codex:default', label: 'Codex·默认', usage } }) as any
     expect(panel.element_id).toBe('console_usage')
@@ -131,8 +131,8 @@ describe('clear account quota detail', () => {
       { kind: 'monthly', label: '月度工具', percent: 7, used: 290, total: 4000, resetsAt: new Date(Date.now() + 15 * 86400_000) },
     ] })
     expect(out.split('\n')).toEqual([
-      `5h　${bar(1)} 11%　${grey('1.0h 后重置')}`,
-      `周　${bar(1)} 17%　${grey('1.0d 后重置')}`,
+      `5h　${bar(1)} 11%　${grey('1.0h')}`,
+      `周　${bar(1)} 17%　${grey('1.0d')}`,
       `月工具　${bar(0)} 7%`,
     ])
     expect(out).not.toMatch(/290|4000|15.0d|Max/)
@@ -145,7 +145,7 @@ describe('clear account quota detail', () => {
       ] })).toBe('5h　MISS')
       expect(consoleUnifiedUsageContent({ state: 'ok', windows: [
         { kind: 'fiveHour', label: '5h', percent, resetsAt: new Date(Date.now() + 3600_000) },
-      ] })).toBe(`5h　MISS　${grey('1.0h 后重置')}`)
+      ] })).toBe(`5h　MISS　${grey('1.0h')}`)
     }
     // A reset time already reached reads as such rather than as a countdown.
     expect(consoleUnifiedUsageContent({ state: 'ok', windows: [
@@ -194,7 +194,7 @@ describe('clear account quota detail', () => {
     const relayLines = [
       `月工具　${bar(0)} 5%`,
       `日额度　${bar(1)} 12%　${grey('重置时间 MISS')}`,
-      `Pro 周额度　${bar(2)} 30%　${grey('1.0d 后重置')}`,
+      `Pro 周额度　${bar(2)} 30%　${grey('1.0d')}`,
     ]
     expect(consoleUnifiedUsageContent(relay).split('\n')).toEqual(relayLines)
     // Windows without a string kind, label, currency or reason are just unlisted, never a thrown panel.
@@ -242,13 +242,13 @@ describe('clear account quota detail', () => {
       { kind: 'seven_day_oauth_apps', label: 'OAuth 应用周额度', percent: 5, resetsAt: weekly },
     ] }).split('\n')
     const exhausted = `周　${bar(6, 'red')} <font color='red'>100%</font>`
-    const reset = (date: Date | null) => grey(date ? `${fmtCountdown(date.getTime() - Date.now())} 后重置` : '重置时间 MISS')
+    const reset = (date: Date | null) => grey(date ? `${fmtCountdown(date.getTime() - Date.now())}` : '重置时间 MISS')
     expect(render(total)).toEqual([
       `${exhausted}　${reset(total)}`, `Fable 周　${bar(3)} 47%　${reset(total)}`, `OAuth 应用周　${bar(0)} 5%　${reset(total)}`,
     ])
-    expect(reset(total)).toBe(grey('2.2d 后重置'))
+    expect(reset(total)).toBe(grey('2.2d'))
     const later = new Date(Date.now() + 3.1 * DAY)
-    expect(render(later)[1]).toBe(`Fable 周　${bar(3)} 47%　${grey('3.1d 后重置')}`)
+    expect(render(later)[1]).toBe(`Fable 周　${bar(3)} 47%　${grey('3.1d')}`)
     // A missing reset is never borrowed from another window, and `<name>　MISS` only ever means nothing is known.
     expect(render(null)[1]).toBe(`Fable 周　${bar(3)} 47%　${grey('重置时间 MISS')}`)
     expect(render(total, null)).toEqual([
@@ -288,7 +288,7 @@ describe('clear account quota detail', () => {
     const base = { state: 'ok' as const, windows: [
       { kind: 'weekly', label: '周额度', percent: 17, resetsAt: new Date(Date.now() + 6.9 * DAY) },
     ] }
-    const weekly = `周　${bar(1)} 17%　${grey('6.9d 后重置')}`
+    const weekly = `周　${bar(1)} 17%　${grey('6.9d')}`
     const render = (days: number | null) => consoleUnifiedUsageContent({ ...base,
       credentialExpiresAt: days === null ? null : Date.now() + days * DAY })
     const row = (fact: string) => `${fact}\n${weekly}`

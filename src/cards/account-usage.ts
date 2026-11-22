@@ -5,7 +5,8 @@ import { codexCreditsSummary, fmtCountdown } from './usage'
 
 // 额度明细：单聊面板（全部账号）与群里 hi（本项目账号）共用一套写法，以清晰为先。
 // - 一个账号一块：首行账号名，后面跟单值结果（余额、失败原因等）或账号级事实（积分、重置卡、凭据剩余）。
-// - 每个额度窗口单独一行：`名称　进度条 已用%　N 后重置`；距重置与凭据共用 fmtCountdown（m / 一位小数的 h、d）。
+// - 每个额度窗口单独一行：`名称　进度条 已用%　N`；距重置与凭据共用 fmtCountdown（m / 一位小数的 h、d），
+//   倒计时后不再跟「后重置」。
 // - 整窗未知只写一次 MISS；已用已知而重置时间未知写「重置时间 MISS」；GLM 月工具只显示百分比。
 // - 积分、重置卡确认为零时省略，未知写 MISS；金额符号紧贴数字，与回复 footer 一致。
 // - 颜色只看显示值（百分比、进度条与凭据倒计时），同一文案颜色不变。
@@ -67,10 +68,10 @@ function resetText(window: UsageWindowUnified): string | null {
   const date: unknown = window.resetsAt
   if (!(date instanceof Date) || !Number.isFinite(date.getTime())) return null
   const remaining = date.getTime() - Date.now()
-  return remaining <= 0 ? '已重置' : `${fmtCountdown(remaining)} 后重置`
+  return remaining <= 0 ? '已重置' : fmtCountdown(remaining)
 }
 
-/** 一个窗口一行：`5h　▰▰▱▱▱▱ 34%　4.1h 后重置`。整窗未知只写一次 MISS，所以 `名称　MISS` 只表示什么都不知道。 */
+/** 一个窗口一行：`5h　▰▰▱▱▱▱ 34%　4.1h`。整窗未知只写一次 MISS，所以 `名称　MISS` 只表示什么都不知道。 */
 function windowLine(window: UsageWindowUnified): string {
   const label = escape(windowLabel(window))
   const shown = shownPercent(window.percent)
