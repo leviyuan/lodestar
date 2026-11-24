@@ -40,7 +40,8 @@ describe('session card delivery diagnostics', () => {
 
   test('quota-wait card failure continues to reject with API details', async () => {
     const s = {
-      chatId: 'oc_diag', isRunning: () => true, backendLabel: () => 'Codex', withModel: (text: string) => text,
+      chatId: 'oc_diag', isRunning: () => true, backendLabel: () => 'Codex',
+      withModel: (text: string) => text, withModelAndAccount: (text: string) => text,
       proc: { turnRetry: { reason: 'quota' } },
     } as unknown as Session
     await expect(runCommand(s, 'hi', 'ou_owner')).rejects.toThrow(`额度等待卡片发送失败\n${diagnostics}`)

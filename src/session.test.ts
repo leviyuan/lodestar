@@ -5893,6 +5893,165 @@ describe('Session usage cache cross-backend isolation', () => {
   })
 })
 
+describe('Session startup account assignment labels', () => {
+  let previousSources: ReturnType<typeof listTokenSources>
+  beforeEach(() => { previousSources = listTokenSources() })
+  afterEach(() => {
+    resetTokenSourceRegistry()
+    for (const source of previousSources) registerTokenSource(source)
+  })
+
+  function claudeSubscription(): any {
+    resetTokenSourceRegistry()
+    const source: any = {
+      id: 'claude-sub', kind: 'claude-subscription', agent: 'claude', enabled: true,
+      display: 'Claude Code 订阅', models: [], defaultModel: 'opus',
+      usageAccount: { id: 'claude:default', label: 'Claude·默认' },
+      modelCatalogState: { status: 'ready', updatedAt: 1 },
+      readUsage: async () => ({ state: 'ok', windows: [] }),
+    }
+    registerTokenSource(source)
+    return source
+  }
+
+  test('restore and ready lines name the Claude subscription account the live process runs on', async () => {
+    claudeSubscription()
+    const { bindProcessClaudeAccount } = await import('./claude-accounts')
+    const session = new Session('startup-account-claude', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'claude-sub'
+    session.selectedModel = 'opus'
+    session.selectedEffort = 'max'
+    const proc = new FakeAgentProc('claude', null, 'claude-sub') as any
+    bindProcessClaudeAccount(proc, 'default')
+    session.proc = proc
+    try {
+      expect(session.withModelAndAccount('✅ 已准备恢复上一会话 thread=…22e24c', proc))
+        .toBe('✅ 已准备恢复上一会话 thread=…22e24c · claude · opus/max · 账号 Claude·默认')
+      // A planned label from an earlier status is replaced, never stacked.
+      expect(session.withModelAndAccount('🔁 恢复上一会话 thread=…22e24c · 账号 Claude·选号中', proc))
+        .toBe('🔁 恢复上一会话 thread=…22e24c · claude · opus/max · 账号 Claude·默认')
+      // Regular turn footers keep the documented `agent · 模型/effort` format.
+      expect(session.withModel('Thinking(1s)')).toBe('Thinking(1s) · claude · opus/max')
+    } finally { proc.alive = false }
+  })
+
+  test('start status lines switch from the planned label to the assigned account', async () => {
+    claudeSubscription()
+    const { bindProcessClaudeAccount } = await import('./claude-accounts')
+    const session = new Session('startup-account-start', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'claude-sub'
+    session.selectedModel = 'opus'
+    session.selectedEffort = 'max'
+    const proc = new FakeAgentProc('claude', null, 'claude-sub') as any
+    bindProcessClaudeAccount(proc, 'default')
+    session.spawnAgent = () => proc
+    const statuses: string[] = []
+    try {
+      expect(await session.start({ announce: false, onStatus: (status: string) => statuses.push(status) })).toBe(true)
+      expect(statuses).toContain('🚀 启动 Claude · claude · opus/max · 账号 Claude·选号中')
+      expect(statuses).toContain('⏳ 检查 Claude 启动 · claude · opus/max · 账号 Claude·默认')
+      expect(statuses.at(-1)).toBe('✅ Claude 已就绪 · claude · opus/max · 账号 Claude·默认')
+    } finally {
+      await session.stop('startup account test complete', { announce: false })
+    }
+  })
+
+  test('restore status lines name the account the restored process was assigned', async () => {
+    claudeSubscription()
+    const { bindProcessClaudeAccount } = await import('./claude-accounts')
+    const session = new Session('startup-account-restore', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'claude-sub'
+    session.selectedModel = 'opus'
+    session.selectedEffort = 'max'
+    session.lastSessionRef = { provider: 'claude', sessionId: 'thread-abc123', cwd: session.workDir }
+    session.lastSessionId = 'thread-abc123'
+    const proc = new FakeAgentProc('claude', null, 'claude-sub') as any
+    proc.resumedSessionId = 'thread-abc123'
+    bindProcessClaudeAccount(proc, 'default')
+    session.spawnAgent = () => proc
+    const statuses: string[] = []
+    try {
+      expect(await session.restartUnlocked(true, { announce: false, onStatus: (status: string) => statuses.push(status) })).toBe(true)
+      expect(statuses).toContain('🔁 恢复上一会话 thread=thread-abc123 · claude · opus/max · 账号 Claude·选号中')
+      expect(statuses.at(-1)).toBe('✅ 已准备恢复上一会话 thread=thread-abc123 · claude · opus/max · 账号 Claude·默认')
+    } finally {
+      await session.stop('restore account test complete', { announce: false })
+    }
+  })
+
+  test('an unstarted subscription shows the selection as pending, and an explicit account wins', () => {
+    claudeSubscription()
+    const session = new Session('startup-account-pending', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'claude-sub'
+    session.selectedModel = 'opus'
+    session.selectedEffort = 'max'
+    expect(session.withModelAndAccount('🚀 启动 Claude', null))
+      .toBe('🚀 启动 Claude · claude · opus/max · 账号 Claude·选号中')
+    session.claudeStartAccountOverride = 'default'
+    expect(session.withModelAndAccount('🚀 启动 Claude', null))
+      .toBe('🚀 启动 Claude · claude · opus/max · 账号 Claude·默认')
+  })
+
+  test('fixed single-account sources and bound Codex accounts use their hi-panel labels', async () => {
+    resetTokenSourceRegistry()
+    registerTokenSource({ id: 'label-glm', kind: 'test', agent: 'claude', enabled: true,
+      display: 'GLM', usageAccount: { id: 'glm', label: 'GLM' }, models: [], defaultModel: 'glm-5.3',
+      modelCatalogState: { status: 'ready', updatedAt: 1 },
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }) } as any)
+    const session = new Session('startup-account-fixed', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'label-glm'
+    session.selectedModel = 'glm-5.3'
+    session.selectedEffort = 'high'
+    expect(session.withModelAndAccount('✅ Claude 已就绪', null))
+      .toBe('✅ Claude 已就绪 · claude · glm-5.3/high · 账号 GLM')
+
+    const { bindProcessCodexAccount } = await import('./codex-accounts')
+    const proc = new FakeAgentProc('codex', 'thread', 'codex-sub') as any
+    bindProcessCodexAccount(proc, 'default')
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = 'codex-sub'
+    session.selectedModel = 'gpt-5.6-sol'
+    session.selectedEffort = 'xhigh'
+    session.proc = proc
+    try {
+      expect(session.withModelAndAccount('✅ 已恢复上一会话 thread=…22e24c', proc))
+        .toBe('✅ 已恢复上一会话 thread=…22e24c · codex · gpt-5.6-sol/xhigh · 账号 Codex·默认')
+    } finally { proc.alive = false }
+  })
+
+  test('cold-start turn 1 shows the planned account from Waiting onward', async () => {
+    claudeSubscription()
+    const session = new Session('startup-account-cold', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'claude-sub'
+    session.selectedModel = 'opus'
+    session.selectedEffort = 'max'
+    let turn: any = null
+    const owner = session.beginTurnOpen(null, 0, true)
+    try {
+      turn = await session.openTurnCard(owner, '', 'user_message', { startupAccount: true })
+      expect(turn).not.toBeNull()
+      expect(JSON.stringify(sentCards.at(-1))).toContain('Waiting...(0s) · claude · opus/max · 账号 Claude·选号中')
+      session.releaseTurnOpen(owner)
+      // Later turns keep the footer rule and add no account.
+      const nextOwner = session.beginTurnOpen(null, 0, true)
+      const next = await session.openTurnCard(nextOwner, '', 'user_message')
+      expect(JSON.stringify(sentCards.at(-1))).not.toContain('账号')
+      session.stopFooterStatus(next)
+      session.releaseTurnOpen(nextOwner)
+      await cardkit.dispose(next!.cardId)
+    } finally {
+      session.releaseTurnOpen(owner)
+      if (turn) { session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId) }
+    }
+  })
+})
+
 describe('Session background tasks in shared delegation cards', () => {
   function makeRunningTask(id: string): any {
     return { id, type: 'shell', description: `bg ${id}`, status: 'running', startedAt: Date.now() - 5000, steps: [] }
