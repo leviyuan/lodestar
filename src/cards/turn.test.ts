@@ -122,6 +122,37 @@ describe('main conversation card rendering', () => {
     expect(card.body.elements[0].header.title.content).toBe('📥 收到 (1) 🚀')
   })
 
+  test('names the account assignment after the cold-start marker', () => {
+    const card = mainConversationCard({
+      sessionName: 'probe',
+      turn: 1,
+      provider: 'claude',
+      kind: 'user_message',
+      userInputs: ['直接做一下'],
+      directStart: true,
+      accountLabel: 'Claude·默认',
+    }) as any
+
+    expect(card.body.elements[0].header.title.content).toBe('📥 收到 (1) 🚀 · 账号 Claude·默认')
+    // The panel is still the replaceable user_input element Session redraws
+    // once the startup settles on the real account.
+    expect(card.body.elements[0].element_id).toBe('user_input')
+    expect(card.body.elements[0].elements.map((element: any) => element.content)).toEqual(['直接做一下'])
+  })
+
+  test('regular turns never carry an account label in the input header', () => {
+    const card = mainConversationCard({
+      sessionName: 'probe',
+      turn: 2,
+      provider: 'claude',
+      kind: 'user_message',
+      userInputs: ['继续做一下'],
+      accountLabel: 'Claude·默认',
+    }) as any
+
+    expect(card.body.elements[0].header.title.content).toBe('📥 收到 (1) #2')
+  })
+
   test('shows the turn number for non-cold-start user turns', () => {
     const card = mainConversationCard({
       sessionName: 'probe',

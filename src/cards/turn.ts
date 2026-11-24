@@ -294,8 +294,12 @@ interface MainCardOpts {
    * after it has converted message_id → card_id, but this value is what
    * the user sees immediately when Feishu creates the card. */
   initialFooter?: string
-  /** True when a bare user prompt cold-started Codex. */
+  /** True when a bare user prompt cold-started the backend. */
   directStart?: boolean
+  /** 冷启动首轮本次账号分配结果（`Claude·默认`、`Codex·工作`、`GLM`、
+   *  `<中转站名>`），订阅池尚未选出时为 `Claude·选号中` / `Codex·选号中`。
+   *  只写在 🚀 启动标识后，供 Session 在进程就绪后用实际账号重绘。 */
+  accountLabel?: string
 }
 
 /** Initial card sent at the start of each turn. CardKit streaming mode stays
@@ -311,15 +315,13 @@ export function mainConversationCard(opts: MainCardOpts): object {
         ? [{ tag: 'markdown', content: `⏰ 定时任务触发，${providerLabel} 正在执行巡检 #${opts.turn}` }]
       : []
   const inputs = opts.userInputs ?? []
-  const userInputHeader = `📥 ${opts.kind === 'user_steering' ? '追加' : '收到'} (${inputs.length}) ${opts.directStart ? '🚀' : `#${opts.turn}`}`
-  const userInputPanel = inputs.length > 0
-    ? [{
-        tag: 'collapsible_panel',
-        element_id: ELEMENTS.userInput,
-        header: { title: { tag: 'plain_text', content: userInputHeader } },
-        expanded: false,
-        elements: inputs.map(text => ({ tag: 'markdown', content: sanitizeMarkdownForCardKit(text) })),
-      }]
+  const userInputPanels = inputs.length > 0
+    ? [userInputPanel(inputs, {
+        turn: opts.turn,
+        kind: opts.kind,
+        directStart: opts.directStart,
+        accountLabel: opts.accountLabel,
+      })]
     : []
   return {
     schema: '2.0',
@@ -341,10 +343,34 @@ export function mainConversationCard(opts: MainCardOpts): object {
       // work are visible, and the terminal line when the turn ends.
       elements: [
         ...banner,
-        ...userInputPanel,
+        ...userInputPanels,
         { tag: 'markdown', element_id: ELEMENTS.footer, content: opts.initialFooter ?? 'Waiting...(0s)' },
       ],
     },
+  }
+}
+
+/** 「📥 收到/追加 (N)」输入面板。冷启动首轮（`directStart`，标题带 🚀）在启动
+ *  标识后标注本次账号分配结果；Session 在进程就绪后用实际账号重绘这块面板，
+ *  所以这里也接受已确定的账号。 */
+export function userInputPanel(
+  inputs: string[],
+  opts: { turn: number; kind?: MainCardOpts['kind']; directStart?: boolean; accountLabel?: string },
+): object {
+  const marker = opts.directStart
+    ? `🚀${opts.accountLabel ? ` · 账号 ${opts.accountLabel}` : ''}`
+    : `#${opts.turn}`
+  return {
+    tag: 'collapsible_panel',
+    element_id: ELEMENTS.userInput,
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: `📥 ${opts.kind === 'user_steering' ? '追加' : '收到'} (${inputs.length}) ${marker}`,
+      },
+    },
+    expanded: false,
+    elements: inputs.map(text => ({ tag: 'markdown', content: sanitizeMarkdownForCardKit(text) })),
   }
 }
 

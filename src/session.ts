@@ -1057,6 +1057,22 @@ export class Session {
     return label ? `${withModel}${marker}${label}` : `${withModel}${existing}`
   }
 
+  /** 冷启动首轮开卡时订阅池还没选出账号，标题先写「选号中」。进程就绪后用实际
+   *  分配结果重绘「📥 收到 (N) 🚀」，让卡片顶部一直显示这次启动用的账号。 */
+  private async refreshTurnInputAccount(turn: TurnState, proc: AgentProcess): Promise<void> {
+    const inputs = turn.userInputs
+    const label = this.accountAssignmentLabel(proc)
+    if (!inputs?.length || !label || label === turn.userInputAccountLabel) return
+    const landed = await cardkit.replaceElementChecked(
+      turn.cardId,
+      cards.ELEMENTS.userInput,
+      cards.userInputPanel(inputs, { turn: turn.turnNo ?? 0, directStart: true, accountLabel: label }),
+      { notifyCardFailure: false },
+    )
+    if (landed) turn.userInputAccountLabel = label
+    else logDiagnostic('session: startup account header write failed')
+  }
+
   private async replaceFooterContent(cardId: string, content: string): Promise<cardkit.CardWriteResult> {
     // Live timing is optional: Card Kit logs failures, and the timer pauses
     // without a user notice. Never mark the footer missing or rotate its card.
@@ -3310,6 +3326,8 @@ export class Session {
       this.startThinkingFooter(turn)
       if (!await this.sendClaimedUserText(proc, wireText)) return
       this.status = 'working'
+      // 账号此时才确定；标题重绘排在用户输入送入后端之后，不拖慢首轮。
+      await this.refreshTurnInputAccount(turn, proc)
     } finally {
       this.releaseTurnOpen(openOwner)
     }
@@ -4890,6 +4908,9 @@ export class Session {
     const initialFooter = opts.startupAccount
       ? this.withModelAndAccount(opts.initialFooter ?? 'Waiting...(0s)', null, turnSelection)
       : this.withModel(opts.initialFooter ?? 'Waiting...(0s)', turnSelection)
+    // 「📥 收到 (N) 🚀」标题同样标注这次启动用的账号：开卡时先写计划中的分配
+    // （订阅池写「选号中」），进程就绪后再用实际结果重绘。
+    const startupAccountLabel = opts.startupAccount ? this.accountAssignmentLabel(null) ?? undefined : undefined
     const card = cards.mainConversationCard({
       sessionName: this.sessionName,
       turn,
@@ -4900,6 +4921,7 @@ export class Session {
       userInputs,
       initialFooter,
       directStart: opts.directStart,
+      accountLabel: startupAccountLabel,
     })
     let sendFailure: unknown
     // 共享任务卡必须留在群尾：新主卡落地前，先把旧卡上的未完成项清走；
@@ -4966,6 +4988,8 @@ export class Session {
       messageId,
       userOpenId,
       trigger,
+      turnNo: turn,
+      ...(opts.startupAccount ? { userInputs, userInputAccountLabel: startupAccountLabel } : {}),
       toolCount: 0,
       toolByUseId: new Map(),
       planSteps: [],

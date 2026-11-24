@@ -14,6 +14,7 @@ export {
   footerTokenDetailLine,
   footerModelLabel,
   mainConversationCard,
+  userInputPanel,
   contextCompactionElement,
   goalDisplaySignature,
   goalElement,

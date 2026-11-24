@@ -31,6 +31,12 @@ export interface TurnState {
    *                      不开卡的话整轮正文会被丢弃)
    *   'scheduled_wakeup' — Claude SDK Cron 定时唤醒轮 */
   trigger: 'user_message' | 'bg_task_resume' | 'scheduled_wakeup'
+  /** 本卡在会话里的 turn 编号，重绘输入面板标题时用（`📥 收到 (N) #n`）。 */
+  turnNo?: number
+  /** 冷启动首轮「📥 收到 (N) 🚀」面板的输入原文与标题里的账号标注。进程就绪后
+   *  用实际分配结果重绘这块面板，其他 turn 不带账号标注。 */
+  userInputs?: string[]
+  userInputAccountLabel?: string
   toolCount: number
   /** `output` / `isError` are filled in by completeTool and kept so
    * card rotation can rebuild unfinished or failed tool panels. */

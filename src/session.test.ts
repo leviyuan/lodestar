@@ -6050,6 +6050,34 @@ describe('Session startup account assignment labels', () => {
       if (turn) { session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId) }
     }
   })
+
+  test('cold-start turn 1 rewrites the 📥 收到 header to the assigned account', async () => {
+    claudeSubscription()
+    const { bindProcessClaudeAccount } = await import('./claude-accounts')
+    const session = new Session('startup-account-header', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'claude-sub'
+    session.selectedModel = 'opus'
+    session.selectedEffort = 'max'
+    const proc = new FakeAgentProc('claude', null, 'claude-sub') as any
+    bindProcessClaudeAccount(proc, 'default')
+    session.spawnAgent = () => proc
+    try {
+      await session.startColdUserTurn('直接做一下', '直接做一下', 'ou_user')
+      const turn = session.currentTurn
+      // 开卡时订阅池还没选出账号，标题先写「选号中」。
+      const opened = sentCards.find((card: any) => card.body?.elements?.[0]?.element_id === 'user_input') as any
+      expect(opened.body.elements[0].header.title.content).toBe('📥 收到 (1) 🚀 · 账号 Claude·选号中')
+      // 进程就绪后用实际分配结果重绘同一块面板，不新开卡片。
+      const writes = calls.filter(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/user_input`)
+      expect(writes).toHaveLength(1)
+      expect(JSON.parse(writes[0].body.element).header.title.content).toBe('📥 收到 (1) 🚀 · 账号 Claude·默认')
+      expect(session.currentTurn).toBe(turn)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      if (session.currentTurn) await cardkit.dispose(session.currentTurn.cardId)
+    }
+  })
 })
 
 describe('Session background tasks in shared delegation cards', () => {
