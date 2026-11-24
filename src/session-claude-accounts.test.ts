@@ -59,8 +59,13 @@ function running(s: any, id: string): Proc {
   return proc
 }
 
+// 选号读取的是 daemon 的全局 Session registry；别的测试文件遗留的会话会混进来，
+// 这里只隔离注册表内容，断言本身仍核对本文件创建的会话。
+let foreignSessions: Session[] = []
 beforeEach(async () => {
   resetFeishuMock()
+  foreignSessions = [...Session.all]
+  for (const s of foreignSessions) Session.all.delete(s)
   root = realpathSync(mkdtempSync(join(tmpdir(), 'session-claude-accounts-')))
   const home = join(root, 'home')
   for (const d of ['.claude', '.claude-accounts/A', '.claude-accounts/B']) mkdirSync(join(home, d), { recursive: true })
@@ -79,6 +84,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await Promise.allSettled(pendingSourceCommands())
   for (const s of sessions.splice(0)) { s.proc = null; s.dispose() }
+  for (const s of foreignSessions.splice(0)) Session.all.add(s)
   for (const spy of spies.splice(0)) spy.mockRestore()
   resetTokenSourceRegistry(); for (const item of previous) registerTokenSource(item)
   rmSync(root, { recursive: true, force: true })
