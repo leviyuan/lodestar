@@ -4,7 +4,6 @@ import type { AgentRunSnapshot, AgentWorkerResult } from '../agent-run-types'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
 import { formatDuration } from './duration'
 import {
-  AGENT_CARD_TASK_KIND_ICON,
   AGENT_CARD_TASK_KIND_ORDER,
   agentCardTaskKindLabel,
   agentCardTaskKindShortLabel,
@@ -124,9 +123,10 @@ export function delegationCardSummary(tasks: Array<{
   }
   if (active.length > 0) {
     const counts = kindCounts(active)
-    if (!counts) return `⏳ ${active.length}项进行中`
-    // 计数里的 ⏳ 就是后台进程，与「进行中」的图标相同：已经有它时不再重复写状态图标。
-    return counts.includes(AGENT_CARD_TASK_KIND_ICON.background) ? counts : `⏳ ${counts}`
+    // 运行中只写类别计数，不加状态前缀：⏳ 在计数里就是后台进程数，再拿同一个图标
+    // 当前缀会被读成「后台进程没有数量」。写法与 hi / bl 的 workload 一致
+    // （`🤖1`、`🤖1·⏳1`），类别太多列不全时才退回总数。
+    return counts ?? `${active.length}项进行中`
   }
   if (failed > 0) return `❌ ${failed}失败·${tasks.length - failed}完成`
   const done = kindCounts(tasks)

@@ -7,7 +7,8 @@ export const AGENT_CARD_TASK_KIND_ORDER: readonly AgentCardTaskKind[] = [
 
 /** 子 Agent 与后台进程在产品里的通用图标：任务卡行、`hi`、`bl` 和单聊面板都用它表示这两类，
  * 不再写中文类别名，任何地方都取同一份定义。委派与项目任务不在卡片正文里成段出现，仍用中文。
- * 后台进程的 ⏳ 与任务「进行中」的状态图标相同，同一个字符串里只写一次。 */
+ * 后台进程的 ⏳ 与任务「进行中」的状态图标相同，同一个字符串里只写一次；共享卡摘要和
+ * `hi`/`bl` 只写图标加数量（`🤖1`、`🤖1·⏳1`），不加 `⏳` 进行中前缀，以免读成后台进程缺数量。 */
 export const AGENT_CARD_TASK_KIND_ICON: Readonly<Record<'subagent' | 'background', string>> = {
   subagent: '🤖',
   background: '⏳',

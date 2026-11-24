@@ -135,7 +135,14 @@ describe('shared card chat-list summary', () => {
   test('keeps the ~15 character preview focused on the running kinds', () => {
     expect(delegationCardSummary([task('background')])).toBe('⏳1')
     expect(delegationCardSummary([task('subagent'), task('background')])).toBe('🤖1·⏳1')
-    expect(delegationCardSummary([task('delegated'), task('subagent'), task('background')])).toBe('⏳ 3项进行中')
+    expect(delegationCardSummary([task('delegated'), task('subagent'), task('background')])).toBe('3项进行中')
+  })
+
+  test('never prefixes the running counts with the background glyph', () => {
+    // ⏳ 在计数里就是后台进程数：只写 `🤖1`，不能写成 `⏳ 🤖1` 让人以为后台进程缺数量。
+    expect(delegationCardSummary([task('subagent')])).toBe('🤖1')
+    expect(delegationCardSummary([task('delegated')])).toBe('委派1')
+    expect(delegationCardSummary([task('subagent'), task('subagent')])).toBe('🤖2')
   })
 
   test('marks the real end instead of reusing the running sentence', () => {

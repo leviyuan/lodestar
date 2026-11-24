@@ -101,7 +101,7 @@ describe('shared delegation card lifecycle', () => {
     const rows = [...h.elements.get('message-1')!.values()]
     expect(rows).toHaveLength(3)
     expect(rows.every(row => row.tag === 'collapsible_panel' && row.expanded === false)).toBe(true)
-    expect(h.settings.get('message-1').config.summary.content).toBe('⏳ 3项进行中')
+    expect(h.settings.get('message-1').config.summary.content).toBe('3项进行中')
     const completedChild = { ...child, status: 'completed' as const, summary: '子任务已完成', endTime: Date.now() }
     await h.cards.syncBackground('chat', 'session', [completedChild, shell])
     terminal(delegated)
