@@ -191,6 +191,9 @@ const ANONYMOUS_COMPACTION_DEDUPE_MS = 10_000
  * settlement gets this long to open the SDK's automatic resume turn before the
  * session owes the user an explicit task-end push. */
 const BACKGROUND_END_NOTICE_GRACE_MS = 10_000
+/** A turn closed with messages queued behind it: the batch continues on a new
+ * card, which owns the normal completion states, not an interruption. */
+const MID_TURN_HANDOFF_SUFFIX = '📨 转交新卡'
 /** Claude Agent SDK does not emit stream `init` until the first user input.
  * Still give synchronous/early startup failures a chance to surface before
  * presenting the session as ready. */
@@ -446,7 +449,11 @@ export class Session {
    * generation, so a late resume turn cannot announce it twice. */
   private backgroundWorkGeneration = 0
   private notifiedBackgroundWorkGeneration = -1
-  private backgroundEndNoticeTimer: ReturnType<typeof setTimeout> | null = null
+  /** A completion push that is owed but not delivered yet. Cleared only by an
+   * actual push or by a stop that throws the work away: a continuation turn
+   * opening over it must not be able to drop the notification silently. */
+  private completionPushPending: { messageId: string; userOpenId: string } | null = null
+  private completionNoticeTimer: ReturnType<typeof setTimeout> | null = null
   /** Feishu message_ids of user messages that arrived while the daemon
    * was busy (turn in flight or mid-open), mapped to the `reaction_id`
    * of the `OneSecond` reaction placed at arrival. The reaction_id is
@@ -1574,8 +1581,10 @@ export class Session {
         'same-process opens must wait for the current owner',
       )
     }
-    // A new visible turn takes over the task-end push decision.
-    this.clearBackgroundEndNotice()
+    // A new visible turn takes over the task-end push decision. Only its timer
+    // is dropped: the owed push itself survives, so a turn that closes without
+    // pushing re-arms it instead of leaving the user unannounced.
+    this.clearCompletionNoticeTimer()
     let resolveDone!: () => void
     const done = new Promise<void>(resolve => { resolveDone = resolve })
     const owner: TurnOpenOwner = {
@@ -2855,7 +2864,7 @@ export class Session {
   /** daemon 解散临时群(bye)时调:从 Session.all registry 移除,避免长期运行的 daemon
    *  因临时群不断建/散而累积孤立 Session 实例(sessions Map 已 delete,但 static all 不会)。 */
   dispose(): void {
-    this.clearBackgroundEndNotice()
+    this.clearCompletionNotice()
     this.modelPanelRefreshEpoch++
     Session.all.delete(this)
   }
@@ -3746,10 +3755,12 @@ export class Session {
     const running = new Set(this.backgroundTasks.filter(task => !cards.isBgTerminal(task)).map(task => task.id))
     this.backgroundTasks = next.active
     this.pendingBgTasks = next.pending
-    // A restarted task (same id, terminal -> running) is new work again.
+    // A restarted task (same id, terminal -> running) is new work again. New
+    // work supersedes any owed completion push: a turn is launching it, so its
+    // own close (or the new work's settle) owns the notification.
     if (next.active.some(task => !cards.isBgTerminal(task) && !running.has(task.id))) {
       this.backgroundWorkGeneration++
-      this.clearBackgroundEndNotice()
+      this.clearCompletionNotice()
     }
   }
 
@@ -3786,7 +3797,7 @@ export class Session {
     }
     // The turn may already be closed while this task kept running; the task
     // itself now owns the task-end push.
-    this.scheduleBackgroundEndNotice()
+    this.noteBackgroundWorkSettled()
   }
 
   private scheduleBackgroundRefresh(): void {
@@ -3801,36 +3812,71 @@ export class Session {
     return this.backgroundTasks.some(task => !cards.isBgTerminal(task))
   }
 
-  /** A turn is not the task: while subagents or background shells still run,
-   * the phone push belongs to the moment the last one ends. */
-  private scheduleBackgroundEndNotice(): void {
+  /** Last subagent/background shell ended after its turn closed: this
+   * generation still owes the user a “task really finished” push. */
+  private noteBackgroundWorkSettled(): void {
+    if (this.hasActiveBackgroundWork()) return
+    if (this.notifiedBackgroundWorkGeneration === this.backgroundWorkGeneration) return
+    this.markCompletionPending()
+  }
+
+  /** Record that a push is owed and remember which card and person it belongs
+   * to. `messageId`/`openId` default to the last closed card and last sender so
+   * a continuation turn (resume, ⏰ wake-up, DSH “继续执行”) that the backend
+   * started on its own cannot swallow the notification. */
+  private markCompletionPending(messageId?: string, userOpenId?: string): void {
+    const card = messageId || this.lastClosedTurnMessageId
+    const recipient = userOpenId || this.lastUserOpenId
+    if (!card || !recipient) {
+      logDiagnostic('session: completion push missing recipient')
+      return
+    }
+    this.completionPushPending = { messageId: card, userOpenId: recipient }
+    this.armCompletionNotice()
+  }
+
+  /** The push waits for the session to be really quiet: no cheap way to tell
+   * an in-flight turn's own close apart from a lost push, so both the close and
+   * every background settle call this again after their own decision. */
+  private armCompletionNotice(): void {
+    if (!this.completionPushPending) return
     if (this.hasActiveBackgroundWork()) return
     if (this.currentTurn || this.openingTurn || this.turnCloseInflight.size > 0) return
-    if (this.backgroundEndNoticeTimer) return
-    this.backgroundEndNoticeTimer = setTimeout(() => {
-      this.backgroundEndNoticeTimer = null
-      void this.notifyBackgroundEnd().catch(error => logError('session: background end notice failed', error))
+    if (this.completionNoticeTimer) return
+    this.completionNoticeTimer = setTimeout(() => {
+      this.completionNoticeTimer = null
+      void this.deliverCompletionNotice().catch(error => logError('session: completion notice failed', error))
     }, BACKGROUND_END_NOTICE_GRACE_MS)
   }
 
   /** Claude normally opens its resume turn inside the grace window, and that
    * turn's close pushes the result instead. Only a session that stays idle owes
-   * the user an explicit “tasks really finished” push. */
-  private async notifyBackgroundEnd(): Promise<void> {
+   * the user the explicit push. Anything that owns the decision re-arms this
+   * from its own settle point — returning early here never drops the intent. */
+  private async deliverCompletionNotice(): Promise<void> {
+    const pending = this.completionPushPending
+    if (!pending) return
     if (this.hasActiveBackgroundWork()) return
     if (this.currentTurn || this.openingTurn || this.turnCloseInflight.size > 0) return
-    const messageId = this.lastClosedTurnMessageId
-    const userOpenId = this.lastUserOpenId
-    if (!messageId || !userOpenId) return
-    if (this.notifiedBackgroundWorkGeneration === this.backgroundWorkGeneration) return
+    if (this.notifiedBackgroundWorkGeneration === this.backgroundWorkGeneration) {
+      this.completionPushPending = null
+      return
+    }
     this.notifiedBackgroundWorkGeneration = this.backgroundWorkGeneration
-    await feishu.urgentApp(messageId, [userOpenId])
+    this.completionPushPending = null
+    await feishu.urgentApp(pending.messageId, [pending.userOpenId])
   }
 
-  private clearBackgroundEndNotice(): void {
-    if (!this.backgroundEndNoticeTimer) return
-    clearTimeout(this.backgroundEndNoticeTimer)
-    this.backgroundEndNoticeTimer = null
+  private clearCompletionNoticeTimer(): void {
+    if (!this.completionNoticeTimer) return
+    clearTimeout(this.completionNoticeTimer)
+    this.completionNoticeTimer = null
+  }
+
+  /** Drop the owed push too: the work it announced was stopped or replaced. */
+  private clearCompletionNotice(): void {
+    this.clearCompletionNoticeTimer()
+    this.completionPushPending = null
   }
 
   private refreshBackgroundCardFull(): Promise<void> {
@@ -3865,7 +3911,8 @@ export class Session {
   private async resetBackgroundTasks(): Promise<void> {
     if (this.backgroundRefreshTimer) clearTimeout(this.backgroundRefreshTimer)
     this.backgroundRefreshTimer = null
-    this.clearBackgroundEndNotice()
+    // Stopped work owes no “finished” push; a killed row must not announce itself.
+    this.clearCompletionNotice()
     const now = Date.now()
     this.backgroundTasks = this.backgroundTasks.map(task => cards.isBgTerminal(task)
       ? task : { ...task, status: 'killed', endTime: task.endTime ?? now })
@@ -3919,7 +3966,9 @@ export class Session {
 
     void (async () => {
       try {
-        const opened = await this.openTurnCard(openOwner, '', 'scheduled_wakeup')
+        // A backend-started turn has no sender of its own. It still finishes
+        // work the last user asked for, so that user is its phone-push target.
+        const opened = await this.openTurnCard(openOwner, this.lastUserOpenId, 'scheduled_wakeup')
         if (this.proc !== p || this.procEpoch !== epoch) {
           if (opened && this.currentTurn === opened) {
             await this.closeTurnCard(`⚠️ ${this.backendLabel(p.provider)} 已退出`)
@@ -4395,7 +4444,7 @@ export class Session {
         suffix = `⚠️ ${stateError}`
         forcePush = true
       } else if (hasMidTurn) {
-        suffix = isError ? `⚠️ ${backend} ${failureDetail},用户已介入` : '📨 转交新卡'
+        suffix = isError ? `⚠️ ${backend} ${failureDetail},用户已介入` : MID_TURN_HANDOFF_SUFFIX
       } else if (isError) {
         suffix = `⚠️ ${backend} ${failureDetail}`
         forcePush = true
@@ -6364,9 +6413,11 @@ export class Session {
     const close = this.finishTurnCardClose(snapshot, suffix, opts)
       .finally(() => this.releaseTurnCloseReactions(snapshot))
     this.turnCloseInflight.add(close)
+    // A settle that raced this close could not arm the owed push (a close was
+    // in flight); re-evaluate once the close has fully landed.
     void close.then(
-      () => { this.turnCloseInflight.delete(close) },
-      () => { this.turnCloseInflight.delete(close) },
+      () => { this.turnCloseInflight.delete(close); this.armCompletionNotice() },
+      () => { this.turnCloseInflight.delete(close); this.armCompletionNotice() },
     )
     return close
   }
@@ -6533,16 +6584,50 @@ export class Session {
 
     // Phone push when the task really ends. A turn that closes while subagents
     // or background shells still run leaves the push to the task-end notice,
-    // and a resume turn reporting work that notice already covered does not
-    // push a second time. `opts.forcePush` still overrides the suffix-gate.
+    // and a continuation turn reporting work that notice already covered does
+    // not push a second time. `opts.forcePush` still overrides the suffix-gate.
     // Fire-and-forget; urgent_app failures are non-fatal and already
     // logged in feishu.ts.
     // 续卡仍未成功时已有失败提示，不推送旧卡的完成通知。
-    const announcedByTaskEnd = turn.trigger === 'bg_task_resume'
+    // A backend-started turn (resume, ⏰ wake-up, DSH “继续执行”) opens with no
+    // sender of its own; the user who asked for the work is still the one to
+    // ping, otherwise the turn that actually finishes the task stays silent.
+    const recipient = turn.userOpenId || this.lastUserOpenId
+    const continuationTurn = turn.trigger === 'bg_task_resume' || turn.trigger === 'scheduled_wakeup'
+    const announcedByTaskEnd = continuationTurn
       && this.notifiedBackgroundWorkGeneration === this.backgroundWorkGeneration
-    if ((opts.forcePush || !suffix) && turn.userOpenId && turn.messageId && !turn.cardRotationFailed
-      && !this.hasActiveBackgroundWork() && !announcedByTaskEnd) {
-      void feishu.urgentApp(turn.messageId, [turn.userOpenId])
+    const pushNow = (opts.forcePush || !suffix) && !!recipient && !!turn.messageId
+      && !turn.cardRotationFailed && !this.hasActiveBackgroundWork() && !announcedByTaskEnd
+    if (pushNow) {
+      // Record the generation so a late settle of this same round cannot push
+      // the same completion twice.
+      this.notifiedBackgroundWorkGeneration = this.backgroundWorkGeneration
+      this.completionPushPending = null
+      void feishu.urgentApp(turn.messageId, [recipient])
+    } else if (opts.hasFreshResult) {
+      // The work finished but the push could not go out now: subagents or
+      // background shells are still running, the batch continues in a new card,
+      // or this continuation turn has nobody of its own to ping. Keep it owed
+      // instead of dropping it — whoever closes or settles next re-arms it, and
+      // an idle session delivers it after the grace. Interruptions, failed card
+      // handoffs and already-announced rounds owe nothing, and log why so a
+      // missing push is never a mystery again.
+      if (turn.cardRotationFailed) {
+        logDiagnostic('session: completion push skipped after a failed card handoff')
+      } else if (announcedByTaskEnd) {
+        logDiagnostic('session: completion push skipped for an announced round')
+      } else if (suffix !== undefined && suffix !== MID_TURN_HANDOFF_SUFFIX) {
+        logDiagnostic('session: completion push skipped for a terminal turn')
+      } else if (this.hasActiveBackgroundWork()) {
+        logDiagnostic('session: completion push deferred for active background work')
+        this.markCompletionPending(turn.messageId, recipient)
+      } else if (suffix === MID_TURN_HANDOFF_SUFFIX) {
+        logDiagnostic('session: completion push deferred to the next card')
+        this.markCompletionPending(turn.messageId, recipient)
+      } else {
+        logDiagnostic('session: completion push has no recipient')
+        this.markCompletionPending(turn.messageId, recipient)
+      }
     }
 
     // Release the OneSecond reactions on every queued Feishu message

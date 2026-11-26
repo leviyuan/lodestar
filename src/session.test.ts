@@ -9113,16 +9113,93 @@ describe('Session task-end notifications', () => {
     session.currentTurn = turnState('card_bg_running')
     cardkit.recordCardCreated('card_bg_running', 1)
     try {
-      await session.closeTurnCard()
+      await session.closeTurnCard(undefined, { hasFreshResult: true })
       expect(urgentPushes).toHaveLength(0)
+      // 回合关掉时后台还在跑：这次完成通知欠着，不能因为卡已收尾就丢掉。
+      expect(session.completionPushPending).toMatchObject({ messageId: 'om_session_turn', userOpenId: 'ou_user' })
 
       session.backgroundTasks = [task('completed')]
-      await session.notifyBackgroundEnd()
+      session.noteBackgroundWorkSettled()
+      await session.deliverCompletionNotice()
       expect(urgentPushes).toEqual([['om_session_turn', ['ou_user']]])
-      await session.notifyBackgroundEnd()
+      await session.deliverCompletionNotice()
       expect(urgentPushes).toHaveLength(1)
     } finally {
       await cardkit.dispose('card_bg_running')
+      session.dispose()
+    }
+  })
+
+  test('the last task settling late still delivers the owed completion push', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    session.lastClosedTurnMessageId = 'om_previous_turn'
+    session.backgroundTasks = [task('completed')]
+    // 结算发生在别的收尾里（或没有回合接手）时，欠下的推送必须留着。
+    session.markCompletionPending()
+    session.currentTurn = turnState('card_busy')
+    cardkit.recordCardCreated('card_busy', 1)
+    try {
+      await session.deliverCompletionNotice()
+      expect(urgentPushes).toHaveLength(0)
+      expect(session.completionPushPending).toEqual({ messageId: 'om_previous_turn', userOpenId: 'ou_user' })
+    } finally {
+      session.currentTurn = null
+      await cardkit.dispose('card_busy')
+    }
+    await session.deliverCompletionNotice()
+    expect(urgentPushes).toEqual([['om_previous_turn', ['ou_user']]])
+    session.dispose()
+  })
+
+  test('a backend-started continuation turn pings the user who asked for the work', async () => {
+    // resume、⏰ 唤醒、DSH「继续执行」的卡没有自己的发送者，完成时不能静默。
+    for (const trigger of ['bg_task_resume', 'scheduled_wakeup'] as const) {
+      urgentPushes.length = 0
+      const session = new Session('probe', 'chat_id') as any
+      session.lastUserOpenId = 'ou_user'
+      const turn = { ...turnState(`card_${trigger}`), userOpenId: '', trigger }
+      session.currentTurn = turn
+      cardkit.recordCardCreated(turn.cardId, 1)
+      try {
+        await session.closeTurnCard(undefined, { hasFreshResult: true })
+      } finally {
+        await cardkit.dispose(turn.cardId)
+        session.dispose()
+      }
+      expect(urgentPushes).toEqual([['om_session_turn', ['ou_user']]])
+    }
+  })
+
+  test('a mid-turn handoff keeps the push owed when no follow-up turn opens', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    session.currentTurn = turnState('card_handoff')
+    cardkit.recordCardCreated('card_handoff', 1)
+    try {
+      await session.closeTurnCard('📨 转交新卡', { hasFreshResult: true })
+      expect(urgentPushes).toHaveLength(0)
+      expect(session.completionPushPending).toMatchObject({ messageId: 'om_session_turn' })
+    } finally {
+      await cardkit.dispose('card_handoff')
+    }
+    // 排队的下一轮没开起来时，欠下的通知仍要在空闲后补发。
+    await session.deliverCompletionNotice()
+    expect(urgentPushes).toEqual([['om_session_turn', ['ou_user']]])
+    session.dispose()
+  })
+
+  test('an interrupted turn owes no completion push', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    session.currentTurn = turnState('card_interrupted')
+    cardkit.recordCardCreated('card_interrupted', 1)
+    try {
+      await session.closeTurnCard('🛑 打断', { hasFreshResult: true })
+      expect(urgentPushes).toHaveLength(0)
+      expect(session.completionPushPending).toBeNull()
+    } finally {
+      await cardkit.dispose('card_interrupted')
       session.dispose()
     }
   })
@@ -9136,11 +9213,12 @@ describe('Session task-end notifications', () => {
     cardkit.recordCardCreated('card_next_turn', 1)
     try {
       // 后台已结束但新一轮正在进行：这一轮收尾负责推送。
-      await session.notifyBackgroundEnd()
+      session.noteBackgroundWorkSettled()
+      await session.deliverCompletionNotice()
       expect(urgentPushes).toHaveLength(0)
 
       session.currentTurn.trigger = 'bg_task_resume'
-      await session.closeTurnCard()
+      await session.closeTurnCard(undefined, { hasFreshResult: true })
       expect(urgentPushes).toHaveLength(1)
     } finally {
       await cardkit.dispose('card_next_turn')
@@ -9153,7 +9231,7 @@ describe('Session task-end notifications', () => {
     session.currentTurn = { ...turnState('card_late_resume'), trigger: 'bg_task_resume' }
     cardkit.recordCardCreated('card_late_resume', 1)
     try {
-      await session.closeTurnCard()
+      await session.closeTurnCard(undefined, { hasFreshResult: true })
       expect(urgentPushes).toHaveLength(0)
     } finally {
       await cardkit.dispose('card_late_resume')
@@ -9170,10 +9248,13 @@ describe('Session task-end notifications', () => {
     session.backgroundTasks = [task('completed')]
     session.currentTurn = turnState('card_closing')
     cardkit.recordCardCreated('card_closing', 1)
-    const close = session.closeTurnCard()
+    const close = session.closeTurnCard(undefined, { hasFreshResult: true })
+    session.markCompletionPending()
     session.turnCloseInflight.add(gate)
-    await session.notifyBackgroundEnd()
+    await session.deliverCompletionNotice()
     expect(urgentPushes).toHaveLength(0)
+    // 收尾在飞时不丢意图：等它落地后再补一次。
+    expect(session.completionPushPending).not.toBeNull()
     release()
     session.turnCloseInflight.delete(gate)
     await close
