@@ -119,7 +119,7 @@ export async function runCommand(
     await s.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId, requester)
     return true
   }
-  // bl/btwlist = 列出本机登记的全部临时会话；btw = 开临时会话(同目录,自动启动)，
+  // bl/btwlist = 列出当前项目的临时会话（基名相同，不列别的项目）；btw = 开临时会话(同目录,自动启动)，
   // `btw 备注` 用备注代替时间后缀；bye = 散临时群；fk/fork = 列当前会话 turn 分叉；
   // bk/back = 列 turn；点选并通过 stale/owner 校验后才终止并切到新分支。
   const btw = raw.trim().match(/^btw(?:[ \t]+([^\r\n]+))?$/i)

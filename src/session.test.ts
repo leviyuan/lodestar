@@ -9035,6 +9035,7 @@ describe('Session workload shown by hi and bl', () => {
   test('bl peers carry the workload of running temporary sessions only', async () => {
     const running = new Session('probe-workload*运行', 'chat_workload_running') as any
     const idle = new Session('probe-workload*未启动', 'chat_workload_idle') as any
+    const otherProject = new Session('other-project*运行', 'chat_workload_other_project') as any
     const proc = new FakeAgentProc('codex', 'codex-thread-1') as any
     proc.backgroundProcessCount = async () => 2
     running.proc = proc
@@ -9048,9 +9049,16 @@ describe('Session workload shown by hi and bl', () => {
       expect(peers.find((peer: any) => peer.chatId === 'chat_workload_idle')).toMatchObject({
         running: false, workload: null,
       })
+      // 别的项目的临时群不属于本群的项目，`bl` 也不会替它读 workload。
+      expect(peers.some((peer: any) => peer.chatId === 'chat_workload_other_project')).toBe(false)
+      expect((await running.tempSessionPeers('other-project')).map((peer: any) => peer.chatId))
+        .toEqual(['chat_workload_other_project'])
+      // WT 群 `<项目>[分支]` 与主项目 `<项目>` 是不同项目，互不混列。
+      expect(await running.tempSessionPeers('probe-workload[feature]')).toEqual([])
     } finally {
       running.dispose()
       idle.dispose()
+      otherProject.dispose()
     }
   })
 })

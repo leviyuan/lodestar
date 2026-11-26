@@ -378,6 +378,7 @@ test('tempSessionNoticeCard：错误态保留原因，缺失时不伪造成功',
 
 test('btwListCard：汇总数量、当前群、模型与运行状态', () => {
   const card = btwListCard({
+    projectName: 'project',
     entries: [
       {
         chatName: 'project*修复登录',
@@ -408,6 +409,7 @@ test('btwListCard：汇总数量、当前群、模型与运行状态', () => {
   expect(card.header.title.content).toBe('📋 bl · btw 列表')
   expect(card.header.template).toBe('turquoise')
   expect(text).toContain('共 **2** 个临时会话 · 已启动 **1** 个')
+  expect(text).toContain('项目 `project` · 按创建时间倒序')
   expect(text).toContain('project*修复登录')
   expect(text).toContain('· 本群')
   expect(text).toContain('创建 08-22 09:05')
@@ -441,10 +443,13 @@ test('btwListCard：运行中会话在状态后写出子 Agent 与后台进程�
 })
 
 test('btwListCard：空列表显示占位，不伪造条目', () => {
-  const card = btwListCard({ entries: [] }) as any
+  const card = btwListCard({ projectName: 'project', entries: [] }) as any
   const text = JSON.stringify(card)
-  expect(text).toContain('还没有临时会话')
+  expect(text).toContain('项目 `project`：还没有临时会话')
   expect(text).toContain('btw')
   expect(text).not.toContain('共 **')
+
+  // 不带项目时保持原来的通用说明。
+  expect(JSON.stringify(btwListCard({ entries: [] }))).toContain('_还没有临时会话')
 })
 

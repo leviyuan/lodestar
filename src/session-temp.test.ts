@@ -107,7 +107,10 @@ function makeHarness(sessionName = 'project'): TempHarness {
     backendLabel: () => 'Codex',
     conversationRouting: () => ({ ...state.routing }),
     isRunning: () => state.running,
-    tempSessionPeers: () => state.peers.map(peer => ({ ...peer })),
+    // 替身按真 Session 的契约只返回同一项目（基名相同）的临时群。
+    tempSessionPeers: (baseName = feishu.stripTempSuffix(session.sessionName)) => state.peers
+      .filter(peer => feishu.stripTempSuffix(peer.sessionName) === baseName)
+      .map(peer => ({ ...peer })),
     runBtwListCommand: () => runBtwListCommand(session),
     listCodexConversations: async () => state.history.slice(),
     claudeHistoryOptions: () => ({ configDir: process.env.CLAUDE_CONFIG_DIR }),
@@ -449,11 +452,14 @@ describe('session-temp Codex btw/fork', () => {
     expect(calls).toEqual([['ou_owner', '修复 登录'], ['ou_owner', '']])
   })
 
-  test('bl 列出全部临时租约并合并已加载会话状态', async () => {
+  test('bl 只列当前项目的临时租约并合并已加载会话状态', async () => {
     const h = makeHarness('project*修复登录')
     tempSessionLeases.push(
       { sessionName: 'project*0821-1337', chatId: 'oc_old', createdAt: new Date(2026, 7, 21, 13, 37).getTime() },
       { sessionName: 'project*修复登录', chatId: h.session.chatId, createdAt: new Date(2026, 7, 22, 9, 5).getTime() },
+      // 别的项目（含同前缀的项目）的临时群不属于本群的项目，不能出现在列表里。
+      { sessionName: 'other*0821-1337', chatId: 'oc_other', createdAt: new Date(2026, 7, 23, 10, 0).getTime() },
+      { sessionName: 'project-v2*0821-1337', chatId: 'oc_v2', createdAt: new Date(2026, 7, 23, 11, 0).getTime() },
     )
     modelSelections.set('project*0821-1337', {
       provider: 'codex', model: 'gpt-5.6-sol', effort: 'high', tokenSourceId: 'codex-sub',
@@ -461,6 +467,15 @@ describe('session-temp Codex btw/fork', () => {
     h.state.peers.push({
       sessionName: 'project*修复登录',
       chatId: h.session.chatId,
+      status: 'working',
+      running: true,
+      provider: 'claude',
+      model: 'claude-opus-4-1',
+      effort: 'high',
+    })
+    h.state.peers.push({
+      sessionName: 'other*运行中',
+      chatId: 'oc_other_running',
       status: 'working',
       running: true,
       provider: 'claude',
@@ -475,6 +490,10 @@ describe('session-temp Codex btw/fork', () => {
     expect(card.header.template).toBe('turquoise')
     const text = cardJson(card)
     expect(text).toContain('共 **2** 个临时会话 · 已启动 **1** 个')
+    expect(text).toContain('项目 `project`')
+    expect(text).not.toContain('other*0821-1337')
+    expect(text).not.toContain('other*运行中')
+    expect(text).not.toContain('project-v2*0821-1337')
     expect(text.indexOf('project*修复登录')).toBeLessThan(text.indexOf('project*0821-1337'))
     expect(text).toContain('· 本群')
     expect(text).toContain('Claude')
@@ -486,11 +505,37 @@ describe('session-temp Codex btw/fork', () => {
     expect(text).toContain('⚪ 未运行')
   })
 
+  test('bl 在 WT 群只列该分支的临时群，不混入主项目或其他分支', async () => {
+    const h = makeHarness('project[feature]')
+    tempSessionLeases.push(
+      { sessionName: 'project[feature]*0821-1200', chatId: 'oc_feature', createdAt: 1 },
+      { sessionName: 'project*0821-1337', chatId: 'oc_main', createdAt: 2 },
+      { sessionName: 'project[other]*0821-1338', chatId: 'oc_other_branch', createdAt: 3 },
+    )
+    h.state.peers.push(
+      { sessionName: 'project[feature]*旧群', chatId: 'oc_legacy_feature', status: 'idle', running: true, provider: 'codex', model: null, effort: null },
+      { sessionName: 'project*运行中', chatId: 'oc_main_peer', status: 'idle', running: true, provider: 'codex', model: null, effort: null },
+    )
+
+    expect(await runCommand(h.session, 'bl', 'ou_owner')).toBe(true)
+
+    const text = cardJson(sentCards.at(-1))
+    expect(text).toContain('项目 `project[feature]`')
+    expect(text).toContain('共 **2** 个临时会话')
+    expect(text).toContain('project[feature]*0821-1200')
+    expect(text).toContain('project[feature]*旧群')
+    expect(text).not.toContain('project*0821-1337')
+    expect(text).not.toContain('project*运行中')
+    expect(text).not.toContain('project[other]*0821-1338')
+  })
+
   test('btwlist 别名同样列出；带参数不吞普通消息', async () => {
     const h = makeHarness()
 
     expect(await runCommand(h.session, ' btwlist ', 'ou_owner')).toBe(true)
-    expect(cardJson(sentCards.at(-1))).toContain('还没有临时会话')
+    const text = cardJson(sentCards.at(-1))
+    expect(text).toContain('项目 `project`：还没有临时会话')
+    expect(text).toContain('发送 `btw` 创建')
 
     const untouched = {}
     expect(await runCommand(untouched as any, 'bl 项目', 'ou_owner')).toBe(false)

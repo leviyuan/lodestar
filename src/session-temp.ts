@@ -632,10 +632,12 @@ export async function runBtwCommand(
   )
 }
 
-/** `bl` / `btwlist`：列出本机登记的全部临时会话（btw/fk 都算），
- * 并合并本 daemon 已构造会话的实时状态；只读本地租约、内存和运行中后端的本机进程状态，不发网络查询。 */
+/** `bl` / `btwlist`：列出与当前群同一项目的临时会话（btw/fk 都算），
+ * 并合并本 daemon 已构造会话的实时状态；只读本地租约、内存和运行中后端的本机进程状态，不发网络查询。
+ * 项目按 `stripTempSuffix` 的基名区分：主群只列 `<项目>*…`，WT 群只列 `<项目>[分支]*…`，不跨项目。 */
 export async function runBtwListCommand(s: Session): Promise<void> {
-  const peers = new Map((await s.tempSessionPeers()).map(peer => [peer.chatId, peer]))
+  const projectName = baseSessionName(s)
+  const peers = new Map((await s.tempSessionPeers(projectName)).map(peer => [peer.chatId, peer]))
   const entries = new Map<string, cards.BtwListEntry>()
   const entryFor = (
     chatName: string,
@@ -658,6 +660,7 @@ export async function runBtwListCommand(s: Session): Promise<void> {
     }
   }
   for (const lease of feishu.listTempSessionLeases()) {
+    if (feishu.stripTempSuffix(lease.sessionName) !== projectName) continue
     entries.set(lease.chatId, entryFor(lease.sessionName, lease.chatId, lease.createdAt, peers.get(lease.chatId)))
   }
   // 兼容租约机制之前创建、但本 daemon 已加载的临时群：内存里仍在就同样列出。
@@ -675,7 +678,7 @@ export async function runBtwListCommand(s: Session): Promise<void> {
   let messageId: string | null = null
   let failure: unknown
   try {
-    messageId = await feishu.sendCard(s.chatId, cards.btwListCard({ entries: list }), error => { failure = error })
+    messageId = await feishu.sendCard(s.chatId, cards.btwListCard({ projectName, entries: list }), error => { failure = error })
   } catch (error) {
     failure = error
   }

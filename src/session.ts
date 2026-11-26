@@ -882,9 +882,11 @@ export class Session {
     return [...Session.all].some(s => s.sessionName === sessionName && s.isRunning())
   }
 
-  /** 本 daemon 中已构造的临时群会话；`bl` 列表与 hi 的 peers 同源。
-   * 还没被任何消息唤醒的旧临时群不在里面，由持久化租约补全。 */
-  async tempSessionPeers(): Promise<Array<{
+  /** 本 daemon 中属于 `baseName`（默认当前会话的项目基名）的临时群会话，供 `bl` 列表：
+   * 只列同一项目发起的临时群，WT 群 `<项目>[分支]` 与主项目 `<项目>` 互不混列。
+   * 还没被任何消息唤醒的旧临时群不在里面，由持久化租约补全。
+   * 先按项目过滤再读 workload，别的项目的运行中会话不会被本群 `bl` 顺带查询。 */
+  async tempSessionPeers(baseName: string = feishu.stripTempSuffix(this.sessionName)): Promise<Array<{
     sessionName: string
     chatId: string
     status: Status
@@ -897,6 +899,7 @@ export class Session {
   }>> {
     const peers = [...Session.all]
       .filter(peer => feishu.tempProjectName(peer.sessionName) !== null)
+      .filter(peer => feishu.stripTempSuffix(peer.sessionName) === baseName)
       .map(peer => ({ peer, running: peer.isRunning() }))
     const workloads = await Promise.all(peers.map(({ peer, running }) => running ? peer.workload() : null))
     return peers.map(({ peer, running }, index) => ({

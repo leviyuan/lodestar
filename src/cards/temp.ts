@@ -435,6 +435,8 @@ export interface BtwListEntry {
 }
 
 export interface BtwListCardOpts {
+  /** 列表所属项目（剥掉 `*` 后缀的基名）；省略时只写通用说明。 */
+  projectName?: string
   entries: BtwListEntry[]
 }
 
@@ -448,15 +450,17 @@ const BTW_LIST_STATUS: Record<string, { emoji: string; label: string }> = {
 
 export function btwListCard(opts: BtwListCardOpts): object {
   const elements: object[] = []
+  // 列表只含当前项目的临时群，把项目写进说明，避免读成整机列表少了别的项目。
+  const scope = opts.projectName ? `项目 ${inlineCode(opts.projectName)}` : ''
   if (!opts.entries.length) {
-    elements.push({ tag: 'markdown', content: '_还没有临时会话。发送 `btw` 创建。_' })
+    elements.push({ tag: 'markdown', content: `_${scope ? `${scope}：` : ''}还没有临时会话。发送 \`btw\` 创建。_` })
   } else {
     const running = opts.entries.filter(entry => entry.running).length
     elements.push({
       tag: 'markdown',
       content: [
         `共 **${opts.entries.length}** 个临时会话${running ? ` · 已启动 **${running}** 个` : ''}`,
-        '_按创建时间倒序；`btw` 创建，`bye` 自己退出，最后一人退出时解散。_',
+        `_${scope ? `${scope} · ` : ''}按创建时间倒序；\`btw\` 创建，\`bye\` 自己退出，最后一人退出时解散。_`,
       ].join('\n'),
     })
     const rows = opts.entries.map(btwListEntryMarkdown)

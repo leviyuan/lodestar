@@ -130,7 +130,7 @@ export function hasTempSessionLease(sessionName: string, chatId: string): boolea
   return lease?.sessionName === sessionName && lease.chatId === chatId
 }
 
-/** 本机登记的全部临时会话租约，按创建时间倒序（同刻按群名），供 `bl` 列表。
+/** 本机登记的全部临时会话租约，按创建时间倒序（同刻按群名），供 `bl` 列表按项目筛选。
  * 返回副本，调用方不能借此改动持久状态。 */
 export function listTempSessionLeases(): TempSessionLease[] {
   return [...tempSessionLeaseByChat.values()]
