@@ -16,13 +16,15 @@
  *   /proc/uptime           —— monotonic seconds since boot (uptime 推算)
  *   systemctl --user show  —— cc-* / codex-* 服务的状态与启动时间
  *   launchctl list + ps    —— macOS 当前用户服务状态与进程运行时长
+ *   launchctl list <label> + stat —— macOS 已停任务的上次活跃（launchd 不给时间戳，
+ *                             只能取它配置的 stdout/stderr 日志最后写入时间）
  *
  * 失败可见: 任何一段读不到就把对应字段标 null,卡片层按 null 渲染
  * `MISS`,绝不假数据 (no_fallbacks)。
  */
 
 import { execFile } from 'node:child_process'
-import { existsSync, readFileSync, statfsSync } from 'node:fs'
+import { existsSync, readFileSync, statfsSync, statSync } from 'node:fs'
 import { cpus, loadavg, totalmem } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { promisify } from 'node:util'
@@ -221,7 +223,13 @@ export function parseProcessElapsed(raw: string): Map<number, number> {
   return times
 }
 
-export async function readMacServices(command: HostCommand = runHostCommand): Promise<{ services: ServiceInfo[]; error: string | null }> {
+/** `launchctl list <label>` 并发上限：已停任务一般只有几个，避免几十个进程一起起。 */
+const LAUNCHD_DETAIL_CONCURRENCY = 8
+
+export async function readMacServices(
+  command: HostCommand = runHostCommand,
+  mtimeMs: (path: string) => number | null = statMtimeMs,
+): Promise<{ services: ServiceInfo[]; error: string | null }> {
   let jobs: LaunchdService[]
   try {
     jobs = parseLaunchctlList(await command('/bin/launchctl', ['list']))
@@ -248,7 +256,73 @@ export async function readMacServices(command: HostCommand = runHostCommand): Pr
       for (const job of running) job.error = `运行时长 MISS: ${e instanceof Error ? e.message : String(e)}`
     }
   }
+  // 已停任务：launchd 只记录当前状态和累计运行次数，不给历史启动时间，所以用
+  // `launchctl list <label>` 拿到它自己配置的日志路径，取最后写入时间作为
+  // “上次活跃”的证据。读不到（没配日志或文件已清理）就保持 MISS，不猜、也不据此
+  // 说从未启动。
+  const idle = jobs.filter(job => job.pid === null)
+  for (let i = 0; i < idle.length; i += LAUNCHD_DETAIL_CONCURRENCY) {
+    await Promise.all(idle.slice(i, i + LAUNCHD_DETAIL_CONCURRENCY).map(async job => {
+      const detail = await readLaunchdDetail(command, job.name)
+      if (!detail) return
+      const lastActiveMs = launchdLastActiveMs(detail, mtimeMs)
+      if (lastActiveMs === null) return
+      job.lastActiveAgoSec = Math.max(0, (Date.now() - lastActiveMs) / 1000)
+      job.hasStarted = true
+    }))
+  }
   return { services: jobs.map(({ pid: _pid, ...service }) => service), error: null }
+}
+
+/** launchd 为任务配置的 stdout/stderr 日志路径。launchd 自己不提供时间戳，
+ * 这两个文件是唯一能反映“最近跑过”的本地证据。 */
+export interface LaunchdJobDetail {
+  stdoutPath: string | null
+  stderrPath: string | null
+}
+
+/** 解析 `launchctl list <label>` 的作业定义（旧式 plist）里的日志路径。
+ * 没配日志时这两个键不存在，按没有证据处理。 */
+export function parseLaunchdJobDetail(raw: string): LaunchdJobDetail {
+  const path = (key: string): string | null => {
+    const match = raw.match(new RegExp(`^\\s*"?${key}"?\\s*=\\s*"((?:[^"\\\\]|\\\\.)*)"\\s*;`, 'm'))
+    const value = match?.[1]?.replace(/\\(.)/g, '$1').trim()
+    return value ? value : null
+  }
+  return { stdoutPath: path('StandardOutPath'), stderrPath: path('StandardErrorPath') }
+}
+
+/** 取日志文件里最新的写入时间；两个路径都读不到返回 null。 */
+export function launchdLastActiveMs(detail: LaunchdJobDetail, mtimeMs: (path: string) => number | null): number | null {
+  let latest: number | null = null
+  for (const path of [detail.stdoutPath, detail.stderrPath]) {
+    if (!path) continue
+    const mtime = mtimeMs(path)
+    if (mtime === null || !Number.isFinite(mtime) || mtime <= 0) continue
+    latest = latest === null ? mtime : Math.max(latest, mtime)
+  }
+  return latest
+}
+
+/** 日志文件可能还没创建、已被清理或不可读：都只是没有证据，不算查询失败。 */
+function statMtimeMs(path: string): number | null {
+  try {
+    const stat = statSync(path)
+    return stat.isFile() ? stat.mtimeMs : null
+  } catch {
+    return null
+  }
+}
+
+/** `launchctl list <label>` 读某个已加载任务的作业定义；任务已卸载或查询失败
+ * 时只是没有日志证据，保持 MISS。 */
+async function readLaunchdDetail(command: HostCommand, label: string): Promise<LaunchdJobDetail | null> {
+  try {
+    return parseLaunchdJobDetail(await command('/bin/launchctl', ['list', label]))
+  } catch (e) {
+    logError('sysinfo: read launchd job detail failed', e)
+    return null
+  }
 }
 
 /** statfsSync 拿到的 blocks/bavail 都按 f_frsize 计算 bytes —— 注意

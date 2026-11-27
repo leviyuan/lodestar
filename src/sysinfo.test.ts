@@ -2,7 +2,8 @@ import { describe, expect, test } from 'bun:test'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import {
-  parseLaunchctlList, parseMacMemory, parseProcessElapsed, readDiskFor, readMacMemory, readMacServices, readWorkDirDisk,
+  launchdLastActiveMs, parseLaunchctlList, parseLaunchdJobDetail, parseMacMemory, parseProcessElapsed, readDiskFor,
+  readMacMemory, readMacServices, readWorkDirDisk,
 } from './sysinfo'
 import { consoleHostContent, consoleHostElement } from './cards/console'
 
@@ -78,17 +79,22 @@ describe('macOS host snapshot', () => {
   })
 
   test('launchd sampling batches active PIDs and keeps inactive scheduled jobs visible', async () => {
-    const calls: unknown[] = []
+    const calls: [string, string[]][] = []
     const result = await readMacServices(async (file, args) => {
       calls.push([file, args])
-      if (file === '/bin/launchctl') return launchList + '789\t0\tcodex-running\n'
+      // 作业定义（list <label>）在这里没有日志路径：已停任务保持 MISS。
+      if (file === '/bin/launchctl') return args.length === 1 ? launchList + '789\t0\tcodex-running\n' : ''
       return '123 02:03\n789 1-00:00:01\n'
     })
     expect(result.error).toBeNull()
-    expect(calls).toEqual([
+    expect(calls.slice(0, 2)).toEqual([
       ['/bin/launchctl', ['list']],
       ['/bin/ps', ['-p', '123,789', '-o', 'pid=,etime=']],
     ])
+    // 只对已停任务查作业定义：运行中的任务用 ps 的 etime，不再多起进程。
+    const details = calls.slice(2)
+    expect(details.every(([file, args]) => file === '/bin/launchctl' && args[0] === 'list' && args.length === 2)).toBe(true)
+    expect(details.map(([, args]) => args[1]).sort()).toEqual(['cc-scheduled', 'codex-failed', 'codex-terminated'])
     expect(result.services.find(s => s.name === 'cc-running')).toMatchObject({ stateAgoSec: 123, lastActiveAgoSec: 123 })
     expect(result.services.find(s => s.name === 'codex-running')).toMatchObject({ stateAgoSec: 86_401 })
     expect(result.services.find(s => s.name === 'cc-scheduled')).toMatchObject({ stateAgoSec: null, hasStarted: null })
@@ -156,6 +162,70 @@ describe('macOS host snapshot', () => {
     expect(unreadable.elements[1].header.title.content).toBe('⚠️ 主机读取失败')
     expect(unreadable.elements[1].elements[0].content).toBe('服务列表：launchctl MISS')
     expect(consoleHostContent({ ...snapshot, services: [{ ...services[1]!, hasStarted: false }] })).toContain('从未启动')
+  })
+
+  test('launchd job definitions expose the log paths launchd writes, with escapes kept intact', () => {
+    const detail = parseLaunchdJobDetail(`{
+	"StandardOutPath" = "/Users/me/Library/Logs/cc-hourly.log";
+	"LimitLoadToSessionType" = "Aqua";
+	"StandardErrorPath" = "/tmp/cc \\"quoted\\" err.log";
+	"Label" = "cc-hourly";
+	"LastExitStatus" = 0;
+};`)
+    expect(detail.stdoutPath).toBe('/Users/me/Library/Logs/cc-hourly.log')
+    expect(detail.stderrPath).toBe('/tmp/cc "quoted" err.log')
+    // 没配标准输出的任务没有可观测的时间证据。
+    expect(parseLaunchdJobDetail('{\n\t"Label" = "cc-plain";\n\t"LastExitStatus" = 0;\n};'))
+      .toEqual({ stdoutPath: null, stderrPath: null })
+    expect(parseLaunchdJobDetail('')).toEqual({ stdoutPath: null, stderrPath: null })
+  })
+
+  test('the last activity comes from the newest launchd log write, never from a guess', () => {
+    const now = Date.now()
+    const detail = { stdoutPath: '/log/out.log', stderrPath: '/log/err.log' }
+    expect(launchdLastActiveMs(detail, path => path === '/log/out.log' ? now - 9_000 : now - 3_000)).toBe(now - 3_000)
+    expect(launchdLastActiveMs({ stdoutPath: '/log/out.log', stderrPath: null }, () => now)).toBe(now)
+    // 文件还没创建、不可读或时间无效都只是没有证据。
+    expect(launchdLastActiveMs(detail, () => null)).toBeNull()
+    expect(launchdLastActiveMs({ stdoutPath: '/log/out.log', stderrPath: null }, () => Number.NaN)).toBeNull()
+    expect(launchdLastActiveMs({ stdoutPath: '/log/out.log', stderrPath: null }, () => 0)).toBeNull()
+    expect(launchdLastActiveMs({ stdoutPath: null, stderrPath: null }, () => now)).toBeNull()
+  })
+
+  test('stopped launchd jobs read the last activity from the log launchd writes', async () => {
+    const now = Date.now()
+    const jobDetail = (label: string): string => label === 'cc-hourly'
+      ? `{\n\t"StandardOutPath" = "/log/cc-hourly.log";\n\t"StandardErrorPath" = "/log/cc-hourly.err.log";\n\t"Label" = "cc-hourly";\n};`
+      : `{\n\t"Label" = "cc-plain";\n};`
+    const result = await readMacServices(
+      async (file, args) => {
+        if (file !== '/bin/launchctl') throw new Error(`Unexpected command: ${file}`)
+        if (args.length === 1) return 'PID Status Label\n- 0 cc-hourly\n- 0 cc-plain\n'
+        return jobDetail(args[1]!)
+      },
+      path => (path === '/log/cc-hourly.log' ? now - 4_000_000 : path === '/log/cc-hourly.err.log' ? now - 120_000 : null),
+    )
+    expect(result.error).toBeNull()
+    // 程序写日志的时间就是它跑过的时间:取 stdout / stderr 里较新的那个写入时间。
+    const hourly = result.services.find(s => s.name === 'cc-hourly')!
+    expect(hourly.hasStarted).toBe(true)
+    expect(Math.round(hourly.lastActiveAgoSec!)).toBe(120)
+    // 没配日志就没有证据:保持 MISS,也不据此说从未启动。
+    expect(result.services.find(s => s.name === 'cc-plain')).toMatchObject({ lastActiveAgoSec: null, hasStarted: null })
+    const content = consoleHostContent({ cpu: null, mem: null, disks: [], services: result.services, servicesError: null })
+    expect(content).toContain('⚪ `cc-hourly` · 上次活跃 2m前 · 退出码 0')
+    expect(content).toContain('⚪ `cc-plain` · 上次活跃 MISS · 退出码 0')
+    expect(content).not.toContain('从未启动')
+  })
+
+  test('an unreadable launchd job definition leaves the stopped row on MISS', async () => {
+    const result = await readMacServices(async (file, args) => {
+      if (file === '/bin/launchctl' && args.length === 1) return 'PID Status Label\n- 0 cc-hourly\n'
+      throw new Error('launchctl list failed')
+    })
+    expect(result.error).toBeNull()
+    expect(result.services).toHaveLength(1)
+    expect(result.services[0]).toMatchObject({ name: 'cc-hourly', lastActiveAgoSec: null, hasStarted: null })
   })
 
   test('the disk follows the working directory and shows occupancy plus free space', () => {
@@ -228,7 +298,9 @@ test('macOS dispatch uses native OS metrics and launchctl, without Linux command
     assert.equal(info.services[0].name, 'cc-scheduled')
     assert.equal(info.servicesError, null)
     assert.ok(!files.some(file => file.startsWith('/proc/')))
-    assert.equal(calls.length, 2)
+    // 一次 list 拿全部状态，再一次 list <label> 取已停任务的日志路径；内存用 vm_stat。
+    assert.deepEqual(calls.filter(call => call[0] === '/bin/launchctl').map(call => call[1]), [['list'], ['list', 'cc-scheduled']])
+    assert.equal(calls.length, 3)
   `], { cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'test' }, stdout: 'pipe', stderr: 'pipe', timeout: 10_000 })
   expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
 })
