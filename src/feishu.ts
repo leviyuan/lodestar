@@ -1588,6 +1588,10 @@ export interface ChatOwner {
 
 /** 单聊面板查询在调用方没给期限时的整体上限。 */
 const LOOKUP_WINDOW_MS = 20_000
+/** 读「最后一条用户消息的发送者」时最多翻的页数：要找回的是任务开始前那条
+ * 指令，通常就贴着群尾；翻完仍只有机器人消息时按未知处理，不无限翻页。 */
+const LAST_SENDER_MAX_PAGES = 5
+const LAST_SENDER_PAGE_SIZE = 50
 
 /**
  * 单聊面板的群主/成员查询共用一个截止到 `deadlineAt` 的恢复窗口：每个请求（含 SDK 取令牌）的超时取单次上限与
@@ -1758,6 +1762,45 @@ export async function getChatTailMessageId(chatId: string): Promise<string | nul
     if (typeof messageId !== 'string' || !messageId.trim()) throw new Error('feishu message.list message_id MISS')
     return messageId
   })
+}
+
+/** open_id of the last person who wrote in this chat: the newest non-deleted
+ * message from a human sender in the real chat tail. A host-started turn
+ * (the daemon-restart continuation in particular) has no sender of its own,
+ * and a restart clears the in-memory one, but the phone push when the work
+ * finishes still belongs to whoever asked for it. Reading it back from
+ * Feishu keeps person identity out of local state; app/other-bot messages
+ * are skipped. Returns null when the scanned tail holds no human message. */
+export async function lastUserMessageSender(chatId: string): Promise<string | null> {
+  if (!chatId.trim()) throw new Error('cannot read the last message sender without chat_id')
+  // Same bounded read as the other identity lookups: one shared deadline, no
+  // page advertised past it, transient failures retried inside the window.
+  const recovery = lookupWindow(undefined)
+  let pageToken: string | undefined
+  for (let page = 0; page < LAST_SENDER_MAX_PAGES; page++) {
+    const token = pageToken
+    const listed = await inLookupWindow(recovery, 'feishu message.list', async () => {
+      const response = await client.im.message.list({ params: {
+        container_id_type: 'chat',
+        container_id: chatId,
+        sort_type: 'ByCreateTimeDesc',
+        page_size: LAST_SENDER_PAGE_SIZE,
+        ...(token ? { page_token: token } : {}),
+      } })
+      if (response.code && response.code !== 0) throw sdkApiError('feishu message.list', response)
+      return response
+    })
+    if (!Array.isArray(listed.data?.items)) throw new Error('feishu message.list items MISS')
+    for (const item of listed.data.items) {
+      if (item.deleted === true) continue
+      if (item.sender?.sender_type !== 'user') continue
+      const sender = item.sender.id
+      if (typeof sender === 'string' && sender.startsWith('ou_')) return sender
+    }
+    pageToken = listed.data?.page_token
+    if (!pageToken) break
+  }
+  return null
 }
 
 export async function updateCard(messageId: string, card: object): Promise<void> {

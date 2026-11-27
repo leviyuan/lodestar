@@ -13,6 +13,7 @@ import {
   setResumeWriteError, setTurnAnchorWriteError, setUpdateCardHandler,
   turnAnchorsBySession, resumeRefs, pendingConversationLaunchBySession,
   sentImages, uploadedImages, sentLocalFiles, setImageUploadHandler,
+  setLastUserMessageSender, setLastUserMessageSenderError, lastUserMessageSenderCalls,
 } from './feishu-test-mock'
 
 const { Session } = await import('./session')
@@ -6946,6 +6947,97 @@ describe('Session lifecycle reliability', () => {
       expect(proc.killCalls).toBe(0)
       await expect(session.continueAfterDaemonRestart()).rejects.toThrow('未发送自动续接请求')
       expect(proc.sentTexts).toHaveLength(1)
+    } finally { await session.stop('测试收尾', { announce: false }) }
+  })
+
+  test('the restart continuation finishes with a push to the restored last sender', async () => {
+    // 重启后进程里没有发送者：续接轮收尾时也必须把完成通知发到原来那个人手机上。
+    const session = new Session('daemon-continue-notify', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'saved-thread')
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = null
+    session.proc = proc
+    session.lastSessionId = proc.sessionId
+    session.lastSessionRef = { provider: 'codex', sessionId: proc.sessionId, cwd: session.workDir }
+    session.initCount = 1
+    session.status = 'idle'
+    session.spawnAgent = () => { throw new Error('must not spawn another conversation') }
+    setLastUserMessageSender('ou_restored')
+    try {
+      await session.continueAfterDaemonRestart()
+      expect(lastUserMessageSenderCalls).toEqual(['chat_id'])
+      const turn = session.currentTurn
+      expect(turn).not.toBeNull()
+      // 续接轮的发送者（也是它交付大文件时的发起人）来自会话尾部的那条用户消息。
+      expect(turn.userOpenId).toBe('ou_restored')
+      await session.closeTurnCard(undefined, { hasFreshResult: true })
+      expect(urgentPushes).toEqual([[turn.messageId, ['ou_restored']]])
+      // 收尾时已有接收人，不再重复查询。
+      expect(lastUserMessageSenderCalls).toEqual(['chat_id'])
+    } finally { await session.stop('测试收尾', { announce: false }) }
+  })
+
+  test('a host-started turn without an in-memory sender pushes to the chat\'s last real sender', async () => {
+    const session = new Session('probe-restored-aware', 'chat_id') as any
+    const turn = { ...turnState('card_restored_wakeup'), userOpenId: '', trigger: 'scheduled_wakeup' }
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    setLastUserMessageSender('ou_restored')
+    try {
+      await session.closeTurnCard(undefined, { hasFreshResult: true })
+      expect(urgentPushes).toEqual([['om_session_turn', ['ou_restored']]])
+      expect(lastUserMessageSenderCalls).toEqual(['chat_id'])
+    } finally {
+      await cardkit.dispose(turn.cardId)
+      session.dispose()
+    }
+  })
+
+  test('a failed last-sender lookup is logged and never blocks the close', async () => {
+    const session = new Session('probe-restored-lookup-failed', 'chat_id') as any
+    const turn = { ...turnState('card_restored_lookup_failed'), userOpenId: '', trigger: 'bg_task_resume' }
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    setLastUserMessageSenderError(new Error('message.list unavailable'))
+    const logged = spyOn(logModule, 'logError').mockImplementation(() => {})
+    try {
+      await session.closeTurnCard(undefined, { hasFreshResult: true })
+      expect(urgentPushes).toHaveLength(0)
+      expect(logged).toHaveBeenCalledWith('session: last message sender lookup failed', expect.any(Error))
+      expect(cardkit.isDisposed(turn.cardId)).toBe(true)
+    } finally {
+      logged.mockRestore()
+      await cardkit.dispose(turn.cardId)
+      session.dispose()
+    }
+  })
+
+  test('a restart continuation on Claude Code pings the restored sender after its native init opens the card', async () => {
+    // Claude 的 init 与 sessionId 要到首条原生消息才出现：续接轮的卡由 init 路径
+    // 用 `lastUserOpenId` 打开，所以找回来的发送者必须在提交续接请求前就位，
+    // 收尾的完成加急才会落到原来那个人手机上。
+    const session = new Session('daemon-continue-claude-notify', 'chat_id') as any
+    const ref = { provider: 'claude' as const, sessionId: 'saved-claude-session', cwd: session.workDir }
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.lastSessionRef = ref
+    session.lastSessionId = ref.sessionId
+    const proc = new FakeAgentProc('claude', null)
+    proc.resumedSessionId = ref.sessionId
+    session.spawnAgent = () => proc
+    setLastUserMessageSender('ou_restored')
+    try {
+      expect(await session.restoreAfterDaemonRestart()).toBe(true)
+      await session.continueAfterDaemonRestart()
+      expect(lastUserMessageSenderCalls).toEqual(['chat_id'])
+      // 首条原生消息到达，Claude 才给出 init 和会话 ID。
+      proc.sessionId = ref.sessionId
+      proc.emit('init', { session_id: ref.sessionId })
+      await waitUntil(() => session.currentTurn !== null)
+      const turn = session.currentTurn
+      expect(turn.userOpenId).toBe('ou_restored')
+      await session.closeTurnCard(undefined, { hasFreshResult: true })
+      expect(urgentPushes).toEqual([[turn.messageId, ['ou_restored']]])
     } finally { await session.stop('测试收尾', { announce: false }) }
   })
 

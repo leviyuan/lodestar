@@ -130,6 +130,15 @@ export function setExactDisbandResult(result: { chatId: string | null; disbanded
 export function setExactDisbandError(error: Error | null): void { exactDisbandError = error }
 let resumeWriteError: Error | null = null
 export function setResumeWriteError(error: Error | null): void { resumeWriteError = error }
+/** `lastUserMessageSender` 替身：默认未知（没有可加急的人），测试按需给一个 open_id。 */
+let lastUserMessageSenderValue: string | null = null
+let lastUserMessageSenderError: Error | null = null
+export const lastUserMessageSenderCalls: string[] = []
+export function setLastUserMessageSender(openId: string | null): void {
+  lastUserMessageSenderValue = openId
+  lastUserMessageSenderError = null
+}
+export function setLastUserMessageSenderError(error: Error | null): void { lastUserMessageSenderError = error }
 let turnAnchorWriteError: Error | null = null
 export function setTurnAnchorWriteError(error: Error | null): void { turnAnchorWriteError = error }
 let updateCardHandler: ((messageId: string, card: object) => Promise<void>) | null = null
@@ -193,6 +202,9 @@ export function resetFeishuMock(): void {
   tempChatError = null
   exactDisbandResult = null
   exactDisbandError = null
+  lastUserMessageSenderValue = null
+  lastUserMessageSenderError = null
+  lastUserMessageSenderCalls.length = 0
 }
 
 mock.module('./feishu', () => ({
@@ -215,6 +227,11 @@ mock.module('./feishu', () => ({
   preferredChatForSession,
   chatNameCache: new Map(),
   getChatTailMessageId: async (chatId: string) => chatTailMessages.get(chatId) ?? null,
+  lastUserMessageSender: async (chatId: string) => {
+    lastUserMessageSenderCalls.push(chatId)
+    if (lastUserMessageSenderError) throw lastUserMessageSenderError
+    return lastUserMessageSenderValue
+  },
   sendCard: async (chatId: string, card: object) => {
     sentCards.push(card)
     const id = `om_status_${sentCards.length}`

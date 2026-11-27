@@ -2300,9 +2300,16 @@ export class Session {
         || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) {
         throw new Error('原会话尚未恢复为空闲可用状态，未发送自动续接请求')
       }
+      // 重启后进程里已经没有发送者：续接轮完成时的加急通知，以及它交付大文件
+      // 时的发起人，都必须是原会话里最后发消息的那个人，否则卡片正常收尾、
+      // 手机永远不响。实时读取会话尾部，身份不落盘。
+      const recipient = this.lastUserOpenId || await this.lastMessageSender()
+      // 固定字面量，只在真正找回推送对象时记一条：缺通知时按它和
+      // `completion push ...` 两条日志就能分辨是「没找回人」还是「没推送」。
+      if (recipient) logDiagnostic('session: restart continuation sender restored')
       await this.onUserMessageUnlocked(
         '[宿主重启自动续接] daemon 已重启并恢复本会话。按用户已授权的范围继续尚未完成的工作，先核对已有执行结果，不要重复已完成的测试或操作。若工作已完成，直接报告结果。',
-        [], '', '', proc,
+        [], recipient, '', proc,
       )
     })
   }
@@ -3813,6 +3820,20 @@ export class Session {
 
   private hasActiveBackgroundWork(): boolean {
     return this.backgroundTasks.some(task => !cards.isBgTerminal(task))
+  }
+
+  /** Who the phone push belongs to when this process never saw the request:
+   * a daemon restart clears the sender from memory, while the host-started
+   * continuation turn still finishes work somebody asked for. Reading the
+   * real chat tail back is exact and keeps person identity out of state.
+   * Failures are logged and leave the recipient unknown — never guessed. */
+  private async lastMessageSender(): Promise<string> {
+    try {
+      return await feishu.lastUserMessageSender(this.chatId) ?? ''
+    } catch (error) {
+      logError('session: last message sender lookup failed', error)
+      return ''
+    }
   }
 
   /** Last subagent/background shell ended after its turn closed: this
@@ -6595,7 +6616,9 @@ export class Session {
     // A backend-started turn (resume, ⏰ wake-up, DSH “继续执行”) opens with no
     // sender of its own; the user who asked for the work is still the one to
     // ping, otherwise the turn that actually finishes the task stays silent.
-    const recipient = turn.userOpenId || this.lastUserOpenId
+    // A daemon restart also clears the in-memory sender, so fall back to the
+    // last person who actually wrote in this chat (read live, never persisted).
+    const recipient = turn.userOpenId || this.lastUserOpenId || await this.lastMessageSender()
     const continuationTurn = turn.trigger === 'bg_task_resume' || turn.trigger === 'scheduled_wakeup'
     const announcedByTaskEnd = continuationTurn
       && this.notifiedBackgroundWorkGeneration === this.backgroundWorkGeneration
