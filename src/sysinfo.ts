@@ -1,6 +1,6 @@
 /**
  * Lightweight host snapshot for the `hi` console panel —— CPU 负载、
- * 内存、根/家目录磁盘、以及当前用户下的 cc-* / codex-* 服务。
+ * 内存、工作目录所在磁盘、以及当前用户下的 cc-* / codex-* 服务。
  *
  * 服务前缀约定:AI 助手拉起的常驻进程通常走
  *   systemd-run --user --unit=cc-<project>-<purpose> -- <cmd>
@@ -12,7 +12,7 @@
  *   os.loadavg()          —— Linux / macOS 的 1m / 5m / 15m
  *   /proc/meminfo          —— Linux Total / Available
  *   vm_stat + os.totalmem —— macOS 应用、wired、压缩内存
- *   statfsSync(path)       —— 各挂载点容量
+ *   statfsSync(path)       —— 工作目录所在磁盘的容量
  *   /proc/uptime           —— monotonic seconds since boot (uptime 推算)
  *   systemctl --user show  —— cc-* / codex-* 服务的状态与启动时间
  *   launchctl list + ps    —— macOS 当前用户服务状态与进程运行时长
@@ -22,8 +22,9 @@
  */
 
 import { execFile } from 'node:child_process'
-import { readFileSync, statfsSync, statSync } from 'node:fs'
-import { cpus, homedir, loadavg, totalmem } from 'node:os'
+import { existsSync, readFileSync, statfsSync } from 'node:fs'
+import { cpus, loadavg, totalmem } from 'node:os'
+import { dirname, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { logError } from './log'
 
@@ -47,10 +48,6 @@ export interface MemInfo {
 }
 
 export interface DiskInfo {
-  /** 显示用的标签 ('/' 或 '$HOME') */
-  label: string
-  /** 实际查询的路径 */
-  path: string
   totalBytes: number
   availBytes: number
   usedBytes: number
@@ -257,7 +254,7 @@ export async function readMacServices(command: HostCommand = runHostCommand): Pr
 /** statfsSync 拿到的 blocks/bavail 都按 f_frsize 计算 bytes —— 注意
  * `usedBytes` 用 total - avail (不是 total - free),跟 `df` 的 Use% 列
  * 一致 (排除 root 保留块)。 */
-function readDiskFor(label: string, path: string): DiskInfo | null {
+export function readDiskFor(path: string): DiskInfo | null {
   try {
     const s = statfsSync(path, { bigint: false }) as {
       bsize: number; blocks: number; bavail: number
@@ -267,7 +264,7 @@ function readDiskFor(label: string, path: string): DiskInfo | null {
     const usedBytes = Math.max(0, totalBytes - availBytes)
     if (!totalBytes) return null
     return {
-      label, path, totalBytes, availBytes, usedBytes,
+      totalBytes, availBytes, usedBytes,
       percent: Math.round((usedBytes / totalBytes) * 100),
     }
   } catch (e) {
@@ -276,27 +273,23 @@ function readDiskFor(label: string, path: string): DiskInfo | null {
   }
 }
 
-/** 取 `/` 和 `$HOME`;如果两者属于同一文件系统(同一 device id),
- * 只返回 `/`,避免面板上挂两条一样的数据 (用户在 AskUserQuestion
- * 时知情的选择)。 */
-function readDisks(): DiskInfo[] {
-  const out: DiskInfo[] = []
-  const root = readDiskFor('/', '/')
-  if (root) out.push(root)
-  const home = homedir()
-  if (home && home !== '/') {
-    let homeOnSameFs = false
-    try {
-      const rs = statSync('/')
-      const hs = statSync(home)
-      homeOnSameFs = rs.dev === hs.dev
-    } catch {}
-    if (!homeOnSameFs) {
-      const homeDisk = readDiskFor('$HOME', home)
-      if (homeDisk) out.push(homeDisk)
-    }
+/** 只看工作目录所在的磁盘：项目工作目录在哪个文件系统，面板就显示哪一个。
+ * 目录还不存在（新建的项目根目录）时沿上级找到最近的已有目录，仍能报出它所在的磁盘。 */
+export function readWorkDirDisk(workDir: string): DiskInfo[] {
+  let path: string
+  try {
+    path = resolve(workDir)
+  } catch (e) {
+    logError('sysinfo: resolve working directory failed', e)
+    return []
   }
-  return out
+  while (!existsSync(path)) {
+    const parent = dirname(path)
+    if (parent === path) return []
+    path = parent
+  }
+  const disk = readDiskFor(path)
+  return disk ? [disk] : []
 }
 
 /** /proc/uptime 第一个数是 monotonic 自启动以来的秒数。 */
@@ -402,13 +395,14 @@ async function readServices(): Promise<{ services: ServiceInfo[]; error: string 
   return { services, error: null }
 }
 
-export async function readSysInfo(): Promise<SysInfo> {
+/** 工作目录缺省取 daemon 的当前目录；调用方（单聊面板）传入项目工作目录的根，按它所在磁盘显示容量。 */
+export async function readSysInfo(workDir: string = process.cwd()): Promise<SysInfo> {
   if (process.platform !== 'linux' && process.platform !== 'darwin') {
     const platform = process.platform === 'win32' ? 'Windows' : process.platform
     return { cpu: null, mem: null, disks: [], services: [], servicesError: `${platform}: sysinfo 暂未支持` }
   }
   const cpu = readCpu()
-  const disks = readDisks()
+  const disks = readWorkDirDisk(workDir)
   const [mem, { services, error }] = await Promise.all([
     process.platform === 'darwin' ? readMacMemory() : readMem(),
     process.platform === 'darwin' ? readMacServices() : readServices(),

@@ -95,6 +95,9 @@ describe('Session delegated-agent capability', () => {
       expect(await session.start({ announce: false })).toBe(true)
       expect(auth).not.toHaveBeenCalled()
       expect(session.peerSnapshot().codexAccountName).toBeUndefined()
+      // The 1:1 panel shows the live model on the account row, same source as the footer.
+      expect(session.peerSnapshot().model).toBe('kimi-k3')
+      expect(session.peerSnapshot().effort).toBe('medium')
       expect(await session.footerUsageSuffix('codex', proc, source.id, source, null, 'kimi-k3')).toBe('  |  剩余 $2.00 / $5.00')
       expect(session.conversationRouting().codexAccountId).toBeUndefined()
       expect(session.conversationRouting().codexAccountAutomatic).toBeUndefined()
@@ -5754,10 +5757,11 @@ describe('Session usage cache cross-backend isolation', () => {
       const panel = replaceSpy.mock.calls.at(-1)?.[2] as any
       expect(panel.element_id).toBe('console_usage')
       expect(panel.elements).toHaveLength(1)
+      // 模型专属周额度只写模型名，总周额度收在最下面。
       expect(content().split('\n')).toEqual([
         `5h　${bar(0)} 7%　${grey('4.1h')}`,
+        `Fable　${bar(3)} 42%　${grey('重置时间 MISS')}`,
         `周　${bar(1)} 17%　${grey('6.9d')}`,
-        `Fable 周　${bar(3)} 42%　${grey('重置时间 MISS')}`,
       ])
       expect(readAllSpy).not.toHaveBeenCalled()
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'opus')).toBe('  |  4.1h·7%·[6.9d·17%]')

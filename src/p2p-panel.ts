@@ -6,7 +6,7 @@
  * 该群正是其群名对应项目已保存绑定的群（按 chat_id 锚定，同名、撞名或改名后留下的群不算），且会话就在这个群里，
  * 或是它的 `名*` 临时群、`名[` wt 群及其临时群。群主与成员关系只在本次请求里用于比较，不缓存、不记录，
  * 日志只有固定事件名；查询失败或超时都隐藏受影响的会话，并在卡片上说明。
- * 不能确认发送者与机器人同属一个企业时按外部联系人显示：没有账号名、主机和全部账号额度。
+ * 面板不区分读者：能拿到面板的人（含外部联系人）看到的都是同样的项目、账号、模型、主机和全部账号额度。
  *
  * 依赖全部注入且只读（daemon 负责接线），模块本身只引用类型和纯函数，没有建会话、写状态或启动进程的途径。
  */
@@ -59,24 +59,6 @@ const CHAT_GONE_CODES = new Set(['232006', '232009', '232011'])
 /** `im.message.receive_v1` 的单聊消息。 */
 export function isP2pMessage(message: unknown): boolean {
   return (message as { chat_type?: unknown } | null | undefined)?.chat_type === 'p2p'
-}
-
-type TenantFields = {
-  tenant_key?: unknown
-  header?: { tenant_key?: unknown }
-  sender?: { tenant_key?: unknown }
-  event?: { sender?: { tenant_key?: unknown } }
-}
-
-/**
- * 单聊面板是否按外部联系人显示：事件里发送者与机器人的租户字段都在且相同才算本企业成员，
- * 任一缺失或不同都按外部处理。只用于单聊面板；`RequesterTenant`（缺失按内部）不受影响。
- */
-export function p2pViewerRestricted(event: unknown): boolean {
-  const data = (event ?? {}) as TenantFields
-  const sender = data.sender?.tenant_key ?? data.event?.sender?.tenant_key
-  const app = data.tenant_key ?? data.header?.tenant_key
-  return !(typeof sender === 'string' && sender.trim() !== '' && sender === app)
 }
 
 /** 发起人当群主、并且就是其群名对应项目已保存绑定的那个群。 */
@@ -269,11 +251,10 @@ function openDeadline(deps: P2pPanelDeps): PanelDeadline {
   return { at: Date.now() + (deps.deadlineMs ?? P2P_PANEL_DEADLINE_MS), signal: new AbortController().signal }
 }
 
-/** 单聊面板卡片。内部成员另有账号名、主机与全部账号额度；受限时没有，额度与主机也不读取。
+/** 单聊面板卡片：任何读者都拿到同一张面板（账号名、当前模型、主机与全部账号额度）。
  * 期限到了在下一个检查点抛出，不再发起读取。 */
 export async function buildP2pPanelCard(
   requesterOpenId: string,
-  restricted: boolean,
   deps: P2pPanelDeps,
   deadline: PanelDeadline = openDeadline(deps),
 ): Promise<object> {
@@ -281,15 +262,14 @@ export async function buildP2pPanelCard(
   checkDeadline(deadline)
   const [workloads, accountUsages, sysinfo] = await Promise.all([
     Promise.all(sessions.map(session => session.workload())),
-    restricted ? undefined : readAccountUsage(deps),
-    restricted ? undefined : readHost(deps),
+    readAccountUsage(deps),
+    readHost(deps),
   ])
   checkDeadline(deadline)
   return p2pConsoleCard({
-    // 受限时由模板去掉账号名。
     peers: sessions.map((session, index) => ({ ...session.peerSnapshot(), workload: workloads[index] })),
-    restricted,
-    ...(restricted ? {} : { accountUsages, sysinfo }),
+    accountUsages,
+    sysinfo,
     ...(failed ? { notice: P2P_LOOKUP_FAILED_NOTE } : {}),
   })
 }
@@ -297,12 +277,11 @@ export async function buildP2pPanelCard(
 /**
  * 回复一条单聊消息：只发一张只读面板。整张面板超过期限就按全部隐藏回复，并中止仍在进行的构建：
  * 它不再发起读取，迟到的结果和错误都丢弃。卡片发不出去时改发纯文本，附飞书诊断并去掉成员 ID。
- * 生成失败或超时，受限读者只看到固定提示，内部成员另附原因。
+ * 生成失败或超时都附上原因（已脱敏）。
  */
 export async function replyP2pPanel(
   chatId: string,
   requesterOpenId: string,
-  restricted: boolean,
   deps: P2pPanelDeps,
 ): Promise<void> {
   const deadlineMs = deps.deadlineMs ?? P2P_PANEL_DEADLINE_MS
@@ -318,7 +297,7 @@ export async function replyP2pPanel(
   let card: object | null = null
   let buildFailure: { error: unknown } | null = null
   try {
-    card = await Promise.race([buildP2pPanelCard(requesterOpenId, restricted, deps, deadline), expired])
+    card = await Promise.race([buildP2pPanelCard(requesterOpenId, deps, deadline), expired])
   } catch (error) {
     // 期限到了才失败的构建按超时处理；其余是真实的生成失败。
     if (!controller.signal.aborted) buildFailure = { error }
@@ -330,17 +309,13 @@ export async function replyP2pPanel(
   if (buildFailure) {
     logError('p2p-panel: build failed', buildFailure.error)
     const { error } = buildFailure
-    const reason = restricted ? '' : `：${redactMemberIds(error instanceof Error ? error.message : String(error))}`
+    const reason = `：${redactMemberIds(error instanceof Error ? error.message : String(error))}`
     await deps.sendTextRaw(chatId, `❌ 面板生成失败${reason}`)
     return
   }
   if (card === null) {
     logDiagnostic('p2p-panel: build timed out')
-    card = p2pConsoleCard({
-      peers: [],
-      restricted: true,
-      notice: restricted ? P2P_LOOKUP_FAILED_NOTE : `${P2P_LOOKUP_FAILED_NOTE}：读取超时`,
-    })
+    card = p2pConsoleCard({ peers: [], notice: `${P2P_LOOKUP_FAILED_NOTE}：读取超时` })
   }
   let failure: unknown
   let messageId: string | null = null

@@ -16,14 +16,11 @@ import type { SysInfo } from './sysinfo'
 const feishu = await import('./feishu')
 const {
   P2P_LOOKUP_FAILED_NOTE, P2P_MEMBERSHIP_CONCURRENCY,
-  anchoredOwnedGroups, buildP2pPanelCard, isDerivedSessionName, isP2pMessage, p2pSessionVisible, p2pViewerRestricted, replyP2pPanel,
+  anchoredOwnedGroups, buildP2pPanelCard, isDerivedSessionName, isP2pMessage, p2pSessionVisible, replyP2pPanel,
 } = await import('./p2p-panel')
 type P2pPanelDeps = import('./p2p-panel').P2pPanelDeps
 type P2pPanelSession = import('./p2p-panel').P2pPanelSession
 
-/** The `restricted` argument: an internal member, or an external / unknown-tenant viewer. */
-const INTERNAL = false
-const RESTRICTED = true
 // Real open_id shape: ou_ + 32 lowercase hex characters.
 const REQUESTER = `ou_${'1a2b3c4d'.repeat(4)}`
 const SOMEONE_ELSE = `ou_${'9f8e7d6c'.repeat(4)}`
@@ -208,20 +205,10 @@ describe('1:1 visibility rule', () => {
     expect(isP2pMessage(undefined)).toBe(false)
   })
 
-  test('the 1:1 panel shows internal details only to a confirmed same-tenant sender', () => {
-    expect(p2pViewerRestricted({ sender: { tenant_key: 't1' }, tenant_key: 't1' })).toBe(false)
-    expect(p2pViewerRestricted({ event: { sender: { tenant_key: 't1' } }, header: { tenant_key: 't1' } })).toBe(false)
-    expect(p2pViewerRestricted({ sender: { tenant_key: 't2' }, tenant_key: 't1' })).toBe(true)
-    // Unknown on either side fails closed.
-    expect(p2pViewerRestricted({ sender: {}, tenant_key: 't1' })).toBe(true)
-    expect(p2pViewerRestricted({ sender: { tenant_key: 't1' } })).toBe(true)
-    expect(p2pViewerRestricted({ sender: { tenant_key: ' ' }, tenant_key: ' ' })).toBe(true)
-    expect(p2pViewerRestricted(undefined)).toBe(true)
-  })
 })
 
 describe('1:1 panel builder', () => {
-  test('an internal owner sees the anchored project and its associated groups, with accounts, host and quota', async () => {
+  test('an owner sees the anchored project and its associated groups, with accounts, models, host and quota', async () => {
     const sessions = [
       fakeSession('foo', 'oc_foo', '工作订阅'),
       fakeSession('foo*x', 'oc_foo_x'),
@@ -243,7 +230,7 @@ describe('1:1 panel builder', () => {
       bindings: { foo: 'oc_foo', my_proj: 'oc_my_proj', 'foo-bar': 'oc_foo_bar' },
       members: { oc_member_only: [REQUESTER] },
     })
-    const card = await buildP2pPanelCard(REQUESTER, INTERNAL, h.deps) as any
+    const card = await buildP2pPanelCard(REQUESTER, h.deps) as any
 
     expect(names(card)).toEqual(byName(['foo', 'foo*x', 'foo[b]', 'foo[b]*x', 'my_proj', 'member-only']))
     // The project and its temp and wt groups stay together.
@@ -258,6 +245,17 @@ describe('1:1 panel builder', () => {
     expect(elementIds(card)).toEqual(['console_projects', 'console_usage', 'console_host', undefined])
     expect(JSON.stringify(card)).toContain('GLM Coding Plan')
     expect(JSON.stringify(card)).not.toContain(P2P_LOOKUP_FAILED_NOTE)
+  })
+
+  test('the live model rides on the same row as the account', async () => {
+    const session = fakeSession('foo', 'oc_foo', '工作订阅')
+    ;(session as any).peerSnapshot = () => ({
+      name: 'foo', status: 'idle' as const, uptimeMs: 120_000,
+      codexAccountName: '工作订阅', model: 'gpt-5.2-codex', effort: 'high',
+    })
+    const h = harness({ sessions: [session], members: { oc_foo: [REQUESTER] } })
+    const card = await buildP2pPanelCard(REQUESTER, h.deps) as any
+    expect(rows(card)).toEqual([row('foo', '已运行 2m', 'Codex·工作订阅 · gpt-5.2-codex/high')])
   })
 
   test('owning a same-named or colliding group reveals nothing (name-spoof regression)', async () => {
@@ -278,13 +276,11 @@ describe('1:1 panel builder', () => {
     // The projects stay bound to their real groups; with no binding at all nothing anchors either.
     const bindingSets: Array<Record<string, string>> = [{ foo: 'oc_real_foo', foo_bar: 'oc_real_foo_dot_bar', ___: 'oc_real_kana' }, {}]
     for (const bindings of bindingSets) {
-      for (const restricted of [INTERNAL, RESTRICTED]) {
-        const h = harness({ sessions: running, owners, bindings })
-        const card = await buildP2pPanelCard(REQUESTER, restricted, h.deps) as any
-        expect(rows(card)).toEqual([])
-        expect(JSON.stringify(card)).not.toContain(P2P_LOOKUP_FAILED_NOTE)
-        expect(h.memberChecks.map(([chatId]) => chatId)).toEqual(running.map(session => session.chatId))
-      }
+      const h = harness({ sessions: running, owners, bindings })
+      const card = await buildP2pPanelCard(REQUESTER, h.deps) as any
+      expect(rows(card)).toEqual([])
+      expect(JSON.stringify(card)).not.toContain(P2P_LOOKUP_FAILED_NOTE)
+      expect(h.memberChecks.map(([chatId]) => chatId)).toEqual(running.map(session => session.chatId))
     }
   })
 
@@ -294,28 +290,9 @@ describe('1:1 panel builder', () => {
       owners: [{ chatId: 'oc_foo', name: 'foo', ownerOpenId: REQUESTER }],
       bindings: { foo: 'oc_foo' },
     })
-    const card = await buildP2pPanelCard(REQUESTER, INTERNAL, h.deps) as any
+    const card = await buildP2pPanelCard(REQUESTER, h.deps) as any
     expect(names(card)).toEqual(['foo', 'foo*x'])
     expect(h.memberChecks).toEqual([['oc_other_foo', REQUESTER]])
-  })
-
-  test('an external requester gets no account names, quota or host data', async () => {
-    const unexpected: string[] = []
-    const h = harness({
-      sessions: [fakeSession('foo', 'oc_foo', '工作订阅', unexpected), fakeSession('bar', 'oc_bar', '备用', unexpected)],
-      owners: [{ chatId: 'oc_foo', name: 'foo', ownerOpenId: REQUESTER }],
-      bindings: { foo: 'oc_foo' },
-      members: { oc_bar: [REQUESTER] },
-    })
-    const card = await buildP2pPanelCard(REQUESTER, RESTRICTED, h.deps) as any
-
-    expect(rows(card)).toEqual([row('bar', '已运行 2m'), row('foo', '已运行 2m')])
-    expect(elementIds(card)).toEqual(['console_projects', undefined])
-    expect(h.calls).not.toContain('readAllAccountUsage')
-    expect(h.calls).not.toContain('readSysInfo')
-    const body = JSON.stringify(card)
-    for (const hidden of ['工作订阅', '备用', 'Codex·', 'Claude·', '主机', '账号额度', 'GLM']) expect(body).not.toContain(hidden)
-    expect(unexpected).toEqual([])
   })
 
   test('a failed membership lookup hides only that row and says so', async () => {
@@ -324,10 +301,10 @@ describe('1:1 panel builder', () => {
       members: { oc_alpha: [REQUESTER], oc_beta: [REQUESTER], oc_gamma: [REQUESTER] },
       memberErrors: { oc_beta: sdkRejection(99991400, 'request trigger frequency limit chat oc_beta') },
     })
-    const card = await buildP2pPanelCard(REQUESTER, INTERNAL, h.deps) as any
+    const card = await buildP2pPanelCard(REQUESTER, h.deps) as any
 
     expect(names(card)).toEqual(['alpha', 'gamma'])
-    expect(card.body.elements[0]).toEqual({ tag: 'markdown', content: P2P_LOOKUP_FAILED_NOTE })
+    expect(card.body.elements[0]).toEqual({ tag: 'markdown', text_size: 'notation', content: P2P_LOOKUP_FAILED_NOTE })
     // The note never carries the failing group's identity.
     expect(JSON.stringify(card)).not.toContain('oc_beta')
     expect(JSON.stringify(card)).not.toContain('beta')
@@ -344,7 +321,7 @@ describe('1:1 panel builder', () => {
       oc_bot_left: sdkRejection(232011, 'Operator can NOT be out of the chat.'),
     }
     const quiet = harness({ sessions, members: { oc_alpha: [REQUESTER] }, memberErrors: gone })
-    const card = await buildP2pPanelCard(REQUESTER, INTERNAL, quiet.deps) as any
+    const card = await buildP2pPanelCard(REQUESTER, quiet.deps) as any
     expect(names(card)).toEqual(['alpha'])
     expect(JSON.stringify(card)).not.toContain(P2P_LOOKUP_FAILED_NOTE)
 
@@ -354,7 +331,7 @@ describe('1:1 panel builder', () => {
       members: { oc_alpha: [REQUESTER] },
       memberErrors: { ...gone, oc_foreign: sdkRejection(232010, 'Operator and chat can NOT be in different tenants.') },
     })
-    const noted = await buildP2pPanelCard(REQUESTER, INTERNAL, noisy.deps) as any
+    const noted = await buildP2pPanelCard(REQUESTER, noisy.deps) as any
     expect(names(noted)).toEqual(['alpha'])
     expect(noted.body.elements[0].content).toBe(P2P_LOOKUP_FAILED_NOTE)
   })
@@ -366,7 +343,7 @@ describe('1:1 panel builder', () => {
       bindings: { foo: 'oc_foo' },
       members: { oc_foo: [REQUESTER] },
     })
-    const card = await buildP2pPanelCard(REQUESTER, INTERNAL, h.deps) as any
+    const card = await buildP2pPanelCard(REQUESTER, h.deps) as any
 
     expect(names(card)).toEqual(['foo'])
     expect(h.memberChecks.map(([chatId]) => chatId)).toEqual(['oc_foo', 'oc_foo_x'])
@@ -375,7 +352,7 @@ describe('1:1 panel builder', () => {
 
   test('an empty list renders without any lookup', async () => {
     const h = harness({ sessions: [] })
-    const card = await buildP2pPanelCard(REQUESTER, INTERNAL, h.deps) as any
+    const card = await buildP2pPanelCard(REQUESTER, h.deps) as any
 
     expect(rows(card)).toEqual([])
     expect(card.body.elements[0].header.title.content).toBe('🗂 活跃项目 (0)')
@@ -386,7 +363,7 @@ describe('1:1 panel builder', () => {
 
   test('an unknown sender sees no project and the note', async () => {
     const h = harness({ sessions: [fakeSession('foo', 'oc_foo')], members: { oc_foo: [''] } })
-    const card = await buildP2pPanelCard('', INTERNAL, h.deps) as any
+    const card = await buildP2pPanelCard('', h.deps) as any
 
     expect(rows(card)).toEqual([])
     expect(card.body.elements[0].content).toBe(P2P_LOOKUP_FAILED_NOTE)
@@ -406,7 +383,7 @@ describe('1:1 panel builder', () => {
       inFlight--
       return true
     }
-    const card = await buildP2pPanelCard(REQUESTER, INTERNAL, h.deps) as any
+    const card = await buildP2pPanelCard(REQUESTER, h.deps) as any
 
     expect(names(card)).toEqual(sessions.map(session => session.sessionName))
     expect(peak).toBeGreaterThan(1)
@@ -417,7 +394,7 @@ describe('1:1 panel builder', () => {
     const h = harness({ sessions: [] })
     h.deps.readAllAccountUsage = async () => { throw new Error('usage cache unavailable') }
     h.deps.readSysInfo = async () => { throw new Error('ps failed') }
-    const card = await buildP2pPanelCard(REQUESTER, INTERNAL, h.deps) as any
+    const card = await buildP2pPanelCard(REQUESTER, h.deps) as any
     const body = JSON.stringify(card)
     expect(body).toContain('**负载**　MISS')
     expect(body).toContain('usage cache unavailable')
@@ -432,30 +409,16 @@ describe('1:1 reply', () => {
       owners: [{ chatId: 'oc_foo', name: 'foo', ownerOpenId: REQUESTER }],
       bindings: { foo: 'oc_foo' },
     })
-    await replyP2pPanel('oc_p2p', REQUESTER, INTERNAL, h.deps)
+    await replyP2pPanel('oc_p2p', REQUESTER, h.deps)
 
     expect(h.calls).toEqual(['runningSessions', 'listChatOwners', 'boundChatIdForSession', 'readAllAccountUsage', 'readSysInfo', 'sendCard'])
     // The session objects are only read: no start, stop, command or binding call reaches them.
     expect(unexpected).toEqual([])
   })
 
-  test('an event without both tenant keys gets the restricted panel', async () => {
-    const h = harness({
-      sessions: [fakeSession('foo', 'oc_foo', '工作订阅')],
-      members: { oc_foo: [REQUESTER] },
-    })
-    await replyP2pPanel('oc_p2p', REQUESTER, p2pViewerRestricted({ sender: { sender_id: { open_id: REQUESTER } }, tenant_key: 'tenant_app' }), h.deps)
-
-    expect(h.cards).toHaveLength(1)
-    expect(elementIds(h.cards[0])).toEqual(['console_projects', undefined])
-    expect(rows(h.cards[0])).toEqual([row('foo', '已运行 2m')])
-    expect(h.calls).not.toContain('readAllAccountUsage')
-    expect(h.calls).not.toContain('readSysInfo')
-  })
-
   test('a stalled lookup is cut off at the deadline with a fail-closed reply and no further reads', async () => {
     for (const stall of ['owners', 'membership'] as const) {
-      for (const restricted of [INTERNAL, RESTRICTED]) {
+      {
         let release!: () => void
         const gate = new Promise<void>(resolve => { release = resolve })
         const h = harness({
@@ -468,13 +431,13 @@ describe('1:1 reply', () => {
         })
 
         const started = Date.now()
-        await replyP2pPanel('oc_p2p', REQUESTER, restricted, h.deps)
+        await replyP2pPanel('oc_p2p', REQUESTER, h.deps)
         expect(Date.now() - started).toBeLessThan(5_000)
         expect(h.cards).toHaveLength(1)
         const card = h.cards[0]
         expect(rows(card)).toEqual([])
-        expect(card.body.elements[0].content).toBe(restricted ? P2P_LOOKUP_FAILED_NOTE : `${P2P_LOOKUP_FAILED_NOTE}：读取超时`)
-        expect(elementIds(card)).toEqual([undefined, 'console_projects', undefined])
+        expect(card.body.elements[0].content).toBe(`${P2P_LOOKUP_FAILED_NOTE}：读取超时`)
+        expect(elementIds(card)).toEqual([undefined, 'console_projects', 'console_usage', 'console_host', undefined])
         expect(JSON.stringify(card)).not.toContain('工作订阅')
 
         // Once the stalled request answers, the abandoned build issues nothing more:
@@ -510,9 +473,9 @@ describe('1:1 reply', () => {
       return false
     }
 
-    await replyP2pPanel('oc_p2p', REQUESTER, INTERNAL, h.deps)
+    await replyP2pPanel('oc_p2p', REQUESTER, h.deps)
     phase = 1
-    await replyP2pPanel('oc_p2p', REQUESTER, INTERNAL, h.deps)
+    await replyP2pPanel('oc_p2p', REQUESTER, h.deps)
     phase = 2
     // Let every request that was already in flight finish.
     await new Promise(resolve => setTimeout(resolve, 200))
@@ -534,7 +497,7 @@ describe('1:1 reply', () => {
         return null
       },
     })
-    await replyP2pPanel('oc_p2p', REQUESTER, INTERNAL, h.deps)
+    await replyP2pPanel('oc_p2p', REQUESTER, h.deps)
 
     const text = h.calls.find(call => call.startsWith('sendTextRaw:'))!
     expect(text).toContain('❌ 面板发送失败')
@@ -543,20 +506,16 @@ describe('1:1 reply', () => {
     expect(text).not.toContain(hidden)
   })
 
-  test('a build failure tells an internal requester why and a restricted one only that it failed', async () => {
+  test('a build failure tells the requester why, with member ids redacted', async () => {
     // Redaction recognises the real open_id shape: ou_ + 32 lowercase hex characters.
     const leaked = `ou_${'5e6f7a8b'.repeat(4)}`
-    for (const [restricted, expected] of [
-      [INTERNAL, '❌ 面板生成失败：snapshot broke for …'],
-      [RESTRICTED, '❌ 面板生成失败'],
-    ] as const) {
-      const broken = fakeSession('foo', 'oc_foo')
-      ;(broken as any).peerSnapshot = () => { throw new Error(`snapshot broke for ${leaked}`) }
-      const h = harness({ sessions: [broken], members: { oc_foo: [REQUESTER] } })
-      await replyP2pPanel('oc_p2p', REQUESTER, restricted, h.deps)
-      expect(h.calls.filter(call => call.startsWith('sendTextRaw:'))).toEqual([`sendTextRaw:${expected}`])
-      expect(h.calls).not.toContain('sendCard')
-    }
+    const broken = fakeSession('foo', 'oc_foo')
+    ;(broken as any).peerSnapshot = () => { throw new Error(`snapshot broke for ${leaked}`) }
+    const h = harness({ sessions: [broken], members: { oc_foo: [REQUESTER] } })
+    await replyP2pPanel('oc_p2p', REQUESTER, h.deps)
+    expect(h.calls.filter(call => call.startsWith('sendTextRaw:')))
+      .toEqual(['sendTextRaw:❌ 面板生成失败：snapshot broke for …'])
+    expect(h.calls).not.toContain('sendCard')
   })
 })
 
@@ -583,7 +542,7 @@ describe('1:1 panel with the Feishu helpers', () => {
     setChatMembers('oc_baz', [SOMEONE_ELSE])
     setChatMemberCheckError('oc_qux', new Error('chatMembers.get failed'))
     const sessions = [fakeSession('foo[b]', 'oc_foo_b'), fakeSession('bar', 'oc_bar'), fakeSession('baz', 'oc_baz'), fakeSession('qux', 'oc_qux')]
-    await replyP2pPanel('oc_p2p', REQUESTER, RESTRICTED, feishuDeps(sessions))
+    await replyP2pPanel('oc_p2p', REQUESTER, feishuDeps(sessions))
 
     expect(chatMemberChecks).toEqual([['oc_bar', REQUESTER], ['oc_baz', REQUESTER], ['oc_qux', REQUESTER]])
     expect(sentCards).toHaveLength(1)
@@ -595,7 +554,7 @@ describe('1:1 panel with the Feishu helpers', () => {
   test('a failing owner list is reported as hidden rows, not as an error', async () => {
     setChatOwnersError(new Error('chat.list failed'))
     setChatMembers('oc_bar', [REQUESTER])
-    await replyP2pPanel('oc_p2p', REQUESTER, INTERNAL, feishuDeps([fakeSession('bar', 'oc_bar')]))
+    await replyP2pPanel('oc_p2p', REQUESTER, feishuDeps([fakeSession('bar', 'oc_bar')]))
 
     expect(names(sentCards[0])).toEqual(['bar'])
     expect((sentCards[0] as any).body.elements[0].content).toBe(P2P_LOOKUP_FAILED_NOTE)
@@ -645,7 +604,7 @@ describe('daemon routing for 1:1 chats', () => {
     expect(route).toBeGreaterThan(-1)
     const branch = (statements[route] as ts.IfStatement).thenStatement as ts.Block
     expect(branch.statements.map(statement => statement.getText(source))).toEqual([
-      'await replyP2pPanel(chatId, userOpenId, p2pViewerRestricted(data), p2pPanelDeps)',
+      'await replyP2pPanel(chatId, userOpenId, p2pPanelDeps)',
       'return',
     ])
     const first = (pattern: RegExp) => statements.findIndex(statement => pattern.test(statement.getText(source)))
@@ -675,7 +634,8 @@ describe('daemon routing for 1:1 chats', () => {
       isChatMember: 'feishu.isChatMember',
       boundChatIdForSession: 'feishu.boundChatIdForSession',
       readAllAccountUsage: 'readAllAccountUsage',
-      readSysInfo: 'readSysInfo',
+      // 硬盘按项目工作目录所在的磁盘（[runtime].projects_root）显示，不是固定的 / 或 $HOME。
+      readSysInfo: '() => readSysInfo(config.runtime.projects_root)',
       sendCard: 'feishu.sendCard',
       sendTextRaw: 'feishu.sendTextRaw',
     })

@@ -180,13 +180,13 @@ test('after a rename, a same-named cached group cannot borrow the old project na
     const projects = card => card.body.elements.find(element => element.element_id === 'console_projects').elements[0].content
     const none = "<font color='grey'>暂无运行中的项目</font>"
 
-    assert.equal(projects(await buildP2pPanelCard(REQ, false, deps(feishu.boundChatIdForSession))), none)
+    assert.equal(projects(await buildP2pPanelCard(REQ, deps(feishu.boundChatIdForSession))), none)
     // With the cache guess the requester's group would anchor and expose the old project's groups.
-    assert.match(projects(await buildP2pPanelCard(REQ, false, deps(feishu.chatIdForSession))), /foo\\*fix/)
+    assert.match(projects(await buildP2pPanelCard(REQ, deps(feishu.chatIdForSession))), /foo\\*fix/)
 
     // Bound again to the real group, the requester's same-named group still does not count.
     feishu.bindSessionToChat('foo', 'oc_real_foo')
     assert.equal(feishu.boundChatIdForSession('foo'), 'oc_real_foo')
-    assert.equal(projects(await buildP2pPanelCard(REQ, false, deps(feishu.boundChatIdForSession))), none)
+    assert.equal(projects(await buildP2pPanelCard(REQ, deps(feishu.boundChatIdForSession))), none)
   `)
 })

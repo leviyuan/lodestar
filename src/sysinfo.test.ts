@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test'
-import { parseLaunchctlList, parseMacMemory, parseProcessElapsed, readMacMemory, readMacServices } from './sysinfo'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import {
+  parseLaunchctlList, parseMacMemory, parseProcessElapsed, readDiskFor, readMacMemory, readMacServices, readWorkDirDisk,
+} from './sysinfo'
 import { consoleHostContent, consoleHostElement } from './cards/console'
 
 const vmStat = `Mach Virtual Memory Statistics: (page size of 16384 bytes)
@@ -152,6 +156,28 @@ describe('macOS host snapshot', () => {
     expect(unreadable.elements[1].header.title.content).toBe('⚠️ 主机读取失败')
     expect(unreadable.elements[1].elements[0].content).toBe('服务列表：launchctl MISS')
     expect(consoleHostContent({ ...snapshot, services: [{ ...services[1]!, hasStarted: false }] })).toContain('从未启动')
+  })
+
+  test('the disk follows the working directory and shows occupancy plus free space', () => {
+    const disk = readDiskFor(process.cwd())
+    expect(disk).not.toBeNull()
+    expect(disk!.totalBytes).toBeGreaterThan(0)
+    expect(disk!.availBytes).toBeGreaterThanOrEqual(0)
+    expect(disk!.percent).toBeGreaterThanOrEqual(0)
+    expect(disk!.percent).toBeLessThanOrEqual(100)
+    expect(readDiskFor('/definitely/not/a/real/path')).toBeNull()
+    // A working directory that does not exist yet still reports its nearest existing ancestor's disk.
+    const missing = join(tmpdir(), `lodestar-missing-${process.pid}`, 'nested')
+    expect(readWorkDirDisk(missing)).toEqual([readDiskFor(resolve(tmpdir()))!])
+
+    const host = (disks: Array<{ totalBytes: number; availBytes: number; usedBytes: number; percent: number }>) =>
+      consoleHostContent({ cpu: null, mem: null, disks, services: [], servicesError: null }).split('\n')
+    expect(host([{ totalBytes: 100 * 1024 ** 3, availBytes: 15 * 1024 ** 3, usedBytes: 85 * 1024 ** 3, percent: 85 }])[2])
+      .toBe('**硬盘**　占用 85% · 剩余 15G')
+    expect(host([])[2]).toBe('**硬盘**　MISS')
+    expect(host([{ totalBytes: 100, availBytes: -1, usedBytes: 101, percent: Number.NaN }])[2]).toBe('**硬盘**　MISS')
+    expect(consoleHostContent(undefined)).toContain('**硬盘**　MISS')
+    expect((consoleHostElement(undefined) as any).elements[0].text_size).toBe('notation')
   })
 
   test('service rows lead with the state duration and print the English state only when nothing else says it', () => {

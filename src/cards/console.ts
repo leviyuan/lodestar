@@ -28,6 +28,9 @@ export interface ConsolePeer {
   /** Actual live Codex process account, independent of the next-start selection. */
   codexAccountName?: string
   claudeAccountName?: string
+  /** 当前实际在用的模型与 effort（与 footer 同口径），和账号写在同一行。 */
+  model?: string
+  effort?: string
   /** Background processes and subagents still running beside the main turn. */
   workload?: SessionWorkload
 }
@@ -268,11 +271,21 @@ function hostErrorDetails(sysinfo?: SysInfo): string[] {
   return sysinfo?.servicesError ? [`服务列表：${escapeInlineMarkdown(sysinfo.servicesError)}`] : []
 }
 
+/** 工作目录所在磁盘的占用与剩余：`占用 80% · 剩余 15G`。 */
+function diskLine(disks: SysInfo['disks']): string {
+  const disk = disks[0]
+  if (!disk || !Number.isFinite(disk.percent) || !Number.isFinite(disk.availBytes) || disk.availBytes < 0) {
+    return '**硬盘**　MISS'
+  }
+  return `**硬盘**　占用 ${Math.round(disk.percent)}% · 剩余 ${fmtBytes(disk.availBytes)}`
+}
+
 export function consoleHostContent(sysinfo?: SysInfo): string {
   if (!sysinfo) {
     return [
       '**负载**　MISS',
       '**内存**　MISS',
+      '**硬盘**　MISS',
       `**服务** ${SERVICE_LABEL}　MISS`,
     ].join('\n')
   }
@@ -284,6 +297,7 @@ export function consoleHostContent(sysinfo?: SysInfo): string {
   } else {
     lines.push('**内存**　MISS')
   }
+  lines.push(diskLine(sysinfo.disks))
 
   if (sysinfo.servicesError) {
     // 完整原因进默认折叠的错误详情，行内只留 MISS。
@@ -362,7 +376,7 @@ export function consoleProjectElement(
   }
 }
 
-/** 单聊面板的主机区：默认展开，标题只写「主机」，负载、内存和服务数都在正文里。 */
+/** 单聊面板的主机区：默认展开，标题只写「主机」，负载、内存、硬盘和服务数都在正文里。 */
 export function consoleHostElement(sysinfo?: SysInfo, elementId = ELEMENTS.consoleHost): object {
   return {
     tag: 'collapsible_panel',
@@ -375,10 +389,11 @@ export function consoleHostElement(sysinfo?: SysInfo, elementId = ELEMENTS.conso
       background_color: 'grey-50',
     },
     border: { color: 'grey-100', corner_radius: '8px' },
-    padding: '8px',
+    padding: '6px',
+    vertical_spacing: '4px',
     expanded: true,
     elements: [
-      { tag: 'markdown', content: consoleHostContent(sysinfo) },
+      { tag: 'markdown', text_size: 'notation', content: consoleHostContent(sysinfo) },
       ...(hostErrorDetails(sysinfo).length ? [errorDetailsElement('主机读取失败', hostErrorDetails(sysinfo))] : []),
     ],
   }

@@ -94,7 +94,7 @@ import {
   type DisbandTempSessionResult,
 } from './src/temp-session-runtime'
 import { cardActionRequesterTenant, messageRequesterTenant, shouldSeedDebugContext } from './src/requester-tenant'
-import { isP2pMessage, p2pViewerRestricted, replyP2pPanel, type P2pPanelDeps } from './src/p2p-panel'
+import { isP2pMessage, replyP2pPanel, type P2pPanelDeps } from './src/p2p-panel'
 import { readAllAccountUsage } from './src/account-usage'
 import { readSysInfo } from './src/sysinfo'
 
@@ -468,7 +468,8 @@ const p2pPanelDeps: P2pPanelDeps = {
   isChatMember: feishu.isChatMember,
   boundChatIdForSession: feishu.boundChatIdForSession,
   readAllAccountUsage,
-  readSysInfo,
+  // 主机区的硬盘按项目工作目录所在的磁盘显示（[runtime].projects_root），不是固定的 / 或 $HOME。
+  readSysInfo: () => readSysInfo(config.runtime.projects_root),
   sendCard: feishu.sendCard,
   sendTextRaw: feishu.sendTextRaw,
 }
@@ -510,8 +511,8 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
 
   // 单聊不对应项目：任何消息都只回只读面板。不建 Session、不绑定群、不写调试上下文或活跃时间，也不启动任何东西。
   if (isP2pMessage(message)) {
-    // 租户字段缺失时单聊面板按外部联系人显示（与群命令的 requester 不同）。
-    await replyP2pPanel(chatId, userOpenId, p2pViewerRestricted(data), p2pPanelDeps)
+    // 单聊面板不区分读者：外部联系人与本企业成员看到同样的项目、账号、模型、主机和额度。
+    await replyP2pPanel(chatId, userOpenId, p2pPanelDeps)
     return
   }
 

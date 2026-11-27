@@ -602,14 +602,19 @@ export class Session {
   }
 
   /** Minimal cross-chat snapshot for the 1:1 panel's active projects.
-   * `startedAt` stays private so this is the documented read path. */
-  peerSnapshot(): { name: string; status: Status; uptimeMs?: number; codexAccountName?: string; claudeAccountName?: string } {
+   * `startedAt` stays private so this is the documented read path. The model
+   * follows the footer's live source: the same account and model row tells
+   * what the project is actually running. */
+  peerSnapshot(): { name: string; status: Status; uptimeMs?: number; codexAccountName?: string; claudeAccountName?: string; model?: string; effort?: string } {
     const proc = this.proc?.isAlive() ? this.proc : null
     const codexAccount = proc ? liveCodexAccount(proc) : null
+    const runtime = this.runtimeModelSelection()
     return {
       name: this.sessionName,
       status: this.status,
       uptimeMs: this.startedAt ? (Date.now() - this.startedAt) : undefined,
+      ...(runtime.model ? { model: runtime.model } : {}),
+      ...(runtime.effort ? { effort: runtime.effort } : {}),
       ...(codexAccount !== null ? { codexAccountName: codexAccounts.get(codexAccount).name } : {}),
       ...(proc?.tokenSourceId === 'claude-sub' && processClaudeAccount(proc)
         ? { claudeAccountName: claudeAccounts.get(processClaudeAccount(proc)!).name } : {}),

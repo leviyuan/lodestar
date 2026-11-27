@@ -7,6 +7,7 @@ import { codexCreditsSummary, fmtCountdown } from './usage'
 // - 一个账号一块：首行账号名，后面跟单值结果（余额、失败原因等）或账号级事实（积分、重置卡、凭据剩余）。
 // - 每个额度窗口单独一行：`名称　进度条 已用%　N`；距重置与凭据共用 fmtCountdown（m / 一位小数的 h、d），
 //   倒计时后不再跟「后重置」。
+// - 总周额度排在最后一行；模型专属周额度只写模型名（`Fable`、`Opus`、`OAuth 应用`），不再重复「周」字。
 // - 整窗未知只写一次 MISS；已用已知而重置时间未知写「重置时间 MISS」；GLM 月工具只显示百分比。
 // - 积分、重置卡确认为零时省略，未知写 MISS；金额符号紧贴数字，与回复 footer 一致。
 // - 颜色只看显示值（百分比、进度条与凭据倒计时），同一文案颜色不变。
@@ -49,18 +50,30 @@ function modelWeekly(kind: unknown): kind is string {
   return typeof kind === 'string' && (kind.startsWith('modelWeekly:') || Object.hasOwn(MODEL_WEEKLY_NAMES, kind))
 }
 
-/** 窗口名：5h、周、月工具；模型专属周额度写作「模型名 周」，与总周并列；其他来源未登记的窗口照写接口给的名称。 */
+/** 模型专属周额度只写模型名：总周额度单独占一行「周」，模型窗口不再重复「周」字。 */
+function modelWeeklyLabel(kind: string, label: string): string {
+  const name = Object.hasOwn(MODEL_WEEKLY_NAMES, kind) ? MODEL_WEEKLY_NAMES[kind]! : kind.slice('modelWeekly:'.length)
+  // 原生给的是「Fable 周额度」；去掉「额度」与结尾的「周」，只留模型名。
+  return label.replace(/额度$/, '').replace(/\s*周$/, '').trim() || name
+}
+
+/** 窗口名：5h、周、月工具；模型专属周额度写作模型名，与总周并列；其他来源未登记的窗口照写接口给的名称。 */
 function windowLabel(window: UsageWindowUnified): string {
   const kind: unknown = window.kind
   const label = typeof window.label === 'string' ? window.label.trim() : ''
   if (kind === 'fiveHour') return '5h'
   if (kind === 'weekly') return '周'
   if (kind === 'monthly') return '月工具'
-  if (modelWeekly(kind)) {
-    const name = Object.hasOwn(MODEL_WEEKLY_NAMES, kind) ? MODEL_WEEKLY_NAMES[kind]! : kind.slice('modelWeekly:'.length)
-    return label.replace(/额度$/, '') || `${name} 周`
-  }
+  if (modelWeekly(kind)) return modelWeeklyLabel(kind, label)
   return label || '额度'
+}
+
+/** 总周额度放最下：5h 和模型专属周额度在上，总周单独一行收尾；其余窗口保持接口顺序。
+ * 中转站脚本可能混入非对象的窗口项，判断前先确认是对象。 */
+function weeklyLast(windows: readonly UsageWindowUnified[]): UsageWindowUnified[] {
+  const isWeekly = (window: UsageWindowUnified): boolean =>
+    typeof window === 'object' && window !== null && window.kind === 'weekly'
+  return windows.some(isWeekly) ? [...windows.filter(window => !isWeekly(window)), ...windows.filter(isWeekly)] : [...windows]
 }
 
 /** 中转站余额脚本的 JSON 原样转入、日期是字符串：只认真正的 Date，其余按 MISS，不能让整个额度区出错。 */
@@ -149,7 +162,8 @@ function usageDetail(snapshot: UsageSnapshotUnified | undefined): AccountUsageDe
       : `剩余 ${money(remaining, currency)} / ${money(limit, currency)}`)
   }
   // 脚本给的不是窗口对象时，这一项按整窗未知处理。
-  const windows = snapshot.windows.map(window => typeof window === 'object' && window !== null ? windowLine(window) : '额度　MISS')
+  const windows = weeklyLast(snapshot.windows)
+    .map(window => typeof window === 'object' && window !== null ? windowLine(window) : '额度　MISS')
   const facts: string[] = windows.length ? [] : ['额度 MISS']
   const credits = snapshot.credits !== undefined ? codexCreditsSummary(snapshot.credits) : null
   if (credits) facts.push(credits)

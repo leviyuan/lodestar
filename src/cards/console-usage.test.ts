@@ -130,10 +130,11 @@ describe('clear account quota detail', () => {
       { kind: 'weekly', label: '周配额', percent: 17, resetsAt: new Date(Date.now() + 86400_000) },
       { kind: 'monthly', label: '月度工具', percent: 7, used: 290, total: 4000, resetsAt: new Date(Date.now() + 15 * 86400_000) },
     ] })
+    // The total week is always the last line, after 5h and the monthly tool bucket.
     expect(out.split('\n')).toEqual([
       `5h　${bar(1)} 11%　${grey('1.0h')}`,
-      `周　${bar(1)} 17%　${grey('1.0d')}`,
       `月工具　${bar(0)} 7%`,
+      `周　${bar(1)} 17%　${grey('1.0d')}`,
     ])
     expect(out).not.toMatch(/290|4000|15.0d|Max/)
   })
@@ -172,8 +173,8 @@ describe('clear account quota detail', () => {
       { kind: 'seven_day_sonnet', label: 'Sonnet 周额度', percent: 100, resetsAt: null },
     ] })
     expect(content.split('\n')).toEqual([
-      `Opus 周　${bar(5, 'orange')} <font color='orange'>80%</font>　${grey('重置时间 MISS')}`,
-      `Sonnet 周　${bar(6, 'red')} <font color='red'>100%</font>　${grey('重置时间 MISS')}`,
+      `Opus　${bar(5, 'orange')} <font color='orange'>80%</font>　${grey('重置时间 MISS')}`,
+      `Sonnet　${bar(6, 'red')} <font color='red'>100%</font>　${grey('重置时间 MISS')}`,
     ])
     // Colors follow the displayed percent, so one label never shows with and without a color.
     const shown = (value: number) => consoleUnifiedUsageContent({ state: 'ok', windows: [{ kind: 'weekly', label: '周额度', percent: value, resetsAt: null }] })
@@ -233,7 +234,7 @@ describe('clear account quota detail', () => {
       .toBe(`**y**\n日额度　${bar(1)} 12%　${grey('重置时间 MISS')}`)
   })
 
-  test('model weekly buckets read as "<model> 周" next to the total and each carries its own reset', () => {
+  test('model weekly buckets read by model name above the total week and each carries its own reset', () => {
     const DAY = 86400_000
     const total = new Date(Date.now() + 2.2 * DAY)
     const render = (fable: Date | null, weekly: Date | null = total) => consoleUnifiedUsageContent({ state: 'ok', windows: [
@@ -243,16 +244,18 @@ describe('clear account quota detail', () => {
     ] }).split('\n')
     const exhausted = `周　${bar(6, 'red')} <font color='red'>100%</font>`
     const reset = (date: Date | null) => grey(date ? `${fmtCountdown(date.getTime() - Date.now())}` : '重置时间 MISS')
+    // The total week always comes last; model buckets above it drop the redundant 周.
     expect(render(total)).toEqual([
-      `${exhausted}　${reset(total)}`, `Fable 周　${bar(3)} 47%　${reset(total)}`, `OAuth 应用周　${bar(0)} 5%　${reset(total)}`,
+      `Fable　${bar(3)} 47%　${reset(total)}`, `OAuth 应用　${bar(0)} 5%　${reset(total)}`, `${exhausted}　${reset(total)}`,
     ])
     expect(reset(total)).toBe(grey('2.2d'))
     const later = new Date(Date.now() + 3.1 * DAY)
-    expect(render(later)[1]).toBe(`Fable 周　${bar(3)} 47%　${grey('3.1d')}`)
+    expect(render(later)[0]).toBe(`Fable　${bar(3)} 47%　${grey('3.1d')}`)
     // A missing reset is never borrowed from another window, and `<name>　MISS` only ever means nothing is known.
-    expect(render(null)[1]).toBe(`Fable 周　${bar(3)} 47%　${grey('重置时间 MISS')}`)
+    expect(render(null)[0]).toBe(`Fable　${bar(3)} 47%　${grey('重置时间 MISS')}`)
     expect(render(total, null)).toEqual([
-      `${exhausted}　${grey('重置时间 MISS')}`, `Fable 周　${bar(3)} 47%　${reset(total)}`, `OAuth 应用周　${bar(0)} 5%　${grey('重置时间 MISS')}`,
+      `Fable　${bar(3)} 47%　${reset(total)}`, `OAuth 应用　${bar(0)} 5%　${grey('重置时间 MISS')}`,
+      `${exhausted}　${grey('重置时间 MISS')}`,
     ])
     const unknownFable = consoleUnifiedUsageContent({ state: 'ok', windows: [
       { kind: 'weekly', label: '周额度', percent: 10, resetsAt: total },
@@ -261,7 +264,7 @@ describe('clear account quota detail', () => {
       { kind: 'modelWeekly:Muse', label: '', percent: 3, resetsAt: total },
     ] }).split('\n')
     expect(unknownFable).toEqual([
-      `周　${bar(1)} 10%　${reset(total)}`, `Fable 周　MISS　${reset(total)}`, 'Opus 周　MISS', `Muse 周　${bar(0)} 3%　${reset(total)}`,
+      `Fable　MISS　${reset(total)}`, 'Opus　MISS', `Muse　${bar(0)} 3%　${reset(total)}`, `周　${bar(1)} 10%　${reset(total)}`,
     ])
     // The full Claude block in the 1:1 panel, including the login end.
     expect(accountUsageBlock({ id: 'claude:default', label: 'Claude·默认',
@@ -269,7 +272,7 @@ describe('clear account quota detail', () => {
         { kind: 'weekly', label: '周额度', percent: 100, resetsAt: total },
         { kind: 'modelWeekly:Fable', label: 'Fable 周额度', percent: 47, resetsAt: total },
       ], credentialExpiresAt: Date.now() + 26.2 * DAY } }).split('\n')).toEqual([
-      '**Claude·默认**　凭据剩余 23.2d', `${exhausted}　${reset(total)}`, `Fable 周　${bar(3)} 47%　${reset(total)}`,
+      '**Claude·默认**　凭据剩余 23.2d', `Fable　${bar(3)} 47%　${reset(total)}`, `${exhausted}　${reset(total)}`,
     ])
   })
 
