@@ -382,7 +382,6 @@ test('btwListCard：汇总数量、当前群、模型与运行状态', () => {
     entries: [
       {
         chatName: 'project*修复登录',
-        projectName: 'project',
         createdAt: new Date(2026, 7, 22, 9, 5).getTime(),
         isCurrent: true,
         status: 'idle',
@@ -393,7 +392,6 @@ test('btwListCard：汇总数量、当前群、模型与运行状态', () => {
       },
       {
         chatName: 'project*0821-1337',
-        projectName: 'project',
         createdAt: null,
         isCurrent: false,
         status: null,
@@ -421,11 +419,15 @@ test('btwListCard：汇总数量、当前群、模型与运行状态', () => {
   expect(text).toContain('模型 MISS')
   expect(text).toContain('⚪ 未运行')
   expect(text).not.toContain('callback')
+  // 列表只含本项目：项目名只在说明行出现一次，条目行不再逐条重复。
+  const rows: string[] = card.body.elements[1].content.split('\n\n')
+  expect(rows).toHaveLength(2)
+  expect(rows.filter(row => row.includes('项目'))).toEqual([])
 })
 
 test('btwListCard：运行中会话在状态后写出子 Agent 与后台进程数，0 不显示', () => {
   const base = {
-    projectName: 'project', createdAt: null, isCurrent: false, running: true,
+    createdAt: null, isCurrent: false, running: true,
     provider: 'claude' as const, model: null, effort: null,
   }
   const card = btwListCard({

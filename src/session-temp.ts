@@ -648,7 +648,6 @@ export async function runBtwListCommand(s: Session): Promise<void> {
     const selection = peer ? null : feishu.getSessionModelSelection(chatName)
     return {
       chatName,
-      projectName: feishu.tempProjectName(chatName) ?? chatName,
       createdAt,
       isCurrent: chatId === s.chatId,
       status: peer?.status ?? null,

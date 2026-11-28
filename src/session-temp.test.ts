@@ -491,6 +491,8 @@ describe('session-temp Codex btw/fork', () => {
     const text = cardJson(card)
     expect(text).toContain('共 **2** 个临时会话 · 已启动 **1** 个')
     expect(text).toContain('项目 `project`')
+    // 项目名只在说明行出现一次，条目行不重复。
+    expect(text.split('项目 `project`')).toHaveLength(2)
     expect(text).not.toContain('other*0821-1337')
     expect(text).not.toContain('other*运行中')
     expect(text).not.toContain('project-v2*0821-1337')
@@ -521,6 +523,8 @@ describe('session-temp Codex btw/fork', () => {
 
     const text = cardJson(sentCards.at(-1))
     expect(text).toContain('项目 `project[feature]`')
+    // 分支临时群同样只在说明行写一次项目（含 [分支]），条目行不重复。
+    expect(text.split('项目 `project[feature]`')).toHaveLength(2)
     expect(text).toContain('共 **2** 个临时会话')
     expect(text).toContain('project[feature]*0821-1200')
     expect(text).toContain('project[feature]*旧群')

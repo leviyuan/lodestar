@@ -414,12 +414,11 @@ export function tempSessionNoticeCard(opts: TempSessionNoticeCardOpts): object {
   }
 }
 
-/** `bl` 列表的一行：租约 + 当前 daemon 中已构造的会话状态。 */
+/** `bl` 列表的一行：租约 + 当前 daemon 中已构造的会话状态。
+ * 列表只含当前项目的临时会话，项目名由卡片说明行统一承载，条目不再逐行重复。 */
 export interface BtwListEntry {
   /** 临时群名 / 会话名（`<基名>*<备注或时间>`）。 */
   chatName: string
-  /** 去掉 `*后缀` 的所属项目，WT 临时群保留 `[分支]`。 */
-  projectName: string
   /** 租约创建时间；旧记录或未登记会话为 null。 */
   createdAt: number | null
   /** 是否为发送 `bl` 的当前群。 */
@@ -450,7 +449,7 @@ const BTW_LIST_STATUS: Record<string, { emoji: string; label: string }> = {
 
 export function btwListCard(opts: BtwListCardOpts): object {
   const elements: object[] = []
-  // 列表只含当前项目的临时群，把项目写进说明，避免读成整机列表少了别的项目。
+  // 列表只含当前项目的临时群：项目名在说明行写一次，避免逐条重复，也避免读成整机列表少了别的项目。
   const scope = opts.projectName ? `项目 ${inlineCode(opts.projectName)}` : ''
   if (!opts.entries.length) {
     elements.push({ tag: 'markdown', content: `_${scope ? `${scope}：` : ''}还没有临时会话。发送 \`btw\` 创建。_` })
@@ -489,7 +488,6 @@ function btwListEntryMarkdown(entry: BtwListEntry): string {
   return [
     `**${inlineCode(entry.chatName)}**${entry.isCurrent ? ' · 本群' : ''}`,
     [
-      `项目 ${inlineCode(entry.projectName)}`,
       entry.createdAt === null ? '创建 MISS' : `创建 ${fmtTime(entry.createdAt)}`,
       btwListModelLabel(entry),
       `${status.emoji} ${status.label}`,
