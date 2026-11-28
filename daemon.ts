@@ -93,6 +93,7 @@ import {
   type CreateTempSessionResult,
   type DisbandTempSessionResult,
 } from './src/temp-session-runtime'
+import { chatWasDissolved, createChatDisbandRuntime, setGoneChatHandler } from './src/chat-disband'
 import { cardActionRequesterTenant, messageRequesterTenant, shouldSeedDebugContext } from './src/requester-tenant'
 import { isP2pMessage, replyP2pPanel, type P2pPanelDeps } from './src/p2p-panel'
 import { readAllAccountUsage } from './src/account-usage'
@@ -105,7 +106,7 @@ import { readSysInfo } from './src/sysinfo'
 {
   const guard = checkPidGuard(PID_FILE)
   if (guard.state === 'exit') {
-    console.error('lodestar: 已经有一个 daemon 在运行（用 lodestar stop 停止）')
+    console.error('lodestar: 已经有一个 daemon 在运行（终端前台启动的用 lodestar stop 停止；交给 systemd / launchd / 任务计划托管的由服务管理器重启或停止）')
     process.exit(1)
   }
   if (existsSync(PID_FILE)) { try { unlinkSync(PID_FILE) } catch {} }
@@ -1245,74 +1246,29 @@ async function pushNotifyCallbackPhase2(
 }
 
 // ── Group lifecycle events ──────────────────────────────────────────────
-/** Forget one dissolved chat: stop without announcing, drop the in-memory
- * Session, clear conversation-scoped state and refresh the alive marker.
- * Project directory and cloud folder/files are intentionally left
- * in place. Callers serialize through chatActor when they can. */
-async function forgetChatBinding(chatId: string, sessionName: string, reason: string): Promise<void> {
-  const session = sessions.get(chatId)
-  if (session) {
-    try { await session.stop(reason, { announce: false }) }
-    catch (e) { logError('daemon.chat.disbanded_stop_failed', e) }
-    sessions.delete(chatId)
-    session.dispose()
-  }
-  try { feishu.clearSessionConversationState(sessionName, chatId) }
-  catch (e) { logError('daemon.chat.disbanded_cleanup_failed', e) }
-  try { sessionRecovery.persist() }
-  catch (e) { logError('daemon.chat.disbanded_marker_failed', e) }
-  log('daemon.chat.disbanded')
-}
-
-/** Feishu `im.chat.disbanded_v1` entry; the event payload is flattened by the
- * SDK in current versions, with an `event` fallback for older shapes. */
-function handleChatDisbanded(data: any): void {
-  const chatId = String(data?.chat_id ?? data?.event?.chat_id ?? '').trim()
-  const session = chatId ? sessions.get(chatId) : undefined
-  const sessionName = session?.sessionName
-    ?? (chatId ? [...feishu.preferredChatForSession].find(([, id]) => id === chatId)?.[0] : undefined)
-  if (!chatId || !sessionName) {
-    log('daemon.chat.disbanded_ignored')
-    return
-  }
-  void chatActor.enqueue(chatId, () => forgetChatBinding(chatId, sessionName, '群已解散'))
-    .catch(e => logError('daemon.chat.disbanded_failed', e))
-}
+// 群解散事件、启动核对与 wt 删除 WT 群后的本地清理（src/chat-disband.ts）：停止且不播报、释放该群的
+// Session、清掉按 chat 的状态；群名绑定确实指向该群时才清群名级状态，同名的另一个群不受影响。
+// 项目目录与云空间文件保留。
+const chatDisband = createChatDisbandRuntime<Session>({
+  registry: sessions,
+  bindings: feishu.preferredChatForSession,
+  clearSessionConversationState: feishu.clearSessionConversationState,
+  forgetChatState: feishu.forgetChatState,
+  persistRecovery: () => sessionRecovery.persist(),
+  runExclusive: (chatId, task) => chatActor.enqueue(chatId, task),
+  log,
+  logError,
+})
+setGoneChatHandler(chatDisband.forgetGoneChat)
 
 /** Event subscription is best-effort on the Feishu side; reconcile bindings
  * after startup so a missed disband event does not leave a dead conversation
  * bound forever. Runs in the background and never blocks readiness. */
-function chatWasDissolved(chatId: string): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  return Promise.race([
-    feishu.client.im.chat.get({ path: { chat_id: chatId } }),
-    new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('chat.get timeout')), 8_000)
-    }),
-  ]).then(res => {
-    const response = res as any
-    const code = response?.code ?? response?.data?.code ?? 0
-    return code === 0 && response?.data?.chat_status === 'dissolved'
-  }, (error) => {
-    const code = feishuErrorDetails(error).code
-    return code === 232009 || code === 232006
-  }).finally(() => { if (timer) clearTimeout(timer) })
-}
-
-async function reconcileDissolvedChats(): Promise<void> {
-  const entries = [...feishu.preferredChatForSession]
-  let next = 0
-  const worker = async () => {
-    for (;;) {
-      const index = next++
-      if (index >= entries.length) return
-      const [sessionName, chatId] = entries[index]
-      if (!await chatWasDissolved(chatId)) continue
-      await chatActor.enqueue(chatId, () => forgetChatBinding(chatId, sessionName, '群已解散（启动核对）'))
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(4, entries.length) }, () => worker()))
-  log('daemon.chat.reconciled')
+function reconcileDissolvedChats(): Promise<void> {
+  return chatDisband.reconcileDissolvedChats(chatId => chatWasDissolved(chatId, {
+    getChat: id => feishu.client.im.chat.get({ path: { chat_id: id } }),
+    errorCode: error => feishuErrorDetails(error).code,
+  }))
 }
 
 // ── WebSocket boot ─────────────────────────────────────────────────────
@@ -1624,7 +1580,7 @@ async function boot(): Promise<void> {
   dispatcher.register({
     // A manual Feishu dissolution never reaches the message path, so cleanup
     // must be driven by this event. The handler acks immediately.
-    'im.chat.disbanded_v1': (d: any) => { handleChatDisbanded(d) },
+    'im.chat.disbanded_v1': (d: any) => { void chatDisband.handleDisbandedEvent(d) },
   })
 
   // Lifecycle callbacks only drive the current client. One fired by a replaced

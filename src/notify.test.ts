@@ -72,6 +72,18 @@ describe('notification HTTP input', () => {
     expect(result.body).not.toContain('see daemon log')
   })
 
+  test('send rejection redacts conversation/message ids, emails and paths like Agent diagnostics', async () => {
+    const result = await invoke([Buffer.from(JSON.stringify({ project: 'ops', text: 'done' }))], '/notify', {
+      sendCard: async (_chatId, _card, onFailure) => {
+        onFailure?.({ response: { data: { code: 230002, error: { log_id: 'notify-log-456' },
+          msg: 'bot not in chat oc_0123456789abcdef0123 for om_0123456789abcdef0123 owner alice@corp.example user ou_0123456789abcdef0123456789abcdef file /home/alice/alpha-team/a.png' } } })
+        return null
+      },
+    })
+    expect(result.status).toBe(502)
+    expect(result.body).toBe('feishu sendCard failed: code=230002 message=bot not in chat <id> for <id> owner <email> user … file <path> log_id=notify-log-456')
+  })
+
   test('unreported send diagnostics remain explicitly missing', async () => {
     const result = await invoke([Buffer.from(JSON.stringify({ project: 'ops', text: 'done' }))], '/notify', {
       sendCard: async () => null,
@@ -98,6 +110,9 @@ describe('notification HTTP input', () => {
   test('HTTP error boundary exposes known Feishu failures and keeps other internal errors private', async () => {
     for (const [error, expected] of [
       [new FeishuRequestError('upload failed', 400, 234001, undefined, 'boundary-log', 'invalid image'), 'code=234001 message=invalid image log_id=boundary-log'],
+      [new FeishuRequestError('send failed', 400, 230002, undefined, 'boundary-log',
+        'chat oc_0123456789abcdef0123 user ou_0123456789abcdef0123456789abcdef mail a@corp.example at /srv/alpha-team'),
+      'code=230002 message=chat <id> user … mail <email> at <path> log_id=boundary-log'],
       [new Error('internal secret'), 'internal error'],
     ] as const) {
       const server = startNotifyServer({ bind: '127.0.0.1', port: 0, extraHandler: async () => { throw error } })!

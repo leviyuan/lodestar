@@ -426,6 +426,42 @@ describe('notification text reply workflow', () => {
     expect((await h.open()).ok).toBe(false)
   })
 
+  test('a reply prompt expired by restart says why, keeps the reply button and is presented again after the next restart', async () => {
+    register(registration())
+    const h = harness()
+    await h.open()
+    const firstPrompt = get('nf_reply')!.replyState!.promptMessageId
+
+    // Restart 1: both cards explain the expiry; the original keeps 「回复」.
+    __setStoreFileForTest(file)
+    const first = loadCallbacks()
+    expect(first.map(reg => reg.notifyId)).toEqual(['nf_reply'])
+    await h.runtime.recover(first[0]!)
+    const prompt = h.updated.find(update => update.messageId === firstPrompt)!.card
+    expect(prompt.header.title.content).toBe('回复已失效（服务重启）')
+    expect(JSON.stringify(prompt)).toContain('服务重启，本次回复已失效')
+    const main = JSON.stringify(h.updated.find(update => update.messageId === 'om_notification')!.card)
+    expect(main).toContain('回复已失效（服务重启），请重新点击「回复」')
+    expect(main).not.toContain('✅ 已回复')
+    expect(main).toContain('"kind":"notify_reply"')
+    expect(buildNotifyResult(get('nf_reply')!)).toMatchObject({ reply: { status: 'cancelled', cancel_reason: 'restart' } })
+
+    // Clicking 「回复」 again opens a fresh prompt; restart 2 must expire it as well,
+    // even though restart 1 already recorded its own presentation.
+    expect((await h.open()).ok).toBe(true)
+    const secondPrompt = get('nf_reply')!.replyState!.promptMessageId
+    expect(secondPrompt).not.toBe(firstPrompt)
+    __setStoreFileForTest(file)
+    const second = loadCallbacks()
+    expect(second.map(reg => reg.notifyId)).toEqual(['nf_reply'])
+    await h.runtime.recover(second[0]!)
+    expect(h.updated.find(update => update.messageId === secondPrompt)!.card.header.title.content).toBe('回复已失效（服务重启）')
+
+    // Once presented, a third restart without a new prompt stays quiet.
+    __setStoreFileForTest(file)
+    expect(loadCallbacks()).toEqual([])
+  })
+
   test('send failure does not reserve input', async () => {
     register(registration())
     const h = harness()

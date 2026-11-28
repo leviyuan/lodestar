@@ -411,8 +411,10 @@ mock.module('./feishu', () => ({
   listNormalChatIdsByName: async () => new Map([...chatIdsByName].map(([name, ids]) => [name, ids.slice()])),
   disbandChatForSession: async (sessionName: string) => {
     const chatId = chatIdsByName.get(sessionName)?.[0] ?? null
+    // 找不到群时与 feishu.ts 一致：不算解散（唯一调用方 wt 删除据此报 group missing）。
+    if (!chatId) return { chatId: null, disbanded: false }
     // 外部群：机器人只能退群，与 feishu.ts 一致。
-    if (chatId && externalChatIds.has(chatId)) {
+    if (externalChatIds.has(chatId)) {
       botLeftChats.push(chatId)
       return { chatId, disbanded: false, left: true }
     }

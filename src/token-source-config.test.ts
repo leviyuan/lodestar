@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { TokenSourceConfig } from './config'
 
 // 配置模块在 import 时读取文件；子进程同时隔离模块 mock 和真实配置。
 function runConfigUpdate(work: string): void {
@@ -190,6 +191,30 @@ test('persists the Claude subscription switch across later model edits and prese
     assert.deepEqual(config.token_sources['claude-sub'], { enabled: true, model: 'sonnet', hidden_models: 'opus', effort: 'high' })
     assert.equal(config.token_sources.glm.auth_token, 'old-token')
     assert.equal(config.token_sources.glm.slots, 'opus=GLM-5.3[1m],sonnet=GLM-5.3[1m]')
+  `)
+})
+
+// 每个可解析字段都必须能写回：TokenSourceConfig 新增字段时类型检查要求补进这里，写回漏掉则下面的用例失败。
+const EVERY_FIELD = {
+  agent: 'claude', enabled: false, display: '团队 "Claude" \\ 备注', auth: 'api_key',
+  base_url: 'https://example.invalid/anthropic', auth_token: 'token-test', api_key: 'key-test',
+  bin: '/opt/reclaude', org: '4242', model: 'opus', effort: 'high', models: 'opus,haiku',
+  hidden_models: 'haiku', shown_models: 'opus', custom_models: 'sonnet', slots: 'opus=GLM-5.3[1m]',
+  usage: 'https://example.invalid/usage', default: true,
+} satisfies Required<TokenSourceConfig>
+
+test('every parsable field survives a rewrite of its section unchanged', () => {
+  runConfigUpdate(`
+    const { loadConfig } = await import(${JSON.stringify(join(import.meta.dir, 'config.ts'))})
+    const every = ${JSON.stringify(EVERY_FIELD)}
+    saveTokenSourceConfigs({ roundtrip: every })
+    assert.deepEqual(loadConfig().token_sources.roundtrip, every)
+    // md 维护模型时只传改动的字段，其余字段按已保存的值整节重写。
+    saveTokenSourceConfigs({ roundtrip: { hidden_models: 'haiku,opus' } })
+    assert.deepEqual(loadConfig().token_sources.roundtrip, { ...every, hidden_models: 'haiku,opus' })
+    saveTokenSourceConfigs({ roundtrip: { enabled: true, default: false } })
+    assert.deepEqual(loadConfig().token_sources.roundtrip, { ...every, hidden_models: 'haiku,opus', enabled: true, default: false })
+    assert.equal(loadConfig().token_sources.glm.auth_token, 'old-token')
   `)
 })
 

@@ -216,10 +216,11 @@ export class AgentService {
     const sameOwner = agentOwnerKey(agentRunOwner(history.run.snapshot)) === agentOwnerKey(context.owner)
     const effort = request.effort ?? (history.worker.identityId === identity.id ? history.worker.effort : undefined)
     const workDir = request.workDir ?? history.run.snapshot.workDir
-    // A continuation keeps the chain's display, but only a project-owned run may stay silent:
-    // a session-owned continuation of a silent project run still returns its own card.
-    const silentSource = isSilentAgentRun(history.run.snapshot) && context.owner.kind === 'project'
-    const display = request.display ?? (silentSource ? 'silent' : 'card')
+    // 同归属续跑保持链上的展示方式（静默续静默、有卡续有卡）；跨归属续跑不继承，
+    // 由 createRun 取调用方归属的默认值：项目调用默认静默，会话委派始终有卡。
+    const inherited = !sameOwner ? undefined
+      : isSilentAgentRun(history.run.snapshot) && context.owner.kind === 'project' ? 'silent' as const : 'card' as const
+    const display = request.display ?? inherited
     const releaseSession = this.reserveNativeSession({ provider: identity.provider, sessionId: request.sessionId! })
     try {
       return await this.createRun(context, {
@@ -961,7 +962,9 @@ export class AgentService {
   }
 
   private loadDurableRuns(): void {
-    pruneExpiredRunArtifacts()
+    // 清理失败（删不掉、清单写不进）只影响隐私保留期，不能让 daemon 起不来；下一轮定期清理会重试。
+    try { pruneExpiredRunArtifacts() }
+    catch (e) { logError('agent-service: retention sweep failed', e) }
     for (const snapshot of this.deps.loadArtifacts()) {
       // Only a run this restart changes needs a new durable record: one that was still
       // active, or one stored before prompts and outputs moved to separate artifacts.
@@ -995,7 +998,8 @@ export class AgentService {
         cancellationEpoch: 0,
         finalizing: false,
         finalized: true,
-        artifactsUnloaded: false,
+        // 正文在启动时读不出来的 run 照常登记（它是归属与续接索引），按未加载处理：status 重新读取并报错。
+        artifactsUnloaded: unreadableAtLoad.has(snapshot),
         persistedArtifacts: new Set([
           ...(snapshot.promptArtifact ? [snapshot.promptArtifact] : []),
           ...snapshot.workers.flatMap(worker => worker.outputArtifact ? [worker.outputArtifact] : []),
@@ -1109,16 +1113,26 @@ function cloneSnapshot(snapshot: AgentRunSnapshot): AgentRunSnapshot {
   return JSON.parse(JSON.stringify(snapshot)) as AgentRunSnapshot
 }
 
+/** Snapshots whose prompt/output body could not be read while loading at boot. */
+const unreadableAtLoad = new WeakSet<AgentRunSnapshot>()
+
 function loadAgentRunArtifacts(): AgentRunSnapshot[] {
   if (!existsSync(AGENT_RUNS_DIR)) return []
   const snapshots: AgentRunSnapshot[] = []
   for (const name of readdirSync(AGENT_RUNS_DIR).filter(name => name.endsWith('.json') && name !== PRUNED_ARTIFACT_MANIFEST).sort()) {
     const path = join(AGENT_RUNS_DIR, name)
     let value: unknown
+    // 快照本身原子写入，损坏或格式不符只可能来自外部改动；它是归属与续接索引，
+    // 静默跳过会丢失归属记录，因此仍然报错。
     try { value = JSON.parse(readFileSync(path, 'utf8')) }
     catch (error) { throw new Error(`agent run artifact is unreadable (${path}): ${messageOf(error)}`) }
     if (!isAgentRunSnapshot(value)) throw new Error(`agent run artifact is invalid: ${path}`)
-    hydrateSnapshotArtifacts(value, path)
+    // 单个正文读不出来不能阻断启动；status 届时重新读取并报告原始错误。
+    try { hydrateSnapshotArtifacts(value, path) }
+    catch (error) {
+      logError('agent-service: run text unreadable at load', error)
+      unreadableAtLoad.add(value)
+    }
     snapshots.push(value)
   }
   return snapshots
@@ -1171,58 +1185,84 @@ function hydrateSnapshotArtifacts(
   snapshot: AgentRunSnapshot,
   snapshotPath: string,
   read: AgentServiceDeps['readTextArtifact'] = readTextArtifact,
+  now = Date.now(),
 ): void {
-  if (loadPrunedRunIds().has(snapshot.runId)) {
-    snapshot.prompt = PRUNED_RUN_TEXT
+  if (loadPrunedRunIds().has(snapshot.runId)) return markRunTextPruned(snapshot)
+  try {
+    if (snapshot.promptArtifact) snapshot.prompt = read(snapshot.promptArtifact, `prompt for ${snapshotPath}`)
     for (const worker of snapshot.workers) {
-      if (worker.outputArtifact) worker.output = PRUNED_RUN_TEXT
+      if (worker.outputArtifact) worker.output = read(worker.outputArtifact, `output for ${snapshotPath}`)
     }
-    return
+  } catch (error) {
+    // 旧版清理先删正文、最后才写清单，中途被杀会留下没登记的过期 run：
+    // 过期正文缺失即视为已清理；其余读取失败照常报错。
+    if (!isMissingFile(error) || !isRunTextExpired(snapshot, now)) throw error
+    markRunTextPruned(snapshot)
   }
-  if (snapshot.promptArtifact) snapshot.prompt = read(snapshot.promptArtifact, `prompt for ${snapshotPath}`)
+}
+
+function markRunTextPruned(snapshot: AgentRunSnapshot): void {
+  snapshot.prompt = PRUNED_RUN_TEXT
   for (const worker of snapshot.workers) {
-    if (worker.outputArtifact) worker.output = read(worker.outputArtifact, `output for ${snapshotPath}`)
+    if (worker.outputArtifact) worker.output = PRUNED_RUN_TEXT
   }
+}
+
+function isRunTextExpired(snapshot: AgentRunSnapshot, now: number): boolean {
+  if (!isTerminal(snapshot.status)) return false
+  const finished = Date.parse(snapshot.finishedAt ?? snapshot.createdAt)
+  return Number.isFinite(finished) && now - finished >= RUN_TEXT_RETENTION_MS
+}
+
+function isMissingFile(error: unknown): boolean {
+  const code = (value: unknown) => (value as NodeJS.ErrnoException | undefined)?.code
+  return code(error) === 'ENOENT' || code((error as { cause?: unknown } | undefined)?.cause) === 'ENOENT'
 }
 
 /** Delete prompt/output bodies of terminal runs older than the retention
  * window, keeping the lifecycle snapshot for status/ownership. Only artifact
- * files are touched; the snapshot is not rewritten on every boot. */
+ * files are touched; the snapshot is not rewritten on every boot.
+ *
+ * 先把 run id 写进清单再删正文：中途被杀或删除失败只会留下已登记的正文，
+ * 下一轮清理重试删除，不会出现“正文已删、清单没记”的 run。 */
 export function pruneExpiredRunArtifacts(dir = AGENT_RUNS_DIR, now = Date.now()): number {
   if (!existsSync(dir)) return 0
   const known = loadPrunedRunIds(dir)
-  const manifest = new Set(known)
+  const expired: string[] = []
   const added = new Set<string>()
-  let pruned = 0
   for (const name of readdirSync(dir)) {
     if (!name.endsWith('.prompt.txt') && !name.endsWith('.output.txt')) continue
     // Artifact names start with the run id, which never contains a dot.
     const runId = name.slice(0, name.indexOf('.'))
-    const snapshotPath = join(dir, `${runId}.json`)
+    // 已登记却还在的正文：上一轮删除失败或中途停止，重试。
+    if (known.has(runId)) { expired.push(name); continue }
     let snapshot: AgentRunSnapshot
-    try { snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as AgentRunSnapshot }
+    try { snapshot = JSON.parse(readFileSync(join(dir, `${runId}.json`), 'utf8')) as AgentRunSnapshot }
     catch { continue }
-    if (!isAgentRunSnapshot(snapshot) || !isTerminal(snapshot.status)) continue
-    if (known.has(snapshot.runId)) continue
-    const finished = Date.parse(snapshot.finishedAt ?? snapshot.createdAt)
-    if (!Number.isFinite(finished) || now - finished < RUN_TEXT_RETENTION_MS) continue
-    try { unlinkSync(join(dir, name)); pruned++ } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
-    }
-    manifest.add(snapshot.runId)
-    added.add(snapshot.runId)
+    if (!isAgentRunSnapshot(snapshot) || snapshot.runId !== runId || !isRunTextExpired(snapshot, now)) continue
+    expired.push(name)
+    added.add(runId)
   }
   if (added.size > 0) {
+    const manifest = new Set([...known, ...added])
     writeJsonStateAtomic(join(dir, PRUNED_ARTIFACT_MANIFEST), { version: 1, runs: [...manifest].sort() })
     if (dir === AGENT_RUNS_DIR) prunedRunIds = manifest
   }
+  let pruned = 0
+  let failure: unknown
+  for (const name of expired) {
+    try { unlinkSync(join(dir, name)); pruned++ } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') failure ??= error
+    }
+  }
+  if (failure !== undefined) throw failure
   return pruned
 }
 
 function readTextArtifact(name: string, label: string): string {
   assertArtifactName(name)
   try { return readFileSync(join(AGENT_RUNS_DIR, name), 'utf8') }
-  catch (error) { throw new Error(`${label} is unreadable (${name}): ${messageOf(error)}`) }
+  catch (error) { throw new Error(`${label} is unreadable (${name}): ${messageOf(error)}`, { cause: error }) }
 }
 
 function assertArtifactName(name: string): void {

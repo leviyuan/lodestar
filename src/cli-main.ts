@@ -39,8 +39,18 @@ const USAGE_LINES: Partial<Record<CommandName, string>> = {
   stop: 'lodestar stop',
 }
 
+/** 参数只有 lodestar 自己选项的子命令：全局 `--no-color` 也可以写在子命令后。agent、claude
+ * 之后的参数归子命令（claude 原样交给原生 Claude Code），不剥离。 */
+const OWN_OPTION_COMMANDS: ReadonlySet<CommandName> = new Set(['start', 'setup', 'stop', 'update', 'version'])
+
 function isCommand(name: string): name is CommandName {
   return (COMMANDS as readonly string[]).includes(name)
+}
+
+function stripColorFlags(args: string[]): string[] {
+  const rest = args.filter(arg => arg !== '--no-color' && arg !== '--color')
+  if (args.includes('--no-color')) disableColor()
+  return rest
 }
 
 function ensureNewline(text: string): string {
@@ -106,7 +116,8 @@ async function runHelp(rest: string[], io: CliIo): Promise<number> {
   return 0
 }
 
-async function runCommand(name: CommandName, rest: string[], commands: CliCommands, io: CliIo): Promise<number> {
+async function runCommand(name: CommandName, args: string[], commands: CliCommands, io: CliIo): Promise<number> {
+  const rest = OWN_OPTION_COMMANDS.has(name) ? stripColorFlags(args) : args
   if (rest[0] === '--help' || rest[0] === '-h') {
     io.out(await helpFor(name))
     return 0

@@ -211,6 +211,8 @@ interface TurnOpenOwner {
    * that is already running. Eager user/drain opens happen before input is
    * sent, so compaction events in that window belong to an older turn. */
   backendTurnStarted: boolean
+  /** 卡片还没落地时用户发了 stop：开卡方落地后以「🛑 打断」收尾，不再提交输入或继续这一轮。 */
+  userStopped: boolean
   /** Resolves exactly once when this owner is released or invalidated. Same-
    * process follow-up opens await it instead of replacing openingTurnOwner. */
   done: Promise<void>
@@ -445,14 +447,24 @@ export class Session {
    * announced against this card, because that is the message the user last
    * saw for the task. */
   lastClosedTurnMessageId = ''
-  /** Bumped whenever new background work starts. A task-end push covers one
-   * generation, so a late resume turn cannot announce it twice. */
+  /** Bumped whenever new background work starts. Any push sent after a
+   * generation's work ended covers it, so a later settle of that same work
+   * cannot owe the push again. */
   private backgroundWorkGeneration = 0
   private notifiedBackgroundWorkGeneration = -1
+  /** Generation whose settle-owed push went out as the idle task-end notice.
+   * Only the SDK resume turn that then reports that same round skips its push,
+   * once; ordinary turn pushes never set it, so ⏰ wake-ups, DSH “继续执行” and
+   * later resume turns still push their own results. */
+  private taskEndNoticeGeneration = -1
+  /** stop 时仍在跑、且有真正后台化行的那一代：记下当时在跑的行，见 `dropCompletionNoticeForStop`。 */
+  private tasksRunningAtStop: { generation: number; ids: Set<string> } | null = null
   /** A completion push that is owed but not delivered yet. Cleared only by an
    * actual push or by a stop that throws the work away: a continuation turn
-   * opening over it must not be able to drop the notification silently. */
-  private completionPushPending: { messageId: string; userOpenId: string } | null = null
+   * opening over it must not be able to drop the notification silently.
+   * `taskEndGeneration` marks a push owed because that background generation
+   * settled after its turn had closed. */
+  private completionPushPending: { messageId: string; userOpenId: string; taskEndGeneration?: number } | null = null
   private completionNoticeTimer: ReturnType<typeof setTimeout> | null = null
   /** Feishu message_ids of user messages that arrived while the daemon
    * was busy (turn in flight or mid-open), mapped to the `reaction_id`
@@ -605,10 +617,15 @@ export class Session {
    * `startedAt` stays private so this is the documented read path. The model
    * follows the footer's live source: the same account and model row tells
    * what the project is actually running. */
-  peerSnapshot(): { name: string; status: Status; uptimeMs?: number; codexAccountName?: string; claudeAccountName?: string; model?: string; effort?: string } {
+  peerSnapshot(): { name: string; status: Status; uptimeMs?: number; codexAccountName?: string; claudeAccountName?: string; accountLabel?: string; model?: string; effort?: string } {
     const proc = this.proc?.isAlive() ? this.proc : null
     const codexAccount = proc ? liveCodexAccount(proc) : null
     const runtime = this.runtimeModelSelection()
+    // 订阅进程的账号名仍由下面两个字段给出（选号中、等额度不写）；GLM、DeepSeek、OpenRouter、
+    // 中转站、reclaude 等来源与启动卡、群里 hi 同口径写来源名，单聊面板的账号行不再只有模型。
+    const subscription = proc?.tokenSourceId === 'claude-sub' || proc?.tokenSourceId === 'codex-sub'
+      || (proc?.provider === 'codex' && getTokenSource(proc.tokenSourceId)?.kind === 'codex-subscription')
+    const accountLabel = proc && !subscription ? this.accountAssignmentLabel(proc) : null
     return {
       name: this.sessionName,
       status: this.status,
@@ -618,6 +635,7 @@ export class Session {
       ...(codexAccount !== null ? { codexAccountName: codexAccounts.get(codexAccount).name } : {}),
       ...(proc?.tokenSourceId === 'claude-sub' && processClaudeAccount(proc)
         ? { claudeAccountName: claudeAccounts.get(processClaudeAccount(proc)!).name } : {}),
+      ...(accountLabel ? { accountLabel } : {}),
     }
   }
 
@@ -1603,12 +1621,31 @@ export class Session {
       terminalForcePush: false,
       pendingCompactions: [],
       backendTurnStarted,
+      userStopped: false,
       done,
       resolveDone,
     }
     this.openingTurnOwner = owner
     this.openingTurn = true
     return owner
+  }
+
+  /** stop 落在开卡窗口（openTurnCard 在途、currentTurn 还是空的）：这一轮同样被打断。
+   * 实际可达的是不经同群消息队列开卡的入口：init 开的排队批次与 SDK 恢复轮、⏰ 唤醒/DSH
+   * 「继续执行」、上一轮收尾后为排队消息开卡；冷启动与空闲直开的消息和 stop 同在一个群队列里
+   * 串行，那两处的同类检查只是直接调用时的防御。只做标记，卡片落地后由开卡方以「🛑 打断」
+   * 收尾、不再提交输入；后端已经开始的轮次同时中断，其 result 按打断丢弃。没有在开的卡，或
+   * 这一轮的 result 已经到达（后端已结束、没有可停的）时返回 false。 */
+  stopOpeningTurn(): boolean {
+    const owner = this.openingTurnOwner
+    if (this.currentTurn || !owner || owner.sawResult) return false
+    if (owner.userStopped) return true
+    owner.userStopped = true
+    if (owner.backendTurnStarted) {
+      this.userInterrupted = true
+      this.interrupt()
+    }
+    return true
   }
 
   private ownsTurnOpen(owner: TurnOpenOwner): boolean {
@@ -1623,6 +1660,9 @@ export class Session {
     this.openingTurn = false
     owner.resolveDone()
     this.steerPendingInputs()
+    // 开卡时停掉了欠账的计时；这一轮没开成（或开卡期间已收尾）时由这里重新计时，否则欠下的推送
+    // 在空闲后永远不补发。开成了则 currentTurn 在，留给它收尾时评估。
+    this.armCompletionNotice()
   }
 
   private invalidateTurnOpen(): void {
@@ -1630,6 +1670,7 @@ export class Session {
     this.openingTurnOwner = null
     this.openingTurn = false
     owner?.resolveDone()
+    if (owner) this.armCompletionNotice()
   }
 
   /** Wait for a same-process card-open transaction to finish. Process
@@ -2140,6 +2181,8 @@ export class Session {
   }
 
   private async stopUnlocked(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
+    // 被停止的工作不欠完成通知：在第一个 await 之前同步作废，kill 等得再久也不会中途推送。
+    this.clearCompletionNotice()
     this.cancelFileDeliveries(reason)
     const announce = opts.announce ?? true
     const report = opts.onStatus
@@ -3094,7 +3137,7 @@ export class Session {
     return sessionTemp.onResumeSelect(this, panelId, choiceId, userOpenId)
   }
 
-  /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
+  /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`)
    * plus their two-letter aliases where applicable.
    * Returns true if the command was consumed (don't forward to Codex). */
   runCommand(raw: string, userOpenId = '', messageId?: string, requester?: RequesterTenant): Promise<boolean> {
@@ -3315,6 +3358,20 @@ export class Session {
       })
       const turn = opened
       if (!turn || this.currentTurn !== turn) return
+      if (openOwner.userStopped) {
+        // 防御：群里的 stop 经同群队列排在这条消息之后，冷启动期间到不了这里；直接调用 Session 时
+        // 卡片还没落地就被 stop，则卡片以「🛑 打断」收尾、这条消息不再送入，进程照常启动留给下一条
+        // 消息。卡片已经收尾，启动失败改发文字说明。
+        await this.closeTurnCard('🛑 打断')
+        let lastStatus = ''
+        const started = await this.startUnlocked({
+          announce: false,
+          freshConversationStateAlreadyReset: true,
+          onStatus: status => { lastStatus = status },
+        })
+        if (!started) await feishu.sendText(this.chatId, lastStatus.startsWith('❌') ? lastStatus : '❌ 启动失败')
+        return
+      }
       const bootTimer = this.startFooterTimer(
         turn.cardId,
         this.withModelAndAccount(`🚀 启动 ${this.backendLabel()}`, null),
@@ -3345,6 +3402,14 @@ export class Session {
       const proc = this.proc
       if (!proc?.isAlive()) {
         await this.closeTurnCard(`❌ ${this.backendLabel()} 启动后已退出`, { forcePush: true })
+        return
+      }
+      // 防御：群里的 stop 经同群队列排在这条消息之后、按正常打断处理。直接调用 Session 时若启动
+      // 期间本轮已被 stop 收尾（卡片显示「🛑 打断」、待发输入已清空），这条消息不能再送进后端执行；
+      // 后端没有在跑的轮次，不会再有被打断轮的 result，等它的标记要清掉，否则会吞掉下一轮的
+      // result；进程保持就绪，留给下一条消息。
+      if (this.currentTurn !== turn) {
+        this.userInterrupted = false
         return
       }
       this.startThinkingFooter(turn)
@@ -3499,6 +3564,13 @@ export class Session {
         // daemon 自渲染,跟 SDK input 流分离)。
         this.pendingTurnInputs.push(text)
         const opened = await this.openTurnCard(openOwner, userOpenId, 'user_message')
+        if (openOwner.userStopped) {
+          // 防御：群里的 stop 经同群队列排在这条消息之后，到不了这里；直接调用 Session 时卡片还没
+          // 落地就被 stop，则这条消息不再送入，卡片以「🛑 打断」收尾。
+          if (opened && this.currentTurn === opened) await this.closeTurnCard('🛑 打断')
+          if (resumedProc) throw new Error('用户已停止，未发送自动续接请求')
+          return
+        }
         if (!opened || this.currentTurn !== opened) {
           if (resumedProc) throw new Error('自动续接卡片未打开，未发送续接请求')
           return
@@ -3846,21 +3918,36 @@ export class Session {
   private noteBackgroundWorkSettled(): void {
     if (this.hasActiveBackgroundWork()) return
     if (this.notifiedBackgroundWorkGeneration === this.backgroundWorkGeneration) return
-    this.markCompletionPending()
+    const atStop = this.tasksRunningAtStop
+    this.tasksRunningAtStop = null
+    if (atStop?.generation === this.backgroundWorkGeneration
+      && !this.backgroundTasks.some(task => atStop.ids.has(task.id) && task.status === 'completed')) {
+      // stop 时在跑的任务没有一个正常完成，都以 killed/failed 结束（随 stop 停掉）：按主动停止处理，不补发。
+      this.clearCompletionNotice()
+      this.notifiedBackgroundWorkGeneration = this.backgroundWorkGeneration
+      return
+    }
+    this.markCompletionPending(undefined, undefined, this.backgroundWorkGeneration)
   }
 
   /** Record that a push is owed and remember which card and person it belongs
    * to. `messageId`/`openId` default to the last closed card and last sender so
    * a continuation turn (resume, ⏰ wake-up, DSH “继续执行”) that the backend
-   * started on its own cannot swallow the notification. */
-  private markCompletionPending(messageId?: string, userOpenId?: string): void {
+   * started on its own cannot swallow the notification. With no sender in
+   * memory (daemon restart, after a stop) an already owed push keeps the
+   * recipient it recorded and is still timed. */
+  private markCompletionPending(messageId?: string, userOpenId?: string, taskEndGeneration?: number): void {
+    const owed = this.completionPushPending
     const card = messageId || this.lastClosedTurnMessageId
-    const recipient = userOpenId || this.lastUserOpenId
+    const recipient = userOpenId || this.lastUserOpenId || owed?.userOpenId
     if (!card || !recipient) {
       logDiagnostic('session: completion push missing recipient')
       return
     }
-    this.completionPushPending = { messageId: card, userOpenId: recipient }
+    const generation = taskEndGeneration ?? owed?.taskEndGeneration
+    this.completionPushPending = generation === undefined
+      ? { messageId: card, userOpenId: recipient }
+      : { messageId: card, userOpenId: recipient, taskEndGeneration: generation }
     this.armCompletionNotice()
   }
 
@@ -3870,7 +3957,8 @@ export class Session {
   private armCompletionNotice(): void {
     if (!this.completionPushPending) return
     if (this.hasActiveBackgroundWork()) return
-    if (this.currentTurn || this.openingTurn || this.turnCloseInflight.size > 0) return
+    // 无卡续写的恢复轮/⏰ 轮（`bgResumeCardless`）同样算这一轮还在跑：等它的 result 到达再计时。
+    if (this.currentTurn || this.openingTurn || this.bgResumeCardless || this.turnCloseInflight.size > 0) return
     if (this.completionNoticeTimer) return
     this.completionNoticeTimer = setTimeout(() => {
       this.completionNoticeTimer = null
@@ -3881,15 +3969,18 @@ export class Session {
   /** Claude normally opens its resume turn inside the grace window, and that
    * turn's close pushes the result instead. Only a session that stays idle owes
    * the user the explicit push. Anything that owns the decision re-arms this
-   * from its own settle point — returning early here never drops the intent. */
+   * from its own settle point — returning early here never drops the intent.
+   * Every push already clears the owed one, so whatever is still owed here is
+   * delivered even if this session pushed something earlier. */
   private async deliverCompletionNotice(): Promise<void> {
     const pending = this.completionPushPending
     if (!pending) return
     if (this.hasActiveBackgroundWork()) return
-    if (this.currentTurn || this.openingTurn || this.turnCloseInflight.size > 0) return
-    if (this.notifiedBackgroundWorkGeneration === this.backgroundWorkGeneration) {
-      this.completionPushPending = null
-      return
+    if (this.currentTurn || this.openingTurn || this.bgResumeCardless || this.turnCloseInflight.size > 0) return
+    // 进程正在停止（kill/restart/clear）：被停止的工作不补发，欠账随这次停止清掉。
+    if (this.stoppingProc || this.blockedProc) return
+    if (pending.taskEndGeneration === this.backgroundWorkGeneration) {
+      this.taskEndNoticeGeneration = pending.taskEndGeneration
     }
     this.notifiedBackgroundWorkGeneration = this.backgroundWorkGeneration
     this.completionPushPending = null
@@ -3906,6 +3997,23 @@ export class Session {
   private clearCompletionNotice(): void {
     this.clearCompletionNoticeTimer()
     this.completionPushPending = null
+  }
+
+  /** 用户主动 stop：欠下的完成通知随被停止的工作作废，打断的轮次收尾后也不补发；这一代后台
+   * 同时记为已处理，免得之后零星的任务事件（含随打断停掉的前台子 Agent、DSH/Codex 子任务）把它
+   * 重新记成欠账。只有真正后台化的行（`isBackgrounded`：is_backgrounded 提升或 workflow/monitor
+   * 这类天生后台）不随 stop 停下、照常跑完：这时欠账原样留给它们结束时的结算，并返回 true，调用方
+   * 据此保留内存里的发送者；同时记下这时在跑的行，它们之后若全以 killed/failed 结束，仍按主动停止
+   * 处理、不补发。 */
+  dropCompletionNoticeForStop(): boolean {
+    const running = this.backgroundTasks.filter(task => !cards.isBgTerminal(task))
+    if (running.some(task => task.isBackgrounded === true)) {
+      this.tasksRunningAtStop = { generation: this.backgroundWorkGeneration, ids: new Set(running.map(task => task.id)) }
+      return true
+    }
+    this.clearCompletionNotice()
+    this.notifiedBackgroundWorkGeneration = this.backgroundWorkGeneration
+    return false
   }
 
   private refreshBackgroundCardFull(): Promise<void> {
@@ -4004,6 +4112,11 @@ export class Session {
           }
           return
         }
+        if (openOwner.userStopped) {
+          // 卡片还没落地时用户已 stop：后端这一轮已中断（result 按打断丢弃），卡片落地就以「🛑 打断」收尾。
+          if (opened && this.currentTurn === opened) await this.closeTurnCard('🛑 打断')
+          return
+        }
         if (!opened || this.currentTurn !== opened) {
           if (!this.ownsTurnOpen(openOwner)) return
           // The scheduled turn is already executing inside the SDK. Preserve
@@ -4014,6 +4127,8 @@ export class Session {
             openOwner.sawResult = false
             logDiagnostic('session: scheduled open failed after result')
             this.flushOrphanAssistantToChat('scheduled open failed, result already arrived')
+            // 这一轮已经结束，没有续窗；释放开卡时重新计时欠下的推送。
+            this.bgResumeCardless = false
           } else {
             logDiagnostic('session: scheduled open failed')
           }
@@ -4178,6 +4293,12 @@ export class Session {
             releaseClaimedReactions()
             return
           }
+          if (openOwner.userStopped) {
+            // 卡片还没落地时用户已 stop：后端这一轮已中断（result 按打断丢弃），等待表情已由 stop
+            // 撤掉，卡片落地就以「🛑 打断」收尾。
+            if (opened && this.currentTurn === opened) await this.closeTurnCard('🛑 打断')
+            return
+          }
           if (!opened || this.currentTurn !== opened) {
             // A newer open on the same process can supersede this owner while
             // Feishu is resolving message_id -> card_id. Never interrupt or
@@ -4209,6 +4330,8 @@ export class Session {
                 openOwner.sawResult = false
                 logDiagnostic('session: bg-resume openTurnCard failed, result already arrived')
                 this.flushOrphanAssistantToChat('bg-resume open failed, result already arrived')
+                // 这一轮已经结束，没有续窗；释放开卡时重新计时欠下的推送。
+                this.bgResumeCardless = false
               } else {
                 logDiagnostic('session: bg-resume openTurnCard failed')
               }
@@ -4458,6 +4581,11 @@ export class Session {
       // 窗口内(openingTurn)不 flush —— 让 openTurnCard 把缓冲并入卡片,
       // 避免又推一遍。有卡的轮次已在开卡时并入,这里 flush 为 no-op。
       if (!this.currentTurn && !this.openingTurn) this.flushOrphanAssistantToChat('result with no turn card')
+      // 无卡续写的这一轮到此结束：复位续窗，欠下的推送这时才开始计时，不会早于这轮回复结束。
+      if (this.bgResumeCardless && !this.currentTurn && !this.openingTurn) {
+        this.bgResumeCardless = false
+        this.armCompletionNotice()
+      }
       const hasMidTurn = this.pendingMidTurnMsgs.length > 0
       const isError = snapshot.result.is_error === true
       const subtype = snapshot.result.subtype ?? 'success'
@@ -4885,6 +5013,12 @@ export class Session {
       // agent until it exists: if sendCard/id_convert fails, the user can
       // safely resend and the model has not already changed files off-screen.
       const opened = await this.openTurnCard(openOwner, userOpenId, 'user_message')
+      if (openOwner.userStopped) {
+        // 卡片还没落地时用户已 stop：这批消息不再送入（等待表情已由 stop 撤掉），卡片以「🛑 打断」收尾。
+        if (opened && this.currentTurn === opened) await this.closeTurnCard('🛑 打断')
+        this.status = 'idle'
+        return
+      }
       if (!opened || this.currentTurn !== opened) {
         for (const msg of batch) {
           if (!msg.msgId) continue
@@ -6613,8 +6747,9 @@ export class Session {
 
     // Phone push when the task really ends. A turn that closes while subagents
     // or background shells still run leaves the push to the task-end notice,
-    // and a continuation turn reporting work that notice already covered does
-    // not push a second time. `opts.forcePush` still overrides the suffix-gate.
+    // and the SDK resume turn reporting the round that idle notice already
+    // announced does not push a second time. `opts.forcePush` still overrides
+    // the suffix-gate.
     // Fire-and-forget; urgent_app failures are non-fatal and already
     // logged in feishu.ts.
     // 续卡仍未成功时已有失败提示，不推送旧卡的完成通知。
@@ -6623,12 +6758,21 @@ export class Session {
     // ping, otherwise the turn that actually finishes the task stays silent.
     // A daemon restart also clears the in-memory sender, so fall back to the
     // last person who actually wrote in this chat (read live, never persisted).
-    const recipient = turn.userOpenId || this.lastUserOpenId || await this.lastMessageSender()
-    const continuationTurn = turn.trigger === 'bg_task_resume' || turn.trigger === 'scheduled_wakeup'
-    const announcedByTaskEnd = continuationTurn
-      && this.notifiedBackgroundWorkGeneration === this.backgroundWorkGeneration
-    const pushNow = (opts.forcePush || !suffix) && !!recipient && !!turn.messageId
-      && !turn.cardRotationFailed && !this.hasActiveBackgroundWork() && !announcedByTaskEnd
+    // Skipped once, and only for that report: ⏰ wake-ups, DSH “继续执行” and
+    // later resume turns bring new results and push like any other turn.
+    const announcedByTaskEnd = turn.trigger === 'bg_task_resume'
+      && this.taskEndNoticeGeneration === this.backgroundWorkGeneration
+    if (announcedByTaskEnd) this.taskEndNoticeGeneration = -1
+    // Only a push or an owed push needs a person. Interrupted, killed, failed
+    // and already-announced closes never read the chat tail — stop and kill
+    // wait for this close.
+    const mayPush = (opts.forcePush || !suffix) && !!turn.messageId
+      && !turn.cardRotationFailed && !announcedByTaskEnd
+    const mayOwe = !!opts.hasFreshResult && !turn.cardRotationFailed && !announcedByTaskEnd
+      && (suffix === undefined || suffix === MID_TURN_HANDOFF_SUFFIX)
+    const recipient = turn.userOpenId || this.lastUserOpenId
+      || (mayPush || mayOwe ? await this.lastMessageSender() : '')
+    const pushNow = mayPush && !!recipient && !this.hasActiveBackgroundWork()
     if (pushNow) {
       // Record the generation so a late settle of this same round cannot push
       // the same completion twice.

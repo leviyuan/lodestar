@@ -1964,6 +1964,124 @@ describe('Claude message dispatch isolation', () => {
       rmSync(root, { recursive: true, force: true })
     }
   })
+
+  test('a throwing token_usage listener still lets the same result message end the turn', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'claude-dispatch-'))
+    const logged = spyOn(logModule, 'logError').mockImplementation(() => {})
+    const spy = spyOn(agentUpdates, 'loadClaudeSdk').mockResolvedValue({
+      query() {
+        let finish!: () => void
+        const ended = new Promise<void>(resolve => { finish = resolve })
+        return {
+          accountInfo: async () => ({ subscriptionType: 'max' }),
+          supportedModels: async () => [],
+          close() { finish() },
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'system', subtype: 'init', session_id: 'usage-session' }
+            yield { type: 'result', subtype: 'success', session_id: 'usage-session',
+              usage: { input_tokens: 3, output_tokens: 1 }, duration_ms: 5, num_turns: 1 }
+            await ended
+          },
+        }
+      },
+    } as any)
+    const proc = new ClaudeAgentProcess({ workDir: root, effort: 'max' })
+    const errors: Error[] = []
+    proc.on('error', error => errors.push(error))
+    // token_usage 与 result 来自同一条 SDK result 消息：footer 渲染抛错不能吞掉 result。
+    proc.on('token_usage', () => { throw new Error('footer usage render bug') })
+    const result = new Promise<any>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('result was never emitted')), 5_000)
+      proc.once('result', value => { clearTimeout(timer); resolve(value) })
+    })
+    try {
+      await proc.initializationPromise()
+      expect(await result).toMatchObject({ is_error: false })
+      expect(errors).toEqual([])
+      expect(proc.isAlive()).toBe(true)
+      expect(logged.mock.calls.map(call => call[0])).toContain('claude-agent-process: message dispatch failed')
+    } finally {
+      await proc.kill().catch(() => {})
+      spy.mockRestore()
+      logged.mockRestore()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('throwing listeners do not drop later blocks of the same assistant or user message', () => {
+    const logged = spyOn(logModule, 'logError').mockImplementation(() => {})
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'max' }) as any
+    const seen: string[] = []
+    proc.on('local_command_output', () => { throw new Error('local output render bug') })
+    proc.on('tool_use', (event: any) => {
+      seen.push(`tool_use:${event.id}`)
+      if (event.id === 'tool-first') throw new Error('tool card bug')
+    })
+    proc.on('assistant_text', () => { throw new Error('text render bug') })
+    proc.on('assistant_block_stop', () => seen.push('block_stop'))
+    proc.on('tool_result', (event: any) => {
+      seen.push(`tool_result:${event.tool_use_id}`)
+      throw new Error('result card bug')
+    })
+    try {
+      expect(() => proc.handleMessage({ type: 'assistant', uuid: 'a', local_command_source: 'x', message: {
+        model: 'claude-opus-5-5',
+        content: [
+          { type: 'text', text: 'out' },
+          { type: 'tool_use', id: 'tool-first', name: 'Bash', input: { command: 'ls' } },
+          { type: 'tool_use', id: 'tool-after', name: 'Read', input: { file_path: '/tmp/x' } },
+        ],
+      } })).not.toThrow()
+      expect(() => proc.handleMessage({ type: 'user', message: { content: [
+        { type: 'tool_result', tool_use_id: 'tool-first', content: 'one' },
+        { type: 'tool_result', tool_use_id: 'tool-after', content: 'two' },
+      ] } })).not.toThrow()
+      expect(seen).toEqual(['block_stop', 'tool_use:tool-first', 'tool_use:tool-after',
+        'tool_result:tool-first', 'tool_result:tool-after'])
+      expect(logged.mock.calls.map(call => call[0])
+        .filter(event => event === 'claude-agent-process: message dispatch failed')).toHaveLength(5)
+    } finally {
+      logged.mockRestore()
+    }
+  })
+
+  test('a throwing exit listener is logged instead of being reported as a read loop failure', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'claude-dispatch-'))
+    const logged = spyOn(logModule, 'logError').mockImplementation(() => {})
+    const spy = spyOn(agentUpdates, 'loadClaudeSdk').mockResolvedValue({
+      query() {
+        return {
+          accountInfo: async () => ({ subscriptionType: 'max' }),
+          supportedModels: async () => [],
+          close() {},
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'system', subtype: 'init', session_id: 'exit-session' }
+          },
+        }
+      },
+    } as any)
+    const proc = new ClaudeAgentProcess({ workDir: root, effort: 'max' })
+    const errors: Error[] = []
+    const exits: any[] = []
+    proc.on('error', error => errors.push(error))
+    proc.on('exit', event => exits.push(event))
+    proc.on('exit', () => { throw new Error('host exit listener bug') })
+    try {
+      await proc.initializationPromise()
+      await (proc as any).exitPromise
+      await Bun.sleep(0)
+      expect(exits).toHaveLength(1)
+      expect(errors).toEqual([])
+      const events = logged.mock.calls.map(call => call[0])
+      expect(events).toContain('claude-agent-process: exit dispatch failed')
+      expect(events).not.toContain('claude-agent-process: read loop failed')
+    } finally {
+      await proc.kill().catch(() => {})
+      spy.mockRestore()
+      logged.mockRestore()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('Claude safety refusal fallback', () => {
@@ -1983,6 +2101,27 @@ describe('Claude safety refusal fallback', () => {
       ...extra,
     }
   }
+
+  test('a main-thread reply from the original model ends the fallback even with a dated id or a [1m] original', () => {
+    const diagnostic = spyOn(logModule, 'logDiagnostic').mockImplementation(() => {})
+    try {
+      const cases: Array<[string, string, boolean]> = [
+        ['claude-opus-5-5', 'claude-opus-5-5', true],
+        ['claude-opus-5-5', 'claude-opus-5-5-20261101', true],
+        ['claude-opus-5-5[1m]', 'claude-opus-5-5', true],
+        ['claude:claude-opus-5-5', 'claude-opus-5-5-20261101', true],
+        // The fallback model itself, or another model, keeps the session marked as degraded.
+        ['claude-opus-5-5', 'claude-opus-4-8', false],
+        ['claude-opus-5-5', 'claude-opus-5-5-mini', false],
+      ]
+      for (const [original, reply, cleared] of cases) {
+        const { proc } = capture()
+        proc.handleMessage(fallback({ original_model: original }))
+        proc.handleMessage({ type: 'assistant', uuid: 'r', message: { model: reply, content: [] } })
+        expect([original, reply, proc.refusalFallback === null]).toEqual([original, reply, cleared])
+      }
+    } finally { diagnostic.mockRestore() }
+  })
 
   test('a session-scoped fallback is reported and the session stays on the fallback model until set again', async () => {
     const diagnostic = spyOn(logModule, 'logDiagnostic').mockImplementation(() => {})

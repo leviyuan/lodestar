@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, join } from 'node:path'
+import { scrubAgentHostEnv } from './agent-env'
 
 export const RECLAUDE_DIAGNOSTIC_PREFIX = 'reclaude:'
 const STATUS_TIMEOUT_MS = 20_000
@@ -105,16 +106,23 @@ export function selectReclaudeBinding(status: ReclaudeStatus, org: string | unde
   return status.current
 }
 
-/** 只读查询：`--check` 不下载也不修改本机安装。 */
+/** 只读查询：`--check` 不下载也不修改本机安装。第三方命令拿不到 Lodestar 宿主变量（配置与数据路径、续接群 ID、飞书凭据）。 */
 export function readReclaudeStatus(
-  bin: string, env: NodeJS.ProcessEnv = { ...process.env, PATH: reclaudePath(process.env.PATH) },
+  bin: string, env: NodeJS.ProcessEnv = scrubAgentHostEnv({ ...process.env, PATH: reclaudePath(process.env.PATH) }),
 ): Promise<ReclaudeStatus> {
   return new Promise((resolve, reject) => {
     execFile(bin, ['status', '--check', '--json'], { env, timeout: STATUS_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024, windowsHide: true },
       (error, stdout, stderr) => {
         // 检查出问题时（如在线检查超时）reclaude 以非零退出，但仍输出完整状态：以状态内容为准。
+        // 输出是 JSON 却缺字段时与退出码 0 一样明确报不兼容，不退回成只报退出码；不是 JSON 才按退出失败报告。
         if (error && String(stdout).trim()) {
-          try { resolve(parseReclaudeStatus(JSON.parse(String(stdout)))); return } catch {}
+          let raw: unknown
+          let json = true
+          try { raw = JSON.parse(String(stdout)) } catch { json = false }
+          if (json) {
+            try { resolve(parseReclaudeStatus(raw)) } catch (cause) { reject(cause) }
+            return
+          }
         }
         if (error) {
           // reclaude 自己的报错行可直接给用户；其余 stderr 不保留。

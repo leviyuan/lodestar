@@ -20,6 +20,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+/** daemon 停机最多等 15 秒（daemon.ts 的 SHUTDOWN_DEADLINE_MS），期限到后还要收尾退出，
+ * 这里再多等 5 秒；短于停机期限会让 `lodestar stop && lodestar start` 误报失败。 */
+export const STOP_WAIT_MS = 20_000
+const STOP_POLL_MS = 100
+
 /** 返回进程退出码：未运行与 stale 记录都按成功处理，真正的停止失败才抛错。 */
 export async function stopDaemon(io: CliIo): Promise<number> {
   let contents: string
@@ -57,12 +62,14 @@ export async function stopDaemon(io: CliIo): Promise<number> {
 
   // 按原进程身份确认退出，不能把 PID 文件移除或替换当作已停止。
   // Windows 强制结束不会清 PID 文件；下一次启动会识别并清理 stale 记录。
-  for (let i = 0; i < 50; i++) {
+  const deadline = Date.now() + STOP_WAIT_MS
+  for (;;) {
     if (!isOurDaemon(pid, marker)) {
       io.out(`${C.green}✓ daemon 已停${C.reset}\n`)
       return 0
     }
-    await sleep(100)
+    if (Date.now() >= deadline) break
+    await sleep(STOP_POLL_MS)
   }
-  throw new Error(`已发送停止请求，但 5s 内 PID ${pid} 的 daemon 仍未退出，可能还在收尾；请检查日志`)
+  throw new Error(`已发送停止请求，但 ${STOP_WAIT_MS / 1000}s 内 PID ${pid} 的 daemon 仍未退出，可能还在收尾；请检查日志`)
 }

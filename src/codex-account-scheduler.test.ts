@@ -663,6 +663,69 @@ describe('weekly quota scheduling', () => {
     expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('plus')
     expect(JSON.parse(readFileSync(h.stateFile, 'utf8')).blocks).toEqual([])
   })
+  describe('stale-at-block windows without a reported duration', () => {
+    const H = 3_600_000
+    function clockHarness() {
+      const root = mkdtempSync(join(tmpdir(), 'codex-scheduling-')); roots.push(root)
+      const stateFile = join(root, 'blocks.json')
+      const clock = { now: NOW }
+      const input: Record<string, UsageSnapshot> = {}
+      const scheduler = new CodexAccountScheduler({ accounts: () => [{ id: 'plus', name: 'plus' }],
+        usage: async id => input[id]!, cachedUsage: () => null, identity: id => id, compatible: async () => null,
+        pendingLogin: () => false, now: () => clock.now, stateFile })
+      const blocks = () => JSON.parse(readFileSync(stateFile, 'utf8')).blocks
+      return { scheduler, input, clock, blocks }
+    }
+    // The protocol allows windowDurationMins to be null: these windows have no duration.
+    const plus = (five: { percent: number; resetsAt: Date } | null, week: { percent: number; resetsAt: Date }, at: number) =>
+      ({ ...quota('plus'), fiveHour: five && { ...five, durationMins: null }, weekly: { ...week, durationMins: null },
+        readStartedAt: at, fetchedAt: at })
+    const week = { percent: 50, resetsAt: new Date(NOW + 100 * H) }
+    const blockStale = (h: ReturnType<typeof clockHarness>, stale: Extract<UsageSnapshot, { state: 'ok' }>) =>
+      h.scheduler.block({ account: { id: 'plus', name: 'plus' }, usage: stale, identity: 'plus',
+        ...rankCodexQuota(stale, 'model', NOW) }, 'model')
+
+    test('the first fresh read after the exhausted window rolled over clears the block without an extra cycle', async () => {
+      const h = clockHarness()
+      // Cached two hours before the native failure; that 5h window had reset 30 min before the block.
+      blockStale(h, plus({ percent: 60, resetsAt: new Date(NOW - H / 2) }, week, NOW - 2 * H))
+      // The window current at the block (NOW-0.5h .. NOW+4.5h) has rolled over by the first fresh read.
+      h.clock.now = NOW + 5 * H
+      h.input.plus = plus({ percent: 0, resetsAt: new Date(NOW + 9.5 * H) }, week, h.clock.now)
+      expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('plus')
+      expect(h.blocks()).toEqual([])
+    })
+
+    test('a read of the window still current at the block keeps it and becomes the baseline', async () => {
+      const h = clockHarness()
+      blockStale(h, plus({ percent: 60, resetsAt: new Date(NOW - H / 2) }, week, NOW - 2 * H))
+      // 3.5h left in the window but only 1.5h since the stale reset: still the window current at the block.
+      h.clock.now = NOW + H
+      h.input.plus = plus({ percent: 70, resetsAt: new Date(NOW + 4.5 * H) }, week, h.clock.now)
+      const blocked = await h.scheduler.choose({ model: 'model' })
+      expect(blocked.selected).toBeNull()
+      expect(blocked.candidates[0]).toMatchObject({ state: 'exhausted' })
+      expect(h.blocks()[0].windows).toContainEqual({ kind: 'fiveHour', percent: 70, reset: NOW + 4.5 * H })
+      // That window then rolls over and the next window is read: recovered from the observed baseline.
+      h.clock.now = NOW + 5 * H
+      h.input.plus = plus({ percent: 0, resetsAt: new Date(NOW + 9.5 * H) }, week, h.clock.now)
+      expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('plus')
+      expect(h.blocks()).toEqual([])
+    })
+
+    test('a new week that is nearly used up cannot clear a block written from the previous week', async () => {
+      const h = clockHarness()
+      // Cached from the previous week at 100%, which reset an hour before the native failure.
+      blockStale(h, plus(null, { percent: 100, resetsAt: new Date(NOW - H) }, NOW - 2 * H))
+      // 100h left but only 1h since the stale reset: the current week is the one that was exhausted.
+      h.input.plus = plus(null, { percent: 99, resetsAt: new Date(NOW + 100 * H) }, NOW + 1)
+      expect((await h.scheduler.choose({ model: 'model' })).selected).toBeNull()
+      expect(h.blocks()[0].windows).toEqual([{ kind: 'weekly', percent: 99, reset: NOW + 100 * H }])
+      h.input.plus = plus(null, { percent: 10, resetsAt: new Date(NOW + 100 * H) }, NOW + 3)
+      expect((await h.scheduler.choose({ model: 'model' })).selected?.account.id).toBe('plus')
+      expect(h.blocks()).toEqual([])
+    })
+  })
   test('short-window recovery is observed when Plus stops reporting an exhausted 5h window', async () => {
     const plus = quota('plus', 20, 80)
     plus.fiveHour = { percent: 100, resetsAt: new Date(NOW + 3600_000), durationMins: 300 }

@@ -11,6 +11,7 @@ import { AGENTS, agentRuntimeState, type UpdatedAgent } from './agent-updates'
 import { UsageError } from './cli-errors'
 import { commandHelp } from './cli-help'
 import type { CliIo } from './cli-output'
+import { AGENT_RUNTIMES_DIR } from './paths'
 import { lodestarVersion } from './version'
 
 interface AgentReport {
@@ -22,10 +23,14 @@ interface AgentReport {
 }
 
 function inspectAgent(agent: UpdatedAgent, verbose: boolean): AgentReport {
+  let directory: string | undefined
   try {
     const state = agentRuntimeState(agent)
     if (!state?.directory) return { agent, status: 'missing' }
-    if (!existsSync(state.directory)) throw new Error(`安装目录不存在: ${state.directory}`)
+    directory = state.directory
+    if (!existsSync(state.directory)) {
+      throw new Error(verbose ? `安装目录不存在: ${state.directory}` : '安装目录不存在（加 --verbose 查看路径）')
+    }
     const names = agent === 'dsh' ? ['@deepseek-ai/dsh'] : Object.keys(state.versions ?? {})
     if (!names.length) throw new Error('安装记录缺少包版本')
     const packages = names.map(name => {
@@ -37,8 +42,18 @@ function inspectAgent(agent: UpdatedAgent, verbose: boolean): AgentReport {
     })
     return { agent, status: 'ok', packages, ...(verbose ? { directory: state.directory } : {}) }
   } catch (error) {
-    return { agent, status: 'error', error: error instanceof Error ? error.message : String(error) }
+    const message = error instanceof Error ? error.message : String(error)
+    return { agent, status: 'error', error: verbose ? message : hideRuntimeDirectories(message, directory) }
   }
+}
+
+/** 运行目录只在 --verbose 时输出；出错时同样如此，系统错误与安装记录错误都带着完整路径。 */
+function hideRuntimeDirectories(message: string, directory: string | undefined): string {
+  let text = message
+  for (const path of [directory, AGENT_RUNTIMES_DIR]) {
+    if (path) text = text.split(path).join('<运行目录>')
+  }
+  return text
 }
 
 export async function runVersion(argv: string[], io: CliIo): Promise<number> {

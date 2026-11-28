@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { writeExecutableFileAtomic, writeJsonStateAtomic, writeStateFileAtomic } from './state-store'
@@ -36,5 +36,21 @@ describe('atomic state store', () => {
     writeExecutableFileAtomic(file, '#!/bin/sh\nexit 0\n')
     expect(readFileSync(file, 'utf8')).toContain('#!/bin/sh')
     if (process.platform !== 'win32') expect(statSync(file).mode & 0o777).toBe(0o700)
+  })
+
+  test('without createParent a removed directory is reported, not recreated', () => {
+    // An update lock removed by another updater must not reappear under a late write.
+    const file = target('pid')
+    let error: unknown
+    try { writeStateFileAtomic(file, '1', { createParent: false }) } catch (caught) { error = caught }
+    expect((error as NodeJS.ErrnoException).code).toBe('ENOENT')
+    expect(existsSync(join(file, '..'))).toBe(false)
+  })
+
+  test('keeps a requested file mode instead of the private default', () => {
+    const file = target('config.toml')
+    writeStateFileAtomic(file, 'model = "x"\n', { mode: 0o644 })
+    expect(readFileSync(file, 'utf8')).toBe('model = "x"\n')
+    if (process.platform !== 'win32') expect(statSync(file).mode & 0o777).toBe(0o644)
   })
 })

@@ -3,6 +3,7 @@ import { spawn } from 'cross-spawn'
 import { constants } from 'node:os'
 import { claudeAccounts } from './claude-accounts'
 import { agentBin } from './agent-updates'
+import { UsageError } from './cli-errors'
 import { lodestarVersion } from './version'
 
 export const usage = [
@@ -10,7 +11,9 @@ export const usage = [
   '  lodestar claude 工作号',
   '  lodestar claude 工作号 auth login',
   '  lodestar claude default --help',
+  '  lodestar claude 工作号 mcp add srv -- npx -y pkg',
   '',
+  '备注名之后的参数原样交给原生 Claude Code；只有紧跟备注名的 -- 是分隔符，其后的 -- 原样保留。',
   '使用 Lodestar 当前选中的 Claude 原生运行时，保留当前终端的 HOME、工作目录和其他环境。',
   '额外账号使用 ~/.claude-accounts/备注名；首次登录前准备共享配置，但不代办登录或收录账号。',
   '账号目录只保留登录状态，其余以全局配置为准并链接共享，备注账号的旧内容会被替换。',
@@ -35,12 +38,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     process.stdout.write(`${usage}\n`)
     return
   }
-  // `--` 之后的参数原样交给原生 Claude Code，避免与 lodestar 的选项冲突。
-  const separator = argv.indexOf('--')
-  const head = separator >= 0 ? argv.slice(0, separator) : argv
-  const args = separator >= 0 ? argv.slice(separator + 1) : argv.slice(1)
-  const [name] = head
-  if (!name?.trim()) throw new Error(usage)
+  // 只有紧跟备注名的 `--` 是 lodestar 的分隔符；之后再出现的 `--` 属于原生命令本身
+  // （如 `mcp add <名称> -- <命令>`），和备注名之后的其余参数一样原样交给原生 Claude Code。
+  const [name] = argv
+  const args = argv[1] === '--' ? argv.slice(2) : argv.slice(1)
+  if (!name?.trim() || name === '--') throw new UsageError(usage)
   assertUserTerminal()
   const env = claudeAccounts.nativeCliEnv(name, process.env)
   const executable = agentBin('claude', 'claude')
@@ -69,5 +71,5 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 /** 统一入口与旧 bin 共用的错误出口。 */
 export function reportClaudeError(error: unknown): void {
   process.stderr.write(`lodestar claude: ${error instanceof Error ? error.message : String(error)}\n`)
-  process.exitCode = 1
+  process.exitCode = error instanceof UsageError ? 2 : 1
 }

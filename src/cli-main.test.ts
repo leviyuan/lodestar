@@ -95,6 +95,7 @@ describe('lodestar 统一入口', () => {
     const { commands, calls } = fakeCommands()
     expect(await runCli([], { io: r.io, commands })).toBe(0)
     expect(await runCli(['--no-color', 'start'], { io: r.io, commands })).toBe(0)
+    // 跨版本协议：已发布的 update 会以 `<新装入口> --agents-only` 调用新版本，不能删除或改名。
     expect(await runCli(['--agents-only'], { io: r.io, commands })).toBe(0)
     expect(calls).toEqual(['start', 'start', 'update --agents-only'])
   })
@@ -119,5 +120,44 @@ describe('lodestar 统一入口', () => {
     expect(await runCli(['--no-color', '--version'], { io: r.io, commands })).toBe(0)
     expect(C.red).toBe('')
     forceColor(undefined)
+  })
+
+  test('--no-color 也可写在 lodestar 自有子命令之后；agent、claude 之后的参数原样交给子命令', async () => {
+    const r = recorder()
+    const { commands, calls } = fakeCommands()
+    try {
+      for (const argv of [['stop', '--no-color'], ['setup', '--no-color'], ['start', '--no-color'],
+        ['update', '--no-color', '--agents-only'], ['version', '--verbose', '--no-color'], ['--agents-only', '--no-color']]) {
+        forceColor(true)
+        expect(await runCli(argv, { io: r.io, commands })).toBe(0)
+        expect(C.red).toBe('')
+      }
+      expect(r.err).toEqual([])
+      expect(await runCli(['claude', '工作号', '--no-color'], { io: r.io, commands })).toBe(0)
+      expect(await runCli(['agent', 'run', '--prompt', '--no-color'], { io: r.io, commands })).toBe(0)
+      expect(calls).toEqual(['stop', 'setup', 'start', 'update --agents-only', 'version --verbose', 'update --agents-only',
+        'claude 工作号 --no-color', 'agent run --prompt --no-color'])
+    } finally {
+      forceColor(true)
+      forceColor(undefined)
+    }
+  })
+
+  test('已在运行时提示服务托管的由服务管理器重启', () => {
+    const script = `
+      import { mock } from 'bun:test'
+      mock.module('./src/pid-guard', () => ({ checkPidGuard: () => ({ state: 'exit', pid: 12345 }) }))
+      const { startDaemon } = await import('./src/daemon-entry')
+      process.exitCode = await startDaemon()
+    `
+    const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+      cwd: process.cwd(), stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: 10_000,
+    })
+    expect(result.exitCode).toBe(1)
+    const stderr = result.stderr.toString()
+    expect(stderr).toContain('已经有一个 daemon 在运行')
+    expect(stderr).toContain('lodestar stop')
+    expect(stderr).toContain('由服务管理器重启或停止')
+    expect(commandHelp('start')).toContain('服务托管的由服务管理器重启或停止')
   })
 })

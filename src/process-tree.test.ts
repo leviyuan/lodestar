@@ -2,9 +2,25 @@ import { expect, test } from 'bun:test'
 import type { ChildProcess } from 'node:child_process'
 import { terminateProcessTree } from './process-tree'
 
-function fakeChild(pid: number | undefined, signals: string[]): Pick<ChildProcess, 'pid' | 'kill'> {
-  return { pid, kill: ((signal?: NodeJS.Signals | number) => { signals.push(String(signal)); return true }) as ChildProcess['kill'] }
+function fakeChild(pid: number | undefined, signals: string[]): Pick<ChildProcess, 'pid' | 'kill' | 'exitCode' | 'signalCode'> {
+  return { pid, exitCode: null, signalCode: null,
+    kill: ((signal?: NodeJS.Signals | number) => { signals.push(String(signal)); return true }) as ChildProcess['kill'] }
 }
+
+test('Windows never runs taskkill on the PID of a child that already exited', () => {
+  const signals: string[] = []
+  const killed: number[] = []
+  for (const exited of [{ exitCode: 1, signalCode: null }, { exitCode: null, signalCode: 'SIGTERM' as const }]) {
+    // The PID may already belong to an unrelated program whose tree `/T /F` would end.
+    const started = terminateProcessTree({ ...fakeChild(4242, signals), ...exited }, 'SIGKILL', undefined, {
+      platform: 'win32',
+      taskkill: pid => { killed.push(pid) },
+    })
+    expect(started).toBe(true)
+  }
+  expect(killed).toEqual([])
+  expect(signals).toEqual([])
+})
 
 test('Windows terminates the whole tree so a .cmd shim cannot orphan the CLI', () => {
   const signals: string[] = []

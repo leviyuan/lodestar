@@ -6,7 +6,7 @@
 import { isAbsolute, relative } from 'node:path'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
 import { shellCommandPresentation, shellCommandDescription } from './shell-command'
-import { TASK_LIST_VISIBLE_LIMIT } from './task-board'
+import { TASK_LIST_VISIBLE_LIMIT, taskListLine } from './task-board'
 import { closeOpenMarkdownFence, fencedCodeBlock, sliceWholeCharacters } from '../markdown-code'
 
 const BASH_OUTPUT_PREVIEW_CHARS = 300
@@ -619,7 +619,7 @@ function renderTodoBody(input: any, output: string | null, resolvedNote?: string
   for (const todo of todos.slice(0, TASK_LIST_VISIBLE_LIMIT)) {
     const status = todoStatusLabel(todo?.status)
     const content = String(todo?.content ?? todo?.activeForm ?? '').trim() || '(空)'
-    lines.push(`- ${status}: ${content}`)
+    lines.push(taskListLine(`- ${status}: `, content))
   }
   if (todos.length > TASK_LIST_VISIBLE_LIMIT) {
     lines.push(`- 还有 ${todos.length - TASK_LIST_VISIBLE_LIMIT} 项未显示`)

@@ -23,7 +23,7 @@
 | `test-dsh-glm.ts` | 使用已配置 GLM Coding Plan 做 DSH Read 与原生 resume 实测，只操作私有临时目录；不连接飞书或控制 daemon |
 | `test-external-temp-group.ts --chat-id oc_xxx [--owner ou_xxx] [--create]` | 在开启「对外共享」的应用上实测：初始成员只有本企业成员时，建群带 `external: true` 能否建出外部群（本企业成员在外部群里发 btw/fk/wt 依赖这一点，不成立就不要发版）。不加 `--create` 只读来源群并打印计划；加上后建一个「Lodestar 外部群实测（可解散）…」群，群主取来源群群主或 `--owner`，成员只有群主和机器人。建成外部群时机器人不能解散，须群主手动解散；建成内部群时尝试删除；建群后读不回群类型时判 INCONCLUSIVE 并保留群供核对，不判 FAIL、不删群。输出遮挡 ID（飞书拒绝原文经 `redactMemberIds`），不连接 daemon |
 | `test-model-panel-live.ts` | 使用现有 daemon，在明确目标群验证分组、隐藏/显示、补录/删除、无效补录拒绝及真实回复；等待最终 footer 后检查模型/effort 与余额/额度，恢复原设置。`--routes-only` 可单测指定模型路由；不自行创建 Session 或控制 daemon |
-| `postinstall.cjs` | 安装/更新时将 Codex 额外账号旧的共享插件链接迁为独立副本，并清理旧 `lodestar-files` 的三处受管副本；不读凭据或启动 Agent/daemon，迁移或清理失败退出非零 |
+| `postinstall.cjs` | 安装/更新时将 Codex 额外账号旧的共享插件链接迁为独立副本，并清理旧 `lodestar-files` 的三处受管副本；不读凭据或启动 Agent/daemon，迁移或清理失败退出非零。结束时打印下一步与从 0.24 及更早升级的迁移提示（再运行一次 `lodestar update --agents-only`、服务里的 `lodestar-daemon` 改为 `lodestar start`、旧命令对照），文本由导出的 `installMessage()` 生成，`require` 该脚本不执行迁移 |
 | `test-generated-image-card.ts` | 向明确的测试群发送一张图片折叠测试卡，使用指定的已有图片；检查提示词、卡内图片及预览。不会调用生图模型、单发图片或启动 Session |
 | `sync-security-deps.ts` | 同步普通安全依赖的发布版本声明，随后需用 Bun 同步锁文件；不锁定 Agent 版本 |
 | `obfuscate-dist.mjs` | `bun run build` 的最后一步，原地改写 `dist/` 中 build 脚本声明的打包产物（字符串数组 + 标识符重命名，种子取包版本，同版本可复现）；`dist/` 里有其他 `.js` 或产物已混淆过时报错退出，不处理随包的 `.cjs`；不联网 |

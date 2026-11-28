@@ -552,6 +552,10 @@ test('hi rows get each account login end from the background usage refresh, in t
     const dir = mkdtempSync(join(tmpdir(), 'claude-credential-row-'))
     process.env.CLAUDE_CONFIG_DIR = join(dir, 'native')
     process.env.ANTHROPIC_API_KEY = 'must-not-leak'
+    // Host variables of the daemon (test-preload sets LODESTAR_CONFIG and LODESTAR_DATA_DIR) stay out of the probe.
+    process.env.LODESTAR_RESTART_CONTINUE_CHAT_ID = 'oc_host_chat'
+    process.env.FEISHU_APP_SECRET = 'host-secret'
+    assert.ok(process.env.LODESTAR_CONFIG && process.env.LODESTAR_DATA_DIR)
     const { config } = await import('./src/config'); config.claude.env = {}
     const accounts = await import('./src/claude-accounts')
     const manager = new accounts.ClaudeAccounts({ home: dir, accountsDir: join(dir, 'accounts'),
@@ -574,7 +578,10 @@ test('hi rows get each account login end from the background usage refresh, in t
       // The real account lease: it repairs and validates the account directory, then releases cleanly.
       acquireUse()()
       probes.push({ accountId: binding.accountId, revision: binding.revision, configDir: env.CLAUDE_CONFIG_DIR,
-        apiKey: env.ANTHROPIC_API_KEY, path: env.PATH, settings })
+        apiKey: env.ANTHROPIC_API_KEY, path: env.PATH, settings,
+        // Only the Agent protocol and source routing prefixes may pass, as for a session.
+        host: Object.keys(env).filter(key => key.startsWith('FEISHU_')
+          || key.startsWith('LODESTAR_') && !/^LODESTAR_(AGENT|DSH|RELAY)_/.test(key)) })
       return ends.get(binding.accountId) ?? null
     } }))
     const registry = await import('./src/token-source')
@@ -606,6 +613,7 @@ test('hi rows get each account login end from the background usage refresh, in t
         assert.equal(probe.configDir, probe.accountId === 'default' ? join(dir, 'native') : account.configDir)
         assert.equal(probe.apiKey, '')
         assert.equal(probe.path, buildClaudeSpawnPath())
+        assert.deepEqual(probe.host, [])
         // The same process-level override a session passes, so user settings cannot swap the credential.
         assert.deepEqual(probe.settings, claudeSubscriptionSettings(manager.candidateEnv(manager.get(probe.accountId), {})))
         assert.equal(probe.settings.apiKeyHelper, '')

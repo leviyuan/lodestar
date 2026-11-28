@@ -180,3 +180,48 @@ describe('ensureDataDir', () => {
     }
   })
 })
+
+describe('file logging starts on the first write', () => {
+  /** A production-mode process (file logging on) with its own data dir. */
+  function production(root: string, argv: string[]) {
+    return Bun.spawnSync([process.execPath, ...argv], {
+      cwd: join(import.meta.dir, '..'), stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: 10_000,
+      env: { ...process.env, NODE_ENV: 'production', LODESTAR_DATA_DIR: join(root, 'data'), LODESTAR_CONFIG: join(root, 'missing.toml') },
+    })
+  }
+
+  test('`lodestar --help` and `--version` touch no data directory', () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-log-lazy-'))
+    try {
+      for (const flag of ['--help', '--version', '-V']) {
+        const result = production(root, ['cli.ts', flag])
+        expect(result.exitCode, result.stderr.toString()).toBe(0)
+      }
+      expect(existsSync(join(root, 'data'))).toBe(false)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test('the first log line creates the private data dir, migrates daemon.log and writes the day file', () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-log-lazy-'))
+    try {
+      const imported = production(root, ['-e', `import('./src/log').then(() => {})`])
+      expect(imported.exitCode, imported.stderr.toString()).toBe(0)
+      expect(existsSync(join(root, 'data'))).toBe(false)
+
+      const fresh = production(root, ['-e', `import('./src/log').then(({ log }) => log('lazy-probe'))`])
+      expect(fresh.exitCode, fresh.stderr.toString()).toBe(0)
+      if (process.platform !== 'win32') expect(statSync(join(root, 'data')).mode & 0o777).toBe(0o700)
+      const day = readdirSync(join(root, 'data')).find(name => /^daemon-\d{4}-\d{2}-\d{2}\.log$/.test(name))!
+      expect(readFileSync(join(root, 'data', day), 'utf8')).toContain('lazy-probe')
+
+      writeFileSync(join(root, 'data', 'daemon.log'), 'legacy line\n')
+      const migrated = production(root, ['-e', `import('./src/log').then(({ log }) => log('after-migration'))`])
+      expect(migrated.exitCode, migrated.stderr.toString()).toBe(0)
+      expect(existsSync(join(root, 'data', 'daemon.log'))).toBe(false)
+      const text = readdirSync(join(root, 'data')).filter(name => name.startsWith('daemon-'))
+        .map(name => readFileSync(join(root, 'data', name), 'utf8')).join('')
+      expect(text).toContain('legacy line')
+      expect(text).toContain('after-migration')
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+})

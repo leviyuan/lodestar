@@ -2,6 +2,7 @@ import { spawn } from 'cross-spawn'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { assertCodexProviderIsolated } from './codex-config'
 import { terminateProcessTree } from './process-tree'
 
 /** Native Codex registers these tools from model metadata, independently of
@@ -41,6 +42,69 @@ interface NativePolicyOptions {
   workDir: string
   env: Record<string, string | undefined>
   signal: AbortSignal
+  /** API provider passed in `configArgs`: checked against local config before `debug models` can fetch with it. */
+  apiProvider?: { id: string; name: string }
+}
+
+const HELPER_KILL_GRACE_MS = 2_000
+
+/** `config/read` (with layers) from a short-lived app-server using the worker's own binary,
+ * configuration overrides and environment. */
+async function readNativeConfigLayers(options: NativePolicyOptions): Promise<unknown> {
+  options.signal.throwIfAborted()
+  const child = spawn(options.binary, ['app-server', '--listen', 'stdio://', ...options.configArgs], {
+    cwd: options.workDir, env: options.env, shell: false, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true,
+  })
+  const send = (message: object) => child.stdin!.write(`${JSON.stringify(message)}\n`)
+  let cleanup = () => {}
+  try {
+    return await new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Codex config/read exceeded 30 seconds')), 30_000)
+      const abort = () => reject(options.signal.reason instanceof Error ? options.signal.reason : new Error('Codex config/read cancelled'))
+      options.signal.addEventListener('abort', abort, { once: true })
+      cleanup = () => { clearTimeout(timer); options.signal.removeEventListener('abort', abort) }
+      child.on('error', reject)
+      child.stdin!.on('error', reject)
+      child.once('close', code => reject(new Error(`Codex app-server exited before config/read (exit ${code})`)))
+      let buffered = ''
+      child.stdout!.on('data', (chunk: Buffer) => {
+        buffered += chunk.toString('utf8')
+        for (let newline = buffered.indexOf('\n'); newline >= 0; newline = buffered.indexOf('\n')) {
+          const line = buffered.slice(0, newline)
+          buffered = buffered.slice(newline + 1)
+          let message: any
+          try { message = JSON.parse(line) } catch { continue }
+          // Server requests and notifications carry `method`; only responses answer ours.
+          if (!message || typeof message !== 'object' || 'method' in message) continue
+          if (message.error && (message.id === 1 || message.id === 2)) {
+            reject(new Error(`Codex ${message.id === 1 ? 'initialize' : 'config/read'} failed: ${message.error.message ?? 'MISS'}`))
+          } else if (message.id === 1) {
+            send({ method: 'initialized' })
+            send({ id: 2, method: 'config/read', params: { includeLayers: true, cwd: options.workDir } })
+          } else if (message.id === 2) resolve(message.result)
+        }
+      })
+      send({ id: 1, method: 'initialize', params: {
+        clientInfo: { name: 'lodestar', version: '0.0.0' }, capabilities: { experimentalApi: true, requestAttestation: false } } })
+    })
+  } finally {
+    cleanup()
+    child.stdin!.end()
+    stopHelper(child)
+  }
+}
+
+/** Ends the short-lived helper without waiting for it: SIGTERM (a tree kill on Windows),
+ * then SIGKILL for this exact child if it is still running after a bounded wait. */
+function stopHelper(child: ReturnType<typeof spawn>): void {
+  const running = () => child.exitCode === null && child.signalCode === null
+  if (!running()) return
+  if (!terminateProcessTree(child, 'SIGTERM')) child.kill('SIGTERM')
+  const escalate = setTimeout(() => {
+    if (running() && !terminateProcessTree(child, 'SIGKILL')) child.kill('SIGKILL')
+  }, HELPER_KILL_GRACE_MS)
+  escalate.unref?.()
+  child.once('exit', () => clearTimeout(escalate))
 }
 
 export function codexInputFeaturesToDisable(output: string): string[] {
@@ -107,6 +171,9 @@ async function runNativePolicyQuery(options: NativePolicyOptions, command: strin
 }
 
 export async function prepareCodexInputPolicyCatalog(options: NativePolicyOptions): Promise<CodexInputPolicyCatalog> {
+  // `debug models` may fetch with the provider definition (catalog URL, headers):
+  // a same-named local provider merged into it is refused before that.
+  if (options.apiProvider) assertCodexProviderIsolated(await readNativeConfigLayers(options), options.apiProvider)
   // Export the effective catalog using the same native binary, account,
   // provider and configuration as the worker. --bundled would lose live model
   // metadata or a user-supplied catalog and is deliberately not used here.

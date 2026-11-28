@@ -27,6 +27,8 @@ import { localFetch } from './network'
  */
 
 import { readFileSync } from 'node:fs'
+import { redactFeishuDiagnostic } from './agent-visible-text'
+import { redactMemberIds } from './feishu-errors'
 import { log, logError } from './log'
 import { NOTIFY_CALLBACKS_FILE } from './paths'
 import { writeJsonStateAtomic } from './state-store'
@@ -298,7 +300,11 @@ export function setReplyState(notifyId: string, state: NotifyReplyState): void {
   if (!rec) throw new Error(`notify registration not found: ${notifyId}`)
   const previous = rec.replyState
   const previousIds = rec.replyMessageIds
+  const previousRecovered = rec.restartRecoveredAt
   rec.replyState = state
+  // A new prompt supersedes the one an earlier boot already showed as expired:
+  // the next restart must present this prompt's expiry too.
+  if (state.status === 'waiting') delete rec.restartRecoveredAt
   if (state.response && !rec.replyMessageIds?.includes(state.response.message_id)) {
     rec.replyMessageIds = [...(rec.replyMessageIds ?? []), state.response.message_id]
   }
@@ -308,6 +314,7 @@ export function setReplyState(notifyId: string, state: NotifyReplyState): void {
     else delete rec.replyState
     if (previousIds) rec.replyMessageIds = previousIds
     else delete rec.replyMessageIds
+    if (previousRecovered !== undefined) rec.restartRecoveredAt = previousRecovered
     throw error
   }
 }
@@ -556,7 +563,7 @@ export function buildNotifyResult(reg: NotifyRegistration): object {
           : unknown && buttonId === undefined ? 'unknown' : reg.replyState.status,
         prompt_message_id: reg.replyState.promptMessageId,
         ...(reg.replyState.cancelReason ? { cancel_reason: reg.replyState.cancelReason } : {}),
-        ...(reg.replyState.error ? { error: reg.replyState.error } : {}),
+        ...(reg.replyState.error ? { error: visibleDetail(reg.replyState.error) } : {}),
       },
     } : {}),
     ...(resolved
@@ -569,8 +576,16 @@ export function buildNotifyResult(reg: NotifyRegistration): object {
       ? {
           ...verdict,
           unknown_at: reg.unknownAt,
-          unknown_reason: reg.unknownReason,
+          unknown_reason: reg.unknownReason === undefined ? undefined : visibleDetail(reg.unknownReason),
         }
       : {}),
   }
+}
+
+/** Failure details can quote Feishu errors or local persistence errors (state
+ * file paths); the pull result is readable by any local process. Same rule as
+ * the /notify error responses, log_id included. The card keeps the original
+ * text for the person who clicked. */
+function visibleDetail(text: string): string {
+  return redactFeishuDiagnostic(redactMemberIds(text))
 }

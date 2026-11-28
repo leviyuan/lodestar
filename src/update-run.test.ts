@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
 import type { spawn } from 'node:child_process'
+import { disableColor, forceColor } from './cli-output'
 import { runInstalledAgentUpdate, runLodestarUpdate } from './update-run'
 
 function deps(overrides: Parameters<typeof runLodestarUpdate>[1] = {}) {
@@ -55,4 +56,27 @@ test('the installed updater is re-executed with the current runtime, script and 
   child.emit('error', new Error('ENOENT'))
   await expect(failed).rejects.toThrow('启动新版 Agent 更新失败')
   await expect(runInstalledAgentUpdate(fake, '/runtime/node', '')).rejects.toThrow('入口路径')
+})
+
+test('--no-color reaches the re-executed updater through NO_COLOR, keeping the --agents-only argv', async () => {
+  let command: unknown[] = []
+  let child!: EventEmitter
+  const fake = ((...args: unknown[]) => { command = args; return child = new EventEmitter() }) as unknown as typeof spawn
+  try {
+    forceColor(true)
+    const colored = runInstalledAgentUpdate(fake, '/runtime/node', '/global/lodestar.js')
+    expect((command[2] as { env: NodeJS.ProcessEnv }).env.NO_COLOR).toBe(process.env.NO_COLOR)
+    child.emit('exit', 0, null)
+    await colored
+    disableColor()
+    const plain = runInstalledAgentUpdate(fake, '/runtime/node', '/global/lodestar.js')
+    expect(command[1]).toEqual(['/global/lodestar.js', '--agents-only'])
+    expect((command[2] as { env: NodeJS.ProcessEnv }).env.NO_COLOR).toBe('1')
+    child.emit('exit', 0, null)
+    expect(await plain).toBe(0)
+  } finally {
+    // forceColor(true) also clears the --no-color state set above.
+    forceColor(true)
+    forceColor(undefined)
+  }
 })

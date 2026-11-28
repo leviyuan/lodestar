@@ -69,6 +69,74 @@ test('agent-visible diagnostics never carry emails, IM ids or absolute host path
   expect(otherPaths.match(/<path>/g)?.length).toBeGreaterThanOrEqual(4)
 })
 
+test('agent-visible path redaction recognizes any absolute path form but leaves URLs and relative text alone', () => {
+  const hidden: Array<[string, string]> = [
+    ['spawn failed: ENOENT /home/alice/secret-project/.venv/bin/python', 'spawn failed: ENOENT <path>'],
+    ['cannot open /data/projects/alpha-team/run.log', 'cannot open <path>'],
+    ['workspace /workspace/alpha team missing', 'workspace <path>'],
+    ['nix store /nix/store/abc-alpha', 'nix store <path>'],
+    ['run dir /run/user/1000/lodestar', 'run dir <path>'],
+    ['Windows C:/Users/alice/alpha-team/out.txt', 'Windows <path>'],
+    ['UNC \\\\fileserver\\share\\alpha-team', 'UNC <path>'],
+    ['UNC //fileserver/share/alpha-team', 'UNC <path>'],
+    ['file:///home/alice/alpha-team/a.txt', '<path>'],
+    ["open '/srv/alpha-team/a.txt' failed", "open '<path>' failed"],
+    ['cwd:/opt/alpha-team', 'cwd:<path>'],
+    ['--dir=/home/alice/alpha-team', '--dir=<path>'],
+    ['thread omt_0123456789abcdef0123', 'thread <id>'],
+  ]
+  for (const [input, expected] of hidden) expect(agentVisibleText(input)).toBe(expected)
+  const kept = [
+    'fetch failed: https://api.example.com/v1/models?x=1 (ECONNREFUSED)',
+    'model openai/gpt-5 via relay a/b at 1/2 of 2026/11/27',
+    "<font color='red'>失败</font>",
+    'cd / and N/A',
+    'see ./src/app.ts and ../docs/usage.md',
+    // A slash right after a letter of any script is not a path start.
+    'OpenRouter 模型请填写完整的 作者/模型 ID',
+    'Claude 首次同步缺少与认证结果一致的原生账号/组织身份；不能确认同步桶',
+    'https://例子.中国/路径/项目 不是本机路径',
+    // Well-known root names inside relative paths or URL paths are not host paths.
+    'see src/data/models.json and ./tmp/out, https://api.example.com/data/v1 and http://localhost:8080/home/x',
+  ]
+  for (const input of kept) expect(agentVisibleText(input)).toBe(input)
+})
+
+test('agent-visible path redaction still catches paths glued to Chinese text', () => {
+  const cases: Array<[string, string]> = [
+    ['无法读取/Users/leviyuan/project/feishu/state.json', '无法读取<path>'],
+    ['目录/tmp/lodestar-attachments-abc不存在', '目录<path>'],
+    ['配置见~/.config/lodestar/config.toml', '配置见<path>'],
+    ['在D:/work/私人项目/a.ts出错', '在<path>'],
+  ]
+  for (const [input, expected] of cases) expect(agentVisibleText(input)).toBe(expected)
+})
+
+test('agent-visible path redaction ends only where the rest cannot be part of the path', () => {
+  const cases: Array<[string, string]> = [
+    // An API path fragment at a boundary cannot be told apart from a host path:
+    // it is redacted too, but only up to the closing bracket or "path: reason".
+    ['中转站模型目录读取失败（/v1/models HTTP 401）：请检查 Key', '中转站模型目录读取失败（<path>）：请检查 Key'],
+    ['relay 测试失败: HTTP 404 for /v1/models: model not found', 'relay 测试失败: HTTP 404 for <path>: model not found'],
+    ['读取失败「/Users/alice/alpha team/a.txt」，请重试', '读取失败「<path>」，请重试'],
+    ['open /home/alice/alpha team/a.txt: permission denied', 'open <path>: permission denied'],
+    ['C:\\Users\\张三\\项目\\a.ts: access denied', '<path>: access denied'],
+    ['spawn /usr/local/bin/codex (exit 1)', 'spawn <path>(exit 1)'],
+    ["copy '/Users/x/a.txt' to '/tmp/b.txt' failed: EACCES", "copy '<path>' to '<path>' failed: EACCES"],
+    // Brackets, colons and quotes inside the path never leave a piece of it behind.
+    ['读取 /Users/x/Documents/【工作】合同/a.pdf 失败', '读取 <path>'],
+    ['读取 /Users/x/Notes : 2024/plan.md: permission denied', '读取 <path>: permission denied'],
+    ['目录 /Users/alice/项目（测试）/src 不存在', '目录 <path>'],
+    ['目录 /Users/alice/项目：二期/src 不存在', '目录 <path>'],
+    ['run C:\\Program Files (x86)\\Vendor\\tool.exe failed', 'run <path>'],
+    ['open /Users/x/proj (copy)/a.ts failed', 'open <path>'],
+    ["read /Users/x/Alice's Project/a.txt failed", 'read <path>'],
+    ['unchanged C:\\Users\\alice\\My Project\\x', 'unchanged <path>'],
+    ['home ~/alpha team/x and more', 'home <path>'],
+  ]
+  for (const [input, expected] of cases) expect(agentVisibleText(input)).toBe(expected)
+})
+
 test('run requests carry an optional card display and responses echo the silent mode', async () => {
   const started: any[] = []
   const base = await serve(request => started.push(request), false, { display: 'silent' })

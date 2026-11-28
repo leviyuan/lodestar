@@ -6,9 +6,11 @@
  */
 
 const GLOBAL_FLAGS = [
-  '  -h, --help       显示帮助并退出（不读配置、不启动进程）',
-  '  -V, --version    只输出版本号',
-  '      --no-color   关闭 ANSI 颜色；非 TTY 或设置 NO_COLOR 时同样自动关闭',
+  '  -h, --help       显示帮助并退出（不读配置、不启动进程）；也可写在子命令后',
+  '  -V, --version    只输出版本号；只用于顶层（lodestar -V），子命令请用 lodestar version',
+  '      --no-color   关闭 ANSI 颜色；写在子命令前对所有命令生效，start/setup/stop/update/version',
+  '                   也可写在子命令后（agent、claude 之后的参数归子命令）；',
+  '                   非 TTY 或设置 NO_COLOR 时同样自动关闭',
 ].join('\n')
 
 const UPDATE_GUIDE = [
@@ -70,7 +72,8 @@ const COMMAND_HELP: Record<string, string> = {
     '  在终端前台运行 daemon；首次运行且没有配置时自动进入配置向导。',
     '  服务化部署（systemd / launchd / 任务计划）让它执行 `lodestar`，',
     '  更新方式见 `lodestar --help` 的「更新」一节。',
-    '  已在运行时不会再启动第二个实例，而是提示用 `lodestar stop` 停止。',
+    '  已在运行时不会再启动第二个实例：终端前台启动的用 `lodestar stop` 停止，',
+    '  服务托管的由服务管理器重启或停止。',
   ].join('\n') + '\n',
 
   setup: [

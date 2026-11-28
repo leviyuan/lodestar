@@ -28,6 +28,9 @@ export interface ConsolePeer {
   /** Actual live Codex process account, independent of the next-start selection. */
   codexAccountName?: string
   claudeAccountName?: string
+  /** 非订阅来源活进程的实际账号，与启动卡、群里 hi 同口径写来源名（`GLM`、中转站名）；
+   * 订阅账号仍由上面两个字段给出。有它时优先于上面两个字段。 */
+  accountLabel?: string
   /** 当前实际在用的模型与 effort（与 footer 同口径），和账号写在同一行。 */
   model?: string
   effort?: string
@@ -266,9 +269,15 @@ export function errorDetailsElement(title: string, lines: string[]): object {
   }
 }
 
-/** 主机区要折叠的错误：服务列表整体读不到时把原因收起来。 */
+/** 主机区要折叠的错误：服务列表整体读不到、服务运行时长读不到时把原因（转义后）收起来；
+ * 一次 ps 失败会落在每个运行中的服务上，同一原因只写一次。 */
 function hostErrorDetails(sysinfo?: SysInfo): string[] {
-  return sysinfo?.servicesError ? [`服务列表：${escapeInlineMarkdown(sysinfo.servicesError)}`] : []
+  if (!sysinfo) return []
+  const uptimeErrors = [...new Set(sysinfo.services.flatMap(service => service.error ? [service.error] : []))]
+  return [
+    ...(sysinfo.servicesError ? [`服务列表：${escapeInlineMarkdown(sysinfo.servicesError)}`] : []),
+    ...uptimeErrors.map(reason => `运行时长：${escapeInlineMarkdown(reason)}`),
+  ]
 }
 
 /** 工作目录所在磁盘的占用与剩余：`占用 80% · 剩余 15G`。 */
@@ -330,12 +339,13 @@ export function consoleHostContent(sysinfo?: SysInfo): string {
         parts.push(s.active)
         if (stateAge != null) parts.push(`已 ${fmtUptime(stateAge * 1000)}`)
       }
-      // 只有什么都不写时才退回英文状态；有报错时报错本身就是内容。
+      // 只有什么都不写时才退回英文状态；运行时长读不到时写明 MISS。
       if (!parts.length && !s.error) parts.push(s.active)
       if (s.active !== 'active' && s.lastExitStatus !== undefined) {
         parts.push(s.lastExitStatus < 0 ? `终止信号 ${-s.lastExitStatus}` : `退出码 ${s.lastExitStatus}`)
       }
-      if (s.error) parts.push(s.error)
+      // 行内只留 MISS：原因可能多行、含尖括号，转义后收进默认折叠的「主机读取失败」。
+      if (s.error) parts.push('运行时长 MISS')
       lines.push(`　· ${dot} \`${s.name}\` · ${parts.join(' · ')}`)
     }
   }

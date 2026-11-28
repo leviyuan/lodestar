@@ -1,14 +1,17 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  TASK_ITEM_VISIBLE_CHARS,
   TASK_LIST_VISIBLE_LIMIT,
   applyTaskTool,
   asTaskToolName,
   summarizeTaskBoard,
   taskBoardElement,
   taskBoardLiveElement,
+  taskListLine,
   type TaskBoardEntry,
 } from './task-board'
+import { toolCallElement } from './tool'
 
 describe('asTaskToolName', () => {
   test('识别 4 个 Task 工具,其余返回 null', () => {
@@ -264,5 +267,46 @@ describe('taskBoardElement — 渲染整个 board', () => {
     expect(body).toContain('还有 5 项未显示')
     expect(body).toContain(`- ⬜ 项${TASK_LIST_VISIBLE_LIMIT - 1}`)
     expect(body).not.toContain(`- ⬜ 项${TASK_LIST_VISIBLE_LIMIT}\n`)
+  })
+})
+
+describe('长待办按字符上限截断', () => {
+  test('超过上限截断加省略号,不拆开代理对,截断在代码围栏里时补上闭合', () => {
+    const exact = '验'.repeat(TASK_ITEM_VISIBLE_CHARS)
+    expect(taskListLine('- ⬜ ', exact)).toBe(`- ⬜ ${exact}`)
+    expect(taskListLine('- ⬜ ', `${exact}多`)).toBe(`- ⬜ ${exact}…`)
+    // 截断点落在 emoji 的两半之间:退一格,不留半个字符。
+    const ascii = 'a'.repeat(TASK_ITEM_VISIBLE_CHARS - 1)
+    expect(taskListLine('', `${ascii}${'😀'.repeat(5)}`)).toBe(`${ascii}…`)
+    // 截断落在代码围栏里:省略号留在块内并补上闭合,后面的条目不会变成代码。
+    expect(taskListLine('- ⬜ ', `说明\n\`\`\`bash\n${'x'.repeat(200)}`))
+      .toBe(`- ⬜ 说明\n\`\`\`bash\n${'x'.repeat(TASK_ITEM_VISIBLE_CHARS - 11)}…\n\`\`\``)
+    const board: TaskBoardEntry[] = [{ id: '1', subject: `${exact}多`, status: 'pending' }]
+    expect((taskBoardLiveElement(board) as any).elements[0].content).toBe(`**待办**: 1 项\n- ⬜ ${exact}…`)
+    const todo = toolCallElement(0, 'TodoWrite', { todos: [{ content: `${exact}多`, status: 'pending' }] }, null, '✅') as any
+    expect(todo.elements[0].content).toContain(`- 待办: ${exact}…`)
+  })
+
+  test('50 条都很长的最坏情况,单个面板仍在整卡约 30KB 的容量内', () => {
+    // 不截断时 50 条各 200 字的面板就有约 30.6KB。
+    const contents: Record<string, string> = {
+      中文: '验'.repeat(5000), emoji: '😀'.repeat(5000), 转义字符: '"\\'.repeat(5000), 控制字符: '\u0001'.repeat(5000),
+    }
+    for (const [kind, content] of Object.entries(contents)) {
+      const board: TaskBoardEntry[] = Array.from({ length: TASK_LIST_VISIBLE_LIMIT }, (_, k) => ({
+        id: String(k + 1), subject: content, status: 'pending' as const,
+      }))
+      const todos = board.map(entry => ({ content: entry.subject, status: 'pending' }))
+      const panels = {
+        实时总览: taskBoardLiveElement(board),
+        任务板快照: taskBoardElement(0, board, { name: 'TaskList', status: '✅' }),
+        TodoWrite: toolCallElement(0, 'TodoWrite', { todos }, null, '✅'),
+      }
+      for (const [panel, element] of Object.entries(panels)) {
+        const bytes = Buffer.byteLength(JSON.stringify(element))
+        // 中文等常见内容约 13KB：快照与实时总览同在一张卡上也放得下；JSON 转义最重的控制字符也低于 30KB。
+        expect(bytes, `${kind} ${panel}`).toBeLessThan(kind === '控制字符' ? 30_000 : 15_000)
+      }
+    }
   })
 })

@@ -6,6 +6,8 @@ import permissions from '../docs/feishu-permissions.json'
 test('the importable permission list carries the 1:1 message scope and the setup guide names every scope', () => {
   const tenant: string[] = permissions.scopes.tenant
   expect(tenant).toContain('im:message.p2p_msg:readonly')
+  // 群解散事件 im.chat.disbanded_v1 要求 im:chat（或 im:chat:readonly）其一，清单已含 im:chat。
+  expect(tenant).toContain('im:chat')
   expect(new Set(tenant).size).toBe(tenant.length)
   expect(permissions.scopes.user).toEqual([])
   // The wizard prints the JSON and then a readable copy; the two must not drift apart.

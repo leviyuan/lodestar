@@ -143,8 +143,9 @@ describe.skipIf(process.platform === 'win32')('claudeCredentialExpiry', () => {
 
   test('transient failures keep the same revision value; unusable answers show MISS instead of an older date', async () => {
     const at = Date.now() + 5 * DAY
+    // 只有专门测超时的读取用 200ms；正常读取给足时间，机器繁忙时子进程启动慢也不会被误判为超时。
     const read = (revision: string, extra: Record<string, string>) => claudeCredentialExpiry({ accountId: 'fallback', revision },
-      () => ({ env: env(extra) }), { executable: () => executable, timeoutMs: 200 })
+      () => ({ env: env(extra) }), { executable: () => executable, timeoutMs: extra.FAKE_SLEEP ? 200 : 10_000 })
     expect(await read('r1', { FAKE_OUTPUT: ending(at) })).toBe(at)
     expect(await read('r1', { FAKE_SLEEP: '5' })).toBe(at)
     expect(await read('r2', { FAKE_SLEEP: '5' })).toBeNull()

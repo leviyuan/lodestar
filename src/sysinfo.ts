@@ -12,7 +12,7 @@
  *   os.loadavg()          —— Linux / macOS 的 1m / 5m / 15m
  *   /proc/meminfo          —— Linux Total / Available
  *   vm_stat + os.totalmem —— macOS 应用、wired、压缩内存
- *   statfsSync(path)       —— 工作目录所在磁盘的容量
+ *   statfs(path)           —— 工作目录所在磁盘的容量
  *   /proc/uptime           —— monotonic seconds since boot (uptime 推算)
  *   systemctl --user show  —— cc-* / codex-* 服务的状态与启动时间
  *   launchctl list + ps    —— macOS 当前用户服务状态与进程运行时长
@@ -24,13 +24,47 @@
  */
 
 import { execFile } from 'node:child_process'
-import { existsSync, readFileSync, statfsSync, statSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
+import { access, stat, statfs } from 'node:fs/promises'
 import { cpus, loadavg, totalmem } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { logError } from './log'
 
 const execFileAsync = promisify(execFile)
+
+/** 工作目录与 launchd 日志可能在失联的网络卷上：同步调用会卡住整个 daemon，所以这些路径
+ * 只用异步读取，超时与这里 launchctl / ps 等命令的读取超时一致，超时按 MISS。测试替换以模拟失联的卷。 */
+export const sysinfoFs = {
+  timeoutMs: 2000,
+  access: (path: string): Promise<void> => access(path),
+  stat: (path: string): Promise<{ isFile(): boolean; mtimeMs: number }> => stat(path),
+  statfs: (path: string): Promise<{ bsize: number; blocks: number; bavail: number }> => statfs(path),
+}
+
+/** 同一路径上一次读取还没返回时复用它：卡住的调用一直占着一个线程，再次读取不再叠加。 */
+const pendingFsReads = new Map<string, Promise<unknown>>()
+
+class FsReadTimeout extends Error {
+  constructor(timeoutMs: number) {
+    super(`文件系统读取超时（${timeoutMs / 1000}s）`)
+    this.name = 'FsReadTimeout'
+  }
+}
+
+function readFsWithTimeout<T>(key: string, read: () => Promise<T>): Promise<T> {
+  let pending = pendingFsReads.get(key) as Promise<T> | undefined
+  if (!pending) {
+    const started = read().finally(() => pendingFsReads.delete(key))
+    pendingFsReads.set(key, started)
+    pending = started
+  }
+  const timeoutMs = sysinfoFs.timeoutMs
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([pending, new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new FsReadTimeout(timeoutMs)), timeoutMs)
+  })]).finally(() => clearTimeout(timer))
+}
 
 export interface CpuInfo {
   cores: number
@@ -76,7 +110,7 @@ export interface ServiceInfo {
   hasStarted?: boolean | null
   /** launchctl 的上一退出状态;负数表示终止信号。 */
   lastExitStatus?: number
-  /** 已读取状态但无法读取运行时长时保留服务及具体错误。 */
+  /** 已读取状态但无法读取运行时长时保留服务及具体错误（原文；卡片行内只写 MISS，原因折叠展示一次）。 */
   error?: string
 }
 
@@ -226,9 +260,12 @@ export function parseProcessElapsed(raw: string): Map<number, number> {
 /** `launchctl list <label>` 并发上限：已停任务一般只有几个，避免几十个进程一起起。 */
 const LAUNCHD_DETAIL_CONCURRENCY = 8
 
+/** 日志最后写入时间；读不到为 null。 */
+type MtimeReader = (path: string) => Promise<number | null> | number | null
+
 export async function readMacServices(
   command: HostCommand = runHostCommand,
-  mtimeMs: (path: string) => number | null = statMtimeMs,
+  mtimeMs: MtimeReader = statMtimeMs,
 ): Promise<{ services: ServiceInfo[]; error: string | null }> {
   let jobs: LaunchdService[]
   try {
@@ -244,7 +281,7 @@ export async function readMacServices(
       for (const job of running) {
         const elapsed = times.get(job.pid!)
         if (elapsed === undefined) {
-          job.error = 'ps 未返回该进程，运行时长 MISS'
+          job.error = 'ps 未返回该进程'
           logError('sysinfo: service status failed', job.error)
         } else {
           job.lastActiveAgoSec = elapsed
@@ -253,7 +290,9 @@ export async function readMacServices(
       }
     } catch (e) {
       logError('sysinfo: read service uptime failed', e)
-      for (const job of running) job.error = `运行时长 MISS: ${e instanceof Error ? e.message : String(e)}`
+      // 同一次失败的原文记在每个运行中服务上；卡片只展示一次。
+      const reason = e instanceof Error ? e.message : String(e)
+      for (const job of running) job.error = reason
     }
   }
   // 已停任务：launchd 只记录当前状态和累计运行次数，不给历史启动时间，所以用
@@ -265,7 +304,7 @@ export async function readMacServices(
     await Promise.all(idle.slice(i, i + LAUNCHD_DETAIL_CONCURRENCY).map(async job => {
       const detail = await readLaunchdDetail(command, job.name)
       if (!detail) return
-      const lastActiveMs = launchdLastActiveMs(detail, mtimeMs)
+      const lastActiveMs = await launchdLastActiveMs(detail, mtimeMs)
       if (lastActiveMs === null) return
       job.lastActiveAgoSec = Math.max(0, (Date.now() - lastActiveMs) / 1000)
       job.hasStarted = true
@@ -293,22 +332,21 @@ export function parseLaunchdJobDetail(raw: string): LaunchdJobDetail {
 }
 
 /** 取日志文件里最新的写入时间；两个路径都读不到返回 null。 */
-export function launchdLastActiveMs(detail: LaunchdJobDetail, mtimeMs: (path: string) => number | null): number | null {
+export async function launchdLastActiveMs(detail: LaunchdJobDetail, mtimeMs: MtimeReader): Promise<number | null> {
+  const paths = [detail.stdoutPath, detail.stderrPath].filter((path): path is string => !!path)
   let latest: number | null = null
-  for (const path of [detail.stdoutPath, detail.stderrPath]) {
-    if (!path) continue
-    const mtime = mtimeMs(path)
+  for (const mtime of await Promise.all(paths.map(path => mtimeMs(path)))) {
     if (mtime === null || !Number.isFinite(mtime) || mtime <= 0) continue
     latest = latest === null ? mtime : Math.max(latest, mtime)
   }
   return latest
 }
 
-/** 日志文件可能还没创建、已被清理或不可读：都只是没有证据，不算查询失败。 */
-function statMtimeMs(path: string): number | null {
+/** 日志文件可能还没创建、已被清理、不可读或在失联的卷上读取超时：都只是没有证据，不算查询失败。 */
+async function statMtimeMs(path: string): Promise<number | null> {
   try {
-    const stat = statSync(path)
-    return stat.isFile() ? stat.mtimeMs : null
+    const info = await readFsWithTimeout(`stat:${path}`, () => sysinfoFs.stat(path))
+    return info.isFile() ? info.mtimeMs : null
   } catch {
     return null
   }
@@ -325,14 +363,12 @@ async function readLaunchdDetail(command: HostCommand, label: string): Promise<L
   }
 }
 
-/** statfsSync 拿到的 blocks/bavail 都按 f_frsize 计算 bytes —— 注意
+/** statfs 拿到的 blocks/bavail 都按 f_frsize 计算 bytes —— 注意
  * `usedBytes` 用 total - avail (不是 total - free),跟 `df` 的 Use% 列
- * 一致 (排除 root 保留块)。 */
-export function readDiskFor(path: string): DiskInfo | null {
+ * 一致 (排除 root 保留块)。读取超时同样按 MISS。 */
+export async function readDiskFor(path: string): Promise<DiskInfo | null> {
   try {
-    const s = statfsSync(path, { bigint: false }) as {
-      bsize: number; blocks: number; bavail: number
-    }
+    const s = await readFsWithTimeout(`statfs:${path}`, () => sysinfoFs.statfs(path))
     const totalBytes = s.blocks * s.bsize
     const availBytes = s.bavail * s.bsize
     const usedBytes = Math.max(0, totalBytes - availBytes)
@@ -348,8 +384,9 @@ export function readDiskFor(path: string): DiskInfo | null {
 }
 
 /** 只看工作目录所在的磁盘：项目工作目录在哪个文件系统，面板就显示哪一个。
- * 目录还不存在（新建的项目根目录）时沿上级找到最近的已有目录，仍能报出它所在的磁盘。 */
-export function readWorkDirDisk(workDir: string): DiskInfo[] {
+ * 目录还不存在（新建的项目根目录）时沿上级找到最近的已有目录，仍能报出它所在的磁盘；
+ * 读取超时（失联的卷）按 MISS，不改报上级目录所在的另一块磁盘。 */
+export async function readWorkDirDisk(workDir: string): Promise<DiskInfo[]> {
   let path: string
   try {
     path = resolve(workDir)
@@ -357,12 +394,21 @@ export function readWorkDirDisk(workDir: string): DiskInfo[] {
     logError('sysinfo: resolve working directory failed', e)
     return []
   }
-  while (!existsSync(path)) {
-    const parent = dirname(path)
-    if (parent === path) return []
-    path = parent
+  for (;;) {
+    try {
+      await readFsWithTimeout(`access:${path}`, () => sysinfoFs.access(path))
+      break
+    } catch (e) {
+      if (e instanceof FsReadTimeout) {
+        logError('sysinfo: read filesystem statistics failed', e)
+        return []
+      }
+      const parent = dirname(path)
+      if (parent === path) return []
+      path = parent
+    }
   }
-  const disk = readDiskFor(path)
+  const disk = await readDiskFor(path)
   return disk ? [disk] : []
 }
 
@@ -476,8 +522,8 @@ export async function readSysInfo(workDir: string = process.cwd()): Promise<SysI
     return { cpu: null, mem: null, disks: [], services: [], servicesError: `${platform}: sysinfo 暂未支持` }
   }
   const cpu = readCpu()
-  const disks = readWorkDirDisk(workDir)
-  const [mem, { services, error }] = await Promise.all([
+  const [disks, mem, { services, error }] = await Promise.all([
+    readWorkDirDisk(workDir),
     process.platform === 'darwin' ? readMacMemory() : readMem(),
     process.platform === 'darwin' ? readMacServices() : readServices(),
   ])

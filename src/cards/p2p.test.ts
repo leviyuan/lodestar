@@ -167,3 +167,21 @@ describe('1:1 read-only panel card', () => {
     expect(new Set(elementIds).size).toBe(elementIds.length)
   })
 })
+
+describe('1:1 panel account row', () => {
+  test('non-subscription sources write their source name; subscriptions keep Claude·/Codex·', () => {
+    const card = p2pConsoleCard({ peers: [
+      { name: 'a-glm', status: 'idle', accountLabel: 'GLM', model: 'glm-5.3', effort: 'high' },
+      { name: 'b-relay', status: 'idle', accountLabel: '中转*站', model: 'claude-opus-5-5' },
+      { name: 'c-sub', status: 'idle', claudeAccountName: '备_用', model: 'opus' },
+      { name: 'd-codex', status: 'idle', codexAccountName: '工作订阅' },
+    ] }) as any
+    // 与启动卡同口径：GLM、中转站等写来源名，账号文字照样转义 markdown。
+    expect(blocks(card)).toEqual([
+      "🟢 **`a-glm`**\n<font color='grey'>GLM · glm-5.3/high</font>",
+      "🟢 **`b-relay`**\n<font color='grey'>中转&#42;站 · claude-opus-5-5</font>",
+      "🟢 **`c-sub`**\n<font color='grey'>Claude·备&#95;用 · opus</font>",
+      "🟢 **`d-codex`**\n<font color='grey'>Codex·工作订阅</font>",
+    ])
+  })
+})

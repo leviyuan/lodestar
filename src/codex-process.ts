@@ -24,6 +24,7 @@ import { scrubAgentHostEnv } from './agent-env'
 import { logError, logDiagnostic } from './log'
 import { agentBin } from './agent-updates'
 import { prepareCodexInputPolicyCatalog, type CodexInputPolicyCatalog } from './codex-input-policy'
+import { assertCodexProviderIsolated, codexProjectTrustArgs } from './codex-config'
 import { terminateProcessTree } from './process-tree'
 import {
   contextCompactionNoticeFromMessage,
@@ -184,7 +185,9 @@ export function codexApiProviderArgs(provider: CodexApiProvider): string[] {
     name: provider.name, base_url: provider.baseUrl, env_key: provider.envKey,
     wire_api: 'responses', requires_openai_auth: false, supports_websockets: false,
   }
-  // Replace the provider definition as one value: local same-name auth/header settings must not leak in.
+  // Codex deep-merges `-c` into config.toml, so this table does not replace a same-named
+  // local provider: its headers, query params or auth would be added. Startup therefore
+  // refuses such a collision before any request (`assertCodexProviderIsolated`).
   const table = `{${Object.entries(definition).map(([key, value]) => `${key}=${JSON.stringify(value)}`).join(',')}}`
   return ['-c', `model_provider=${JSON.stringify(provider.id)}`, '-c', `${prefix}=${table}`,
     // ChatGPT connectors require the subscription account; project MCP/skills remain native.
@@ -485,7 +488,7 @@ export class CodexProcess extends EventEmitter {
           ...codexAccounts.cliArgs(opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)]
     // Project trust is scoped to this launch; never write it to the shared
     // ~/.codex/config.toml (the backend Agent reads that file).
-    const projectTrustArgs = ['-c', `projects.${JSON.stringify(opts.workDir)}.trust_level="trusted"`]
+    const projectTrustArgs = codexProjectTrustArgs(opts.workDir)
     const baseEnv = scrubAgentHostEnv({
       ...(process.env as Record<string, string>),
       NPM_CONFIG_LOGLEVEL: 'error',
@@ -508,6 +511,7 @@ export class CodexProcess extends EventEmitter {
     if (opts.allowUserInput === false) {
       this.startupPromise = prepareCodexInputPolicyCatalog({ binary: codexBin, configArgs: providerArgs,
         env: spawnEnv, workDir: opts.workDir, signal: this.inputPolicyAbort.signal,
+        ...(opts.apiProvider ? { apiProvider: opts.apiProvider } : {}),
       }).then(async catalog => {
         if (this.expectedExit) { await catalog.dispose(); throw new Error('Codex startup cancelled') }
         start(catalog)
@@ -618,7 +622,10 @@ export class CodexProcess extends EventEmitter {
     this.exitEventEmitted = true
     this.resolveExit()
     if (!this.expectedExit) logDiagnostic('codex-process: unexpected process exit')
-    this.emit('exit', { code, signal, expected: this.expectedExit })
+    // 多由子进程 close 回调触发：宿主监听器抛错会逃出 node:child_process 变成
+    // uncaughtException 让整个 daemon 停机，只记录不外抛。
+    try { this.emit('exit', { code, signal, expected: this.expectedExit }) }
+    catch (error) { logError('codex-process: exit dispatch failed', error) }
   }
 
   private onStdout(chunk: Buffer): void {
@@ -1647,10 +1654,14 @@ export class CodexProcess extends EventEmitter {
   private async ensureInitialized(): Promise<void> {
     if (this.startupPromise) await this.startupPromise
     if (!this.initializePromise) {
-      this.initializePromise = this.request('initialize', this.initializeParams()).then(() => {
+      this.initializePromise = this.request('initialize', this.initializeParams()).then(async () => {
         if (!this.write({ method: 'initialized' })) {
           throw new Error('codex app-server initialized notification write failed')
         }
+        // Before any thread or catalog request can reach the relay: its provider must be
+        // exactly Lodestar's definition, not merged with a same-named local one.
+        const provider = this.opts.apiProvider
+        if (provider) assertCodexProviderIsolated(await this.request('config/read', { includeLayers: true, cwd: this.opts.workDir }), provider)
       })
     }
     await this.initializePromise

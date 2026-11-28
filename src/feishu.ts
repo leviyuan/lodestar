@@ -35,7 +35,7 @@ import {
   SESSION_TURNS_MAP_FILE,
   TEMP_SESSION_LEASES_FILE,
 } from './paths'
-import { log, logError } from './log'
+import { log, logDiagnostic, logError } from './log'
 import { attachmentDir } from './attachments'
 import { sessionActivity } from './session-activity'
 import { sync as spawnSync } from 'cross-spawn'
@@ -1055,6 +1055,27 @@ export function clearSessionConversationState(sessionName: string, chatIdHint?: 
   }
 }
 
+/**
+ * 群已不存在（解散，或外部群里机器人已退群）时只清这个 chat 自己的状态：活跃时间、该 chat_id 的临时会话
+ * 租约，以及群名与群类型缓存（群名缓存不清的话 `chatIdForSession` 会按群名兜底解析到已解散的群）。
+ * 绑定、resume、模型与 turns 按群名保存，可能属于同名的另一个群：只有群名绑定确实指向本群时，
+ * 调用方才另用 `clearSessionConversationState` 清理（见 `chat-disband.ts`）。
+ */
+export function forgetChatState(chatId: string): void {
+  if (!chatId) return
+  chatNameCache.delete(chatId)
+  externalChatCache.delete(chatId)
+  const lease = tempSessionLeaseByChat.get(chatId)
+  if (lease) {
+    tempSessionLeaseByChat.delete(chatId)
+    try { saveTempSessionLeases() } catch (error) {
+      tempSessionLeaseByChat.set(chatId, lease)
+      throw error
+    }
+  }
+  sessionActivity.forget(chatId)
+}
+
 // ── Alive-on-shutdown marker ──────────────────────────────────────────
 // Persists the list of session names that were still running when the
 // daemon went down. Next boot reads the file and auto-spawns
@@ -1500,6 +1521,15 @@ async function ensureUserInChat(chatId: string, userOpenId: string): Promise<boo
   if (add.code && add.code !== 0) {
     throw sdkApiError('feishu chatMembers.create', add)
   }
+  // code 为 0 也不一定进了群：群开了入群审批时成员进待审批列表，ID 无效或不存在时进对应列表。
+  // 这些情况如实报错，不能报“已加入”；只请求了发起人一个人，报错不需要带成员 ID。
+  const listed = (ids: string[] | undefined) => (ids ?? []).includes(userOpenId)
+  if (listed(add.data?.pending_approval_id_list)) {
+    throw new Error('飞书已提交入群申请：该群开启了入群审批，须群主或群管理员通过后才会进群')
+  }
+  if (listed(add.data?.invalid_id_list) || listed(add.data?.not_existed_id_list)) {
+    throw new Error('飞书未能把发起人拉进群：成员 ID 无效或不存在')
+  }
   return true
 }
 
@@ -1576,7 +1606,12 @@ export async function isExternalChat(chatId: string): Promise<boolean> {
   if (!chatId) throw new Error('cannot inspect a group without chat_id')
   const known = externalChatCache.get(chatId)
   if (known !== undefined) return known
-  return (await inLookupWindow(lookupWindow(undefined), 'feishu chat.get', () => fetchChatStatus(chatId))).external
+  const { external } = await inLookupWindow(lookupWindow(undefined), 'feishu chat.get', () => fetchChatStatus(chatId))
+  if (external !== null) return external
+  // 飞书没返回群类型（文档写明调用方不在群里时只返回群名、头像、人数和群状态，内部群同样会缺）：
+  // 沿用原行为按内部群处理、不缓存，下次再读；记一条固定字面量的诊断。
+  logDiagnostic('feishu chat type missing')
+  return false
 }
 
 export interface ChatOwner {
@@ -1717,7 +1752,7 @@ async function sendViaSdkWithRetry(
   } // withFeishuRetry logs the final failure; callers surface null.
 }
 
-async function fetchChatStatus(chatId: string): Promise<{ name: string | null; status: string | null; external: boolean }> {
+async function fetchChatStatus(chatId: string): Promise<{ name: string | null; status: string | null; external: boolean | null }> {
   const res = await client.im.chat.get({ path: { chat_id: chatId } })
   if (res.code && res.code !== 0) {
     throw sdkApiError('feishu chat.get', res)
@@ -1726,8 +1761,8 @@ async function fetchChatStatus(chatId: string): Promise<{ name: string | null; s
   return {
     name: res.data?.name ?? null,
     status: res.data?.chat_status ?? null,
-    // 缺字段按内部群处理，与原行为一致。
-    external: res.data?.external === true,
+    // 飞书没返回群类型时为 null；使用方按内部群处理，与原行为一致。
+    external: typeof res.data?.external === 'boolean' ? res.data.external : null,
   }
 }
 

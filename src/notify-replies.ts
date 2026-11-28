@@ -59,8 +59,9 @@ export function createNotifyReplyRuntime(deps: {
     async recover(reg: NotifyRegistration): Promise<void> {
       if (reg.replyState?.status === 'cancelled' && reg.replyState.cancelReason === 'restart') {
         const state = reg.replyState
-        const resolution: NotifyResolution = { kind: 'text', status: 'cancelled', text: '', operatorOpenId: '' }
-        await update(reg, state.promptMessageId, buildNotifyReplyCard(reg, state, resolution), '服务重启，回复已失效，请重新点击回复')
+        // The original card keeps its 回复 button under the expired marker.
+        const resolution: NotifyResolution = { kind: 'text', status: 'cancelled', text: '', operatorOpenId: '', detail: '服务重启' }
+        await update(reg, state.promptMessageId, buildNotifyReplyCard(reg, state), '服务重启，回复已失效，请重新点击回复')
         await update(reg, reg.messageId, buildNotifyCardFromReg(reg, resolution), '服务重启，回复已失效，请重新点击回复')
         markRestartRecovered(reg.notifyId)
         return

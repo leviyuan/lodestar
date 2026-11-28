@@ -5,12 +5,24 @@
  * session-tools.ts 在工具完成时应用更新，再渲染整个任务板。
  */
 
+import { closeOpenMarkdownFence, sliceWholeCharacters } from '../markdown-code'
 import { ELEMENTS } from './elements'
 
 /** 待办列表在卡片里最多显示的条目数。整块待办是单个 markdown 元素，条目数不增加
  * 卡片元素数；上限按整卡约 30KB 的 JSON 预算与可读长度取值 —— 每条中文待办约 66
  * 字节，50 条约 3KB。Codex 的实时计划面板不做截断，这里也只在超长任务板上压缩。 */
 export const TASK_LIST_VISIBLE_LIMIT = 50
+
+/** 单条待办最多显示的字符数，超出截断加省略号。不截断时 50 条各 200 字的面板就有约 30.6KB；
+ * 按这个上限，50 条中文长待办的单个面板约 13KB，任务板快照与实时总览同在一张卡上也放得下。 */
+export const TASK_ITEM_VISIBLE_CHARS = 80
+
+/** 待办列表的一行：内容超过上限截断加省略号（不拆开代理对）；截断处若落在代码围栏里则补上闭合，
+ * 后面的条目和分区不会被渲染成代码。任务板与 TodoWrite 面板共用。 */
+export function taskListLine(prefix: string, content: string): string {
+  if (content.length <= TASK_ITEM_VISIBLE_CHARS) return `${prefix}${content}`
+  return closeOpenMarkdownFence(`${prefix}${sliceWholeCharacters(content, TASK_ITEM_VISIBLE_CHARS)}…`)
+}
 
 /** 一条任务在板上的累积视图。status 含 'deleted' —— 删除先标记,供渲染层过滤;
  * 真正移除由 TaskList 全量替换自然回收。 */
@@ -278,7 +290,7 @@ function renderTaskBoardBody(board: TaskBoardEntry[], resolvedNote?: string): st
     const emoji = STATUS_EMOJI[t.status]
     // 进行中时优先用 activeForm(更"正在进行"的语气),其余用 subject。
     const content = (t.status === 'in_progress' && t.activeForm) ? t.activeForm : t.subject
-    lines.push(`- ${emoji} ${content || '(空)'}`)
+    lines.push(taskListLine(`- ${emoji} `, content || '(空)'))
   }
   if (ordered.length > TASK_LIST_VISIBLE_LIMIT) {
     lines.push(`- 还有 ${ordered.length - TASK_LIST_VISIBLE_LIMIT} 项未显示`)

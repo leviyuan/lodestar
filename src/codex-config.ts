@@ -5,11 +5,11 @@
  * the user's global `~/.codex/config.toml` for every project directory it
  * provisioned. That file is read by the Codex Agent itself, so the accumulated
  * entries would disclose every group/project directory name to any backend
- * Agent. New launches pass the same trust level with `-c` instead; this module
- * removes the entries Lodestar wrote while leaving unrelated Codex settings
- * untouched.
+ * Agent. New launches pass the same trust level with `-c` instead
+ * (`codexProjectTrustArgs`); this module removes the entries Lodestar wrote
+ * while leaving unrelated Codex settings untouched.
  */
-import { readFileSync } from 'node:fs'
+import { readFileSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { writeStateFileAtomic } from './state-store'
@@ -19,6 +19,46 @@ const TRUST_ONLY = 'trust_level = "trusted"'
 
 export function codexConfigFile(home = homedir()): string {
   return join(home, '.codex', 'config.toml')
+}
+
+/** TOML 基本字符串:转义引号、反斜杠(Windows 路径)与控制字符,其余字符原样保留。 */
+function tomlBasicString(value: string): string {
+  return `"${value.replace(/[\\"\u0000-\u001f\u007f]/g, char => char === '\\' || char === '"'
+    ? `\\${char}`
+    : `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`)}"`
+}
+
+/**
+ * 本次启动的项目信任参数,只随进程下发,不写共享的 `~/.codex/config.toml`。
+ * Codex 的 `-c` 在第一个 `=` 处分出键,键再按 `.` 切分且不识别引号:
+ * `projects."<path>".trust_level` 得到的是带引号的键(路径含点时还会被截断),
+ * 永远匹配不到 cwd。因此键只写 `projects`,路径放进 TOML 内联表的带引号键里。
+ * 实测 Codex 0.172 把 `-c` 作为 sessionFlags 层与 config.toml 深合并:内联表只增补
+ * 或覆盖该路径的 `trust_level`,用户自建的其他 projects 项(包括上级仓库根的信任)
+ * 照常生效;即使某个版本改为整表替换,本会话所需的工作目录信任也仍在表内。
+ */
+export function codexProjectTrustArgs(workDir: string): string[] {
+  return ['-c', `projects={ ${tomlBasicString(workDir)} = { trust_level = "trusted" } }`]
+}
+
+/**
+ * 中转站 provider 只能是 Lodestar 下发的那份定义。Codex 把 `-c` 与各层配置深合并：
+ * 本机（用户、系统或托管配置）若也有同名 `[model_providers.<id>]`，它的请求头、查询参数、
+ * 认证命令、模型目录地址等会混进来，而深合并删不掉这些键（覆盖成空表也只是合并进去）；
+ * provider id 又记录在原生会话里，改名会让已有会话无法续接（原生报该 provider 未配置）。
+ * 所以在任何请求发出前，用 `config/read` 的分层结果核对：除本进程的 sessionFlags 外，
+ * 生效中的层定义了同名 provider 就拒绝启动。
+ */
+export function assertCodexProviderIsolated(configRead: unknown, provider: { id: string; name: string }): void {
+  const layers = (configRead as { layers?: unknown } | null)?.layers
+  if (!Array.isArray(layers)) throw new Error('Codex config/read 未返回配置分层，无法确认中转站 provider 没有混入本机配置')
+  for (const layer of layers) {
+    if (layer?.name?.type === 'sessionFlags' || layer?.disabledReason) continue
+    const providers = layer?.config?.model_providers
+    if (!providers || typeof providers !== 'object' || !Object.hasOwn(providers, provider.id)) continue
+    const where = typeof layer.name?.file === 'string' ? layer.name.file : String(layer.name?.type ?? 'MISS')
+    throw new Error(`本机 Codex 配置（${where}）也定义了 model provider「${provider.id}」，Codex 会把它与中转站「${provider.name}」的设置合并（如附加请求头、查询参数或认证方式），已停止启动；请删除或改名该 provider 后重试`)
+  }
 }
 
 /** True only for a direct child of the configured projects root: those are the
@@ -76,6 +116,11 @@ export function pruneLodestarProjectTrust(
     kept.push(...lines.slice(index, end))
     index = end - 1
   }
-  if (removed > 0) writeStateFileAtomic(file, kept.join('\n'))
+  if (removed > 0) {
+    // The file is the user's: rewrite a symlinked config (dotfiles managers) at
+    // its real target instead of replacing the link, and keep its own mode.
+    const target = realpathSync(file)
+    writeStateFileAtomic(target, kept.join('\n'), { mode: statSync(target).mode & 0o777 })
+  }
   return removed
 }

@@ -3,6 +3,7 @@ import type { AccountInfo, Settings } from '@anthropic-ai/claude-agent-sdk'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { config } from './config'
+import { scrubAgentHostEnv } from './agent-env'
 import { isClaudeReasoningEffort } from './agent-process'
 import { ANTHROPIC_ENV_KEYS, registerTokenSourceFactory, scrubAnthropicEnv, type TokenSource, type UsageSnapshotUnified } from './token-source'
 import { fetchNativeClaudeModels } from './token-source-models'
@@ -167,9 +168,10 @@ registerTokenSourceFactory({
             validateAccount: source.validateClaudeAccount, tokenSourceId: source.id,
           }, { accountId, revision: expectedRevision, acquireUse: () => claudeAccounts.acquireUse(accountId),
             current: () => claudeAccounts.revision(accountId) === expectedRevision }),
-          // hi 的凭据剩余天数：原生 auth status 用与会话相同的账号环境和进程级设置，不读取钥匙串或凭据文件。
+          // hi 的凭据剩余天数：原生 auth status 用与会话相同的账号环境和进程级设置，不读取钥匙串或凭据文件；
+          // 环境同会话一样先清掉 Lodestar 宿主变量（配置与数据路径、续接群 ID、飞书凭据）。
           claudeCredentialExpiry({ accountId, revision: expectedRevision }, () => ({
-            env: source.spawnEnv({ ...process.env, PATH: buildClaudeSpawnPath(), ...config.claude.env }), settings,
+            env: source.spawnEnv(scrubAgentHostEnv({ ...process.env, PATH: buildClaudeSpawnPath(), ...config.claude.env })), settings,
             acquireUse: () => claudeAccounts.acquireUse(accountId),
           })),
         ]).then(([usage, credentialExpiresAt]) => credentialExpiresAt === undefined ? usage : { ...usage, credentialExpiresAt })

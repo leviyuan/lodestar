@@ -390,7 +390,7 @@ describe('1:1 panel builder', () => {
     expect(peak).toBeLessThanOrEqual(P2P_MEMBERSHIP_CONCURRENCY)
   })
 
-  test('host and quota failures stay visible as MISS for an internal requester', async () => {
+  test('host and quota failures show MISS and keep the quota failure reason', async () => {
     const h = harness({ sessions: [] })
     h.deps.readAllAccountUsage = async () => { throw new Error('usage cache unavailable') }
     h.deps.readSysInfo = async () => { throw new Error('ps failed') }
@@ -439,6 +439,16 @@ describe('1:1 reply', () => {
         expect(card.body.elements[0].content).toBe(`${P2P_LOOKUP_FAILED_NOTE}：读取超时`)
         expect(elementIds(card)).toEqual([undefined, 'console_projects', 'console_usage', 'console_host', undefined])
         expect(JSON.stringify(card)).not.toContain('工作订阅')
+        // Nothing updates this reply later: the quota section names the timeout instead of staying on 加载中…,
+        // and the host section shows MISS.
+        const section = (id: string) => card.body.elements.find((element: any) => element.element_id === id)
+        const usageSection = section('console_usage')
+        expect(JSON.stringify(usageSection)).not.toContain('加载中')
+        expect(usageSection.elements[0].content).toBe("**额度**　<font color='red'>MISS</font>")
+        expect(usageSection.elements[1].header.title.content).toBe('⚠️ 额度读取失败 (1)')
+        expect(usageSection.elements[1].elements[0].content).toBe('**额度**　读取超时')
+        expect(section('console_host').elements[0].content.split('\n'))
+          .toEqual(['**负载**　MISS', '**内存**　MISS', '**硬盘**　MISS', '**服务** cc-* / codex-*　MISS'])
 
         // Once the stalled request answers, the abandoned build issues nothing more:
         // no further owner or membership lookup, no quota or host read, no second message.

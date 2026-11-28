@@ -2,6 +2,7 @@ import type { Session } from './session'
 import type { AgentProvider } from './agent-process'
 import { channelInstructions } from './instructions'
 import * as cards from './cards'
+import { notifyChatGone } from './chat-disband'
 import * as feishu from './feishu'
 import { formatFeishuError, redactMemberIds } from './feishu-errors'
 import { logError } from './log'
@@ -269,6 +270,12 @@ export async function onWorktreeDisband(s: Session, slugRaw: string): Promise<Wo
         else disbandedTemps.push(name)
       }
       const disbanded = await feishu.disbandChatForSession(chatName)
+      // 外部 WT 群机器人只是退群，收不到解散事件（未订阅解散事件的应用同样收不到）：
+      // daemon 里该群的 Session 在这里一并停止释放，按 chat 的状态一起清理。不等待，不占着 worktree 锁排队。
+      if (disbanded.chatId && (disbanded.disbanded || disbanded.left)) {
+        void notifyChatGone(disbanded.chatId, disbanded.left ? 'left' : 'disbanded')
+          .catch(error => logError('session-worktree: wt group release failed', error))
+      }
       const removed = worktree.removeProjectWorktreeIfClean(projectDir, projectName, slug)
       const message = [
         `✅ ${slug} 已解散`,

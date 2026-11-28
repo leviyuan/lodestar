@@ -22,9 +22,10 @@ export function escapeInlineMarkdown(value: string): string {
 const escape = escapeInlineMarkdown
 const grey = (text: string): string => `<font color='grey'>${text}</font>`
 
-/** 显示用的已用百分比（四舍五入）；不是 0–100 的数字时为 null，按 MISS 显示。 */
+/** 显示用的已用百分比（四舍五入）。中转站脚本可能给出略超 100 的值（100.4、101），按 100% 显示，
+ * 不能把已耗尽藏成 MISS；负数、NaN、无穷和非数字为 null，按 MISS 显示。 */
 function shownPercent(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100 ? Math.round(value) : null
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.min(100, Math.round(value)) : null
 }
 
 /** 颜色只看显示值：79.6 显示为 80% 即标橙，99.6 显示为 100% 即标红，同一文案颜色不变。 */

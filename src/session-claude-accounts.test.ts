@@ -132,7 +132,11 @@ describe('Claude named hi integration', () => {
       return accountB
     })
     const close = spyOn(s, 'closeStatusCard').mockResolvedValue(undefined)
-    const restart = spyOn(s, 'restartUnlocked').mockResolvedValue(true)
+    // 重启成功后活进程换成了 B 账号。
+    const restart = spyOn(s, 'restartUnlocked').mockImplementation(async () => {
+      bindProcessClaudeAccount(proc as any, accountB)
+      return true
+    })
     spies.push(enroll, close, restart,
       spyOn(s, 'openStatusCard').mockResolvedValue(card),
       spyOn(s, 'setStatusCard').mockImplementation((_card: unknown, value: string) => { updates.push(value) }),
@@ -149,7 +153,8 @@ describe('Claude named hi integration', () => {
       expect(s.claudeStartAccountOverride).toBeUndefined()
     } finally { complete(); await pending }
     expect(restart).toHaveBeenCalledTimes(1)
-    expect(close).toHaveBeenCalledWith(card, '✅ Claude 订阅「B」已就绪 · 本次指定')
+    // 终态与其他启动/恢复终态同口径：模型行后写实际账号。
+    expect(close).toHaveBeenCalledWith(card, '✅ Claude 订阅「B」已就绪 · 本次指定 · claude · opus/high · 账号 Claude·B')
   })
   test('failed initial sync presents the retry instruction without switching the running account', async () => {
     const s = session(), proc = running(s, accountA)

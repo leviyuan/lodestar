@@ -25,6 +25,8 @@ function cfgToToml(id: string, cfg: TokenSourceConfig): string {
   push('auth_token', cfg.auth_token)
   push('api_key', cfg.api_key)
   push('bin', cfg.bin)
+  // reclaude 固定组织：漏写会让 md 里的模型维护把来源改绑到 `reclaude org use` 的当前组织。
+  push('org', cfg.org)
   push('model', cfg.model)
   push('effort', cfg.effort)
   push('models', cfg.models)

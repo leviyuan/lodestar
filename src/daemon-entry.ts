@@ -45,7 +45,8 @@ export async function startDaemon(): Promise<number> {
       + (process.platform === 'win32'
           ? ' %LOCALAPPDATA%\\Lodestar\\daemon-YYYY-MM-DD.log'
           : ' ~/.local/share/lodestar/daemon-YYYY-MM-DD.log'))
-    console.error('  • 想停: 运行 lodestar stop')
+    console.error('  • 想停: 终端前台启动的运行 lodestar stop')
+    console.error('  • 交给 systemd / launchd / 任务计划托管时，由服务管理器重启或停止，不要用 lodestar stop（见 lodestar --help 的「更新」一节）')
     return 1
   }
   // PID 文件存在但 isOurDaemon 判否（stale + PID 回收）时顺手清掉，daemon 启动会写新的。

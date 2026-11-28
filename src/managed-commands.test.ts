@@ -80,7 +80,7 @@ describe('managed lodestar command', () => {
       targetDir,
       launch: { runtime: "/opt/bun's/bin/bun", entry: '/repo/cli.ts' },
       env,
-    })
+    })!
     expect(target.endsWith('lodestar')).toBe(true)
     expect(readFileSync(target, 'utf8')).toBe(`#!/bin/sh\nexec '/opt/bun'"'"'s/bin/bun' '/repo/cli.ts' "$@"\n`)
     expect(statSync(target).mode & 0o777).toBe(0o700)
@@ -114,9 +114,72 @@ describe('managed lodestar command', () => {
       targetDir,
       launch: { runtime: 'C:\\Bun\\bun.exe', entry: 'C:\\Lodestar\\dist\\lodestar.js' },
       env,
-    })
+    })!
     expect(target.endsWith('lodestar.cmd')).toBe(true)
     expect(readFileSync(target, 'utf8')).toBe('@"C:\\Bun\\bun.exe" "C:\\Lodestar\\dist\\lodestar.js" %*\r\n')
     expect(env.Path).toBe(`${targetDir};C:\\Windows`)
+  })
+
+  test('updates an existing Lodestar wrapper of the same shape, including the source-checkout form', () => {
+    const targetDir = join(tempRoot(), 'bin')
+    mkdirSync(targetDir, { recursive: true })
+    const target = join(targetDir, 'lodestar')
+    // Same shape as a wrapper generated for a source checkout with an older Bun.
+    writeFileSync(target, `#!/bin/sh\nexec '/home/u/.local/share/lodestar-dev-tools/bun-1.3.10/bun' '/home/u/project/feishu/cli.ts' "$@"\n`, { mode: 0o700 })
+    const env: NodeJS.ProcessEnv = { PATH: '/usr/bin' }
+    expect(ensureLodestarCommand({
+      platform: 'linux', targetDir, env,
+      launch: { runtime: '/home/u/.local/share/lodestar-dev-tools/bun-1.3.11/bun', entry: '/home/u/project/feishu/cli.ts' },
+    })).toBe(target)
+    expect(readFileSync(target, 'utf8')).toBe(`#!/bin/sh\nexec '/home/u/.local/share/lodestar-dev-tools/bun-1.3.11/bun' '/home/u/project/feishu/cli.ts' "$@"\n`)
+    // A release-bundle wrapper with quoted characters is recognized as well.
+    writeFileSync(target, `#!/bin/sh\nexec '/opt/node'"'"'s/node' '/usr/lib/node_modules/@leviyuan/lodestar/dist/lodestar.js' "$@"\n`)
+    ensureLodestarCommand({ platform: 'linux', targetDir, env, launch: { runtime: '/usr/bin/node', entry: '/srv/lodestar/dist/lodestar.js' } })
+    expect(readFileSync(target, 'utf8')).toBe(`#!/bin/sh\nexec '/usr/bin/node' '/srv/lodestar/dist/lodestar.js' "$@"\n`)
+    expect(env.PATH).toBe(`${targetDir}:/usr/bin`)
+  })
+
+  test('never replaces a user script, a foreign symlink or the npm command link', () => {
+    const root = tempRoot()
+    const targetDir = join(root, 'bin')
+    mkdirSync(targetDir, { recursive: true })
+    const target = join(targetDir, 'lodestar')
+    const launch = { runtime: '/usr/bin/node', entry: join(root, 'dist', 'lodestar.js') }
+    mkdirSync(join(root, 'dist'))
+    writeFileSync(launch.entry, '// bundle')
+
+    const script = `#!/bin/sh\n# my own lodestar helper\nexec /usr/local/bin/other "$@"\n`
+    writeFileSync(target, script, { mode: 0o755 })
+    const userEnv: NodeJS.ProcessEnv = { PATH: '/usr/bin' }
+    expect(ensureLodestarCommand({ platform: 'linux', targetDir, env: userEnv, launch })).toBeNull()
+    expect(readFileSync(target, 'utf8')).toBe(script)
+    expect(userEnv.PATH).toBe('/usr/bin')
+
+    rmSync(target)
+    writeFileSync(join(root, 'other.js'), '// other')
+    symlinkSync(join(root, 'other.js'), target)
+    expect(ensureLodestarCommand({ platform: 'linux', targetDir, env: { PATH: '/usr/bin' }, launch })).toBeNull()
+    expect(realpathSync(target)).toBe(join(root, 'other.js'))
+
+    // npm's global bin link to the running entry already works; keep the link.
+    rmSync(target)
+    symlinkSync('../dist/lodestar.js', target)
+    const npmEnv: NodeJS.ProcessEnv = { PATH: '/usr/bin' }
+    expect(ensureLodestarCommand({ platform: 'linux', targetDir, env: npmEnv, launch })).toBeNull()
+    expect(realpathSync(target)).toBe(launch.entry)
+    expect(npmEnv.PATH).toBe(`${targetDir}:/usr/bin`)
+  })
+
+  test('Windows wrappers follow the same ownership rule', () => {
+    const targetDir = join(tempRoot(), 'bin')
+    mkdirSync(targetDir, { recursive: true })
+    const target = join(targetDir, 'lodestar.cmd')
+    const launch = { runtime: 'C:\\Bun\\bun.exe', entry: 'C:\\Lodestar\\dist\\lodestar.js' }
+    writeFileSync(target, '@"C:\\Old\\node.exe" "C:\\Old\\dist\\lodestar.js" %*\r\n')
+    expect(ensureLodestarCommand({ platform: 'win32', targetDir, env: { Path: 'C:\\Windows' }, launch })).toBe(target)
+    expect(readFileSync(target, 'utf8')).toBe('@"C:\\Bun\\bun.exe" "C:\\Lodestar\\dist\\lodestar.js" %*\r\n')
+    writeFileSync(target, '@echo off\r\nC:\\Tools\\lodestar.exe %*\r\n')
+    expect(ensureLodestarCommand({ platform: 'win32', targetDir, env: { Path: 'C:\\Windows' }, launch })).toBeNull()
+    expect(readFileSync(target, 'utf8')).toBe('@echo off\r\nC:\\Tools\\lodestar.exe %*\r\n')
   })
 })

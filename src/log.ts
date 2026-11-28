@@ -18,10 +18,6 @@ export function ensureDataDir(dir: string = DATA_DIR): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 })
 }
 
-if (fileLoggingEnabled()) {
-  try { ensureDataDir() } catch {}
-}
-
 /** 按日日志保留天数(含今天);超过即清理。 */
 const LOG_RETENTION_DAYS = 7
 const LOG_PREFIX = 'daemon-'
@@ -207,6 +203,17 @@ export function logDiagnostic(event: string, fields: DiagnosticFields = {}): voi
   logDeduplicated(formatLogDiagnostic(event, fields))
 }
 
+let fileLogPrepared = false
+
+/** 首次真正写日志时才建数据目录并把老 daemon.log 迁移成按日文件；导入本模块没有任何 IO，
+ * `lodestar --help` / `--version` 等不写日志的调用不碰数据目录。 */
+function prepareFileLogging(): void {
+  if (fileLogPrepared) return
+  fileLogPrepared = true
+  try { ensureDataDir() } catch {}
+  migrateLegacyLogFile()
+}
+
 /** 追加一行到今天的按日日志,同时打到 stderr。跨天(含进程启动后首次
  * 写入)顺带清理超过 7 天的旧日志。 */
 export function log(msg: string): void {
@@ -215,6 +222,7 @@ export function log(msg: string): void {
   process.stderr.write(line)
   if (!fileLoggingEnabled()) return
   try {
+    prepareFileLogging()
     const key = localDayKey(now)
     if (lastDayKey !== key) {
       lastDayKey = key
@@ -222,10 +230,4 @@ export function log(msg: string): void {
     }
     appendFileSync(logFileForDate(now), line, { mode: 0o600 })
   } catch {}
-}
-
-// 启动:先把老 daemon.log 迁移成按日文件,再清理过期日志。
-if (fileLoggingEnabled()) {
-  migrateLegacyLogFile()
-  try { pruneOldLogs(DATA_DIR) } catch {}
 }

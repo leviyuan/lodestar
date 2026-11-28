@@ -297,6 +297,20 @@ describe('CardActionAdmission integration', () => {
     expect(h.executeCalls()).toBe(1)
   })
 
+  test('task-list buttons left on old cards are refused at admission and never reach a handler', async () => {
+    // The task-list feature was removed (2546a99); its kinds stay out of the supported set.
+    const h = admissionHarness()
+    for (const kind of ['tasklist_enable', 'tasklist_delete_prompt', 'tasklist_delete_confirm']) {
+      const event = actionEvent(`event-${kind}`, 'chat-a', { kind, guid: 'task-guid', project: 'feishu', panel_id: 'p' })
+      expect(validateCardActionAdmission(event)).toBe(`不支持的操作: ${kind}`)
+      expect(h.admission.accept(event)).toEqual({ state: 'invalid', message: `不支持的操作: ${kind}` })
+    }
+    expect(h.work.size).toBe(0)
+    await h.drain()
+    expect(h.executeCalls()).toBe(0)
+    expect(h.effects).toEqual([])
+  })
+
   test('returns ACK before business or presentation side effects', async () => {
     const barrier = deferred<void>()
     const h = admissionHarness({ afterAck: () => barrier.promise })

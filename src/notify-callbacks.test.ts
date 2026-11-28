@@ -19,6 +19,7 @@ import {
   prune,
   register,
   setDispatching,
+  setReplyState,
   type NotifyRegistration,
 } from './notify-callbacks'
 
@@ -260,6 +261,37 @@ describe('buildNotifyResult (pull payload)', () => {
     expect(r.button).toEqual({ id: 'approve', text: '✅ 通过', type: 'primary' })
     expect(r.unknown_by).toBeUndefined()
     expect(r.unknown_reason).toContain('tombstone persistence')
+    // The local persistence error names the state file; the pull result is readable by any local process.
+    expect(get('nf_unknown')!.unknownReason).toContain(tempFile)
+    expect(r.unknown_reason).not.toContain(tempFile)
+    expect(r.unknown_reason).toContain('<path>')
+  })
+
+  test('reply failure details are redacted like Agent diagnostics', () => {
+    register(sampleReg({ notifyId: 'nf_reply_error', buttons: [], allowReply: true }))
+    setReplyState('nf_reply_error', {
+      id: 'reply-1', promptMessageId: 'om_prompt', openedAt: 1, status: 'failed',
+      error: 'code=230002 message=chat oc_0123456789abcdef0123 user ou_0123456789abcdef0123456789abcdef a@corp.example /home/alice/alpha log_id=x',
+    })
+    const r = buildNotifyResult(get('nf_reply_error')!) as any
+    expect(r.reply.status).toBe('failed')
+    // The path placeholder must not swallow the log_id, same as the /notify 502 response.
+    expect(r.reply.error).toBe('code=230002 message=chat <id> user … <email> <path> log_id=x')
+  })
+
+  test('pull results keep the Feishu log_id after a redacted path, like /notify error responses', () => {
+    const detail = 'code=230099 message=Failed to create card content, ext=ErrMsg: schema invalid at /body/elements/1 log_id=20261128ABCDEF'
+    register(sampleReg({ notifyId: 'nf_reply_logid', buttons: [], allowReply: true }))
+    setReplyState('nf_reply_logid', { id: 'reply-2', promptMessageId: 'om_prompt', openedAt: 1, status: 'failed', error: `回复卡片更新失败：${detail}` })
+    expect((buildNotifyResult(get('nf_reply_logid')!) as any).reply.error)
+      .toBe('回复卡片更新失败：code=230099 message=Failed to create card content, ext=ErrMsg: schema invalid at <path> log_id=20261128ABCDEF')
+
+    register(sampleReg({ notifyId: 'nf_unknown_logid' }))
+    __setStoreFileForTest(join(tempFile, 'child.json'), false)
+    expect(recordCallbackSuccess('nf_unknown_logid', 'approve', 'ou_op').state).toBe('unknown')
+    get('nf_unknown_logid')!.unknownReason = `卡片更新失败：${detail}`
+    expect((buildNotifyResult(get('nf_unknown_logid')!) as any).unknown_reason)
+      .toBe('卡片更新失败：code=230099 message=Failed to create card content, ext=ErrMsg: schema invalid at <path> log_id=20261128ABCDEF')
   })
 })
 

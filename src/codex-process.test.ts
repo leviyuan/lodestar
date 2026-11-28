@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from 'bun:test'
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
@@ -18,6 +18,7 @@ import {
   usageFromTokenUsagePayload,
 } from './codex-process'
 import { resetAgentSessionRegistryForTest } from './agent-session-registry'
+import { prepareCodexInputPolicyCatalog } from './codex-input-policy'
 import * as logModule from './log'
 
 function makeCodexLifecycleHarness(stdinOverrides: Record<string, unknown> = {}): any {
@@ -62,6 +63,8 @@ test('custom provider is explicit on fresh, resumed and forked Codex threads', a
     const launch = kind === 'fresh' ? { kind } : { kind, source: { provider: 'codex', sessionId: 'source-thread', cwd: '/repo' } }
     const { proc, calls } = makeCodexProtocolHarness({ model: 'kimi-k3', effort: 'high', apiProvider, launch })
     await proc.initializeAndStartThread()
+    // The provider is checked against local configuration before the thread request.
+    expect(calls.slice(0, 2).map(call => call.method)).toEqual(['initialize', 'config/read'])
     const call = calls.find(call => call.method === `thread/${kind === 'fresh' ? 'start' : kind}`)!
     expect(call.params.modelProvider).toBe('packy')
     expect(call.params.model).toBe('kimi-k3')
@@ -201,6 +204,7 @@ function makeCodexProtocolHarness(
     else if (method === 'thread/resume') result = { thread: { id: params.threadId, cwd: '/repo' } }
     else if (method === 'thread/fork') result = { thread: { id: 'forked-thread', cwd: '/repo' } }
     else if (method === 'model/list' || method === 'thread/list') result = { data: [], nextCursor: null }
+    else if (method === 'config/read') result = { config: {}, layers: [] }
     else throw new Error(`unexpected request ${method}`)
     if (
       method.startsWith('thread/')
@@ -1100,6 +1104,177 @@ describe('codex JSON-RPC lifecycle reliability', () => {
     await proc.exitPromise
     expect(exits).toEqual([{ code: 0, signal: null, expected: false }])
     expect(proc.isAlive()).toBe(false)
+  })
+
+  test('a throwing exit listener is logged instead of escaping the child close callback', () => {
+    const logged = spyOn(logModule, 'logError').mockImplementation(() => {})
+    try {
+      const proc = makeCodexLifecycleHarness()
+      const exits: any[] = []
+      proc.on('exit', (event: any) => exits.push(event))
+      proc.on('exit', () => { throw new Error('host exit listener bug') })
+      proc.handleChildExit(0, null)
+      // close 回调里逃出的异常在 daemon 中是 uncaughtException，会让整个进程停机。
+      expect(() => proc.handleChildClose(0, null)).not.toThrow()
+      expect(exits).toEqual([{ code: 0, signal: null, expected: false }])
+      expect(logged.mock.calls.map(call => call[0])).toContain('codex-process: exit dispatch failed')
+    } finally {
+      logged.mockRestore()
+    }
+  })
+
+  test('a failing, timed-out or unsupported config/read stops only API-provider launches', async () => {
+    const apiProvider = { id: 'relay-site', name: 'Site', baseUrl: 'https://relay.test/v1', envKey: 'RELAY_KEY' }
+    const failures: Array<[string, () => Promise<unknown>]> = [
+      ['unsupported', async () => { throw new Error('codex app-server config/read failed: Method not found') }],
+      ['timed out', async () => { throw new Error('codex app-server config/read timed out after 30000ms') }],
+      ['malformed', async () => ({ config: {} })],
+    ]
+    for (const [label, configRead] of failures) {
+      for (const opts of [{ apiProvider }, { tokenSourceId: 'codex-sub' }, {}]) {
+        const proc = makeCodexLifecycleHarness()
+        const calls: string[] = []
+        proc.opts = { workDir: '/repo', ...opts }
+        proc.write = () => true
+        proc.request = async (method: string) => {
+          calls.push(method)
+          return method === 'config/read' ? configRead() : {}
+        }
+        const outcome = await proc.ensureInitialized().then(() => 'ready', (error: Error) => error.message)
+        if ('apiProvider' in opts) {
+          expect(outcome, label).not.toBe('ready')
+          expect(calls).toEqual(['initialize', 'config/read'])
+        } else {
+          // Subscription and default launches never ask, so the same failure cannot reach them.
+          expect(outcome, label).toBe('ready')
+          expect(calls).toEqual(['initialize'])
+        }
+      }
+    }
+  })
+
+  test('an API provider merged with a same-named local provider is refused before any thread request', async () => {
+    const userLayer = { name: { type: 'user', file: '/home/u/.codex/config.toml' }, version: '1',
+      config: { model_providers: { 'relay-site': { http_headers: { 'X-Local': 'leak' } } } } }
+    const ours = { name: { type: 'sessionFlags' }, version: '1', config: { model_providers: { 'relay-site': {} } } }
+    for (const [layers, refused] of [[[ours, userLayer], true], [[ours], false]] as const) {
+      const proc = makeCodexLifecycleHarness()
+      const calls: string[] = []
+      proc.opts = { workDir: '/repo', apiProvider: { id: 'relay-site', name: 'Site', baseUrl: 'https://relay.test/v1', envKey: 'RELAY_KEY' } }
+      proc.write = () => true
+      proc.request = async (method: string, params: any) => {
+        calls.push(method)
+        if (method === 'config/read') {
+          expect(params).toEqual({ includeLayers: true, cwd: '/repo' })
+          return { config: {}, layers }
+        }
+        return {}
+      }
+      const outcome = await proc.ensureInitialized().then(() => 'ready', (error: Error) => error.message)
+      expect(calls).toEqual(['initialize', 'config/read'])
+      if (refused) expect(outcome).toContain('本机 Codex 配置（/home/u/.codex/config.toml）也定义了 model provider「relay-site」')
+      else expect(outcome).toBe('ready')
+    }
+    // Subscription launches use no Lodestar provider definition and skip the check.
+    const plain = makeCodexLifecycleHarness()
+    const plainCalls: string[] = []
+    plain.opts = { workDir: '/repo' }
+    plain.write = () => true
+    plain.request = async (method: string) => { plainCalls.push(method); return {} }
+    await plain.ensureInitialized()
+    expect(plainCalls).toEqual(['initialize'])
+  })
+
+  /** A stand-in Codex for the service-launch catalog export: every invocation is logged;
+   * `app-server` answers config/read as the FAKE_CODEX_* variables say, other commands print
+   * an empty catalog. */
+  function fakeCodex(root: string) {
+    const fake = join(root, 'fake-codex.mjs')
+    writeFileSync(fake, `
+      import { appendFileSync, writeFileSync } from 'node:fs'
+      const args = process.argv.slice(2)
+      appendFileSync(process.env.FAKE_CODEX_LOG, args.join(' ') + '\\n')
+      if (args[0] !== 'app-server') { process.stdout.write('{"models":[]}'); process.exit(0) }
+      if (process.env.FAKE_CODEX_PIDFILE) writeFileSync(process.env.FAKE_CODEX_PIDFILE, String(process.pid))
+      if (process.env.FAKE_CODEX_IGNORE_TERM) { process.on('SIGTERM', () => {}); setInterval(() => {}, 1000) }
+      let buffered = ''
+      const send = message => process.stdout.write(JSON.stringify(message) + '\\n')
+      process.stdin.on('data', chunk => {
+        buffered += chunk
+        for (let nl = buffered.indexOf('\\n'); nl >= 0; nl = buffered.indexOf('\\n')) {
+          const message = JSON.parse(buffered.slice(0, nl)); buffered = buffered.slice(nl + 1)
+          if (message.id === 1) send({ id: 1, result: {} })
+          if (message.id !== 2) continue
+          // A server request may reuse a number our client also uses as a request id.
+          if (process.env.FAKE_CODEX_EARLY_REQUEST) send({ id: 2, method: 'item/tool/requestUserInput', params: {} })
+          if (process.env.FAKE_CODEX_CONFIG_ERROR) send({ id: 2, error: { code: -32601, message: process.env.FAKE_CODEX_CONFIG_ERROR } })
+          else send({ id: 2, result: { config: {}, layers: JSON.parse(process.env.FAKE_CODEX_LAYERS) } })
+        }
+      })
+    `)
+    const binary = join(root, 'codex')
+    writeFileSync(binary, `#!/bin/sh\nexec "$FAKE_BUN" "${fake}" "$@"\n`, { mode: 0o755 })
+    const log = join(root, 'native.log')
+    const prepare = (vars: Record<string, string>, apiProvider: { id: string, name: string } | null = { id: 'relay-site', name: 'Site' }) =>
+      prepareCodexInputPolicyCatalog({ binary, configArgs: [], workDir: root,
+        env: { ...process.env, FAKE_BUN: process.execPath, FAKE_CODEX_LOG: log, ...vars },
+        signal: new AbortController().signal, ...(apiProvider ? { apiProvider } : {}) })
+        .then(() => 'prepared', (error: Error) => error.message)
+    const invocations = () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : []
+    return { prepare, invocations, log }
+  }
+  const ourLayer = { name: { type: 'sessionFlags' }, config: { model_providers: { 'relay-site': {} } } }
+  const userLayer = { name: { type: 'user', file: '/home/u/.codex/config.toml' },
+    config: { model_providers: { 'relay-site': { model_catalog_url: 'https://elsewhere.test/catalog' } } } }
+
+  test('a service launch checks the API provider before the native catalog export can fetch with it', async () => {
+    if (process.platform === 'win32') return
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-codex-provider-'))
+    try {
+      const codex = fakeCodex(root)
+      expect(await codex.prepare({ FAKE_CODEX_LAYERS: JSON.stringify([ourLayer, userLayer]) }))
+        .toContain('也定义了 model provider「relay-site」')
+      expect(codex.invocations().filter(line => !line.startsWith('app-server'))).toEqual([])
+      // A server request numbered like our request is not taken for its response.
+      expect(await codex.prepare({ FAKE_CODEX_LAYERS: JSON.stringify([ourLayer, userLayer]), FAKE_CODEX_EARLY_REQUEST: '1' }))
+        .toContain('也定义了 model provider「relay-site」')
+      // Without a local definition the native exports run (this stand-in then returns an empty catalog).
+      expect(await codex.prepare({ FAKE_CODEX_LAYERS: JSON.stringify([ourLayer]) })).toContain('Codex raw model catalog has no models')
+      expect(codex.invocations()).toContain('debug models')
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test('a failing or unsupported config/read stops only API-provider service launches', async () => {
+    if (process.platform === 'win32') return
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-codex-provider-'))
+    try {
+      const codex = fakeCodex(root)
+      expect(await codex.prepare({ FAKE_CODEX_CONFIG_ERROR: 'Method not found: config/read' }))
+        .toContain('Codex config/read failed: Method not found: config/read')
+      expect(codex.invocations()).toEqual(['app-server --listen stdio://'])
+      // A subscription service launch never asks: the same failure cannot affect it.
+      rmSync(codex.log)
+      expect(await codex.prepare({ FAKE_CODEX_CONFIG_ERROR: 'Method not found: config/read' }, null))
+        .toContain('Codex raw model catalog has no models')
+      expect(codex.invocations().some(line => line.startsWith('app-server'))).toBe(false)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
+  test('the config/read helper that ignores SIGTERM is killed after a bounded wait', async () => {
+    if (process.platform === 'win32') return
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-codex-provider-'))
+    const pidFile = join(root, 'helper.pid')
+    try {
+      const codex = fakeCodex(root)
+      expect(await codex.prepare({ FAKE_CODEX_LAYERS: JSON.stringify([ourLayer, userLayer]), FAKE_CODEX_IGNORE_TERM: '1',
+        FAKE_CODEX_PIDFILE: pidFile })).toContain('也定义了 model provider「relay-site」')
+      const pid = Number(readFileSync(pidFile, 'utf8'))
+      const alive = () => { try { process.kill(pid, 0); return true } catch { return false } }
+      await Bun.sleep(500)
+      expect(alive()).toBe(true)
+      for (let waited = 0; waited < 4_000 && alive(); waited += 100) await Bun.sleep(100)
+      expect(alive()).toBe(false)
+    } finally { rmSync(root, { recursive: true, force: true }) }
   })
 
   test('times out unanswered requests and removes them from pending', async () => {

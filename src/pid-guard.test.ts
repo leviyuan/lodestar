@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test'
+import { expect, spyOn, test } from 'bun:test'
 
 function runScript(script: string): void {
   const result = Bun.spawnSync([process.execPath, '-e', script], {
@@ -21,8 +21,11 @@ const fixture = `
   let emptyCommandReads = 0
   let commandReads = 0
   const executions = []
+  const realpaths = {}
   const originalRead = fs.readFileSync
+  const realpath = path => { if (path in realpaths) return realpaths[path]; throw enoent() }
   mock.module('node:fs', () => ({ ...fs,
+    realpathSync: Object.assign(realpath, { native: realpath }),
     readFileSync(path, ...args) {
       if (path === '/test/pid') { if (fileError) throw fileError; return raw }
       if (String(path).startsWith('/proc/')) {
@@ -165,6 +168,124 @@ test('macOS and Windows command queries surface failures and preserve entry boun
     assert.throws(() => isOurDaemon(12345, marker), /CIM access denied/)
     assert.ok(executions.find(([bin, args]) => bin === 'powershell' && args.at(-1).includes('-ErrorAction Stop')))
   `)
+})
+
+test('the same entry file reached through a symlink or a versioned runtime is recognized on every platform', () => {
+  runScript(fixture + `
+    // Bun records the resolved entry; ps, /proc and Windows show the path the daemon was started with.
+    realpaths['/link/daemon.ts'] = '/real/daemon.ts'
+    realpaths['/real/daemon.ts'] = '/real/daemon.ts'
+    command = 'bun\\0/link/daemon.ts\\0'
+    assert.equal(isOurDaemon(12345, '/real/daemon.ts'), true)
+    // Keeps the PID guard's direction: the running daemon still blocks a second one.
+    raw = '12345\\n/real/daemon.ts'
+    assert.deepEqual(checkPidGuard('/test/pid'), { state: 'exit', pid: 12345 })
+    realpaths['/link/daemon.ts'] = '/real/other.ts'
+    assert.equal(isOurDaemon(12345, '/real/daemon.ts'), false)
+    delete realpaths['/link/daemon.ts']
+    // An unresolvable path proves nothing: only a literal match counts.
+    assert.equal(isOurDaemon(12345, '/real/daemon.ts'), false)
+    for (const runtime of ['node-22', 'node22', 'nodejs-22', 'node-v22.19.0', 'bun-1.3.11', '/opt/node-22/bin/node22']) {
+      command = runtime + '\\0/project/daemon.ts\\0'
+      assert.equal(isOurDaemon(12345, '/project/daemon.ts'), true, runtime)
+    }
+    for (const runtime of ['nodemon', 'nodenv', 'bunx']) {
+      command = runtime + '\\0/project/daemon.ts\\0'
+      assert.equal(isOurDaemon(12345, '/project/daemon.ts'), false, runtime)
+    }
+    platform('darwin')
+    realpaths['/link/daemon.ts'] = '/real/daemon.ts'
+    command = '/usr/local/bin/node-22 /link/daemon.ts'
+    assert.equal(isOurDaemon(12345, '/real/daemon.ts'), true)
+    platform('win32')
+    realpaths['C:/Link/lodestar.js'] = 'C:\\\\Real\\\\lodestar.js'
+    realpaths['C:/Real/lodestar.js'] = 'C:\\\\real\\\\Lodestar.js'
+    command = '"C:/nodejs/node.exe" "C:/Link/lodestar.js"'
+    assert.equal(isOurDaemon(12345, 'C:/Real/lodestar.js'), true)
+  `)
+})
+
+test.skipIf(process.platform === 'win32')('a real Bun process started through a symlinked directory matches its resolved entry', () => {
+  runScript(`
+    import assert from 'node:assert/strict'
+    import { spawn } from 'node:child_process'
+    import { once } from 'node:events'
+    import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+    import { tmpdir } from 'node:os'
+    import { join } from 'node:path'
+    import { isOurDaemon } from './src/pid-guard'
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'lodestar-pid-link-')))
+    mkdirSync(join(dir, 'real'))
+    writeFileSync(join(dir, 'real', 'daemon.js'), "console.log(process.argv[1]); setTimeout(() => {}, 30000)")
+    symlinkSync(join(dir, 'real'), join(dir, 'linked'), 'dir')
+    const child = spawn(process.execPath, [join(dir, 'linked', 'daemon.js')], { stdio: ['ignore', 'pipe', 'ignore'] })
+    try {
+      const [stdout] = await once(child.stdout, 'data')
+      // The marker a Bun daemon writes for itself is its resolved entry.
+      const marker = stdout.toString().trim()
+      assert.equal(marker, join(dir, 'real', 'daemon.js'))
+      assert.equal(isOurDaemon(child.pid, marker), true)
+    } finally { child.kill(); rmSync(dir, { recursive: true, force: true }) }
+  `)
+})
+
+test('a live process keeps one start identity while the wall clock steps; none without the process', async () => {
+  const { processStartId, sameProcessStart } = await import('./pid-guard')
+  const child = Bun.spawn([process.execPath, '-e', 'setTimeout(() => {}, 30000)'])
+  const clock = spyOn(Date, 'now')
+  try {
+    await Bun.sleep(200)
+    const first = await processStartId(child.pid)
+    expect(first).not.toBeNull()
+    // The identity is the process's own start record, not a time derived from Date.now.
+    const real = Date.now()
+    for (const step of [30_000, -30_000]) {
+      clock.mockReturnValue(real + step)
+      const again = await processStartId(child.pid)
+      expect(again).not.toBeNull()
+      expect(sameProcessStart(again!, first!)).toBe(true)
+    }
+    clock.mockRestore()
+    // A process started long before (PID 1 at boot) has another identity.
+    if (process.platform !== 'win32') expect(sameProcessStart(await processStartId(1) ?? 'linux:0', first!)).toBe(false)
+  } finally {
+    clock.mockRestore()
+    child.kill()
+    await child.exited
+  }
+  expect(await processStartId(child.pid)).toBeNull()
+  expect(await processStartId(0)).toBeNull()
+})
+
+test('start identities compare exactly on Linux and within a second where they are clock times', async () => {
+  const { sameProcessStart } = await import('./pid-guard')
+  expect(sameProcessStart('linux:98765', 'linux:98765')).toBe(true)
+  expect(sameProcessStart('linux:98765', 'linux:98766')).toBe(false)
+  expect(sameProcessStart('darwin:1795832636000', 'darwin:1795832637000')).toBe(true)
+  expect(sameProcessStart('darwin:1795832636000', 'darwin:1795832638000')).toBe(false)
+  expect(sameProcessStart('win32:1795832636123', 'win32:1795832636999')).toBe(true)
+  expect(sameProcessStart('linux:98765', 'darwin:98765')).toBe(false)
+  expect(sameProcessStart('linux:98765', 'linux:')).toBe(false)
+  expect(sameProcessStart('', '')).toBe(false)
+})
+
+test('Linux start identity is the raw starttime, unchanged by a wall-clock step while the lock is held', async () => {
+  const { linuxStartId, sameProcessStart } = await import('./pid-guard')
+  // The holder started 987.65 s after boot; its /proc record never changes, whatever the wall
+  // clock does afterwards (the earlier wall-clock conversion moved with a 30-second step).
+  const stat = '4321 (bun (x) y) S 1 4321 4321 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 12345678 99 0\n'
+  const clock = spyOn(Date, 'now')
+  try {
+    clock.mockReturnValue(1_795_832_636_000)
+    const recorded = linuxStartId(stat)
+    clock.mockReturnValue(1_795_832_636_000 + 50_000)
+    const later = linuxStartId(stat)
+    expect(recorded).toBe('linux:98765')
+    expect(sameProcessStart(later!, recorded!)).toBe(true)
+  } finally { clock.mockRestore() }
+  // Another process that got PID 4321 has a different start.
+  expect(sameProcessStart(linuxStartId(stat.replace(' 98765 ', ' 412345 '))!, 'linux:98765')).toBe(false)
+  expect(linuxStartId('4321 (bun) S 1')).toBeNull()
 })
 
 test.skipIf(process.platform !== 'linux')('real Linux process entries distinguish relative scripts from stdin syntax checks', () => {

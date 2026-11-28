@@ -18,6 +18,7 @@ import {
   setExternalChatError,
 } from './feishu-test-mock'
 import type { RequesterTenant } from './requester-tenant'
+import { setGoneChatHandler, type ChatGoneKind } from './chat-disband'
 
 // feishu-test-mock 必须先注册，session-worktree 才会拿到共享的 Feishu 替身。
 const { onWorktreeDisband, runWorktreeCommand } = await import('./session-worktree')
@@ -25,12 +26,17 @@ const worktree = await import('./worktree')
 const EXTERNAL: RequesterTenant = { external: true, appTenantKey: 'tenant_app' }
 
 let roots: string[] = []
+/** daemon 登记的“群已没了”处理函数收到的通知（释放该群的 Session）。 */
+let goneChats: Array<[string, ChatGoneKind]> = []
 
 beforeEach(() => {
   resetFeishuMock()
+  goneChats = []
+  setGoneChatHandler(async (chatId, kind) => { goneChats.push([chatId, kind]) })
 })
 
 afterEach(() => {
+  setGoneChatHandler(null)
   for (const root of roots) rmSync(root, { recursive: true, force: true })
   roots = []
 })
@@ -192,6 +198,22 @@ describe('worktree disband cascades to its temp groups', () => {
     expect(h.tempCalls).toEqual([])
     expect(result.message).toContain('无临时群')
     expect(disbandedChats).toEqual([chatName])
+    // 不依赖解散事件（应用可能没订阅）：被删 WT 群的 Session 交给 daemon 释放。
+    expect(goneChats).toEqual([['oc_wt', 'disbanded']])
+  })
+
+  test('a WT group that no longer exists releases nothing', async () => {
+    const { repo } = initRepo()
+    worktree.ensureProjectWorktree(repo, 'feishu', 'feature')
+    const h = harness(repo)
+
+    const result = await onWorktreeDisband(h.session, 'feature')
+
+    expect(result.ok).toBe(true)
+    expect(result.message).toContain('group missing')
+    expect(result.message).not.toContain('group removed')
+    expect(disbandedChats).toEqual([])
+    expect(goneChats).toEqual([])
   })
 
   test('an external WT group is left by the bot for its owner; the directory is still removed', async () => {
@@ -210,6 +232,8 @@ describe('worktree disband cascades to its temp groups', () => {
     expect(result.message).toContain('机器人已退出 WT 群，请群主手动解散')
     expect(result.message).toContain('dir removed')
     expect(worktree.listProjectWorktrees(repo, 'feishu').some(entry => entry.slug === 'feature' && entry.mounted)).toBe(false)
+    // 退群后收不到解散事件：daemon 里该群的 Session 由这次删除释放。
+    expect(goneChats).toEqual([['oc_wt', 'left']])
   })
 })
 

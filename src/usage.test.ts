@@ -544,3 +544,34 @@ describe('usage read snapshot semantics', () => {
     expect(snap.state).toBe('network')
   })
 })
+
+test('Windows close does not taskkill the PID again once the direct child exited', async () => {
+  const childProcess = await import('node:child_process')
+  const { EventEmitter } = await import('node:events')
+  const { StringDecoder } = await import('node:string_decoder')
+  const { AppServerOnce } = await import('./usage')
+  const calls: string[][] = []
+  const child: any = { pid: 4242, exitCode: null, signalCode: null, kill: () => false }
+  const execFile = spyOn(childProcess, 'execFile').mockImplementation(((file: string, args: string[], _options: unknown, done: (error: Error | null) => void) => {
+    calls.push([file, ...args])
+    // The tree kill ends cmd.exe (the direct child) while a descendant still holds stdout, so
+    // `close` is late; the reaped PID may already belong to an unrelated program.
+    child.exitCode = 1
+    setImmediate(() => done(null))
+    return {} as any
+  }) as any)
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
+  const app: any = Object.create(AppServerOnce.prototype)
+  EventEmitter.call(app)
+  Object.assign(app, { proc: child, alive: true, buf: '', decoder: new StringDecoder('utf8'), pending: new Map(),
+    exitPromise: new Promise(() => {}), resolveExit: () => {} })
+  try {
+    const outcome = await app.close(30).then(() => 'closed', (error: Error) => error.message)
+    expect(calls).toEqual([['taskkill', '/PID', '4242', '/T', '/F']])
+    expect(outcome).toContain('did not exit after SIGKILL')
+  } finally {
+    Object.defineProperty(process, 'platform', platform)
+    execFile.mockRestore()
+  }
+})

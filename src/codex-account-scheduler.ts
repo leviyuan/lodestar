@@ -188,14 +188,22 @@ export class CodexAccountScheduler {
         const blockedAt = block.blockedAt
         const staleAtBlock = (old: Block['windows'][number]) =>
           blockedAt !== undefined && old.reset !== null && old.reset <= blockedAt
-        const startedAfterBlock = (w: UsageWindow) => blockedAt !== undefined && w.percent !== null
-          && w.resetsAt !== null && w.durationMins != null && w.durationMins > 0
-          && w.resetsAt.getTime() - w.durationMins * 60_000 > blockedAt
+        const startedAfterBlock = (old: Block['windows'][number], w: UsageWindow) => {
+          if (blockedAt === undefined || w.percent === null || w.resetsAt === null) return false
+          const reset = w.resetsAt.getTime()
+          if (w.durationMins != null && w.durationMins > 0) return reset - w.durationMins * 60_000 > blockedAt
+          // The protocol may omit the duration. A window that started after the block is separated from the
+          // stale reset by at least the whole window current at the block, and it has at most one window
+          // left, so its remaining time cannot exceed the time since the stale reset. A longer remaining time
+          // proves it is still the window current at the block; otherwise treat it as rolled over rather than
+          // block an extra cycle (before this rule, any fresh read cleared such a block).
+          return old.reset !== null && reset - readAt <= readAt - old.reset
+        }
         const resetObserved = fresh && rank.funding !== 'credits' && block.windows.some(old => {
           const w = quota[old.kind]
           // A successful read can remove a limit; do not wait for that absent window to reset.
           if (w === null) return true
-          if (staleAtBlock(old)) return !!w && startedAfterBlock(w)
+          if (staleAtBlock(old)) return !!w && startedAfterBlock(old, w)
           return w && w.percent !== null && ((old.percent !== null && w.percent < old.percent)
             || (old.reset !== null && old.reset <= now && (w.resetsAt?.getTime() ?? 0) > old.reset))
         })
@@ -218,7 +226,7 @@ export class CodexAccountScheduler {
         // A window without a reset time could never prove recovery later, so it stays stale and is re-read.
         const baseline = (old: Block['windows'][number]) => {
           const w = quota[old.kind]
-          return staleAtBlock(old) && w && w.resetsAt !== null && !startedAfterBlock(w) ? w : null
+          return staleAtBlock(old) && w && w.resetsAt !== null && !startedAfterBlock(old, w) ? w : null
         }
         if (!recovered.has(block.key) && fresh && block.windows.some(baseline)) {
           observed = { ...(observed ?? block), windows: block.windows.map(old => {

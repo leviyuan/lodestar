@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pruneLodestarProjectTrust } from './codex-config'
+import { assertCodexProviderIsolated, pruneLodestarProjectTrust } from './codex-config'
 
 function fixture(): { root: string, config: string, cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), 'lodestar-codex-trust-'))
@@ -55,7 +55,27 @@ describe('Codex project-trust pruning', () => {
       expect(text).toContain('extra = true')
       expect(text).toContain('[other]\nvalue = 1')
       expect(text).toContain('model = "gpt-test"')
-      if (process.platform !== 'win32') expect(statSync(f.config).mode & 0o777).toBe(0o600)
+    } finally { f.cleanup() }
+  })
+
+  test('rewrites a symlinked config at its target and keeps the file mode', () => {
+    const f = fixture()
+    try {
+      const entry = `[projects.${JSON.stringify(join(f.root, 'group-a'))}]\ntrust_level = "trusted"\n`
+      // A config kept by a dotfiles manager is a symlink with its owner's mode.
+      const target = join(f.root, '..', 'dotfiles-codex.toml')
+      writeFileSync(target, `model = "x"\n\n${entry}`, { mode: 0o640 })
+      if (process.platform !== 'win32') {
+        symlinkSync(target, f.config)
+        expect(pruneLodestarProjectTrust(f.config, f.root)).toBe(1)
+        expect(lstatSync(f.config).isSymbolicLink()).toBe(true)
+        expect(readFileSync(target, 'utf8')).toBe('model = "x"\n')
+        expect(statSync(target).mode & 0o777).toBe(0o640)
+      }
+      // A plain file keeps its mode too instead of becoming 0600.
+      writeFileSync(join(f.root, 'plain.toml'), entry, { mode: 0o644 })
+      expect(pruneLodestarProjectTrust(join(f.root, 'plain.toml'), f.root)).toBe(1)
+      if (process.platform !== 'win32') expect(statSync(join(f.root, 'plain.toml')).mode & 0o777).toBe(0o644)
     } finally { f.cleanup() }
   })
 
@@ -88,4 +108,32 @@ test('known session names preserve unrelated direct-child trust entries', () => 
     expect(text).not.toContain(`[projects."${join(f.root, 'group-a')}"]`)
     expect(text).toContain(`[projects."${userOwn}"]`)
   } finally { f.cleanup() }
+})
+
+describe('Codex API provider isolation', () => {
+  const provider = { id: 'relay-site', name: 'Site' }
+  const ours = { name: { type: 'sessionFlags' }, version: '1', config: { model_providers: { 'relay-site': { name: 'Site' } } } }
+  test('only Lodestar\'s own definition passes', () => {
+    expect(() => assertCodexProviderIsolated({ layers: [ours, { name: { type: 'user', file: '/home/u/.codex/config.toml' },
+      version: '1', config: { model_providers: { other: { http_headers: { X: '1' } } } } }] }, provider)).not.toThrow()
+    // An untrusted project layer is not applied, so its definitions do not merge either.
+    expect(() => assertCodexProviderIsolated({ layers: [ours, { name: { type: 'project', dotCodexFolder: '/repo/.codex' },
+      version: '1', disabledReason: 'untrusted', config: { model_providers: { 'relay-site': {} } } }] }, provider)).not.toThrow()
+  })
+
+  test('a same-named provider in an applied local layer is refused, naming where it is', () => {
+    for (const layer of [
+      { name: { type: 'user', file: '/home/u/.codex/config.toml' }, where: '/home/u/.codex/config.toml' },
+      { name: { type: 'mdm', domain: 'com.openai.codex', key: 'config' }, where: 'mdm' },
+    ]) {
+      expect(() => assertCodexProviderIsolated({ layers: [ours, { name: layer.name, version: '1',
+        config: { model_providers: { 'relay-site': { http_headers: { 'X-Local': 'leak' } } } } }] }, provider))
+        .toThrow(`本机 Codex 配置（${layer.where}）也定义了 model provider「relay-site」`)
+    }
+  })
+
+  test('a response without layers cannot prove isolation', () => {
+    expect(() => assertCodexProviderIsolated({ config: {} }, provider)).toThrow('未返回配置分层')
+    expect(() => assertCodexProviderIsolated(null, provider)).toThrow('未返回配置分层')
+  })
 })

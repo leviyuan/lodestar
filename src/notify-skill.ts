@@ -268,10 +268,16 @@ is the script's acknowledgement, distinct from the user's response.
   anything. A completed custom-reply notification accepts one text response.
 - Callback failure stays visible on the receipt; click 「回复」 on the
   original card again to start a new attempt. No automatic resend.
-- Waiting input survives daemon restart within the existing 7-day
-  registration retention. A restart during sending or a persistence
-  failure after external success marks the outcome \`unknown\` and
-  forbids automatic retry; verify delivery with the caller.
+- A daemon restart expires a waiting reply because the clicker's identity
+  is never stored: \`reply.status\` becomes \`cancelled\` with
+  \`cancel_reason:"restart"\`, nothing is POSTed, both cards say the reply
+  expired, and the original card keeps 「回复」 so the user can click it
+  again (\`cancel_reason:"switched"\` means another notification's reply
+  replaced it; a cancel by the clicker has no \`cancel_reason\`). Keep
+  waiting or polling; the registration itself stays within the 7-day
+  retention. A restart during sending or a persistence failure after
+  external success marks the outcome \`unknown\` and forbids automatic
+  retry; verify delivery with the caller.
 
 ## Notes
 

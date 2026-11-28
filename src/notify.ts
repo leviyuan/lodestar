@@ -58,6 +58,7 @@ import { isLoopback } from './network-proxy'
 import * as feishu from './feishu'
 import { formatFeishuError, redactMemberIds } from './feishu-errors'
 import { FeishuRequestError } from './feishu-retry'
+import { redactFeishuDiagnostic } from './agent-visible-text'
 import { downgradeExternalImagesForCardKit, sanitizeMarkdownForCardKit } from './cards/elements'
 import {
   buildNotifyResult,
@@ -169,14 +170,17 @@ export function buildNotifyCard(opts: {
 
   if (opts.resolution) {
     // Post-click status marker normally replaces the button row. A definite
-    // callback failure is the one retryable terminal state, so it keeps the
-    // original buttons below the marker; processing/delivered/done/unknown
-    // remain non-interactive.
+    // callback failure and a reply prompt cancelled by a restart are the
+    // retryable terminal states, so they keep the original controls below the
+    // marker; processing/delivered/done/unknown remain non-interactive.
     const r = opts.resolution
     const choice = r.kind === 'text' ? '已回复' : `已选择:${r.text}`
     let marker: string
     if (r.status === 'processing') {
       marker = `<font color='blue'>⏳ ${choice} · 推送中…</font>`
+    } else if (r.status === 'cancelled') {
+      // 只有服务重启会把主卡改成 cancelled：输入没有提交，用户需要重新点击「回复」。
+      marker = `<font color='orange'>⚠️ 回复已失效${r.detail ? `（${sanitizeMarkdownForCardKit(r.detail)}）` : ''}，请重新点击「回复」 · ${hhmm}</font>`
     } else if (r.status === 'failed') {
       marker = `<font color='red'>⚠️ ${r.kind === 'text' ? choice : `已选:${r.text}`} · 回调失败:${sanitizeMarkdownForCardKit(r.detail ?? '未知')} · ${hhmm}</font>`
     } else if (r.status === 'delivered') {
@@ -194,7 +198,8 @@ export function buildNotifyCard(opts: {
       elements.push({ tag: 'markdown', content: sanitizeMarkdownForCardKit(r.reply) })
     }
   }
-  const canAnswer = interactive && (!opts.resolution || opts.resolution.status === 'failed')
+  const canAnswer = interactive
+    && (!opts.resolution || opts.resolution.status === 'failed' || opts.resolution.status === 'cancelled')
   if (canAnswer && opts.buttons?.length) {
     // One full-width column whose elements stack vertically ⇒ each
     // button gets its own row, however many there are. Avoids the
@@ -273,6 +278,10 @@ export function buildNotifyReplyCard(
   if (status === 'cancelled' && state.cancelReason === 'switched') {
     elements.push({ tag: 'markdown', content: '已切换到另一条通知，本次回复已放弃。' })
   }
+  const expiredByRestart = status === 'cancelled' && state.cancelReason === 'restart'
+  if (expiredByRestart) {
+    elements.push({ tag: 'markdown', content: '服务重启，本次回复已失效，尚未提交任何内容。请点击原通知的「回复」按钮后重新输入。' })
+  }
   const detail = resolution?.detail ?? state.error
   if (detail) elements.push({ tag: 'markdown', content: `<font color='red'>${sanitizeMarkdownForCardKit(detail)}</font>` })
   if (status === 'failed') elements.push({ tag: 'markdown', content: '请点击原通知的「回复」按钮后重新输入。' })
@@ -281,7 +290,7 @@ export function buildNotifyReplyCard(
   return {
     schema: '2.0', config: { update_multi: true },
     header: {
-      title: { tag: 'plain_text', content: labels[status] },
+      title: { tag: 'plain_text', content: expiredByRestart ? '回复已失效（服务重启）' : labels[status] },
       template: status === 'failed' || status === 'unknown' ? 'red'
         : status === 'delivered' || status === 'done' ? 'green' : 'blue',
     },
@@ -345,6 +354,12 @@ export function parseCallbackUrl(raw: unknown): { url?: string; error?: string }
   return { url: s }
 }
 
+/** /notify 的错误响应任何本机进程（包括后端 Agent）都能读到：在 redactMemberIds 之外，
+ * 按 Agent 可见文本同一口径替换邮箱、oc_/om_ 等 IM ID 与绝对路径，并保留 log_id。 */
+export function notifyVisibleError(error: unknown): string {
+  return redactFeishuDiagnostic(redactMemberIds(formatFeishuError(error)))
+}
+
 export interface NotifyOptions {
   bind: string
   port: number
@@ -396,7 +411,7 @@ export function startNotifyServer(opts: NotifyOptions): Server | undefined {
         if (!res.headersSent) {
           res.statusCode = 500
           res.setHeader('content-type', 'text/plain; charset=utf-8')
-          res.end(err instanceof FeishuRequestError ? formatFeishuError(err) : 'internal error')
+          res.end(err instanceof FeishuRequestError ? notifyVisibleError(err) : 'internal error')
         } else {
           try { res.end() } catch {}
         }
@@ -525,7 +540,7 @@ export async function handleNotifyRequest(
   const messageId = await transport.sendCard(chatId, card, error => { sendFailure = error })
   if (!messageId) {
     logError('notify.card.send_failed', sendFailure)
-    return sendText(502, `feishu sendCard failed: ${redactMemberIds(formatFeishuError(sendFailure))}`)
+    return sendText(502, `feishu sendCard failed: ${notifyVisibleError(sendFailure)}`)
   }
 
   if (interactive && notifyId) {

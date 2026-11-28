@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { DshProcess } from './dsh-process'
 import type { DshSpawnOptions } from './dsh-process'
+import * as logModule from './log'
 import type { ConversationLaunch } from './conversation'
 import { queryDshRuntime } from './dsh-runtime'
 import { sharedTokenSourceConfigs } from './token-source-accounts'
@@ -377,6 +378,62 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(proc.isAlive()).toBe(true)
   }, 15_000)
 
+  test('throwing init, token_usage and answered-question tool_result listeners do not end the DSH session', async () => {
+    const logged = spyOn(logModule, 'logError').mockImplementation(() => {})
+    try {
+      const f = await fixture((_body, count) => count === 1
+        ? completion({ tool_calls: [{ index: 0, id: 'call-question', type: 'function', function: {
+          name: 'ask_user_question', arguments: JSON.stringify({ questions: [{ id: 'colour', question: 'Which colour?', options: [{ label: 'Blue' }, { label: 'Red' }] }] }),
+        } }] }, 'tool_calls') : completion({ content: 'answer received' }))
+      const proc = f.processFor()
+      const errors: Error[] = []
+      const asked: string[] = []
+      const answered: string[] = []
+      proc.on('error', error => errors.push(error))
+      proc.on('init', () => { throw new Error('init listener bug') })
+      proc.on('token_usage', () => { throw new Error('usage footer bug') })
+      proc.on('tool_result', event => {
+        answered.push(event.tool_use_id)
+        throw new Error('question card bug')
+      })
+      proc.on('can_use_tool', request => {
+        asked.push(request.tool_use_id)
+        proc.sendPermissionResponse(request.request_id, 'allow', { updatedInput: { answers: { 'Which colour?': 'Blue' } } })
+      })
+      await proc.initializationPromise()
+      const result = nextResult(proc)
+      proc.sendUserText('ask for a colour')
+      expect(await result).toMatchObject({ is_error: false })
+      expect(asked).toHaveLength(1)
+      expect(answered).toContain(asked[0])
+      expect(errors).toEqual([])
+      expect(proc.isAlive()).toBe(true)
+      expect(logged.mock.calls.map(call => call[0])).toContain('dsh-process: notification dispatch failed')
+    } finally {
+      logged.mockRestore()
+    }
+  }, 30_000)
+
+  test('throwing exit listeners are logged instead of escaping the child close callback', async () => {
+    const logged = spyOn(logModule, 'logError').mockImplementation(() => {})
+    try {
+      const f = await fixture(() => completion({ content: 'unused' }))
+      const proc = f.processFor()
+      await proc.initializationPromise()
+      const exited = new Promise<any>(resolve => proc.once('exit', resolve))
+      // 逃出 close 回调的异常在 daemon 里是 uncaughtException，会让整个进程停机。
+      proc.on('exit', () => { throw new Error('host exit listener bug') })
+      ;(proc as any).runtime.on('exit', () => { throw new Error('runtime exit listener bug') })
+      await proc.kill()
+      expect(await exited).toMatchObject({ expected: true })
+      const events = logged.mock.calls.map(call => call[0])
+      expect(events).toContain('dsh-process: exit dispatch failed')
+      expect(events).toContain('dsh.exit.dispatch_failed')
+    } finally {
+      logged.mockRestore()
+    }
+  }, 15_000)
+
   test('a throwing failure listener still terminates the native runtime', async () => {
     const f = await fixture(() => completion({ content: 'unused' }))
     const proc = f.processFor()
@@ -538,6 +595,10 @@ describe('DSH native runtime through Lodestar bridge', () => {
       } }] }, 'tool_calls') : completion({ content: 'answer received' }))
     const proc = f.processFor()
     let asked = 0
+    const toolUses: any[] = []
+    const toolResults: any[] = []
+    proc.on('tool_use', event => toolUses.push(event))
+    proc.on('tool_result', event => toolResults.push(event))
     proc.on('can_use_tool', request => {
       asked++
       proc.sendPermissionResponse(request.request_id, 'allow', { updatedInput: { answers: { [answerKey]: 'Blue' } } })
@@ -548,6 +609,11 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(await result).toMatchObject({ is_error: false })
     expect(asked).toBe(1)
     expect(JSON.stringify(f.requests[1].messages)).toContain('Blue')
+    // The bridge's AskUserQuestion panel alone renders the question: the native
+    // ask_user_question call and its result are not forwarded as a second block.
+    expect(toolUses.map(event => event.name)).toEqual(['AskUserQuestion'])
+    expect(toolUses.some(event => event.id === 'call-question')).toBe(false)
+    expect(toolResults.map(event => event.tool_use_id)).toEqual([toolUses[0].id])
   }, 30_000)
 
   test('fresh and resumed DSH input tools follow the current invocation policy', async () => {
@@ -878,11 +944,14 @@ describe('DSH native runtime through Lodestar bridge', () => {
     const f = await fixture((_body, count) => count === 1
       ? completion({ tool_calls: [{ index: 0, id: 'call-env', type: 'function', function: {
         name: 'bash', arguments: JSON.stringify({
-          command: '# desc: 验证主会话凭据环境隔离\ntest -n "$DSH_LODESTAR_AGENT_CONTEXT" && test -z "$LODESTAR_AGENT_CAPABILITY" && printf scoped-context-ok',
+          command: '# desc: 验证主会话凭据环境隔离\ncase "$DSH_LODESTAR_AGENT_CONTEXT" in *stale-task*) exit 1;; *test-task-context*) ;; *) exit 1;; esac; test -z "$LODESTAR_AGENT_CAPABILITY" && printf scoped-context-ok',
           description: 'Verify scoped root environment',
         }),
       } }] }, 'tool_calls') : completion({ content: 'environment checked' }))
-    const proc = f.processFor(undefined, { hostEnv: { LODESTAR_AGENT_URL: 'http://127.0.0.1:9876', LODESTAR_AGENT_CAPABILITY: 'test-task-context' } })
+    // A context left in the host environment by an earlier DSH task is replaced by this launch's own.
+    const stale = JSON.stringify({ baseUrl: 'http://127.0.0.1:9876', capability: 'stale-task' })
+    const proc = f.processFor(undefined, { hostEnv: { DSH_LODESTAR_AGENT_CONTEXT: stale,
+      LODESTAR_AGENT_URL: 'http://127.0.0.1:9876', LODESTAR_AGENT_CAPABILITY: 'test-task-context' } })
     const results: any[] = []
     proc.on('tool_result', value => results.push(value))
     await proc.initializationPromise()

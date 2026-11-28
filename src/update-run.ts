@@ -6,7 +6,7 @@ import { PID_FILE } from './paths'
 import { updateAgentRuntimes } from './agent-updates'
 import { UsageError } from './cli-errors'
 
-import { C } from './cli-output'
+import { C, colorEnabled } from './cli-output'
 
 const UPDATE_PACKAGES = [
   '@leviyuan/lodestar@latest',
@@ -33,8 +33,10 @@ function runNpmInstall(): Promise<number> {
  * the new updater entry performs the Agent update. */
 export function runInstalledAgentUpdate(spawnProcess: typeof spawn = spawn, execPath = process.execPath, script = process.argv[1]): Promise<number> {
   if (!script) return Promise.reject(new Error('无法确定更新入口路径，Agent 未更新；请运行 lodestar update --agents-only'))
+  // 子进程参数固定为 `<入口> --agents-only`（跨版本协议）；关闭颜色（含 --no-color）经 NO_COLOR 传下去。
+  const env = colorEnabled() ? process.env : { ...process.env, NO_COLOR: '1' }
   return new Promise((resolve, reject) => {
-    const child = spawnProcess(execPath, [script, '--agents-only'], { stdio: 'inherit', windowsHide: true })
+    const child = spawnProcess(execPath, [script, '--agents-only'], { stdio: 'inherit', windowsHide: true, env })
     child.on('error', error => reject(new Error(`启动新版 Agent 更新失败: ${error.message}`)))
     child.on('exit', code => resolve(code ?? 1))
   })

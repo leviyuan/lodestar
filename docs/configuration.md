@@ -31,9 +31,11 @@ lodestar
 | `lodestar agent <command>` | 调用已配置模型执行任务；不支持 Claude 订阅，遵守 Claude 用户协议，中转站等第三方 Claude 模型仍可调用 |
 | `lodestar claude <备注> [-- <原生参数>...]` | 用户终端入口，使用 Lodestar 管理的当前 Claude 安装和对应账号目录；例如 `lodestar claude 工作号 auth login`，不自动收录账号或清理历史 |
 
-所有命令都支持 `-h` / `--help`（只打印帮助，不读配置、不启动进程）和 `-V` / `--version`（只输出 Lodestar 版本号）；`--no-color` 与 `NO_COLOR` 关闭 ANSI 颜色。退出码为 0 成功、1 运行失败、2 用法错误、130 中断；`lodestar help <命令>` 查看单条命令帮助。旧版分散的 `lodestar-*` 命令已移除，对应用 `lodestar <子命令>`。
+所有命令都支持 `-h` / `--help`（只打印帮助，不读配置、不读写数据目录、不启动进程）：紧跟 `lodestar` 显示总览，紧跟子命令显示该命令的帮助（`lodestar claude <备注> --help` 交给原生 Claude Code）；`lodestar -V` / `lodestar --version` 只输出 Lodestar 版本号，只用于顶层，子命令后请用 `lodestar version`。`--no-color` 与 `NO_COLOR` 关闭 ANSI 颜色：`--no-color` 写在子命令前（`lodestar --no-color update`）对所有命令生效，`start`、`setup`、`stop`、`update`、`version` 也可写在子命令后；`agent`、`claude` 之后的参数归子命令（`claude` 原样交给原生 Claude Code）。退出码为 0 成功、1 运行失败、2 用法错误、130 中断；`lodestar help <命令>` 查看单条命令帮助。旧版分散的 `lodestar-*` 命令已移除，对应用 `lodestar <子命令>`，升级注意事项见[从 0.24 及更早版本升级](#从-024-及更早版本升级)。
 
-启动和停止命令会核对 PID 对应的实际入口，读取进程信息失败时明确报错。无法识别的运行时选项、macOS 无法区分边界的含空格入口、Windows 相对入口也会拒绝操作，请通过对应服务管理器处理。旧式单行 PID 文件缺少入口标识，`lodestar stop` 会拒绝发送信号；请先核对该 PID 的完整命令行，再通过服务管理器或精确 PID 停止。停止命令以进程退出为准，删除 PID 文件不会被当作停止成功。
+启动和停止命令会核对 PID 对应的实际入口，读取进程信息失败时明确报错；经符号链接启动或运行时文件名带版本号（如 `node-22`）时，按入口文件的真实路径比较。无法识别的运行时选项、macOS 无法区分边界的含空格入口、Windows 相对入口也会拒绝操作，请通过对应服务管理器处理。旧式单行 PID 文件缺少入口标识，`lodestar stop` 会拒绝发送信号；请先核对该 PID 的完整命令行，再通过服务管理器或精确 PID 停止。停止命令以进程退出为准，删除 PID 文件不会被当作停止成功；daemon 停机最多用 15 秒收尾，`lodestar stop` 最多等待 20 秒。
+
+daemon 启动时会在 `~/.local/bin`（Windows 为 `%LOCALAPPDATA%\Lodestar\bin`）放一个 `lodestar` 小脚本并把该目录加到 Agent 的 `PATH` 前面，方便 Agent 调用 `lodestar agent`。那里已有不是 Lodestar 生成的同名文件（自己的脚本，或指向其他程序的链接）时保持原样、只在日志记一行，移走后重启 daemon 即由 Lodestar 管理；npm 全局安装的 `lodestar` 链接本身就能用，也不会被替换。
 
 长期运行可交给 Linux `systemd --user`、macOS `launchd` 或 Windows 任务计划程序。daemon 重启后会恢复上次活跃的会话。
 
@@ -51,6 +53,24 @@ lodestar version                                      # 3. 确认新版本已生
 
 `lodestar update` 只安装新包并更新 Agent 运行时，不会重启服务；重启前服务继续运行旧代码。前台手动运行时使用 `lodestar stop && lodestar start`。这几个步骤与 `lodestar --help` 中「更新」一节一致。
 
+### 从 0.24 及更早版本升级
+
+0.25 起只保留一个 `lodestar` 命令，旧的分散命令已移除：
+
+| 旧命令 | 新命令 |
+| --- | --- |
+| `lodestar-daemon` | `lodestar start`（或 `lodestar`） |
+| `lodestar-setup` | `lodestar setup` |
+| `lodestar-stop` | `lodestar stop` |
+| `lodestar-update` | `lodestar update` |
+| `lodestar-version` | `lodestar version` |
+| `lodestar-agent` | `lodestar agent` |
+| `lodestar-claude` | `lodestar claude` |
+
+- 用旧版 `lodestar-update` 升级时，新包会装好，但随后的 Agent 更新必然失败：旧版装完后要重新执行它自己的旧入口，新包里已经没有了。装好后再运行一次 `lodestar update --agents-only` 即可。
+- 按旧文档配置的系统服务（systemd unit、launchd plist、Windows 任务计划）如果仍执行 `lodestar-daemon`，升级后服务起不来：把命令改成 `lodestar start`（npm 全局 bin 目录下的 `lodestar`），再按上一节由服务管理器重启。
+- npm 安装完成时会打印同样的提示。
+
 ## Agent 更新
 
 `lodestar update` 先用 npm 全局安装最新的 Lodestar，再以子进程运行**新装版本**的 `lodestar update --agents-only` 更新 Agent，因此新版本对安装逻辑的修改在这次更新中就会生效；`lodestar update --agents-only` 直接在当前进程内更新。命令不会重启 daemon：检测到 daemon 仍在运行时会提示用对应服务管理器重启，旧进程重启前继续运行旧版 Lodestar。
@@ -61,7 +81,7 @@ Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`�
 
 运行文件放在 Lodestar 数据目录的 `agent-runtimes/` 下，每个版本使用独立目录；更新只切换新进程所用的目录，保留正在运行任务的程序和 SDK。更新成功后保留最近 3 个版本目录（当前选中版本始终保留），更旧的目录在没有运行中进程使用时删除。Windows 下也不覆盖、重命名或删除正在使用的旧版 EXE/DLL。取消安装时按安装器 PID 终止其进程树，并等待退出；若无法确认终止，保留可能被占用的临时目录并报告错误。
 
-中断或取消的安装留下的临时目录（`.install-*`）和失效的更新锁，由该 Agent 下一次成功更新时一并清理，仍被运行中进程使用的目录保留；临时目录在安装进程确认退出后才删除，无法确认的满 24 小时后删除；无法读取进程列表的平台跳过清理。清理失败只在更新输出中提示，不影响更新结果。更新程序在创建锁后、写入 PID 前退出时，该锁 30 秒后可被回收，不会阻塞之后的更新。
+中断或取消的安装留下的临时目录（`.install-*`）和失效的更新锁，由该 Agent 下一次成功更新时一并清理，仍被运行中进程使用的目录保留；记录了安装进程的临时目录只在该进程确认退出后删除（无法确认就一直保留），没有安装记录的（安装器启动前就中断，或旧版遗留）满 24 小时后删除；无法读取进程列表的平台跳过清理。清理失败只在更新输出中提示，不影响更新结果。更新程序在创建锁后、写入 PID 前退出时，该锁 30 秒后可被回收，不会阻塞之后的更新。
 
 后台更新失败只记日志，继续使用当前安装；已开启自动更新的 Agent 会在下一个 6 小时检查周期再试。启动和 `lodestar version` 不提示历史更新错误，版本查询只显示当前安装。手动更新命令仍如实返回本次更新结果。尚未安装或本地安装损坏时无法启动。旧版若已因失败清除了安装选择记录，需要一次成功的 `lodestar update --agents-only` 恢复记录，不会自动猜测目录中的版本。文件占用只做有限重试，最终失败仍显示。显式配置的 `[claude].bin` 按该路径执行。
 
@@ -79,7 +99,7 @@ Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`�
 
 清单还包括原生附件的 `im:resource`、机器人发消息的 `im:message:send_as_bot`、Card Kit 权限，以及排障时读取租户和认证信息的权限。需要审批的权限应完成审批，再创建并发布飞书应用版本。取得应用访问凭据不代表业务权限已生效。
 
-事件订阅：在开放平台的「事件与回调 → 事件订阅」中订阅「群解散」（`im.chat.disbanded_v1`）。收到后 daemon 停止该会话并清理会话映射、租约和活跃时间；项目目录和云空间文件保留。daemon 启动后还会在后台核对已绑定群的 `chat_status`，把已解散的绑定一并清理，作为事件丢失时的兜底。
+事件订阅：在开放平台的「事件与回调 → 事件订阅」中订阅「群解散」（`im.chat.disbanded_v1`）。收到后 daemon 停止该会话并清理会话映射、租约和活跃时间；同名的另一个群（例如换成同名外部群后解散旧群）的会话不受影响；项目目录和云空间文件保留。daemon 启动后还会在后台核对已绑定群的 `chat_status`，把已解散的绑定一并清理，作为事件丢失时的兜底。
 
 升级已有应用时也应补齐清单并发布应用版本。文件按大小自动交付：不超过 30 MB 发聊天附件，超过 30 MB 传云空间，无需切换命令。大文件交付缺少云空间权限时会明确报错。文件夹权限与实际文件的分享入口会分别处理，具体行为见[文件与生图](usage.md#文件与生图)。
 
@@ -87,7 +107,9 @@ Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`�
 
 默认配置文件是 `~/.config/lodestar/config.toml`，可通过 `LODESTAR_CONFIG` 指定文件。日志和会话状态位于 `~/.local/share/lodestar/`；Windows 使用相应的应用数据目录。完整路径定义见 [src/paths.ts](../src/paths.ts)。数据目录和 PID 目录由 Lodestar 新建时权限为 `0700`，已存在的目录不修改权限。
 
-运行日志按日保存，保留近 7 天。正常流程仅记录关键状态；不记录协议大包、工具输出、代码 diff、请求/响应正文或内部阶段流水。日志省略用户、群、项目和账号名称、路径、聊天/消息/会话/任务标识，以及人数和群数，不生成可关联的匿名编号。故障记录保留固定操作说明、错误类别、错误码和 HTTP 状态；相同摘要在 10 分钟内合并，不显示重复次数。用户收到的错误详情不因此省略。会话历史、任务结果和恢复绑定是功能状态，仍由相应模块保存。
+运行日志按日保存，保留近 7 天。正常流程仅记录关键状态；不记录协议大包、工具输出、代码 diff、请求/响应正文或内部阶段流水。日志省略用户、群、项目和账号名称、路径、聊天/消息/会话/任务标识，以及人数和群数，不生成可关联的匿名编号。故障记录保留固定操作说明、错误类别、错误码和 HTTP 状态；相同摘要在 10 分钟内合并，不显示重复次数。用户收到的错误详情不因此省略。会话历史、任务结果和恢复绑定是功能状态，仍由相应模块保存；其中 Agent 任务（`lodestar agent`）的提示词与输出正文保留 30 天，之后在启动时或每日清理中删除正文、保留任务状态与归属，查询时正文显示「已清理」。
+
+群里收到的图片和文件下载到系统临时目录下 Lodestar 自己的私有目录（仅本人可读写，不在数据目录里），以绝对路径交给 Agent。daemon 停止或重启不删除这些附件，重启续接后会话里引用的文件仍可读取；超过 7 天的附件在 daemon 启动时清理，运行中每天再清理一次（系统临时目录自身的清理策略可能更早删除）。
 
 ```toml
 [feishu]

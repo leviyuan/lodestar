@@ -1,4 +1,5 @@
 import { localFetch } from './network'
+import { isLoopback } from './network-proxy'
 import { requireAgentDescription, PROJECT_AGENT_INPUT_ERROR } from './agent-run-types'
 import { readAgentProjectClient } from './agent-project-client'
 import { HelpRequest, UsageError } from './cli-errors'
@@ -293,18 +294,28 @@ function cliContext(project?: string): CliContext {
     }
     return { ...readAgentProjectClient(), project }
   }
-  if (process.env.DSH_LODESTAR_AGENT_CONTEXT !== undefined) {
-    const context = JSON.parse(process.env.DSH_LODESTAR_AGENT_CONTEXT)
-    if (typeof context.baseUrl !== 'string' || !context.baseUrl || typeof context.capability !== 'string' || !context.capability) {
-      throw new Error('invalid DSH Lodestar delegation context')
-    }
-    return { baseUrl: context.baseUrl.replace(/\/+$/, ''), capability: context.capability }
-  }
+  // 受管上下文由启动时给本进程注入的 LODESTAR_AGENT_URL/CAPABILITY 判定。DSH 启动时删掉它们，
+  // 改由 DSH_LODESTAR_AGENT_CONTEXT 经 ShellEnv 传给自己的 shell 与原生后代；两者同时出现时，
+  // DSH 上下文只能是宿主环境遗留的旧任务（例如 daemon 从受管 DSH shell 启动），不能借用。
   const baseUrl = String(process.env.LODESTAR_AGENT_URL ?? '').replace(/\/+$/, '')
   const capability = String(process.env.LODESTAR_AGENT_CAPABILITY ?? '')
-  if (!baseUrl || !capability) {
-    throw new Error('lodestar agent must run inside a Lodestar-managed Agent session (missing capability)')
-  }
+  if (baseUrl && capability) return { baseUrl, capability }
+  if (process.env.DSH_LODESTAR_AGENT_CONTEXT !== undefined) return dshDelegationContext(process.env.DSH_LODESTAR_AGENT_CONTEXT)
+  throw new Error('lodestar agent must run inside a Lodestar-managed Agent session (missing capability)')
+}
+
+/** DSH 委派上下文须是 `{ baseUrl, capability }`，且 baseUrl 指向本机回环地址。 */
+function dshDelegationContext(raw: string): CliContext {
+  let context: { baseUrl?: unknown; capability?: unknown } | null = null
+  try { context = JSON.parse(raw) } catch {}
+  const baseUrl = typeof context?.baseUrl === 'string' ? context.baseUrl.replace(/\/+$/, '') : ''
+  const capability = typeof context?.capability === 'string' ? context.capability : ''
+  let local = false
+  try {
+    const url = new URL(baseUrl)
+    local = (url.protocol === 'http:' || url.protocol === 'https:') && isLoopback(url)
+  } catch {}
+  if (!local || !capability) throw new Error('invalid DSH Lodestar delegation context')
   return { baseUrl, capability }
 }
 

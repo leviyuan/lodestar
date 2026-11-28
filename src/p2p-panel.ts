@@ -6,7 +6,8 @@
  * 该群正是其群名对应项目已保存绑定的群（按 chat_id 锚定，同名、撞名或改名后留下的群不算），且会话就在这个群里，
  * 或是它的 `名*` 临时群、`名[` wt 群及其临时群。群主与成员关系只在本次请求里用于比较，不缓存、不记录，
  * 日志只有固定事件名；查询失败或超时都隐藏受影响的会话，并在卡片上说明。
- * 面板不区分读者：能拿到面板的人（含外部联系人）看到的都是同样的项目、账号、模型、主机和全部账号额度。
+ * 面板不按读者所属企业区分：上面的可见规则对每个发起人（含外部联系人）都一样，各自只列看得到的项目；
+ * 列出项目的账号与模型、主机和全部账号额度对谁都一样显示。
  *
  * 依赖全部注入且只读（daemon 负责接线），模块本身只引用类型和纯函数，没有建会话、写状态或启动进程的途径。
  */
@@ -52,6 +53,8 @@ export const P2P_MEMBERSHIP_CONCURRENCY = 4
 /** 整张面板的读取期限：卡住的查询不能一直占着这个单聊的消息队列。到期后不再发起任何读取，不重试。 */
 export const P2P_PANEL_DEADLINE_MS = 20_000
 export const P2P_LOOKUP_FAILED_NOTE = '⚠️ 部分项目读取失败，已隐藏'
+/** 超时回复之后不会再更新：额度区明确写读取超时（MISS），不能停在「加载中…」；主机区没有数据即 MISS。 */
+const TIMED_OUT_USAGE: AccountUsage = { id: 'timeout', label: '额度', usage: { state: 'network', windows: [], reason: '读取超时' } }
 
 /** `chatMembers.get` 的这几种拒绝说明群已不在或机器人已不在群里：chat_id 无效、群已解散、操作者不在群里。 */
 const CHAT_GONE_CODES = new Set(['232006', '232009', '232011'])
@@ -251,7 +254,7 @@ function openDeadline(deps: P2pPanelDeps): PanelDeadline {
   return { at: Date.now() + (deps.deadlineMs ?? P2P_PANEL_DEADLINE_MS), signal: new AbortController().signal }
 }
 
-/** 单聊面板卡片：任何读者都拿到同一张面板（账号名、当前模型、主机与全部账号额度）。
+/** 单聊面板卡片：只列发起人看得到的项目，账号名、当前模型、主机与全部账号额度不按读者区分。
  * 期限到了在下一个检查点抛出，不再发起读取。 */
 export async function buildP2pPanelCard(
   requesterOpenId: string,
@@ -315,7 +318,7 @@ export async function replyP2pPanel(
   }
   if (card === null) {
     logDiagnostic('p2p-panel: build timed out')
-    card = p2pConsoleCard({ peers: [], notice: `${P2P_LOOKUP_FAILED_NOTE}：读取超时` })
+    card = p2pConsoleCard({ peers: [], accountUsages: [TIMED_OUT_USAGE], notice: `${P2P_LOOKUP_FAILED_NOTE}：读取超时` })
   }
   let failure: unknown
   let messageId: string | null = null

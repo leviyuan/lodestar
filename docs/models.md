@@ -67,7 +67,7 @@ Codex 启动和换号优先使用最近一次成功的额度缓存；能选出�
 lodestar claude 工作号 auth login
 ```
 
-`lodestar claude <备注> [-- <原生参数>...]` 选择对应账号目录并将其余参数传给原生 Claude Code。上例的账号目录与 `CLAUDE_CONFIG_DIR="$HOME/.claude-accounts/工作号" claude auth login` 一致。命令本身不收录账号；首次登录前会准备共享配置，已有目录的非登录内容会替换为全局共享配置。登录后仍需在群内发送 `hi 工作号`。
+`lodestar claude <备注> [-- <原生参数>...]` 选择对应账号目录并将其余参数传给原生 Claude Code；只有紧跟备注名的 `--` 是 Lodestar 的分隔符，原生参数里的 `--`（如 `mcp add … -- npx …`）原样保留。上例的账号目录与 `CLAUDE_CONFIG_DIR="$HOME/.claude-accounts/工作号" claude auth login` 一致。命令本身不收录账号；首次登录前会准备共享配置，已有目录的非登录内容会替换为全局共享配置。登录后仍需在群内发送 `hi 工作号`。
 
 该入口仅供用户本机终端使用，受管 Agent 上下文中拒绝启动；使用 Lodestar 当前选中的已安装 Claude 运行时，缺失时报错，不自动安装或回退。它保留终端的 `HOME` 和工作目录；`default` 保留终端 `CLAUDE_CONFIG_DIR` 的未设置状态或原始路径，不读取 `[claude.env]`。
 
@@ -111,7 +111,7 @@ reclaude 是第三方的 Claude Code 启动器：登录、组织绑定和网络�
 
 **组织**：默认跟随 `reclaude org use <组织 ID>` 选定的当前组织；在配置中写 `org = "<组织 ID>"` 则固定使用该组织，该组织须已用 `reclaude org bind <组织 ID>` 绑定。切换组织在下一次目录刷新时生效：模型和额度改读新组织，绑定旧组织的空闲进程在下一轮开始前停止，按新组织重新启动。
 
-**会话记录**：reclaude 的会话记录保存在各组织自己的配置目录中，与其他 Claude 来源共用的会话目录相互独立。在 reclaude 与其他 Claude 来源之间切换，或切换组织后，原会话无法在新来源续接：续接时会说明原因，发送 `hi` 开始新会话，或用 `md` 切回原来源继续。`rs` 只列出当前来源目录下的历史会话。
+**会话记录**：reclaude 的会话记录保存在各组织自己的配置目录中，与其他 Claude 来源共用的会话目录相互独立。在 reclaude 与其他 Claude 来源之间切换后，原会话无法在新来源续接：续接时会说明原因，发送 `hi` 开始新会话，或用 `md` 切回原来源继续。切换 reclaude 组织后，旧组织的会话同样不能在新组织续接，但来源仍是 reclaude，`md` 切不回去：续接提示会说明记录在另一个组织下，在本机执行 `reclaude org use <原组织 ID>`，或在配置中写 `org = "<原组织 ID>"` 固定原组织，等下一次目录刷新后再继续；也可发送 `hi` 开始新会话。如果此时群里已改用别的来源，提示会说明要先用 `md` 切回 reclaude，再按上面的方法选回原组织。`rs` 只列出当前来源（当前组织）目录下的历史会话。
 
 **状态**：
 
@@ -178,6 +178,8 @@ protocol = "anthropic"        # Claude Code；OpenAI 类型同时提供 Codex �
 
 - `anthropic`：在 Claude Code → 中转站下显示，使用 Anthropic Messages。
 - `openai`：同时在 Codex → 中转站和 DeepSeek Harness → 中转站下显示；Codex 使用 Responses，DSH 使用 OpenAI Completions。
+
+Codex 视图把站点作为 Codex 的 model provider 随启动参数传入，provider id 由站点标识生成（如 `relay-my-relay`）。Codex 会把这份定义与本机的 Codex 配置合并：如果本机 `~/.codex/config.toml`（或系统、托管配置）里也有同名的 `[model_providers.relay-<站点标识>]`，其中的请求头、查询参数、认证方式等会混进中转站的请求，而且合并后无法删除。因此这时 Lodestar 不启动该站点的 Codex 会话，错误里会写明冲突所在的配置文件；删除或改名本机的那个 provider 后重新发送消息即可。provider id 记录在 Codex 的会话里，Lodestar 不会自行改名，以免已有会话无法续接。同一站点的 DSH 视图和其他来源不受影响。
 
 发送 `relay-setup <site_id> <anthropic|openai> <base_url> <api_key>` 可校验模型目录并保存站点。模型面板路径为“中转站 → 站点 → 模型 → effort”。模型目录读取站点的 `/v1/models`，模型 ID 和显示名称按上游返回保留；未声明 effort 时按当前 Agent 提供可用档位。
 

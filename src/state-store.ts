@@ -28,8 +28,8 @@ function ensureParent(filePath: string): void {
  * helper writes and fsyncs a sibling temporary file, renames it over the live
  * path, then best-effort fsyncs the directory entry.
  */
-function writeFileAtomicWithMode(filePath: string, content: string | Uint8Array, mode: number): void {
-  ensureParent(filePath)
+function writeFileAtomicWithMode(filePath: string, content: string | Uint8Array, mode: number, createParent = true): void {
+  if (createParent) ensureParent(filePath)
   const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`
   let fd: number | null = null
   try {
@@ -66,8 +66,16 @@ function writeFileAtomicWithMode(filePath: string, content: string | Uint8Array,
   }
 }
 
-export function writeStateFileAtomic(filePath: string, content: string | Uint8Array): void {
-  writeFileAtomicWithMode(filePath, content, PRIVATE_FILE_MODE)
+export interface AtomicWriteOptions {
+  /** false: the parent must already exist. A lock directory another process
+   * removed meanwhile is then reported as ENOENT instead of being recreated. */
+  createParent?: boolean
+  /** Final permission bits (default 0600), e.g. to keep a user file's own mode. */
+  mode?: number
+}
+
+export function writeStateFileAtomic(filePath: string, content: string | Uint8Array, options: AtomicWriteOptions = {}): void {
+  writeFileAtomicWithMode(filePath, content, options.mode ?? PRIVATE_FILE_MODE, options.createParent ?? true)
 }
 
 export function writeExecutableFileAtomic(filePath: string, content: string | Uint8Array): void {

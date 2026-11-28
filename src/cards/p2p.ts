@@ -59,7 +59,9 @@ function projectBlock(peer: ConsolePeer): string {
   const workload = sessionWorkloadLabel(peer.workload)
   const uptime = peer.uptimeMs != null && peer.uptimeMs > 0 ? `已运行 ${fmtUptime(peer.uptimeMs)}` : ''
   const running = [workload, uptime].filter(Boolean).join(' · ')
-  const account = peer.claudeAccountName !== undefined ? `Claude·${escapeInlineMarkdown(peer.claudeAccountName)}`
+  // 实际账号：GLM、中转站等来源写来源名（与启动卡同口径，优先），订阅写 `Claude·备注` / `Codex·备注`。
+  const account = peer.accountLabel ? escapeInlineMarkdown(peer.accountLabel)
+    : peer.claudeAccountName !== undefined ? `Claude·${escapeInlineMarkdown(peer.claudeAccountName)}`
     : peer.codexAccountName !== undefined ? `Codex·${escapeInlineMarkdown(peer.codexAccountName)}`
     : null
   // 当前模型与账号同一行：一眼看到这个项目在用谁、跑哪个模型。

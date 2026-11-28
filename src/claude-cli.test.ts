@@ -162,7 +162,8 @@ test('help is independent of installation, while missing runtimes and invalid na
   const f = fixture(false)
   expect(f.run(['--help']).stdout).toContain('lodestar claude 工作号 auth login')
   expect(f.run(['--help']).status).toBe(0)
-  expect(f.run([]).status).toBe(1)
+  // A missing account name is a usage error.
+  expect(f.run([]).status).toBe(2)
   const missing = f.run(['工作号'])
   expect(missing.status).toBe(1)
   expect(missing.stderr).toContain('claude runtime 未安装')
@@ -199,6 +200,50 @@ test.skipIf(process.platform === 'win32')('native signal termination propagates 
   const result = f.run(['default', '--self-signal', 'SIGTERM'])
   expect(result.signal, result.stderr).toBe('SIGTERM')
   expect(result.status).toBeNull()
+})
+
+/** Runs `lodestar claude …` through the real dispatcher with synthetic spawn and account modules. */
+function dispatchClaude(argv: string[]) {
+  const script = `
+    import { mock } from 'bun:test'
+    import { EventEmitter } from 'node:events'
+    const calls = []
+    mock.module('cross-spawn', () => ({ spawn: (cmd, args) => {
+      calls.push(args)
+      const child = new EventEmitter()
+      child.kill = () => true
+      queueMicrotask(() => child.emit('close', 0, null))
+      return child
+    } }))
+    mock.module('./src/agent-updates', () => ({ agentBin: () => '/synthetic/claude' }))
+    mock.module('./src/claude-accounts', () => ({ claudeAccounts: { nativeCliEnv: () => ({}) } }))
+    for (const key of ${JSON.stringify(managedKeys)}) delete process.env[key]
+    const { runCli } = await import('./src/cli-main')
+    let err = ''
+    const code = await runCli(${JSON.stringify(['claude', ...argv])}, { io: { out: () => {}, err: text => { err += text } } })
+    console.log(JSON.stringify({ code, calls, err }))
+  `
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+    cwd: process.cwd(), stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: 10_000,
+  })
+  const line = result.stdout.toString().trim().split('\n').at(-1) ?? ''
+  expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+  return JSON.parse(line) as { code: number; calls: string[][]; err: string }
+}
+
+test('runCli hands every argument after the account to native Claude, keeping a later `--`', () => {
+  // Native `claude mcp add <name> -- <command>` has its own separator.
+  const native = ['mcp', 'add', '--transport', 'stdio', 'srv', '--', 'npx', '-y', 'pkg']
+  expect(dispatchClaude(['工作号', ...native])).toMatchObject({ code: 0, calls: [native] })
+  // Only a `--` right after the account belongs to lodestar.
+  expect(dispatchClaude(['工作号', '--', ...native])).toMatchObject({ code: 0, calls: [native] })
+  expect(dispatchClaude(['default', '--', '--help'])).toMatchObject({ code: 0, calls: [['--help']] })
+  expect(dispatchClaude(['工作号', 'auth', 'login'])).toMatchObject({ code: 0, calls: [['auth', 'login']] })
+  for (const argv of [[], ['--'], ['--', '工作号']]) {
+    const missing = dispatchClaude(argv)
+    expect(missing).toMatchObject({ code: 2, calls: [] })
+    expect(missing.err).toContain('用法：lodestar claude')
+  }
 })
 
 test('forwarded terminal signals retain the exact native status and remove all handlers', () => {

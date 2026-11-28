@@ -12,6 +12,9 @@ import {
 } from './agent-run-types'
 import { configureRelay, reloadRelays, testRelay } from './relay-config'
 import type { RelayConfig } from './config'
+import { agentVisibleText } from './agent-visible-text'
+
+export { agentVisibleText } from './agent-visible-text'
 
 export interface AgentApiContext {
   service: AgentService
@@ -235,19 +238,4 @@ function serializeRun(run: AgentRunSnapshot): object {
 
 function messageOf(error: unknown): string {
   return agentVisibleText(error instanceof Error ? error.message : String(error))
-}
-
-const AGENT_VISIBLE_LIMIT = 300
-
-/** Agent-facing diagnostics may quote upstream errors. Keep them useful but
- * never hand over emails, IM identifiers or absolute host paths. */
-export function agentVisibleText(value: string): string {
-  const redacted = value
-    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '<email>')
-    .replace(/\b(?:ou|on|oc|om)_[0-9a-z]{12,}\b/g, '<id>')
-    // Paths can contain spaces, so consume until a real delimiter. This is
-    // deliberately over-eager: a diagnostic may lose trailing text, but must
-    // not leave a partial project name after the first space.
-    .replace(/(?:[A-Za-z]:\\|\/(?:Users|Volumes|Applications|Library|usr|private|var|tmp|opt|root|etc|System|srv|mnt|media)\/|~\/)[^\n"'`()\[\]]*/g, '<path>')
-  return redacted.length > AGENT_VISIBLE_LIMIT ? `${redacted.slice(0, AGENT_VISIBLE_LIMIT)}…` : redacted
 }

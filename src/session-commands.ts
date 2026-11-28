@@ -252,9 +252,16 @@ export async function runCommand(
       // but the daemon can't reach into it directly; in practice the
       // sendInterrupt() control_request causes the SDK to discard
       // queued input alongside the in-flight call.
+      // 主动停止不补发：欠下的完成通知在这里作废，打断的续跑轮收尾后也不会再计时推送；
+      // 仍在跑的后台任务不受 stop 影响，结束时照常补发。
+      const backgroundContinues = s.dropCompletionNoticeForStop()
       s.clearStaleIdleQueueState('stop')
       s.clearMultiMsgBuffer('stop command')
-      if (!s.currentTurn && s.pendingUserMessageCount === 0 && s.pendingMidTurnMsgs.length === 0) {
+      // 卡片还没落地（openTurnCard 在途）时 stop 同样打断这一轮：开卡方落地后以「🛑 打断」收尾、
+      // 不再提交输入；后端已开始的轮次由 stopOpeningTurn 一并中断。
+      const stoppedOpening = s.stopOpeningTurn()
+      const sdkQueued = s.pendingUserMessageCount > 0
+      if (!stoppedOpening && !s.currentTurn && !sdkQueued && s.pendingMidTurnMsgs.length === 0) {
         if (cancelledFiles) {
           await s.closeTurnCard('🛑 已取消未完成的文件上传')
           await feishu.sendText(s.chatId, '🛑 已取消未完成的文件上传，已上传文件保留')
@@ -291,9 +298,12 @@ export async function runCommand(
       s.pendingUserMessageCount = 0
       s.pendingMidTurnMsgs = []
       s.pendingTurnInputs = []
-      s.lastUserOpenId = ''
+      // 后台任务还在跑时留着发送者：它们结束时的补发要推给这个人。
+      if (!backgroundContinues) s.lastUserOpenId = ''
       s.pendingReactionIds = new Map()
       s.currentBatchReactionIds = new Map()
+      // 开卡窗口里的这一轮交给开卡方收尾，卡片落地即显示「🛑 打断」，与正常打断一致。
+      if (stoppedOpening && !sdkQueued) return true
       // Tag the imminent SDK `result` so the result handler does not
       // repaint the footer after this stop path already closed the card.
       // Must be set BEFORE sendInterrupt — the result can land next tick.

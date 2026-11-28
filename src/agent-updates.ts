@@ -4,13 +4,14 @@ import { createHash, randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { execFile } from 'node:child_process'
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
-import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises'
 import { join, isAbsolute } from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { AGENT_RUNTIMES_DIR } from './paths'
 import { AGENT_INSTALLER_RECORD, AgentInstallTerminationError, installAgentPackages } from './agent-install'
 import { writeStateFileAtomic } from './state-store'
+import { processStartId, sameProcessStart } from './pid-guard'
 export { installAgentPackages } from './agent-install'
 
 export const AGENTS = ['codex', 'claude', 'dsh'] as const
@@ -28,11 +29,19 @@ interface Manifest {
   dependencies?: Record<string, string>
   peerDependencies?: Record<string, string>
   optionalDependencies?: Record<string, string>
+  os?: string[] | string
+  cpu?: string[] | string
+  libc?: string[] | string
 }
-/** Optional transitive packages may be skipped by npm on platforms their
- * manifest excludes; they still belong in the version snapshot/overrides. */
-const OPTIONAL_PACKAGES = Symbol('optionalPackages')
-type ResolvedAgentPackages = Record<string, string> & { [OPTIONAL_PACKAGES]?: ReadonlySet<string> }
+type PlatformConstraint = Pick<Manifest, 'os' | 'cpu' | 'libc'>
+/** Family-internal edges of each resolved DSH package: what it requires (`dependencies`,
+ * `peerDependencies`) and what it lists as optional, plus its own platform constraint.
+ * npm may skip an optional package on platforms its manifest excludes, together with
+ * whatever only that package requires; such packages still belong in the version
+ * snapshot/overrides. */
+interface FamilyEdges { hard: ReadonlySet<string>; optional: ReadonlySet<string>; platform: PlatformConstraint }
+const FAMILY_EDGES = Symbol('familyEdges')
+type ResolvedAgentPackages = Record<string, string> & { [FAMILY_EDGES]?: ReadonlyMap<string, FamilyEdges> }
 export interface AgentRuntimeState {
   directory?: string
   versions?: Record<string, string>
@@ -56,9 +65,10 @@ const RUNTIME_KEEP = 3
 const RUNTIME_FINGERPRINT = /^[0-9a-f]{20}$/
 const execFileAsync = promisify(execFile)
 const STALE_LOCK_PREFIX = '.stale-lock-'
-/** Far longer than mkdir -> atomic PID write, including Windows sharing retries. */
+const LOCK_STAGING_PREFIX = '.lock-staging-'
+/** Far longer than mkdir -> holder file, including an older version's atomic PID write. */
 const LOCK_PID_GRACE_MS = 30_000
-/** A recently moved-aside lock may still be verified and renamed back by its reclaimer. */
+/** Older versions verified a moved-aside lock and could rename it back; leave a recent one alone. */
 const STALE_LOCK_SWEEP_AGE_MS = 5 * 60_000
 /** Staging without a readable installer record (crash before spawn, older Lodestar):
  * its installer cannot be checked, so only age proves it is abandoned. */
@@ -133,7 +143,8 @@ export async function resolveAgentPackages(agent: UpdatedAgent, read: (name: str
   const main = await read('@deepseek-ai/dsh', 'latest')
   const pending = new Set(PACKAGES.dsh)
   const seen = new Set<string>()
-  const optional = new Set<string>()
+  const edges = new Map<string, FamilyEdges>()
+  const family = (name: string) => name.startsWith('@deepseek-ai/dsh')
   while (pending.size) {
     const batch = [...pending].slice(0, 12)
     for (const name of batch) { pending.delete(name); seen.add(name) }
@@ -141,14 +152,14 @@ export async function resolveAgentPackages(agent: UpdatedAgent, read: (name: str
     for (const row of rows) {
       if (row.version !== main.version) throw new Error(`DSH release package mismatch: ${row.name}@${row.version}, expected ${main.version}`)
       dependencies[row.name] = row.version
-      for (const name of Object.keys(row.optionalDependencies ?? {})) optional.add(name)
-      for (const name of Object.keys({ ...row.dependencies, ...row.peerDependencies, ...row.optionalDependencies })) {
-        if (name.startsWith('@deepseek-ai/dsh') && !seen.has(name)) pending.add(name)
-      }
+      // npm lets an optionalDependencies entry override a same-named regular dependency.
+      const optional = new Set(Object.keys(row.optionalDependencies ?? {}).filter(family))
+      const hard = new Set(Object.keys({ ...row.dependencies, ...row.peerDependencies }).filter(name => family(name) && !optional.has(name)))
+      edges.set(row.name, { hard, optional, platform: { os: row.os, cpu: row.cpu, libc: row.libc } })
+      for (const name of [...hard, ...optional]) if (!seen.has(name)) pending.add(name)
     }
   }
-  for (const name of PACKAGES.dsh) optional.delete(name)
-  Object.defineProperty(dependencies, OPTIONAL_PACKAGES, { value: optional, enumerable: false })
+  Object.defineProperty(dependencies, FAMILY_EDGES, { value: edges, enumerable: false })
   return dependencies
 }
 
@@ -199,22 +210,59 @@ async function validateClaudeNativeBinary(directory: string): Promise<void> {
   throw new Error(`Invalid Agent runtime at ${directory}: @anthropic-ai/claude-agent-sdk@${installed.version} is missing its ${process.platform}-${process.arch} native CLI binary; reinstall with optional dependencies`)
 }
 
-async function validateInstalledPackages(
-  agent: UpdatedAgent,
-  directory: string,
-  versions: Record<string, string>,
-  optional: ReadonlySet<string> = new Set(),
-): Promise<void> {
+/** npm's os/cpu list rule (npm-install-checks): `!x` excludes x, and a list made only of
+ * exclusions allows everything else. */
+function npmPlatformListAllows(list: string[] | string | undefined, value: string): boolean {
+  if (list === undefined) return true
+  const entries = typeof list === 'string' ? [list] : list
+  if (entries.length === 1 && entries[0] === 'any') return true
+  let excluded = 0
+  let listed = false
+  for (const entry of entries) {
+    if (!entry.startsWith('!')) listed ||= entry === value
+    else if (entry.slice(1) === value) return false
+    else excluded++
+  }
+  return listed || excluded === entries.length
+}
+
+/** True only when npm certainly installs the package on this platform. A libc
+ * constraint is never confirmed (Lodestar does not detect the C library), so such a
+ * package counts as possibly excluded and its absence stays excused. */
+function npmInstallsHere(platform: PlatformConstraint): boolean {
+  return platform.libc === undefined && npmPlatformListAllows(platform.os, process.platform)
+    && npmPlatformListAllows(platform.cpu, process.arch)
+}
+
+async function validateInstalledPackages(agent: UpdatedAgent, directory: string, versions: ResolvedAgentPackages): Promise<void> {
+  const family = versions[FAMILY_EDGES]
+  const missing = new Set<string>()
   for (const [name, version] of Object.entries(versions)) {
     let installed: Manifest
     try {
       installed = JSON.parse(await readFile(join(directory, 'node_modules', name, 'package.json'), 'utf8')) as Manifest
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT' && optional.has(name)) continue
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT' && family) { missing.add(name); continue }
       throw error
     }
     if (installed.name !== name || installed.version !== version) {
       throw new Error(`Invalid Agent runtime at ${directory}: expected ${name}@${version}, found ${installed.name}@${installed.version}`)
+    }
+  }
+  // A DSH package npm skipped is excused only when nothing installed requires it: every
+  // package that needs it lists it as optional, or is itself absent (reachable only
+  // through a skipped optional package). A required one missing is a broken install, and
+  // so is an optional one npm attempted (an installed package lists it) on a platform its
+  // manifest does not exclude: npm exits 0 when such an install fails.
+  for (const name of missing) {
+    const requiredBy = PACKAGES.dsh.includes(name) ? name
+      : [...family!].find(([dependent, edges]) => !missing.has(dependent) && edges.hard.has(name))?.[0]
+    if (requiredBy) {
+      throw new Error(`Invalid Agent runtime at ${directory}: ${name}@${versions[name]} is missing${requiredBy === name ? '' : ` but required by ${requiredBy}`}`)
+    }
+    const attemptedBy = [...family!].find(([dependent, edges]) => !missing.has(dependent) && edges.optional.has(name))?.[0]
+    if (attemptedBy && npmInstallsHere(family!.get(name)?.platform ?? {})) {
+      throw new Error(`Invalid Agent runtime at ${directory}: optional ${name}@${versions[name]} of ${attemptedBy} applies to ${process.platform}-${process.arch} but is missing (its installation failed)`)
     }
   }
   if (agent === 'claude') await validateClaudeNativeBinary(directory)
@@ -315,51 +363,102 @@ async function stagingAbandoned(path: string): Promise<boolean> {
   return await ageMs(path) >= UNRECORDED_STAGING_AGE_MS
 }
 
+/** Older versions' moved-aside locks and staging directories of lock creations that never
+ * reached their rename; either name carries the time it was made. */
 async function staleLockAbandoned(name: string, path: string): Promise<boolean> {
-  const movedAt = Number(/^\.stale-lock-(\d+)-/.exec(name)?.[1])
+  const movedAt = Number(/^\.(?:stale-lock|lock-staging)-(\d+)-/.exec(name)?.[1])
   const age = Number.isSafeInteger(movedAt) ? Date.now() - movedAt : await ageMs(path)
   return age >= STALE_LOCK_SWEEP_AGE_MS
 }
 
-/** Staging directories of interrupted or cancelled installs (and reclaimed
- * locks) belong to no updater once this one holds the lock. One an orphaned
- * installer may still own stays; without a process table nothing is removed. */
+/** Staging directories of interrupted or cancelled installs belong to no updater once
+ * this one holds the lock. One an orphaned installer may still own stays; without a
+ * process table no staging is removed. Lock directories older versions moved aside
+ * while reclaiming belong to no process at all and are removed without that check. */
 async function pruneStaleStaging(agent: UpdatedAgent, directory: string, options: AgentUpdateOptions): Promise<void> {
   const report = (message: string) => { try { options.report?.(message) } catch {} }
   try {
     const stale: string[] = []
+    const staleLocks: string[] = []
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue
       const path = join(directory, entry.name)
       try {
-        if (entry.name.startsWith('.install-') ? await stagingAbandoned(path)
-          : entry.name.startsWith(STALE_LOCK_PREFIX) && await staleLockAbandoned(entry.name, path)) stale.push(path)
+        if (entry.name.startsWith('.install-')) { if (await stagingAbandoned(path)) stale.push(path) }
+        else if ((entry.name.startsWith(STALE_LOCK_PREFIX) || entry.name.startsWith(LOCK_STAGING_PREFIX))
+          && await staleLockAbandoned(entry.name, path)) staleLocks.push(path)
       } catch (error) {
         // Already removed by its own reclaimer; anything else keeps the directory.
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       }
     }
-    if (stale.length === 0) return
-    const result = await removeUnusedDirectories(stale, options)
-    if (!result) {
-      report(`${agent}: 中断安装的临时目录清理跳过（无法确认占用）`)
-      return
+    let removed = 0
+    let failed = false
+    for (const path of staleLocks) {
+      if (options.signal?.aborted) break
+      try {
+        await retryAgentFileOperation(() => rm(path, { recursive: true, force: true }))
+        removed++
+      } catch { failed = true }
     }
-    if (result.removed > 0) report(`${agent}: 已清理 ${result.removed} 个中断安装的临时目录`)
-    if (result.failed) report(`${agent}: 中断安装的临时目录清理未完成，保留原目录`)
+    if (stale.length > 0) {
+      const result = await removeUnusedDirectories(stale, options)
+      if (!result) report(`${agent}: 中断安装的临时目录清理跳过（无法确认占用）`)
+      else {
+        removed += result.removed
+        failed ||= result.failed
+      }
+    }
+    if (removed > 0) report(`${agent}: 已清理 ${removed} 个中断安装的临时目录`)
+    if (failed) report(`${agent}: 中断安装的临时目录清理未完成，保留原目录`)
   } catch {
     report(`${agent}: 中断安装的临时目录清理未完成，保留原目录`)
   }
 }
 
-/** What identified a lock when it was judged stale: the PID and owner token recorded in it.
- * Never the inode or the timestamps of the directory: Linux gives the inode of a directory
- * just removed to the next one created, and a check that kept failing on some platform made
- * the reclaim retry without pause. `mtimeMs` only dates a lock that has no PID yet. */
-interface ObservedLock { pid: string | undefined; owner: string | undefined; mtimeMs: number }
+/** A lock directory names its holder with one empty file, `holder-<pid>-<token>`: PID and
+ * a random token in a single name. A new lock appears complete: its files are written into a
+ * private `.lock-staging-<ms>-<token>` directory that one rename publishes as the lock, so no
+ * other updater ever sees, or removes, a lock half made. Taking over a stale lock renames
+ * exactly its holder file to the new holder's name: of all waiters that judged the same lock
+ * stale only one succeeds, and a judgement made before the lock changed finds nothing to
+ * rename; nothing is ever moved back. `start-<token>` records the holder's own process start
+ * identity (`processStartId`); a live process whose identity differs got the holder's PID
+ * later. The identity does not depend on the wall clock, which may step while a lock is held.
+ * `pid` repeats the holder for older Lodestar versions, whose own locks (`pid` + `owner`) are
+ * taken over through their `owner` file the same way. Older versions create the directory
+ * first and fill it afterwards, and on POSIX a rename may replace such a still-empty
+ * directory, so an old and a new version updating at the same moment are not strictly
+ * serialized. A released lock is first renamed to `.stale-lock-<ms>-<uuid>`, freeing the path
+ * at once; what an interrupted removal leaves there is swept later. Never the inode or the
+ * timestamps of the directory: Linux gives the inode of a directory just removed to the next
+ * one created; `mtimeMs` only dates an older version's directory without a holder. */
+const LOCK_HOLDER = /^holder-([1-9]\d*)-([0-9a-f-]{36})$/
+const lockHolderName = (pid: number, token: string): string => `holder-${pid}-${token}`
+/** Holder files this process owns or is about to own. One naming this PID but missing here
+ * was left by an earlier process that had the same PID (a daemon restarted after a reboot). */
+const ownHolders = new Set<string>()
+/** This process's start identity; a failed query is retried by the next lock. */
+let ownStartId: string | null = null
+async function currentProcessStartId(): Promise<string | null> {
+  return ownStartId ??= await processStartId(process.pid)
+}
+
+interface ObservedLock {
+  entries: string[]
+  /** Holder file; absent only in an older version's lock. */
+  holder: string | undefined
+  pid: number | undefined
+  /** An older version's complete lock: `pid` and `owner`, no holder file. */
+  legacy: boolean
+  /** The holder's start identity (`start-<token>`), if recorded yet. */
+  start: string | undefined
+  mtimeMs: number
+}
 
 async function observeLock(path: string): Promise<ObservedLock> {
   const { mtimeMs } = await stat(path)
+  const entries = await readdir(path)
   const read = async (name: string): Promise<string | undefined> => {
     try { return await readFile(join(path, name), 'utf8') }
     catch (error) {
@@ -367,90 +466,192 @@ async function observeLock(path: string): Promise<ObservedLock> {
       return undefined
     }
   }
-  return { pid: await read('pid'), owner: await read('owner'), mtimeMs }
+  const holder = entries.find(name => LOCK_HOLDER.test(name))
+  if (holder) {
+    const [, pid, token] = LOCK_HOLDER.exec(holder)!
+    const start = (await read(`start-${token}`))?.trim() || undefined
+    return { entries, holder, pid: Number(pid), legacy: false, start, mtimeMs }
+  }
+  const recorded = entries.includes('pid') ? await read('pid') : undefined
+  const pid = recorded === undefined ? undefined : Number(recorded)
+  if (pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0)) throw new Error(`Invalid runtime update lock: ${path}`)
+  return { entries, holder: undefined, pid, legacy: pid !== undefined && entries.includes('owner'), start: undefined, mtimeMs }
 }
 
-/** Moves a dead updater's lock aside, then checks it is the same lock that was
- * judged stale: another waiter may have reclaimed it and taken a fresh one in
- * between, and that live lock is handed back instead of deleted. Returns whether
- * the path is now free; false means another updater holds it and the caller waits. */
-async function reclaimLock(directory: string, path: string, observed: ObservedLock): Promise<boolean> {
-  const aside = join(directory, `${STALE_LOCK_PREFIX}${Date.now()}-${randomUUID()}`)
-  try { await retryAgentFileOperation(() => rename(path, aside)) }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true
-    throw error
-  }
-  const moved = await observeLock(aside)
-  // A lock taken meanwhile carries its holder's PID and token within moments of its creation.
-  if (moved.pid !== observed.pid || moved.owner !== observed.owner) {
-    try { await retryAgentFileOperation(() => rename(aside, path)) }
-    catch (error) { throw new Error(`Runtime update lock was replaced while reclaiming a stale lock and could not be restored: ${path}: ${errorMessage(error)}`) }
+/** What a waiter learned about one holder: a definite answer, or when to ask again after a
+ * failed start-identity query (backing off up to half a minute). */
+interface HolderCheck { reused?: boolean; retryAt: number; delay: number }
+
+/** The recorded holder exited, or its PID now belongs to a process with another start
+ * identity. Anything short of that proof (identity not recorded yet, query failed) counts as
+ * the holder still running, and the lock is waited for. */
+async function lockHolderGone(observed: ObservedLock, checks: Map<string, HolderCheck>): Promise<boolean> {
+  const pid = observed.pid!
+  if (pid === process.pid) return !observed.holder || !ownHolders.has(observed.holder)
+  if (!processAlive(pid)) return true
+  if (!observed.holder || observed.start === undefined) return false
+  const check = checks.get(observed.holder)
+  if (check?.reused !== undefined) return check.reused
+  if (check && performance.now() < check.retryAt) return false
+  const current = await processStartId(pid)
+  if (current === null) {
+    const delay = check ? Math.min(check.delay * 2, 30_000) : 1_000
+    checks.set(observed.holder, { retryAt: performance.now() + delay, delay })
     return false
   }
-  // A failed removal leaves only an inert directory; the next successful update sweeps and reports it.
-  try { await retryAgentFileOperation(() => rm(aside, { recursive: true })) } catch {}
-  return true
+  const reused = !sameProcessStart(current, observed.start)
+  checks.set(observed.holder, { reused, retryAt: 0, delay: 0 })
+  return reused
+}
+
+/** Publishes a complete lock held by `mine` with one rename of a private staging directory.
+ * `exists` when a lock is already in place. The rename only runs when the path was free:
+ * POSIX lets a rename replace an empty directory, which is how an older version's lock looks
+ * between its creation and its first write (or after that version died there, which the
+ * 30-second rule handles), so only that narrow moment remains open to it. */
+async function createLock(directory: string, path: string, mine: string, files: Record<string, string>): Promise<'held' | 'exists'> {
+  try {
+    await stat(path)
+    return 'exists'
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+  const staging = join(directory, `${LOCK_STAGING_PREFIX}${Date.now()}-${randomUUID()}`)
+  await mkdir(staging)
+  try {
+    // A private directory published by one rename: plain writes, retried while Windows
+    // scanners briefly hold a new file.
+    await retryAgentFileOperation(() => writeFile(join(staging, mine), '', { flag: 'wx', mode: 0o600 }))
+    for (const [name, content] of Object.entries(files)) {
+      await retryAgentFileOperation(() => writeFile(join(staging, name), content, { mode: 0o600 }))
+    }
+    try {
+      await rename(staging, path)
+      return 'held'
+    } catch (error) {
+      // POSIX refuses a non-empty target; Windows refuses any existing directory.
+      if (['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES', 'EBUSY'].includes((error as NodeJS.ErrnoException).code ?? '')) return 'exists'
+      throw error
+    }
+  } finally {
+    // Gone after a successful rename; a leftover is swept by a later update.
+    await rm(staging, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+/** Claims a lock judged stale for `mine`. `held`: the holder file is now this updater's;
+ * `free`: the abandoned directory is gone and may be created again; `changed`: the lock
+ * is no longer the one judged stale and the caller waits. */
+async function reclaimLock(path: string, observed: ObservedLock, mine: string): Promise<'held' | 'free' | 'changed'> {
+  const source = observed.holder ?? (observed.legacy ? 'owner' : undefined)
+  if (source) {
+    try {
+      await retryAgentFileOperation(() => rename(join(path, source), join(path, mine)))
+      return 'held'
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'changed'
+      throw error
+    }
+  }
+  // No holder: an older version died right after creating the directory. Remove what was
+  // seen in it, then the directory only if empty. A lock published meanwhile always holds
+  // its holder file, so the removal fails and the caller waits.
+  for (const name of observed.entries) await retryAgentFileOperation(() => rm(join(path, name), { recursive: true, force: true }))
+  try {
+    await rmdir(path)
+    return 'free'
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') return 'free'
+    if (code === 'ENOTEMPTY' || code === 'EEXIST' || code === 'EPERM' || code === 'EBUSY') return 'changed'
+    throw error
+  }
 }
 
 /** Directory lock also serializes a manual CLI update with the daemon timer. */
 async function lock(directory: string, signal?: AbortSignal): Promise<() => Promise<void>> {
   const path = join(directory, 'update.lock')
   const deadline = Date.now() + 360_000
-  for (;;) {
-    signal?.throwIfAborted()
+  const token = randomUUID()
+  const mine = lockHolderName(process.pid, token)
+  const checks = new Map<string, HolderCheck>()
+  const startId = await currentProcessStartId()
+  const records = (): Record<string, string> => ({ pid: String(process.pid), ...(startId ? { [`start-${token}`]: startId } : {}) })
+  // A lock already gone, or held by another updater, is not this updater's to remove. One
+  // rename frees the path at once; a removal cut short leaves only an inert directory.
+  const release = async (): Promise<void> => {
     try {
-      await mkdir(path)
-      // Identifies this updater's lock at release. An inode cannot: Linux hands the same
-      // number to a directory created right after one was removed.
-      const owner = randomUUID()
-      try {
-        // Other updaters may inspect the directory immediately. Publish a complete PID atomically.
-        await retryAgentFileOperation(async () => writeStateFileAtomic(join(path, 'pid'), String(process.pid)))
-        await retryAgentFileOperation(async () => writeStateFileAtomic(join(path, 'owner'), owner))
-      } catch (error) {
-        try { await retryAgentFileOperation(() => rm(path, { recursive: true })) }
-        catch (cleanup) { throw new AggregateError([error, cleanup], `${errorMessage(error)}; runtime update lock cleanup failed: ${errorMessage(cleanup)}`) }
-        throw error
+      await stat(join(path, mine))
+      const aside = join(directory, `${STALE_LOCK_PREFIX}${Date.now()}-${randomUUID()}`)
+      try { await retryAgentFileOperation(() => rename(path, aside)) }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+        await retryAgentFileOperation(() => rm(path, { recursive: true }))
+        return
       }
-      // A lock already gone, or replaced by another updater's, is not this updater's to remove.
-      return async () => {
-        try {
-          if (await readFile(join(path, 'owner'), 'utf8') !== owner) return
-          await retryAgentFileOperation(() => rm(path, { recursive: true }))
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-        }
+      await retryAgentFileOperation(() => rm(aside, { recursive: true, force: true })).catch(() => {})
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    } finally { ownHolders.delete(mine) }
+  }
+  /** After taking over a lock in place: its records still describe the previous holder. */
+  const publish = async (): Promise<() => Promise<void>> => {
+    try {
+      // Other updaters may inspect the directory immediately: every file appears complete,
+      // and none recreates a lock directory that is gone.
+      for (const [name, content] of Object.entries(records())) {
+        await retryAgentFileOperation(async () => writeStateFileAtomic(join(path, name), content, { createParent: false }))
       }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      try { await release() }
+      catch (cleanup) { throw new AggregateError([error, cleanup], `${errorMessage(error)}; runtime update lock cleanup failed: ${errorMessage(cleanup)}`) }
+      throw error
+    }
+    return release
+  }
+  ownHolders.add(mine)
+  try {
+    for (;;) {
+      signal?.throwIfAborted()
+      if (await createLock(directory, path, mine, records()) === 'held') {
+        await updateLockForTest.afterCreate?.()
+        return release
+      }
       try {
         const observed = await observeLock(path)
-        // A reclaim that finds another updater's lock in its place waits like any other
-        // waiter; retrying at once would spin on a lock that keeps failing the check.
-        let stale = false
-        if (observed.pid === undefined) {
-          // The PID is published right after mkdir; a lock still without one
-          // long after belongs to an updater that died in between.
-          stale = Date.now() - observed.mtimeMs >= LOCK_PID_GRACE_MS
-        } else {
-          const pid = Number(observed.pid)
-          if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`Invalid runtime update lock: ${path}`)
-          try { process.kill(pid, 0) }
-          catch (cause) {
-            if ((cause as NodeJS.ErrnoException).code !== 'ESRCH') throw cause
-            stale = true
-          }
+        const stale = observed.holder || observed.legacy ? await lockHolderGone(observed, checks)
+          // A directory without a holder file: an older version died before publishing one
+          // (`pid` without `owner`: it died between its two writes).
+          : observed.pid !== undefined ? observed.pid === process.pid || !processAlive(observed.pid)
+            : Date.now() - observed.mtimeMs >= LOCK_PID_GRACE_MS
+        if (stale) {
+          const outcome = await reclaimLock(path, observed, mine)
+          if (outcome === 'held') return await publish()
+          // A reclaim that finds another updater's lock in its place waits like any other waiter.
+          if (outcome === 'free') continue
         }
-        if (stale && await reclaimLock(directory, path, observed)) continue
       } catch (cause) {
         if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause
       }
       if (Date.now() >= deadline) throw new Error(`Timed out waiting for runtime update lock: ${path}`)
       await new Promise(resolve => setTimeout(resolve, 200))
     }
+  } catch (error) {
+    ownHolders.delete(mine)
+    throw error
   }
 }
+
+/** Lock protocol steps exposed for concurrency tests (outdated judgements are replayed
+ * directly); `afterCreate` runs right after this process published a new lock. */
+export const updateLockForTest: {
+  observe: typeof observeLock
+  reclaim: typeof reclaimLock
+  create: typeof createLock
+  holderGone: typeof lockHolderGone
+  holderName: typeof lockHolderName
+  afterCreate?: () => Promise<void> | void
+} = { observe: observeLock, reclaim: reclaimLock, create: createLock, holderGone: lockHolderGone, holderName: lockHolderName }
 
 export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpdateOptions = {}): Promise<AgentRuntimeState> {
   const root = options.root ?? AGENT_RUNTIMES_DIR
@@ -464,7 +665,6 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
     const previous = readState(agent, root)
     options.report?.(`${agent}: 检查 upstream latest`)
     const versions = await resolveAgentPackages(agent, options.metadata ?? ((name, version) => metadata(name, version, options.signal)))
-    const optional = (versions as ResolvedAgentPackages)[OPTIONAL_PACKAGES]
     options.signal?.throwIfAborted()
     const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
     // Fixes for one Agent's runtime stay in that Agent's own dependency tree; they are
@@ -484,7 +684,7 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
         dependencies: Object.fromEntries(PACKAGES[agent].map(name => [name, versions[name]])),
         overrides: { ...security, ...(agent === 'dsh' ? versions : {}) } }) + '\n', { mode: 0o600 })
       await (options.install ?? installAgentPackages)(staging, options.signal)
-      await validateInstalledPackages(agent, staging, versions, optional)
+      await validateInstalledPackages(agent, staging, versions)
       options.signal?.throwIfAborted()
       const completedInstall = staging
       await retryAgentFileOperation(() => rename(completedInstall, destination))
@@ -492,7 +692,7 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
     } else {
       // An existing fingerprint is not proof that its installation is intact.
       // Never activate a damaged directory or overwrite files a process may use.
-      await validateInstalledPackages(agent, destination, versions, optional)
+      await validateInstalledPackages(agent, destination, versions)
     }
     const state = { directory: destination, versions, checkedAt: Date.now() }
     const unchanged = previous?.directory === destination

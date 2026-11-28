@@ -424,12 +424,59 @@ test('a group type read once is remembered, because Feishu cannot change it; a m
     assert.equal(await feishu.isExternalChat('oc_source'), true)
     assert.deepEqual(gets, ['oc_source'])
 
-    // No field: treated as internal as before, but asked again next time.
+    // No field (Feishu documents that a non-member only gets name/avatar/count/status, for internal
+    // groups too): treated as internal as before, asked again next time, and logged as a fixed literal.
+    const logged = []
+    const write = process.stderr.write.bind(process.stderr)
+    process.stderr.write = (chunk, ...rest) => { logged.push(String(chunk)); return write(chunk, ...rest) }
     data = { name: 'other', chat_status: 'normal' }
     assert.equal(await feishu.isExternalChat('oc_other'), false)
+    const diagnostics = logged.filter(line => line.includes('feishu chat type missing'))
+    assert.equal(diagnostics.length, 1)
+    assert.match(diagnostics[0], /\\] feishu chat type missing\\n$/)
     data = { name: 'other', chat_status: 'normal', external: true }
     assert.equal(await feishu.isExternalChat('oc_other'), true)
     assert.equal(await feishu.isExternalChat('oc_other'), true)
     assert.deepEqual(gets, ['oc_source', 'oc_other', 'oc_other'])
+  `)
+})
+
+test('a join Feishu parks for approval or rejects as an invalid ID is reported as such, never as joined', async () => {
+  await runIsolated(`
+    ${IDS}
+    feishu.client.im.chat.list = async () => ({ code: 0, data: { items: [
+      { chat_id: 'oc_ext', name: 'project*评审', chat_status: 'normal' },
+      { chat_id: 'oc_ext_wt', name: 'project[review]', chat_status: 'normal' },
+    ] } })
+    feishu.client.im.chat.get = async args => ({ code: 0, data: {
+      name: args.path.chat_id === 'oc_ext' ? 'project*评审' : 'project[review]', chat_status: 'normal', external: true,
+    } })
+    feishu.client.im.chatMembers.get = async () => ({ code: 0, data: { items: [] } })
+    feishu.client.im.chat.create = async () => { throw new Error('must join, not create') }
+    let lists = {}
+    feishu.client.im.chatMembers.create = async () => ({ code: 0, data: lists })
+    const failure = promise => promise.then(() => assert.fail('expected the join to be reported as not done'), error => error)
+
+    // 外部群由真人当群主，开了入群审批时飞书只把人放进待审批列表。
+    lists = { invalid_id_list: [], not_existed_id_list: [], pending_approval_id_list: [guest] }
+    const pending = await failure(feishu.ensureTempChatForSession('project*评审', guest, 'reuse', undefined, true))
+    assert.match(pending.message, /入群审批/)
+    const pendingWt = await failure(feishu.ensureWorktreeChatForSession('project[review]', guest, undefined, true))
+    assert.match(pendingWt.message, /入群审批/)
+
+    lists = { invalid_id_list: [guest], not_existed_id_list: [], pending_approval_id_list: [] }
+    const invalid = await failure(feishu.ensureWorktreeChatForSession('project[review]', guest, undefined, true))
+    assert.match(invalid.message, /成员 ID 无效或不存在/)
+    lists = { invalid_id_list: [], not_existed_id_list: [guest], pending_approval_id_list: [] }
+    const missing = await failure(feishu.ensureTempChatForSession('project*评审', guest, 'reuse', undefined, true))
+    assert.match(missing.message, /成员 ID 无效或不存在/)
+    // 这些文本会留在群里：不带成员 ID。
+    for (const error of [pending, pendingWt, invalid, missing]) assert.ok(!error.message.includes(guest), error.message)
+
+    // Lists naming nobody we asked for leave an actual add reported as joined.
+    lists = { invalid_id_list: [], not_existed_id_list: [], pending_approval_id_list: [] }
+    assert.deepEqual(await feishu.ensureTempChatForSession('project*评审', member, 'reuse'), { chatId: 'oc_ext', created: false, joined: true })
+    lists = { pending_approval_id_list: [guest] }
+    assert.deepEqual(await feishu.ensureWorktreeChatForSession('project[review]', member), { chatId: 'oc_ext_wt', created: false, joined: true })
   `)
 })

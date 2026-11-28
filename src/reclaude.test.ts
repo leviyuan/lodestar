@@ -132,6 +132,36 @@ describe.skipIf(process.platform === 'win32')('readReclaudeStatus', () => {
     expect(parsed.current?.orgId).toBe('7')
   })
 
+  test('the default environment passes no Lodestar host variables to the third-party command', async () => {
+    // test-preload sets LODESTAR_CONFIG and LODESTAR_DATA_DIR like the daemon's own environment.
+    expect(process.env.LODESTAR_CONFIG).toBeTruthy()
+    expect(process.env.LODESTAR_DATA_DIR).toBeTruthy()
+    const host = { LODESTAR_RESTART_CONTINUE_CHAT_ID: 'oc_host_chat', FEISHU_APP_SECRET: 'host-secret' }
+    Object.assign(process.env, host)
+    try {
+      const leaked = '"$LODESTAR_CONFIG$LODESTAR_DATA_DIR$LODESTAR_RESTART_CONTINUE_CHAT_ID$FEISHU_APP_SECRET"'
+      const bin = fake('host-env', `[ -z ${leaked} ] || { echo "reclaude: host variables leaked" >&2; exit 9; }\ncat <<'JSON'\n${JSON.stringify(status())}\nJSON`)
+      const result = await readReclaudeStatus(bin).then(parsed => parsed.current?.orgId, (error: Error) => error.message)
+      expect(result).toBe('7')
+    } finally {
+      for (const key of Object.keys(host)) delete process.env[key]
+    }
+  })
+
+  test('JSON without the required fields is reported as incompatible whatever the exit code', async () => {
+    // A newer format without global.data_dir.
+    const body = JSON.stringify({ claude: { login: { state: 'valid' }, bindings: [] } })
+    for (const exit of [0, 1]) {
+      const bin = fake(`incompatible-${exit}`, `cat <<'JSON'\n${body}\nJSON\nexit ${exit}`)
+      const failure = await readReclaudeStatus(bin, { PATH: '/usr/bin:/bin' }).then(() => null, (error: Error) => error.message)
+      expect(failure).toBe('reclaude status 输出缺少 global.data_dir，可能与当前 reclaude 版本不兼容')
+    }
+    // Text that is not JSON on a failed run is still reported as the failed run.
+    const text = fake('text-exit', 'echo "status unavailable"\necho "reclaude: 暂不可用" >&2\nexit 2')
+    const failure = await readReclaudeStatus(text, { PATH: '/usr/bin:/bin' }).then(() => null, (error: Error) => error.message)
+    expect(failure).toBe('reclaude status 查询失败：reclaude: 暂不可用')
+  })
+
   test('rejects output that is not JSON and a missing command', async () => {
     await expect(readReclaudeStatus(fake('garbage', 'echo "not json"'), { PATH: '/usr/bin:/bin' })).rejects.toThrow('reclaude status 输出不是有效 JSON')
     await expect(readReclaudeStatus(join(root, 'absent'), { PATH: '/usr/bin:/bin' })).rejects.toThrow('reclaude status 查询失败：命令不存在')

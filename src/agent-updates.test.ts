@@ -1,15 +1,26 @@
 import { afterEach, expect, spyOn, test } from 'bun:test'
-import { existsSync, mkdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, symlinkSync } from 'node:fs'
 import { chmod, copyFile, mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { AGENT_UPDATE_INTERVAL_MS, retryAgentFileOperation, resolveAgentPackages, startAgentAutoUpdates, updateAgentRuntime, updateAgentRuntimes } from './agent-updates'
+import { AGENT_UPDATE_INTERVAL_MS, retryAgentFileOperation, resolveAgentPackages, startAgentAutoUpdates, updateAgentRuntime, updateAgentRuntimes, updateLockForTest } from './agent-updates'
+import { writeStateFileAtomic } from './state-store'
+import * as pidGuard from './pid-guard'
+import { processStartId } from './pid-guard'
 import { AGENT_INSTALLER_RECORD, AgentInstallTerminationError } from './agent-install'
 
 const temporary: string[] = []
 afterEach(async () => {
   for (const path of temporary.splice(0)) await retryAgentFileOperation(() => rm(path, { recursive: true }))
 })
+/** Windows CI (AGENTS.md): settle first, then assert. Bun on Windows can spin inside
+ * expect(promise).rejects while the promise waits on a timer or a retry. */
+async function rejection(promise: Promise<unknown>): Promise<Error> {
+  const outcome = await promise.then(() => undefined, (error: unknown) => error)
+  if (!(outcome instanceof Error)) throw new Error('expected the promise to reject')
+  return outcome
+}
 /** A PID that belonged to a process which has already exited. */
 async function exitedPid(): Promise<number> {
   const exited = Bun.spawn([process.execPath, '-e', ''])
@@ -158,24 +169,24 @@ test('Windows file sharing violations retry the same operation and still surface
   expect(attempts).toBe(3)
   const error = Object.assign(new Error('file remains busy'), { code: 'EBUSY' })
   attempts = 0
-  await expect(retryAgentFileOperation(async () => { attempts++; throw error }, 'win32')).rejects.toBe(error)
+  expect(await rejection(retryAgentFileOperation(async () => { attempts++; throw error }, 'win32'))).toBe(error)
   expect(attempts).toBe(6)
   attempts = 0
-  await expect(retryAgentFileOperation(async () => { attempts++; throw error }, 'linux')).rejects.toBe(error)
+  expect(await rejection(retryAgentFileOperation(async () => { attempts++; throw error }, 'linux'))).toBe(error)
   expect(attempts).toBe(1)
 })
 
 test('unconfirmed installer termination preserves occupied staging files and reports the failure', async () => {
   const root = await scratch()
   let partial = ''
-  await expect(updateAgentRuntime('codex', { root,
+  expect((await rejection(updateAgentRuntime('codex', { root,
     metadata: async name => ({ name, version: '1.0.0' }),
     install: async directory => {
       partial = directory
       await writeFile(join(directory, 'installer-held.exe'), 'still owned by installer')
       throw new AgentInstallTerminationError(`installer PID 12345 termination unconfirmed; partial directory retained: ${directory}`)
     },
-  })).rejects.toThrow('termination unconfirmed')
+  }))).message).toContain('termination unconfirmed')
   expect(await readFile(join(partial, 'installer-held.exe'), 'utf8')).toBe('still owned by installer')
   expect(existsSync(join(root, 'codex/current.json'))).toBe(false)
 })
@@ -202,7 +213,7 @@ test('updating while an old native executable is running never overwrites, moves
     version = '2.0.0'
     const second = await updateAgentRuntime('codex', options)
     expect(second.directory).not.toBe(first.directory)
-    await expect(updateAgentRuntime('codex', { ...options, metadata: async () => { throw new Error('registry offline') } })).rejects.toThrow('registry offline')
+    expect((await rejection(updateAgentRuntime('codex', { ...options, metadata: async () => { throw new Error('registry offline') } }))).message).toContain('registry offline')
     running.stdin.write('ping')
     running.stdin.flush()
     expect(new TextDecoder().decode((await reader.read()).value)).toBe('alive')
@@ -240,6 +251,9 @@ test('DSH discovers new dependency and peer packages from the latest release wit
   expect(calls.some(call => call.startsWith('ordinary-library'))).toBe(false)
 })
 
+/** An OS other than this one: what a platform package for another system declares. */
+const ELSEWHERE = process.platform === 'darwin' ? 'linux' : 'darwin'
+
 test('DSH optional platform packages may be absent while staying in the snapshot', async () => {
   const root = await scratch()
   const version = '9.0.0-rc.8'
@@ -248,7 +262,8 @@ test('DSH optional platform packages may be absent while staying in the snapshot
     root,
     metadata: async name => ({ name, version,
       ...(name === '@deepseek-ai/dsh' ? { dependencies: { '@deepseek-ai/dsh-cua-bundle': version } } : {}),
-      ...(name === '@deepseek-ai/dsh-cua-bundle' ? { optionalDependencies: { [optional]: version } } : {}) }),
+      ...(name === '@deepseek-ai/dsh-cua-bundle' ? { optionalDependencies: { [optional]: version } } : {}),
+      ...(name === optional ? { os: [ELSEWHERE] } : {}) }),
     install: async directory => {
       await install(directory)
       await rm(join(directory, 'node_modules', optional), { recursive: true, force: true })
@@ -256,6 +271,63 @@ test('DSH optional platform packages may be absent while staying in the snapshot
   })
   expect(state.versions?.[optional]).toBe(version)
   expect(existsSync(join(state.directory!, 'node_modules', optional))).toBe(false)
+})
+
+test('a DSH package is excused only when nothing installed requires it', async () => {
+  const version = '9.0.0'
+  const macOnly = '@deepseek-ai/dsh-experimental-cua-macos'
+  const helper = '@deepseek-ai/dsh-cua-protocol'
+  const core = '@deepseek-ai/dsh-core'
+  const attempt = async (manifests: Record<string, object>, absent: string[]) => {
+    const root = await scratch()
+    const result = await updateAgentRuntime('dsh', { root, runningCommands: async () => [],
+      metadata: async name => ({ name, version, ...manifests[name] }),
+      install: async directory => {
+        await install(directory)
+        for (const name of absent) await rm(join(directory, 'node_modules', name), { recursive: true, force: true })
+      },
+    }).then(state => state, (error: unknown) => error)
+    return { result, selected: existsSync(join(root, 'dsh/current.json')) }
+  }
+  // npm skips the platform package and, with it, what only that package requires.
+  const transitive = await attempt({
+    '@deepseek-ai/dsh': { dependencies: { '@deepseek-ai/dsh-cua-bundle': version } },
+    '@deepseek-ai/dsh-cua-bundle': { optionalDependencies: { [macOnly]: version } },
+    [macOnly]: { os: [ELSEWHERE], dependencies: { [helper]: version } },
+  }, [macOnly, helper])
+  expect(transitive.result).not.toBeInstanceOf(Error)
+  expect(transitive.selected).toBe(true)
+  // npm attempted an optional package this platform does not exclude: its install failed (npm exits 0).
+  for (const platform of [{ os: [process.platform], cpu: [process.arch] }, {}, { os: [`!${ELSEWHERE}`] }]) {
+    const failed = await attempt({
+      '@deepseek-ai/dsh': { dependencies: { '@deepseek-ai/dsh-cua-bundle': version } },
+      '@deepseek-ai/dsh-cua-bundle': { optionalDependencies: { [macOnly]: version } },
+      [macOnly]: platform,
+    }, [macOnly])
+    expect((failed.result as Error).message).toContain(`optional ${macOnly}@${version} of @deepseek-ai/dsh-cua-bundle applies to ${process.platform}-${process.arch} but is missing`)
+    expect(failed.selected).toBe(false)
+  }
+  // Excluded here (an exclusion, another CPU) or not judged (libc): still excused.
+  for (const platform of [{ os: [`!${process.platform}`] }, { cpu: [process.arch === 'arm64' ? 'x64' : 'arm64'] }, { libc: ['musl'] }]) {
+    const skipped = await attempt({
+      '@deepseek-ai/dsh': { dependencies: { '@deepseek-ai/dsh-cua-bundle': version } },
+      '@deepseek-ai/dsh-cua-bundle': { optionalDependencies: { [macOnly]: version } },
+      [macOnly]: platform,
+    }, [macOnly])
+    expect(skipped.result).not.toBeInstanceOf(Error)
+    expect(skipped.selected).toBe(true)
+  }
+  // Optional for one package but required by an installed one: a broken install.
+  const required = await attempt({
+    '@deepseek-ai/dsh': { dependencies: { [core]: version } },
+    '@deepseek-ai/dsh-llm-pi-ai': { optionalDependencies: { [core]: version } },
+  }, [core])
+  expect((required.result as Error).message).toContain(`${core}@${version} is missing but required by @deepseek-ai/dsh`)
+  expect(required.selected).toBe(false)
+  // A root package is never optional.
+  const root = await attempt({}, ['@deepseek-ai/dsh-tool-ask-user'])
+  expect((root.result as Error).message).toContain('@deepseek-ai/dsh-tool-ask-user@9.0.0 is missing')
+  expect(root.selected).toBe(false)
 })
 
 test('DSH preserves upstream peer placement while keeping the resolved plugin family on one release', async () => {
@@ -294,8 +366,8 @@ test('successful installs activate immediately without compatibility gating and 
 test.each(['codex', 'claude', 'dsh'] as const)('%s installation failure retains the selected runtime and removes the partial install', async agent => {
   const root = await scratch()
   const selected = await updateAgentRuntime(agent, { root, install, metadata: async name => ({ name, version: '1.0.0' }) })
-  await expect(updateAgentRuntime(agent, { root, metadata: async name => ({ name, version: '2.0.0' }),
-    install: async () => { throw new Error('npm installation failed') } })).rejects.toThrow('npm installation failed')
+  expect((await rejection(updateAgentRuntime(agent, { root, metadata: async name => ({ name, version: '2.0.0' }),
+    install: async () => { throw new Error('npm installation failed') } }))).message).toContain('npm installation failed')
   const state = JSON.parse(await readFile(join(root, agent, 'current.json'), 'utf8'))
   expect(state).toEqual(selected)
   expect((await readdir(join(root, agent))).some(name => name.startsWith('.install-') || name === 'update.lock')).toBe(false)
@@ -306,7 +378,7 @@ test('repeated registry failures leave the selected install unchanged until a su
   const options = { root, install, metadata: async (name: string) => ({ name, version: '1.0.0' }) }
   const before = await updateAgentRuntime('codex', options)
   for (let attempt = 0; attempt < 2; attempt++) {
-    await expect(updateAgentRuntime('codex', { ...options, metadata: async () => { throw new Error('registry offline') } })).rejects.toThrow('registry offline')
+    expect((await rejection(updateAgentRuntime('codex', { ...options, metadata: async () => { throw new Error('registry offline') } }))).message).toContain('registry offline')
     const failed = JSON.parse(await readFile(join(root, 'codex/current.json'), 'utf8'))
     expect(failed).toEqual(before)
   }
@@ -342,7 +414,7 @@ test.each(['missing', 'version', 'name'])('a cached runtime with a %s package ca
   else await writeFile(manifest, JSON.stringify({ name: damage === 'name' ? 'wrong-package' : '@openai/codex', version: damage === 'version' ? '0.0.0' : '1.0.0' }))
   version = '1.0.0'
   const reports: string[] = []
-  await expect(updateAgentRuntime('codex', { ...options, report: message => reports.push(message) })).rejects.toThrow(
+  expect((await rejection(updateAgentRuntime('codex', { ...options, report: message => reports.push(message) }))).message).toContain(
     damage === 'missing' ? 'ENOENT' : 'Invalid Agent runtime',
   )
   expect(JSON.parse(await readFile(join(root, 'codex/current.json'), 'utf8'))).toEqual(current)
@@ -368,7 +440,7 @@ test('a cached claude runtime without its native CLI binary cannot replace the c
   // npm exits 0 when an optional platform package cannot be extracted (for example ENOSPC).
   await rm(join(current.directory!, 'node_modules', native), { recursive: true })
   const reports: string[] = []
-  await expect(updateAgentRuntime('claude', { ...options, report: message => reports.push(message) })).rejects.toThrow('native CLI binary')
+  expect((await rejection(updateAgentRuntime('claude', { ...options, report: message => reports.push(message) }))).message).toContain('native CLI binary')
   expect(JSON.parse(await readFile(join(root, 'claude/current.json'), 'utf8'))).toEqual(current)
   expect(reports.some(message => message.includes('已是 latest'))).toBe(false)
   expect(existsSync(join(root, 'claude/update.lock'))).toBe(false)
@@ -433,9 +505,9 @@ test.each(['checking', 'completed'])('a %s report failure preserves the last com
   const options = { root, install, metadata: async (name: string) => ({ name, version }) }
   const first = await updateAgentRuntime('codex', options)
   version = '2.0.0'
-  await expect(updateAgentRuntime('codex', { ...options, report: message => {
+  expect((await rejection(updateAgentRuntime('codex', { ...options, report: message => {
     if (message.includes(phase === 'checking' ? '检查' : '已更新')) throw new Error('report failed')
-  } })).rejects.toThrow('report failed')
+  } }))).message).toContain('report failed')
   const state = JSON.parse(await readFile(join(root, 'codex/current.json'), 'utf8'))
   expect(state.error).toBeUndefined()
   expect(state.versions['@openai/codex']).toBe(phase === 'checking' ? '1.0.0' : '2.0.0')
@@ -445,10 +517,10 @@ test.each(['checking', 'completed'])('a %s report failure preserves the last com
 
 test('one Agent update failure does not prevent other Agents from getting their latest runtime', async () => {
   const root = await scratch()
-  await expect(updateAgentRuntimes({ root, install, metadata: async name => {
+  expect((await rejection(updateAgentRuntimes({ root, install, metadata: async name => {
     if (name.startsWith('@anthropic-ai/')) throw new Error('Claude registry failed')
     return { name, version: '7.0.0' }
-  } })).rejects.toThrow('Claude registry failed')
+  } }))).message).toContain('Claude registry failed')
   for (const agent of ['codex', 'dsh']) {
     expect(JSON.parse(await readFile(join(root, agent, 'current.json'), 'utf8')).directory).toBeTruthy()
   }
@@ -525,7 +597,7 @@ test('lodestar version displays only the selected installation, without update d
   const root = await scratch()
   const runtimeRoot = join(root, 'agent-runtimes')
   const selected = await updateAgentRuntime('codex', { root: runtimeRoot, install, metadata: async name => ({ name, version: '1.0.0' }) })
-  await expect(updateAgentRuntime('codex', { root: runtimeRoot, metadata: async () => { throw new Error('TLS disconnected') } })).rejects.toThrow('TLS disconnected')
+  expect((await rejection(updateAgentRuntime('codex', { root: runtimeRoot, metadata: async () => { throw new Error('TLS disconnected') } }))).message).toContain('TLS disconnected')
   await writeFile(join(runtimeRoot, 'codex/current.json'), JSON.stringify({ ...selected, error: 'legacy TLS disconnected' }))
   const run = async (args: string[]) => {
     const child = Bun.spawn([process.execPath, 'cli.ts', 'version', ...args], {
@@ -587,7 +659,7 @@ test('a failed scheduled update keeps the current install and succeeds on the ne
     } })
     expect(checks).toBe(0)
     tick()
-    await expect(pending).rejects.toThrow('temporary TLS failure')
+    expect((await rejection(pending)).message).toContain('temporary TLS failure')
     await new Promise<void>(resolve => setImmediate(resolve))
     expect(checks).toBe(1)
     expect(JSON.parse(await readFile(join(root, 'codex/current.json'), 'utf8'))).toEqual(selected)
@@ -635,13 +707,27 @@ test('stale staging stays when the process table is unavailable, and a failed up
   const crashed = join(root, 'codex/.install-crashed')
   await mkdir(crashed)
   await recordInstaller(crashed, await exitedPid())
-  await expect(updateAgentRuntime('codex', { ...options, runningCommands: async () => [],
-    metadata: async () => { throw new Error('registry offline') } })).rejects.toThrow('registry offline')
+  expect((await rejection(updateAgentRuntime('codex', { ...options, runningCommands: async () => [],
+    metadata: async () => { throw new Error('registry offline') } }))).message).toContain('registry offline')
   expect(existsSync(crashed)).toBe(true)
   const reports: string[] = []
   await updateAgentRuntime('codex', { ...options, report: message => reports.push(message), runningCommands: async () => null })
   expect(existsSync(crashed)).toBe(true)
   expect(reports).toContain('codex: 中断安装的临时目录清理跳过（无法确认占用）')
+})
+
+test('locks an older version moved aside are swept even without a process table (Windows)', async () => {
+  const root = await scratch()
+  const options = { root, install, metadata: async (name: string) => ({ name, version: '1.0.0' }) }
+  await updateAgentRuntime('codex', { ...options, runningCommands: async () => [] })
+  const left = join(root, `codex/.stale-lock-${Date.now() - 10 * 60_000}-left`)
+  const recent = join(root, `codex/.stale-lock-${Date.now()}-inflight`)
+  for (const path of [left, recent]) await mkdir(path)
+  const reports: string[] = []
+  await updateAgentRuntime('codex', { ...options, report: message => reports.push(message), runningCommands: async () => null })
+  expect(existsSync(left)).toBe(false)
+  expect(existsSync(recent)).toBe(true)
+  expect(reports).toContain('codex: 已清理 1 个中断安装的临时目录')
 })
 
 test('a preserved staging directory of a cancelled install is removed only after its installer is gone', async () => {
@@ -650,12 +736,12 @@ test('a preserved staging directory of a cancelled install is removed only after
   // Stands in for an orphaned npm lifecycle child: alive, but no command line names the staging path.
   const installer = Bun.spawn([process.execPath, '-e', 'setTimeout(() => {}, 60_000)'])
   try {
-    await expect(updateAgentRuntime('codex', { root, metadata: async name => ({ name, version: '1.0.0' }),
+    expect((await rejection(updateAgentRuntime('codex', { root, metadata: async name => ({ name, version: '1.0.0' }),
       install: async directory => {
         partial = directory
         await recordInstaller(directory, installer.pid)
         throw new AgentInstallTerminationError('termination unconfirmed')
-      } })).rejects.toThrow('termination unconfirmed')
+      } }))).message).toContain('termination unconfirmed')
     const options = { root, install, metadata: async (name: string) => ({ name, version: '1.0.0' }) }
     await updateAgentRuntime('codex', { ...options, runningCommands: async () => [`npm install --prefix ${partial} --include=optional`] })
     expect(existsSync(partial)).toBe(true)
@@ -740,6 +826,278 @@ test('a lock held by an exited updater is reclaimed immediately', async () => {
   await updateAgentRuntime('codex', { root, install, runningCommands: async () => [], metadata: async name => ({ name, version: '1.0.0' }) })
   expect(Date.now() - started).toBeLessThan(5_000)
   expect((await readdir(join(root, 'codex'))).filter(name => name === 'update.lock' || name.startsWith('.stale-lock-'))).toEqual([])
+})
+
+test('of waiters that judged the same dead lock stale only one takes it over; an outdated judgement changes nothing', async () => {
+  const root = await scratch()
+  const { observe, reclaim, holderName } = updateLockForTest
+  const lockPath = join(root, 'codex/update.lock')
+  // An older version's lock (`pid` + `owner`), then the current layout, each left by an exited updater.
+  await mkdir(lockPath, { recursive: true })
+  await writeFile(join(lockPath, 'pid'), String(await exitedPid()))
+  await writeFile(join(lockPath, 'owner'), 'dead-owner')
+  for (const layout of ['legacy', 'current']) {
+    if (layout === 'current') {
+      await rm(lockPath, { recursive: true })
+      await mkdir(lockPath)
+      await writeFile(join(lockPath, holderName(await exitedPid(), randomUUID())), '')
+    }
+    const seenByA = await observe(lockPath)
+    const seenByB = await observe(lockPath)
+    const a = holderName(process.pid, randomUUID())
+    expect(await reclaim(lockPath, seenByA, a)).toBe('held')
+    // B finds no file it judged: nothing is moved, nothing has to be moved back.
+    expect(await reclaim(lockPath, seenByB, holderName(process.pid, randomUUID()))).toBe('changed')
+    expect((await readdir(lockPath)).filter(name => name.startsWith('holder-'))).toEqual([a])
+    expect((await readdir(join(root, 'codex'))).filter(name => name.startsWith('.stale-lock-'))).toEqual([])
+  }
+})
+
+test('an abandoned lock directory is removed only while it has no holder; a lock appears complete', async () => {
+  const root = await scratch()
+  const { observe, reclaim, create, holderName } = updateLockForTest
+  const directory = join(root, 'codex')
+  const lockPath = join(directory, 'update.lock')
+  // An older version's directory that never got a holder, left for over 30 seconds.
+  await mkdir(lockPath, { recursive: true })
+  const old = new Date(Date.now() - 60_000)
+  await utimes(lockPath, old, old)
+  const seen = await observe(lockPath)
+  expect(seen.holder).toBeUndefined()
+  expect(await reclaim(lockPath, seen, holderName(process.pid, randomUUID()))).toBe('free')
+  // A new lock is published by one rename with its holder and records already inside.
+  const live = holderName(process.pid, randomUUID())
+  expect(await create(directory, lockPath, live, { pid: String(process.pid) })).toBe('held')
+  expect((await readdir(lockPath)).sort()).toEqual([live, 'pid'])
+  // The outdated judgement finds a directory that is not empty: nothing is removed or shared.
+  expect(await reclaim(lockPath, seen, holderName(process.pid, randomUUID()))).toBe('changed')
+  expect(await create(directory, lockPath, holderName(process.pid, randomUUID()), {})).toBe('exists')
+  expect((await readdir(lockPath)).filter(name => name.startsWith('holder-'))).toEqual([live])
+  expect((await readdir(directory)).filter(name => name.startsWith('.lock-staging-'))).toEqual([])
+  // Records written after a takeover never recreate a lock directory removed meanwhile.
+  await rm(lockPath, { recursive: true })
+  let late: unknown
+  try { writeStateFileAtomic(join(lockPath, 'pid'), String(process.pid), { createParent: false }) } catch (error) { late = error }
+  expect((late as NodeJS.ErrnoException).code).toBe('ENOENT')
+  expect(existsSync(lockPath)).toBe(false)
+})
+
+test('an outdated reclaim of an abandoned directory cannot remove or share a lock published meanwhile', async () => {
+  const root = await scratch()
+  const { observe, reclaim, create, holderName } = updateLockForTest
+  const directory = join(root, 'codex')
+  const lockPath = join(directory, 'update.lock')
+  await mkdir(lockPath, { recursive: true })
+  const old = new Date(Date.now() - 60_000)
+  await utimes(lockPath, old, old)
+  // B judged the abandoned directory as well, then stalled; this updater reclaims it, publishes
+  // its own lock, and only then does B act on its judgement.
+  const seenByB = await observe(lockPath)
+  let outcomeB: string | undefined
+  let holders: string[] = []
+  updateLockForTest.afterCreate = async () => {
+    updateLockForTest.afterCreate = undefined
+    outcomeB = await reclaim(lockPath, seenByB, holderName(process.pid, randomUUID()))
+    if (outcomeB === 'free') await create(directory, lockPath, holderName(process.pid, randomUUID()), {})
+    holders = (await readdir(lockPath)).filter(name => name.startsWith('holder-'))
+  }
+  try {
+    await updateAgentRuntime('codex', { root, install, runningCommands: async () => [], metadata: async name => ({ name, version: '1.0.0' }) })
+  } finally { updateLockForTest.afterCreate = undefined }
+  expect(outcomeB).toBe('changed')
+  expect(holders).toHaveLength(1)
+})
+
+test.each(['dead updater', 'abandoned directory'] as const)('concurrent updaters on a lock of a %s take turns and all finish', async left => {
+  const root = await scratch()
+  const lockPath = join(root, 'codex/update.lock')
+  await mkdir(lockPath, { recursive: true })
+  if (left === 'dead updater') {
+    await writeFile(join(lockPath, 'pid'), String(await exitedPid()))
+    await writeFile(join(lockPath, 'owner'), 'dead-owner')
+  } else {
+    const old = new Date(Date.now() - 60_000)
+    await utimes(lockPath, old, old)
+  }
+  let inside = 0
+  let most = 0
+  const run = () => {
+    let entered = false
+    return updateAgentRuntime('codex', { root, install, runningCommands: async () => [], metadata: async name => {
+      if (!entered) {
+        entered = true
+        most = Math.max(most, ++inside)
+      }
+      await Bun.sleep(20)
+      return { name, version: '1.0.0' }
+    } }).then(() => true, () => false).finally(() => { if (entered) inside-- })
+  }
+  expect(await Promise.all([run(), run(), run(), run()])).toEqual([true, true, true, true])
+  expect(most).toBe(1)
+  expect((await readdir(join(root, 'codex'))).filter(name => name === 'update.lock' || name.startsWith('.stale-lock-'))).toEqual([])
+})
+
+test('a lock naming this process\'s PID that it does not hold is reclaimed (the PID of a daemon before a restart)', async () => {
+  const root = await scratch()
+  const lockPath = join(root, 'codex/update.lock')
+  await mkdir(lockPath, { recursive: true })
+  // An earlier daemon that had the same PID (deterministic after a reboot) died holding the lock.
+  await writeFile(join(lockPath, updateLockForTest.holderName(process.pid, randomUUID())), '')
+  const started = Date.now()
+  await updateAgentRuntime('codex', { root, install, runningCommands: async () => [], metadata: async name => ({ name, version: '1.0.0' }) })
+  expect(Date.now() - started).toBeLessThan(5_000)
+  expect(existsSync(lockPath)).toBe(false)
+})
+
+test('a lock is reclaimed only when its PID now has another start identity, whatever the wall clock does', async () => {
+  const root = await scratch()
+  const lockPath = join(root, 'codex/update.lock')
+  const live = Bun.spawn([process.execPath, '-e', 'setTimeout(() => {}, 60_000)'])
+  const hold = async (start: string | undefined): Promise<string> => {
+    await rm(lockPath, { recursive: true, force: true })
+    await mkdir(lockPath, { recursive: true })
+    const token = randomUUID()
+    const holder = updateLockForTest.holderName(live.pid, token)
+    await writeFile(join(lockPath, holder), '')
+    if (start !== undefined) await writeFile(join(lockPath, `start-${token}`), start)
+    return holder
+  }
+  const waitedFor = async (holder: string) => {
+    const controller = new AbortController()
+    const waiting = updateAgentRuntime('codex', { root, install, signal: controller.signal, runningCommands: async () => [],
+      metadata: async name => ({ name, version: '2.0.0' }) })
+    await Bun.sleep(800)
+    controller.abort(new Error('stopped waiting'))
+    // Windows CI: never expect(...).rejects on a promise parked on the 200 ms wait timer.
+    const stopped = await waiting.then(() => undefined, (error: unknown) => error)
+    expect((stopped as Error).message).toBe('stopped waiting')
+    expect(await readdir(lockPath)).toContain(holder)
+  }
+  const clock = spyOn(Date, 'now')
+  const realNow = clock.getMockImplementation() ?? (() => performance.timeOrigin + performance.now())
+  try {
+    await Bun.sleep(200)
+    const identity = await processStartId(live.pid)
+    expect(identity).not.toBeNull()
+    // The process with this PID started at another time than the recorded holder: reused.
+    await hold(identity!.replace(/\d+$/, digits => String(Number(digits) + 5_000)))
+    const started = performance.now()
+    await updateAgentRuntime('codex', { root, install, runningCommands: async () => [], metadata: async name => ({ name, version: '1.0.0' }) })
+    expect(performance.now() - started).toBeLessThan(10_000)
+    expect(existsSync(lockPath)).toBe(false)
+    // Still the recorded holder, even after the wall clock stepped either way while it held the lock.
+    for (const step of [30_000, -30_000]) {
+      clock.mockImplementation(() => realNow() + step)
+      await waitedFor(await hold(identity!))
+    }
+    clock.mockRestore()
+    // Nothing recorded yet proves nothing either.
+    await waitedFor(await hold(undefined))
+  } finally {
+    clock.mockRestore()
+    live.kill()
+  }
+})
+
+test('a failed start-identity query is asked again after a backoff, not remembered as an answer', async () => {
+  const live = Bun.spawn([process.execPath, '-e', 'setTimeout(() => {}, 60_000)'])
+  const query = spyOn(pidGuard, 'processStartId')
+  const clock = spyOn(performance, 'now')
+  try {
+    await Bun.sleep(200)
+    const identity = await processStartId(live.pid)
+    expect(identity).not.toBeNull()
+    // The recorded holder had another start: the PID was reused, once the query can tell.
+    const observed = { entries: [], holder: updateLockForTest.holderName(live.pid, randomUUID()), pid: live.pid, legacy: false,
+      start: identity!.replace(/\d+$/, digits => String(Number(digits) + 5_000)), mtimeMs: 0 }
+    const checks = new Map()
+    query.mockClear()
+    query.mockResolvedValue(null)
+    clock.mockReturnValue(1_000)
+    expect(await updateLockForTest.holderGone(observed, checks)).toBe(false)
+    clock.mockReturnValue(1_500)
+    expect(await updateLockForTest.holderGone(observed, checks)).toBe(false)
+    expect(query).toHaveBeenCalledTimes(1)
+    query.mockRestore()
+    clock.mockReturnValue(2_100)
+    expect(await updateLockForTest.holderGone(observed, checks)).toBe(true)
+  } finally {
+    query.mockRestore()
+    clock.mockRestore()
+    live.kill()
+  }
+})
+
+test.skipIf(process.platform === 'win32')('a release cut short leaves only an inert directory; the lock path is free at once', async () => {
+  const root = await scratch()
+  const lockPath = join(root, 'codex/update.lock')
+  let blocked = ''
+  // While the lock is held, put something in it the removal cannot delete.
+  await updateAgentRuntime('codex', { root, runningCommands: async () => [], metadata: async name => ({ name, version: '1.0.0' }),
+    install: async directory => {
+      blocked = join(lockPath, 'kept')
+      await mkdir(blocked)
+      await writeFile(join(blocked, 'file'), '')
+      await chmod(blocked, 0o500)
+      await install(directory)
+    } })
+  try {
+    expect(existsSync(lockPath)).toBe(false)
+    const aside = (await readdir(join(root, 'codex'))).filter(name => name.startsWith('.stale-lock-'))
+    expect(aside).toHaveLength(1)
+    // The next updater takes the free path without waiting for anything.
+    const started = performance.now()
+    await updateAgentRuntime('codex', { root, install, runningCommands: async () => [], metadata: async name => ({ name, version: '2.0.0' }) })
+    expect(performance.now() - started).toBeLessThan(5_000)
+  } finally {
+    for (const name of (await readdir(join(root, 'codex'))).filter(name => name.startsWith('.stale-lock-'))) {
+      await chmod(join(root, 'codex', name, 'kept'), 0o700).catch(() => {})
+    }
+  }
+})
+
+test.skipIf(process.platform === 'win32')('a live updater started through a symlinked path keeps its own lock', async () => {
+  const root = await scratch()
+  // The holder takes the lock itself (its own records), started through a directory symlink:
+  // Bun reports the resolved script path, ps shows the path it was started with.
+  const real = join(root, 'real')
+  await mkdir(real)
+  await writeFile(join(real, 'holder.ts'), `
+    import { mkdir, readFile, writeFile } from 'node:fs/promises'
+    import { join } from 'node:path'
+    import { updateAgentRuntime } from ${JSON.stringify(join(import.meta.dir, 'agent-updates.ts'))}
+    const [root, marker] = process.argv.slice(2)
+    await updateAgentRuntime('codex', { root, runningCommands: async () => [], metadata: async name => ({ name, version: '1.0.0' }),
+      install: async directory => {
+        await writeFile(marker, 'installing')
+        await new Promise(resolve => setTimeout(resolve, 5_000))
+        const manifest = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'))
+        for (const [name, version] of Object.entries(manifest.dependencies)) {
+          await mkdir(join(directory, 'node_modules', name), { recursive: true })
+          await writeFile(join(directory, 'node_modules', name, 'package.json'), JSON.stringify({ name, version }))
+        }
+      } })
+  `)
+  symlinkSync(real, join(root, 'linked'), 'dir')
+  const marker = join(root, 'holder-installing')
+  const holder = Bun.spawn([process.execPath, join(root, 'linked', 'holder.ts'), root, marker], { stdout: 'ignore', stderr: 'ignore' })
+  try {
+    for (let i = 0; i < 100 && !existsSync(marker); i++) await Bun.sleep(100)
+    expect(existsSync(marker)).toBe(true)
+    let installedMeanwhile = false
+    const controller = new AbortController()
+    const waiting = updateAgentRuntime('codex', { root, signal: controller.signal, runningCommands: async () => [],
+      metadata: async name => ({ name, version: '2.0.0' }), install: async () => { installedMeanwhile = true } })
+    await Bun.sleep(1_500)
+    controller.abort(new Error('stopped waiting'))
+    const stopped = await waiting.then(() => undefined, (error: unknown) => error)
+    expect((stopped as Error).message).toBe('stopped waiting')
+    expect(installedMeanwhile).toBe(false)
+    expect(holder.exitCode).toBeNull()
+  } finally {
+    holder.kill()
+    await holder.exited
+  }
 })
 
 test('stopping auto-updates aborts synchronously and resolves only after the in-flight update settled', async () => {

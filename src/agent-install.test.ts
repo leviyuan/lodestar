@@ -6,6 +6,14 @@ import { PassThrough } from 'node:stream'
 import { afterEach, expect, test } from 'bun:test'
 import { AGENT_INSTALLER_RECORD, AgentInstallTerminationError, installAgentPackages, terminateWindowsInstaller } from './agent-install'
 
+/** Windows CI (AGENTS.md): settle first, then assert. Bun on Windows can spin inside
+ * expect(promise).rejects while the promise waits on a timer or a retry. */
+async function rejection(promise: Promise<unknown>): Promise<Error> {
+  const outcome = await promise.then(() => undefined, (error: unknown) => error)
+  if (!(outcome instanceof Error)) throw new Error('expected the promise to reject')
+  return outcome
+}
+
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
 
@@ -34,7 +42,7 @@ test('an already-aborted update never starts npm', async () => {
   const h = installer()
   const controller = new AbortController()
   controller.abort(new Error('already stopped'))
-  await expect(installAgentPackages(h.directory, controller.signal, { spawn: h.spawn })).rejects.toThrow('already stopped')
+  expect((await rejection(installAgentPackages(h.directory, controller.signal, { spawn: h.spawn }))).message).toContain('already stopped')
   expect(h.spawns()).toBe(0)
 })
 
@@ -65,10 +73,10 @@ test('Windows abort waits for both its exact installer tree and stdio to finish'
 test('Windows installation timeout also terminates the installer tree', async () => {
   const h = installer()
   const pids: number[] = []
-  await expect(installAgentPackages(h.directory, undefined, {
+  expect((await rejection(installAgentPackages(h.directory, undefined, {
     platform: 'win32', spawn: h.spawn, timeoutMs: 1,
     terminateWindows: async pid => { pids.push(pid); h.child.emit('close', 1, null) },
-  })).rejects.toThrow('timed out after 1ms')
+  }))).message).toContain('timed out after 1ms')
   expect(pids).toEqual([12345])
 })
 
@@ -121,7 +129,7 @@ test('npm failures retain installation diagnostics', async () => {
   const installing = installAgentPackages(h.directory, undefined, { spawn: h.spawn })
   h.child.stderr.write('native.exe: EPERM')
   h.child.emit('close', 1, null)
-  await expect(installing).rejects.toThrow('native.exe: EPERM')
+  expect((await rejection(installing)).message).toContain('native.exe: EPERM')
 })
 
 test('Windows termination rejects non-specific process targets before invoking taskkill', async () => {
@@ -145,7 +153,7 @@ test('npm receives the same physical root for prefix and cwd when installation u
 
 test('a missing installation directory fails before npm starts', async () => {
   const h = installer()
-  await expect(installAgentPackages(join(h.root, 'missing'), undefined, { spawn: h.spawn })).rejects.toThrow('ENOENT')
+  expect((await rejection(installAgentPackages(join(h.root, 'missing'), undefined, { spawn: h.spawn }))).message).toContain('ENOENT')
   expect(h.spawns()).toBe(0)
 })
 
@@ -159,7 +167,7 @@ test('the running installer PID is recorded in its staging directory and removed
   expect(existsSync(record)).toBe(false)
   const failed = installAgentPackages(h.directory, undefined, { spawn: h.spawn })
   h.child.emit('close', 1, null)
-  await expect(failed).rejects.toThrow('npm install exited code=1')
+  expect((await rejection(failed)).message).toContain('npm install exited code=1')
   // The updater removes or preserves the whole directory; the record stays with it.
   expect(JSON.parse(readFileSync(record, 'utf8'))).toEqual({ pid: 12345 })
 })

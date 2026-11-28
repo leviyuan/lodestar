@@ -9,7 +9,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFile
 import spawn from 'cross-spawn'
 import type { ChildProcess } from 'node:child_process'
 import type { ProjectProfile } from './config'
-import { scrubAgentHostEnv } from './agent-env'
+import { envRuleName, scrubAgentHostEnv } from './agent-env'
 import { DSH_HOME_DIR } from './paths'
 import { DSH_PROTOCOL_VERSION, type DshNotification } from './dsh-protocol'
 import { agentRuntimeRoot } from './agent-updates'
@@ -137,7 +137,9 @@ export class DshRuntime extends EventEmitter {
         try { rmSync(this.launchDir, { recursive: true, force: true }) }
         catch (cleanup) { logError('dsh.launch_dir.cleanup_failed', cleanup) }
         resolve()
-        this.emit('exit', { code, signal, expected: this.closing })
+        // 同理，exit 监听器抛错只记录，不能逃出 close 回调。
+        try { this.emit('exit', { code, signal, expected: this.closing }) }
+        catch (listener) { logError('dsh.exit.dispatch_failed', listener) }
       })
     })
   }
@@ -195,7 +197,7 @@ export class DshRuntime extends EventEmitter {
         baseUrl: childEnv.LODESTAR_AGENT_URL, capability: childEnv.LODESTAR_AGENT_CAPABILITY,
       })
     }
-    for (const key of Object.keys(childEnv)) if (key.startsWith('LODESTAR_AGENT_')) delete childEnv[key]
+    for (const key of Object.keys(childEnv)) if (envRuleName(key).startsWith('LODESTAR_AGENT_')) delete childEnv[key]
     return spawn(node, args, {
       cwd: opts.cwd, stdio: ['pipe', 'pipe', 'pipe'], shell: false,
       env: { ...childEnv, DSH_HOME: home, DSH_PERMISSION_MODE: 'danger-full-access' },

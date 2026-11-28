@@ -334,6 +334,13 @@ export function resetClaudeContextWindowCache(): void {
   contextWindowByRoute.clear()
 }
 
+/** 安全拦截降级后判断主线程回复是否回到原模型：回复带日期后缀
+ * （`claude-opus-5-5-20261101`）、原模型带 `claude:` 前缀或 `[1m]` 后缀时仍是同一个模型。 */
+function sameClaudeModel(a: string, b: string): boolean {
+  const normalize = (model: string) => model.trim().replace(/^claude:/, '').replace(/\[1m\]$/i, '').replace(/[-@]\d{8}$/, '')
+  return normalize(a) === normalize(b)
+}
+
 function totalUsageFromModelUsage(modelUsage: any): { usage: CodexUsage | null; contextWindow: number | null } {
   if (!modelUsage || typeof modelUsage !== 'object') return { usage: null, contextWindow: null }
   const usage: CodexUsage = {}
@@ -1213,6 +1220,8 @@ export class ClaudeAgentProcess extends EventEmitter {
         // A host listener (session card/render) throwing is a dispatch bug, not
         // an SDK/transport failure: Codex isolates the same case. Keep the
         // process and the turn alive; only the iterator itself may end it.
+        // Listeners are isolated per event (safeEmit); this guard only catches
+        // a bug in the handler code itself.
         try { this.handleMessage(message) }
         catch (error) { logError('claude-agent-process: message dispatch failed', error) }
       }
@@ -1227,6 +1236,14 @@ export class ClaudeAgentProcess extends EventEmitter {
       this.emit('error', err)
       this.finishExit(1, null)
     }
+  }
+
+  /** SDK 消息派生的事件逐个隔离宿主监听器异常:一个监听器抛错只记录这一个事件,
+   * 同一条消息里后面的块(token_usage 之后的 result、本地命令输出之后的 tool_use 等)
+   * 照常分发,回合不会因此静默卡住。 */
+  private safeEmit(event: string, ...args: unknown[]): void {
+    try { this.emit(event, ...args) }
+    catch (error) { logError('claude-agent-process: message dispatch failed', error) }
   }
 
   private finishExit(code: number | null, signal: string | null): void {
@@ -1245,7 +1262,9 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.denyPendingPermissions('claude process exited')
     this.resolveExit()
     if (!this.expectedExit) logDiagnostic('claude-agent-process: unexpected process exit')
-    this.emit('exit', { code, signal, expected: this.expectedExit })
+    // 与 Codex/DSH 一致：exit 监听器抛错只记录，不冒充读循环失败或逃出回调。
+    try { this.emit('exit', { code, signal, expected: this.expectedExit }) }
+    catch (error) { logError('claude-agent-process: exit dispatch failed', error) }
   }
 
   private denyPendingPermissions(message: string): void {
@@ -1304,13 +1323,13 @@ export class ClaudeAgentProcess extends EventEmitter {
           if (this.steeringInputs.delete(raw.command_uuid)) {
             this.inputTurnPending = true
             if (raw.state === 'started') this.nativeTurnPending = true
-            if (raw.state === 'started') this.emit('user_input_consumed', { inputId: raw.command_uuid })
+            if (raw.state === 'started') this.safeEmit('user_input_consumed', { inputId: raw.command_uuid })
           }
         }
         if (raw.state === 'cancelled' && this.steeringInputs.delete(raw.command_uuid)) {
           const error = '原生 Claude 取消了一条尚未处理的追加消息，请重新发送。'
           this.steeringFailures.push(error)
-          this.emit('turn_input_error', { error })
+          this.safeEmit('turn_input_error', { error })
           // Cancellation outside our own stop path must not leave an already
           // completed native turn waiting forever for the discarded input.
           if (!this.steeringInputs.size && !this.inputTurnPending && !this.turnActive && this.deferredSteeringResult) {
@@ -1320,7 +1339,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         }
         return
       case 'rate_limit_event':
-        this.emit('rate_limits_updated', raw.rate_limit_info)
+        this.safeEmit('rate_limits_updated', raw.rate_limit_info)
         return
       case 'stream_event':
       case 'tool_progress':
@@ -1350,7 +1369,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         if (this.opts.forkSession && raw.session_id === this.nativeSessionId) this.sessionLease?.releaseSource()
         if (typeof raw.model === 'string' && raw.model) this.lastModel = claudeModelKey(raw.model)
         this.lastEffort = this.opts.effort
-        this.emit('init', { session_id: this.sessionId, raw })
+        this.safeEmit('init', { session_id: this.sessionId, raw })
         return
       case 'session_state_changed':
         if (raw.state === 'running') this.nativeTurnPending = true
@@ -1360,14 +1379,14 @@ export class ClaudeAgentProcess extends EventEmitter {
           // A checkpoint belongs to exactly one clean turn. Clear the prior
           // assistant UUID at the authoritative SDK turn boundary.
           this.lastAssistantUuid = null
-          this.emit('turn_started', { turn_id: raw.uuid, thread_id: this.sessionId,
+          this.safeEmit('turn_started', { turn_id: raw.uuid, thread_id: this.sessionId,
             ...(this.steeringResults.length ? { retry: true } : {}) })
         } else if (raw.state === 'idle') {
           this.turnActive = false
         }
         return
       case 'compact_boundary':
-        this.emit('context_compacted', {
+        this.safeEmit('context_compacted', {
           threadId: raw.session_id ?? this.sessionId ?? undefined,
           sessionId: raw.session_id ?? this.sessionId ?? undefined,
           itemId: raw.uuid,
@@ -1387,19 +1406,19 @@ export class ClaudeAgentProcess extends EventEmitter {
           return
         }
         this.lastThinkingTokens = raw.estimated_tokens
-        this.emit('thinking_progress', { estimatedTokens: raw.estimated_tokens })
+        this.safeEmit('thinking_progress', { estimatedTokens: raw.estimated_tokens })
         return
       case 'permission_denied':
         logDiagnostic('claude-agent-process: permission denied')
         return
       case 'local_command_output':
-        if (typeof raw.content === 'string') this.emit('local_command_output', { text: raw.content })
+        if (typeof raw.content === 'string') this.safeEmit('local_command_output', { text: raw.content })
         return
       // ── 后台任务 / 子 agent 生命周期(SDK 的 task_* 消息族,统一 type:'system')
       // 全部 emit 出去给 session 维护 backgroundTasks 状态 + 驱动后台游标卡。
       // 之前落 default 静默丢,子 agent 启动后全程黑盒直到 tool_result 回来。
       case 'task_started':
-        this.emit('bg_task_started', {
+        this.safeEmit('bg_task_started', {
           task_id: String(raw.task_id ?? ''),
           tool_use_id: typeof raw.tool_use_id === 'string' ? raw.tool_use_id : undefined,
           task_type: typeof raw.task_type === 'string' ? raw.task_type : undefined,
@@ -1410,7 +1429,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         })
         return
       case 'task_progress':
-        this.emit('bg_task_progress', {
+        this.safeEmit('bg_task_progress', {
           task_id: String(raw.task_id ?? ''),
           description: typeof raw.description === 'string' ? raw.description : undefined,
           subagent_type: typeof raw.subagent_type === 'string' ? raw.subagent_type : undefined,
@@ -1420,7 +1439,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         })
         return
       case 'task_updated':
-        this.emit('bg_task_updated', {
+        this.safeEmit('bg_task_updated', {
           task_id: String(raw.task_id ?? ''),
           patch: raw.patch && typeof raw.patch === 'object' ? raw.patch : {},
         })
@@ -1435,7 +1454,7 @@ export class ClaudeAgentProcess extends EventEmitter {
           logDiagnostic('claude-agent-process: unknown task status')
           return
         }
-        this.emit('bg_task_settled', {
+        this.safeEmit('bg_task_settled', {
           task_id: raw.task_id,
           tool_use_id: typeof raw.tool_use_id === 'string' ? raw.tool_use_id : undefined,
           status: raw.status,
@@ -1475,7 +1494,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       this.lastModel = claudeModelKey(notice.fallbackModel)
     }
     logDiagnostic(fallback ? 'claude-agent-process: model refusal fallback' : 'claude-agent-process: model refusal without fallback')
-    this.emit('model_refusal', notice)
+    this.safeEmit('model_refusal', notice)
   }
 
   private handleAssistantMessage(raw: any): void {
@@ -1494,11 +1513,12 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (!parentToolUseId && typeof message?.model === 'string' && message.model && message.model !== '<synthetic>') {
       this.lastModel = claudeModelKey(message.model)
       // 原生自己回到了原模型（主线程回复又来自它），降级状态随之结束。
-      if (this.refusalFallback && message.model === this.refusalFallback.originalModel) this.refusalFallback = null
+      const original = this.refusalFallback?.originalModel
+      if (original && sameClaudeModel(message.model, original)) this.refusalFallback = null
     }
     const content = Array.isArray(message?.content) ? message.content : []
     if (!parentToolUseId && typeof raw.local_command_source === 'string') {
-      this.emit('local_command_output', {
+      this.safeEmit('local_command_output', {
         text: content.flatMap((block: any) => block?.type === 'text' && typeof block.text === 'string' ? [block.text] : []).join('\n'),
       })
     }
@@ -1508,8 +1528,8 @@ export class ClaudeAgentProcess extends EventEmitter {
         this.rememberServerToolInput(block.text)
         if (isServerToolScaffoldText(block.text)) continue
         const uuid = raw.uuid ?? message?.id
-        this.emit('assistant_text', { uuid, text: block.text, parentToolUseId })
-        this.emit('assistant_block_stop', { index: uuid, parentToolUseId })
+        this.safeEmit('assistant_text', { uuid, text: block.text, parentToolUseId })
+        this.safeEmit('assistant_block_stop', { index: uuid, parentToolUseId })
       } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
         this.emitToolUseOnce(block.id, block.name, block.input ?? {}, parentToolUseId)
       } else if (block.type === 'server_tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
@@ -1536,7 +1556,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
     // parentToolUseId:子 agent 内的工具调用 = 触发它的 Task tool_use id;主线程为 null。
     // session 据此把子 agent 的逐步过程累积进对应后台 task 的 steps[]。
-    this.emit('tool_use', { id, name, input, parentToolUseId })
+    this.safeEmit('tool_use', { id, name, input, parentToolUseId })
   }
 
   private rememberServerToolInput(text: string): void {
@@ -1566,7 +1586,7 @@ export class ClaudeAgentProcess extends EventEmitter {
 
   private emitToolResultOnce(toolUseId: string, content: string, isError: boolean, parentToolUseId: string | null): void {
     if (!rememberEmittedId(this.emittedToolResultIds, toolUseId)) return
-    this.emit('tool_result', {
+    this.safeEmit('tool_result', {
       tool_use_id: toolUseId,
       content,
       is_error: isError,
@@ -1586,7 +1606,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       typeof rawContent === 'string' &&
       rawContent.trim()
     ) {
-      this.emit('scheduled_turn_input', {
+      this.safeEmit('scheduled_turn_input', {
         text: rawContent,
         promptId: typeof raw.promptId === 'string' && raw.promptId ? raw.promptId : null,
       })
@@ -1664,7 +1684,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.lastContextTokens = contextOccupancyFromUsage(transcriptUsage)
       ?? (existsSync(transcriptPath) ? contextOccupancyFromUsage(usage) : null)
     if (this.lastTotalUsage || this.lastUsage) {
-      this.emit('token_usage', {
+      this.safeEmit('token_usage', {
         usage: this.lastUsage,
         totalUsage: this.lastTotalUsage,
         contextWindow: this.lastContextWindow,
@@ -1680,7 +1700,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         turns: typeof raw.num_turns === 'number' ? raw.num_turns : 1, error: resultError })
       if (this.steeringInputs.size) {
         this.deferredSteeringResult = { raw, subtype, error: resultError }
-        if (resultError) this.emit('turn_input_error', { error: resultError })
+        if (resultError) this.safeEmit('turn_input_error', { error: resultError })
         logDiagnostic('claude-agent-process: additional input consumption unconfirmed')
         return
       }
@@ -1711,7 +1731,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       subtype: errors.length && subtype === 'success' ? 'claude_steering_failed' : subtype,
       is_error: errors.length > 0,
     }
-    this.emit('result', {
+    this.safeEmit('result', {
       subtype: this.lastResult.subtype,
       is_error: this.lastResult.is_error,
       ...(this.lastResult.is_error ? {

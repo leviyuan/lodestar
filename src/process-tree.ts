@@ -23,18 +23,23 @@ function defaultTaskkill(pid: number, done: (error: Error | null) => void): void
  * switch. `taskkill /T` ends the tree; `claude-credential` and `agent-install`
  * already terminate their Windows wrappers this way.
  *
- * Returns true when a tree kill was started (the caller still awaits the child's
- * `close`), false when the caller should signal the child itself (POSIX, or no
- * pid). A taskkill that fails falls back to the direct signal.
+ * Returns true when the caller should only await the child's `close`: a tree
+ * kill was started, or the child already exited. False when the caller should
+ * signal the child itself (POSIX, or no pid). A taskkill that fails falls back
+ * to the direct signal.
  */
 export function terminateProcessTree(
-  child: Pick<ChildProcess, 'pid' | 'kill'> | null | undefined,
+  child: Pick<ChildProcess, 'pid' | 'kill' | 'exitCode' | 'signalCode'> | null | undefined,
   signal: NodeJS.Signals,
   onError?: (error: Error) => void,
   options: ProcessTreeOptions = {},
 ): boolean {
   if (!child?.pid) return false
   if ((options.platform ?? process.platform) !== 'win32') return false
+  // Once Node has reaped the direct child its PID may belong to another program,
+  // and `/T /F` would end that program's whole tree: only a child still running
+  // is targeted (a second round after a stalled `close` must not taskkill again).
+  if (child.exitCode != null || child.signalCode != null) return true
   const taskkill = options.taskkill ?? defaultTaskkill
   taskkill(child.pid, error => {
     if (!error) return

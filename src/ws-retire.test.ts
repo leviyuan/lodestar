@@ -1,4 +1,8 @@
 import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import ts from 'typescript'
 import { clientEventDispatcher, createWsRetirement, type WsRetireTimers } from './ws-retire'
 
 function fakeTimers() {
@@ -120,4 +124,81 @@ test('an event counts as proof of life only when the current client delivered it
   await live.invoke({ id: 3 })
   expect(proofs).toBe(1)
   expect(handled).toHaveLength(3)
+})
+
+// daemon.ts boots the service on import, so the current/retired client split is checked structurally.
+describe('daemon wiring: only the current client drives the long connection', () => {
+  const root = fileURLToPath(new URL('../', import.meta.url))
+  const source = ts.createSourceFile('daemon.ts', readFileSync(join(root, 'daemon.ts'), 'utf8'), ts.ScriptTarget.Latest, true)
+  const text = (node: ts.Node) => node.getText(source).replace(/\s+/g, ' ')
+  const descendants = (start: ts.Node | undefined): ts.Node[] => {
+    const found: ts.Node[] = []
+    const walk = (node: ts.Node): void => { found.push(node); ts.forEachChild(node, walk) }
+    if (start) walk(start)
+    return found
+  }
+  const all = descendants(source)
+  const variable = (name: string) => all.find((node): node is ts.VariableDeclaration =>
+    ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === name)?.initializer
+  const assigned = (name: string) => all.find((node): node is ts.BinaryExpression =>
+    ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+    && ts.isIdentifier(node.left) && node.left.text === name)?.right
+  const statements = (fn: ts.Node | undefined): ts.Node[] => {
+    expect(fn !== undefined && (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn))).toBe(true)
+    const body = (fn as ts.ArrowFunction).body
+    return ts.isBlock(body) ? [...body.statements] : [body]
+  }
+  const clientOptions = () => {
+    const created = descendants(variable('makeWs')).find((node): node is ts.NewExpression =>
+      ts.isNewExpression(node) && node.expression.getText(source) === 'lark.WSClient')
+    const options = created!.arguments![0] as ts.ObjectLiteralExpression
+    return new Map(options.properties.map(property => [
+      property.name!.getText(source),
+      ts.isPropertyAssignment(property) ? property.initializer : property,
+    ]))
+  }
+
+  test('every client hands events to the shared dispatcher; only the current one proves liveness', () => {
+    const wrappers = descendants(variable('startWs')).filter((node): node is ts.CallExpression =>
+      ts.isCallExpression(node) && node.expression.getText(source) === 'clientEventDispatcher')
+    expect(wrappers.map(text)).toEqual(['clientEventDispatcher(dispatcher, () => client === ws, markEvent)'])
+    // The shared dispatcher's logger is bound to no client, so it never retires one.
+    expect(text(variable('dispatcher')!)).toBe('new lark.EventDispatcher({ logger: wsLogger(), loggerLevel: lark.LoggerLevel.warn })')
+  })
+
+  test('lifecycle callbacks of a replaced client only retire it again', () => {
+    expect(statements(variable('makeWs')).map(text)).toContain('const current = () => client === ws')
+    const options = clientOptions()
+    expect(text(options.get('logger')!)).toBe('wsLogger(() => client)')
+    for (const name of ['onReady', 'onReconnecting', 'onError']) {
+      const [guard] = statements(options.get(name))
+      expect(guard && ts.isIfStatement(guard)).toBe(true)
+      expect(text((guard as ts.IfStatement).expression)).toBe('!current()')
+      expect(text((guard as ts.IfStatement).thenStatement)).toMatch(
+        name === 'onReady' ? /^wsRetirement\.retire\(client\)$/ : /^\{ wsRetirement\.retire\(client\); return \}$/,
+      )
+    }
+    expect(statements(options.get('onReconnected')).map(text)).toEqual([
+      'if (current()) onReconnectedHeal(); else wsRetirement.retire(client)',
+    ])
+  })
+
+  test("a replaced client's liveness warning retires it instead of rebuilding the current connection", () => {
+    const warn = descendants(variable('wsLogger')).find((node): node is ts.PropertyAssignment =>
+      ts.isPropertyAssignment(node) && node.name.getText(source) === 'warn')
+    const inside = descendants(warn)
+    const guard = inside.findIndex(node => ts.isIfStatement(node) && text(node.expression) === 'client && client !== ws')
+    const rebuild = inside.findIndex(node => ts.isCallExpression(node) && node.expression.getText(source) === 'scheduleWsRebuild')
+    expect(guard).toBeGreaterThan(-1)
+    expect(text((inside[guard] as ts.IfStatement).thenStatement)).toBe('{ wsRetirement.retire(client); return }')
+    expect(rebuild).toBeGreaterThan(guard)
+  })
+
+  test('a rebuild retires the replaced client once the fresh one is current; shutdown closes all retired ones', () => {
+    const steps = statements(assigned('rebuildWs')).map(text)
+    const swap = steps.indexOf('const old = ws')
+    expect(swap).toBeGreaterThan(-1)
+    expect(steps.slice(swap, swap + 3)).toEqual(['const old = ws', 'ws = makeWs()', 'if (old) wsRetirement.retire(old)'])
+    expect(statements(assigned('stopFeishuWs')).map(text)).toContain('wsRetirement.closeAll()')
+  })
 })

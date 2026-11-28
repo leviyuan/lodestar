@@ -140,7 +140,7 @@ describe('clear account quota detail', () => {
   })
 
   test('missing or failed data stays visible without displaying stale windows', () => {
-    for (const percent of [null, NaN, -1, 101]) {
+    for (const percent of [null, NaN, -1, Infinity]) {
       expect(consoleUnifiedUsageContent({ state: 'ok', windows: [
         { kind: 'fiveHour', label: '5h', percent, resetsAt: null },
       ] })).toBe('5h　MISS')
@@ -183,6 +183,20 @@ describe('clear account quota detail', () => {
     expect(shown(79.6)).toBe(`周　${bar(5, 'orange')} <font color='orange'>80%</font>${missing}`)
     expect(shown(99.4)).toBe(`周　${bar(6, 'orange')} <font color='orange'>99%</font>${missing}`)
     expect(shown(99.6)).toBe(`周　${bar(6, 'red')} <font color='red'>100%</font>${missing}`)
+  })
+
+  test('a relay value just above 100 shows as exhausted; negative or non-numeric values stay MISS', () => {
+    const line = (percent: unknown) => consoleUnifiedUsageContent({ state: 'ok', windows: [
+      { kind: 'weekly', label: '周额度', percent, resetsAt: null },
+    ] } as any)
+    const exhausted = `周　${bar(6, 'red')} <font color='red'>100%</font>　${grey('重置时间 MISS')}`
+    for (const percent of [99.5, 100, 100.4, 101, 250]) expect(line(percent)).toBe(exhausted)
+    expect(line(0)).toBe(`周　${bar(0)} 0%　${grey('重置时间 MISS')}`)
+    for (const percent of [-0.1, -1, NaN, Infinity, -Infinity, null, undefined, '50', '101']) expect(line(percent)).toBe('周　MISS')
+    // The reset countdown still follows a clamped value.
+    expect(consoleUnifiedUsageContent({ state: 'ok', windows: [
+      { kind: 'fiveHour', label: '5h', percent: 100.4, resetsAt: new Date(Date.now() + 3600_000) },
+    ] })).toBe(`5h　${bar(6, 'red')} <font color='red'>100%</font>　${grey('1.0h')}`)
   })
 
   test('relay script windows with unparsed dates or unlisted kinds render without breaking the panel', () => {

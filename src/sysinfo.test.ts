@@ -1,9 +1,10 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import {
   launchdLastActiveMs, parseLaunchctlList, parseLaunchdJobDetail, parseMacMemory, parseProcessElapsed, readDiskFor,
-  readMacMemory, readMacServices, readWorkDirDisk,
+  readMacMemory, readMacServices, readWorkDirDisk, sysinfoFs,
 } from './sysinfo'
 import { consoleHostContent, consoleHostElement } from './cards/console'
 
@@ -123,13 +124,43 @@ describe('macOS host snapshot', () => {
       })
       expect(result.error).toBeNull()
       expect(result.services[0]).toMatchObject({ active: 'active', stateAgoSec: null })
-      expect(result.services[0]!.error).toContain('MISS')
+      expect(result.services[0]!.error).toBeTruthy()
       expect(result.services[1]!.error).toBeUndefined()
       const content = consoleHostContent({ cpu: null, mem: null, disks: [], services: result.services, servicesError: null })
       expect(content).toContain('运行时长 MISS')
       expect(content).toContain('cc-scheduled')
       expect(content).not.toContain('已运行 0')
     }
+  })
+
+  test('a failing ps shows MISS on each running row and its escaped reason once in the folded panel', async () => {
+    const list = 'PID\tStatus\tLabel\n101\t0\tcc-alpha-dev\n102\t0\tcc-beta-dev\n103\t0\tcodex-gamma-run\n-\t0\tcc-idle\n'
+    const result = await readMacServices(async (file, args) => {
+      if (file === '/bin/launchctl') return args.length === 1 ? list : ''
+      // Shape of a real execFile rejection: the command line plus stderr, over several lines.
+      throw new Error(`Command failed: ${file} ${args.join(' ')}\nps: illegal option -- <x>\nusage: ps [-AaCcEefhjlMmrSTvwXx]`)
+    })
+    const snapshot = { cpu: null, mem: null, disks: [], services: result.services, servicesError: null }
+    const host = consoleHostElement(snapshot) as any
+    const content: string = host.elements[0].content
+    expect(content.split('\n').slice(4)).toEqual([
+      '　· 🟢 `cc-alpha-dev` · 运行时长 MISS',
+      '　· 🟢 `cc-beta-dev` · 运行时长 MISS',
+      '　· ⚪ `cc-idle` · 上次活跃 MISS · 退出码 0',
+      '　· 🟢 `codex-gamma-run` · 运行时长 MISS',
+    ])
+    expect(content).not.toContain('Command failed')
+    expect(content).not.toContain('<x>')
+    expect(host.elements).toHaveLength(2)
+    expect(host.elements[1].expanded).toBe(false)
+    expect(host.elements[1].header.title.content).toBe('⚠️ 主机读取失败')
+    // The user decided the raw reason stays visible: folded, on one line, escaped and written once.
+    expect(host.elements[1].elements[0].content).toBe('运行时长：Command failed: /bin/ps -p 101,102,103 -o pid=,etime= '
+      + 'ps: illegal option -- &#60;x&#62; usage: ps &#91;-AaCcEefhjlMmrSTvwXx&#93;')
+    // Together with an unreadable service list, each reason is still listed once.
+    const both = consoleHostElement({ ...snapshot, servicesError: 'launchctl <denied>' }) as any
+    expect(both.elements[1].elements[0].content)
+      .toBe(`服务列表：launchctl &#60;denied&#62;\n\n${host.elements[1].elements[0].content}`)
   })
 
   test('host panel does not mistake unavailable launchd timestamps for never started', async () => {
@@ -180,16 +211,16 @@ describe('macOS host snapshot', () => {
     expect(parseLaunchdJobDetail('')).toEqual({ stdoutPath: null, stderrPath: null })
   })
 
-  test('the last activity comes from the newest launchd log write, never from a guess', () => {
+  test('the last activity comes from the newest launchd log write, never from a guess', async () => {
     const now = Date.now()
     const detail = { stdoutPath: '/log/out.log', stderrPath: '/log/err.log' }
-    expect(launchdLastActiveMs(detail, path => path === '/log/out.log' ? now - 9_000 : now - 3_000)).toBe(now - 3_000)
-    expect(launchdLastActiveMs({ stdoutPath: '/log/out.log', stderrPath: null }, () => now)).toBe(now)
+    expect(await launchdLastActiveMs(detail, path => path === '/log/out.log' ? now - 9_000 : now - 3_000)).toBe(now - 3_000)
+    expect(await launchdLastActiveMs({ stdoutPath: '/log/out.log', stderrPath: null }, async () => now)).toBe(now)
     // 文件还没创建、不可读或时间无效都只是没有证据。
-    expect(launchdLastActiveMs(detail, () => null)).toBeNull()
-    expect(launchdLastActiveMs({ stdoutPath: '/log/out.log', stderrPath: null }, () => Number.NaN)).toBeNull()
-    expect(launchdLastActiveMs({ stdoutPath: '/log/out.log', stderrPath: null }, () => 0)).toBeNull()
-    expect(launchdLastActiveMs({ stdoutPath: null, stderrPath: null }, () => now)).toBeNull()
+    expect(await launchdLastActiveMs(detail, () => null)).toBeNull()
+    expect(await launchdLastActiveMs({ stdoutPath: '/log/out.log', stderrPath: null }, () => Number.NaN)).toBeNull()
+    expect(await launchdLastActiveMs({ stdoutPath: '/log/out.log', stderrPath: null }, () => 0)).toBeNull()
+    expect(await launchdLastActiveMs({ stdoutPath: null, stderrPath: null }, () => now)).toBeNull()
   })
 
   test('stopped launchd jobs read the last activity from the log launchd writes', async () => {
@@ -228,17 +259,17 @@ describe('macOS host snapshot', () => {
     expect(result.services[0]).toMatchObject({ name: 'cc-hourly', lastActiveAgoSec: null, hasStarted: null })
   })
 
-  test('the disk follows the working directory and shows occupancy plus free space', () => {
-    const disk = readDiskFor(process.cwd())
+  test('the disk follows the working directory and shows occupancy plus free space', async () => {
+    const disk = await readDiskFor(process.cwd())
     expect(disk).not.toBeNull()
     expect(disk!.totalBytes).toBeGreaterThan(0)
     expect(disk!.availBytes).toBeGreaterThanOrEqual(0)
     expect(disk!.percent).toBeGreaterThanOrEqual(0)
     expect(disk!.percent).toBeLessThanOrEqual(100)
-    expect(readDiskFor('/definitely/not/a/real/path')).toBeNull()
+    expect(await readDiskFor('/definitely/not/a/real/path')).toBeNull()
     // A working directory that does not exist yet still reports its nearest existing ancestor's disk.
     const missing = join(tmpdir(), `lodestar-missing-${process.pid}`, 'nested')
-    expect(readWorkDirDisk(missing)).toEqual([readDiskFor(resolve(tmpdir()))!])
+    expect(await readWorkDirDisk(missing)).toEqual([(await readDiskFor(resolve(tmpdir())))!])
 
     const host = (disks: Array<{ totalBytes: number; availBytes: number; usedBytes: number; percent: number }>) =>
       consoleHostContent({ cpu: null, mem: null, disks, services: [], servicesError: null }).split('\n')
@@ -258,9 +289,70 @@ describe('macOS host snapshot', () => {
     expect(row({ active: 'failed', stateAgoSec: 40, hasStarted: false, lastExitStatus: 1 }))
       .toBe('　· ❌ `cc-x` · 已挂 40s · 从未启动 · 退出码 1')
     expect(row({ active: 'activating', stateAgoSec: 3 })).toBe('　· 🚀 `cc-x` · activating · 已 3s')
-    // A running job whose runtime is unreadable shows the reason, not "active".
-    expect(row({ active: 'active', error: 'ps 未返回该进程，运行时长 MISS' })).toBe('　· 🟢 `cc-x` · ps 未返回该进程，运行时长 MISS')
+    // A running job whose runtime is unreadable shows MISS, not "active"; the reason is folded below.
+    expect(row({ active: 'active', error: 'ps 未返回该进程' })).toBe('　· 🟢 `cc-x` · 运行时长 MISS')
     expect(row({ active: 'active' })).toBe('　· 🟢 `cc-x` · active')
+  })
+})
+
+describe('paths on an unreachable network volume', () => {
+  const original = { ...sysinfoFs }
+  afterEach(() => { Object.assign(sysinfoFs, original) })
+  /** A file system call that never returns, as on a dead network mount. */
+  const hang = <T>(calls: string[]) => (path: string): Promise<T> => { calls.push(path); return new Promise<T>(() => {}) }
+
+  test('a working directory whose disk never answers shows MISS within the timeout, not its parent disk', async () => {
+    sysinfoFs.timeoutMs = 20
+    const statfsCalls: string[] = []
+    sysinfoFs.statfs = hang(statfsCalls)
+    // A path of its own: the stalled read stays pending for the rest of the process.
+    const workDir = mkdtempSync(join(tmpdir(), 'lodestar-hung-statfs-'))
+    try {
+      // The loop keeps running while the read is pending: the timer below fires first.
+      let ticked = false
+      setTimeout(() => { ticked = true }, 1)
+      const started = Date.now()
+      expect(await readWorkDirDisk(workDir)).toEqual([])
+      expect(ticked).toBe(true)
+      expect(Date.now() - started).toBeLessThan(2_000)
+      // A second read of the same stalled path reuses the pending call instead of piling up another.
+      expect(await readDiskFor(workDir)).toBeNull()
+      expect(statfsCalls).toEqual([workDir])
+    } finally {
+      rmSync(workDir, { recursive: true, force: true })
+    }
+
+    const accessCalls: string[] = []
+    sysinfoFs.access = hang(accessCalls)
+    sysinfoFs.statfs = original.statfs
+    const missing = join(tmpdir(), `lodestar-hung-access-${process.pid}`, 'nested')
+    expect(await readWorkDirDisk(missing)).toEqual([])
+    expect(accessCalls).toEqual([missing])
+  })
+
+  test('a stopped job whose log never answers keeps its row on MISS', async () => {
+    sysinfoFs.timeoutMs = 20
+    const statCalls: string[] = []
+    sysinfoFs.stat = hang(statCalls)
+    const log = join(tmpdir(), `lodestar-hung-log-${process.pid}.log`)
+    const started = Date.now()
+    const result = await readMacServices(async (_file, args) => args.length === 1
+      ? 'PID Status Label\n- 0 cc-hourly\n'
+      : `{\n\t"StandardOutPath" = "${log}";\n\t"Label" = "cc-hourly";\n};`)
+    expect(Date.now() - started).toBeLessThan(2_000)
+    expect(statCalls).toEqual([log])
+    expect(result.services[0]).toMatchObject({ name: 'cc-hourly', lastActiveAgoSec: null, hasStarted: null })
+    expect(consoleHostContent({ cpu: null, mem: null, disks: [], services: result.services, servicesError: null }))
+      .toContain('⚪ `cc-hourly` · 上次活跃 MISS · 退出码 0')
+  })
+
+  test('readable logs and disks still answer through the asynchronous reads', async () => {
+    const result = await readMacServices(async (_file, args) => args.length === 1
+      ? 'PID Status Label\n- 0 cc-hourly\n'
+      : `{\n\t"StandardOutPath" = "${import.meta.path}";\n\t"Label" = "cc-hourly";\n};`)
+    expect(result.services[0]!.hasStarted).toBe(true)
+    expect(result.services[0]!.lastActiveAgoSec).toBeGreaterThanOrEqual(0)
+    expect((await readWorkDirDisk(process.cwd()))[0]!.totalBytes).toBeGreaterThan(0)
   })
 })
 

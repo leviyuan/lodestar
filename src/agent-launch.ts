@@ -6,7 +6,8 @@ import type {
 } from './agent-process'
 import { isClaudeReasoningEffort, isDshReasoningEffort } from './agent-process'
 import { DshProcess } from './dsh-process'
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { ClaudeAgentProcess, assertClaudeCodeAvailable } from './claude-agent-process'
 import { claudeTranscriptPath } from './claude-transcript'
 import { CodexProcess, isCodexReasoningEffort } from './codex-process'
@@ -61,12 +62,35 @@ function assertClaudeHistoryReachable(source: TokenSource, launch: ConversationL
   const own = source.claudeHistoryDir
   if (own) {
     if (recorded(own)) return
+    // 换了 reclaude 组织：来源没变，md 切不回去；记录留在并列的另一个组织绑定目录里，
+    // 要让 reclaude 重新选中原组织。
+    if (source.kind === 'reclaude' && otherBindingRecorded(own, recorded)) {
+      throw new Error(`该会话的记录保存在 ${source.display} 的另一个组织下（各组织的会话记录各自独立），当前组织无法续接。在本机执行 reclaude org use <原组织 ID>，或在 [token_source.reclaude] 配置 org = "<原组织 ID>"，等下一次目录刷新后继续；也可发送 hi 开始新会话`)
+    }
     throw new Error(`该会话的记录不在 ${source.display} 的会话目录中（${source.display} 与其他 Claude 来源的会话记录各自独立），无法在这里续接。发送 hi 开始新会话，或用 md 切回原来源后继续`)
   }
   const owner = listTokenSources().find(other => other.claudeHistoryDir && recorded(other.claudeHistoryDir))
   if (owner) {
     throw new Error(`该会话的记录保存在 ${owner.display} 的会话目录中（${owner.display} 与其他 Claude 来源的会话记录各自独立），${source.display} 无法续接。发送 hi 开始新会话，或用 md 切回 ${owner.display} 后继续`)
   }
+  // 记录在 reclaude 当前组织以外的绑定目录：切回 reclaude 之外还要让它选回原组织。
+  const otherOrg = listTokenSources().find(other => other.kind === 'reclaude' && other.claudeHistoryDir
+    && otherBindingRecorded(other.claudeHistoryDir, recorded))
+  if (otherOrg) {
+    throw new Error(`该会话的记录保存在 ${otherOrg.display} 的另一个组织下（各组织与其他 Claude 来源的会话记录各自独立），${source.display} 无法续接。用 md 切回 ${otherOrg.display}，并在本机执行 reclaude org use <原组织 ID> 或在 [token_source.reclaude] 配置 org = "<原组织 ID>"，等下一次目录刷新后继续；也可发送 hi 开始新会话`)
+  }
+}
+
+/** reclaude keeps each organization's binding directory side by side
+ * (`<data>/claude/accounts/<device>/config`, see `parseReclaudeStatus`); a record in a sibling
+ * binding was written under another organization of the same reclaude. */
+function otherBindingRecorded(own: string, recorded: (configDir: string) => boolean): boolean {
+  const binding = dirname(own)
+  const accounts = dirname(binding)
+  if (basename(own) !== 'config' || basename(accounts) !== 'accounts') return false
+  let siblings: string[]
+  try { siblings = readdirSync(accounts) } catch { return false }
+  return siblings.some(name => name !== basename(binding) && recorded(join(accounts, name, basename(own))))
 }
 
 /** Single source of truth for main Sessions and delegated agents, including

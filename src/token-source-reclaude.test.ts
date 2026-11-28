@@ -371,3 +371,54 @@ test('the registry lists reclaude for md, reads its organisation from config and
   })
   expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
 })
+
+test('maintaining the model list in md keeps the pinned organisation', () => {
+  const script = `
+    import assert from 'node:assert/strict'
+    import { appendFileSync, readFileSync } from 'node:fs'
+    const { CONFIG_FILE } = await import('./src/paths')
+    const { reloadTokenSources, config } = await import('./src/config')
+    const registry = await import('./src/token-source')
+    const { reclaudeRuntime } = await import('./src/token-source-reclaude')
+    const { buildTokenSourcesFromConfig } = await import('./src/token-source-builtins')
+    const { editTokenSourceModels, registerCustomTokenSourceModel, removeCustomTokenSourceModel } = await import('./src/token-source-config')
+
+    reclaudeRuntime.find = () => '/opt/reclaude'
+    // 本机 \`reclaude org use\` 的当前组织是 7，配置固定 9。
+    const bindings = [{ orgId: '7', deviceId: '101', configDir: '/rec/101' }, { orgId: '9', deviceId: '202', configDir: '/rec/202' }]
+    reclaudeRuntime.status = async () => ({ loginState: 'valid', bindings, current: bindings[0] })
+    reclaudeRuntime.bindingReady = () => true
+    reclaudeRuntime.models = async options => {
+      await options.afterCatalog({ readSubscriptionUsage: async () => { throw new Error('quota closed') } })
+      return [{ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' },
+        { model: 'haiku', display: 'Haiku', efforts: ['high'], defaultEffort: 'high' }]
+    }
+    appendFileSync(CONFIG_FILE, '\\n[token_source.reclaude]\\norg = "9"\\n')
+    reloadTokenSources()
+    buildTokenSourcesFromConfig()
+    await registry.getTokenSource('reclaude').refreshModels()
+    const pinned = source => {
+      assert.equal(config.token_sources.reclaude.org, '9')
+      assert.match(readFileSync(CONFIG_FILE, 'utf8'), /\\[token_source\\.reclaude\\][^[]*\\norg = "9"\\n/)
+      assert.equal(source.modelCatalogState.status, 'ready')
+      assert.deepEqual(source.claudeLauncher.args, ['--org', '9', 'cli'])
+      assert.equal(source.spawnEnv({}).CLAUDE_CONFIG_DIR, '/rec/202')
+    }
+
+    await editTokenSourceModels('reclaude', 'haiku', 'remove')
+    pinned(registry.getTokenSource('reclaude'))
+    assert.equal(config.token_sources.reclaude.hidden_models, 'haiku')
+    await registerCustomTokenSourceModel('reclaude', 'sonnet')
+    pinned(registry.getTokenSource('reclaude'))
+    await removeCustomTokenSourceModel('reclaude', 'sonnet')
+    pinned(registry.getTokenSource('reclaude'))
+    // 下一次目录刷新仍绑定固定组织，而不是当前组织。
+    await registry.getTokenSource('reclaude').refreshModels()
+    pinned(registry.getTokenSource('reclaude'))
+    process.exit(0)
+  `
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+    cwd: process.cwd(), stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: 30_000,
+  })
+  expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+})

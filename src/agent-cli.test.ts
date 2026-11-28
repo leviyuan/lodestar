@@ -27,9 +27,10 @@ describe('lodestar agent subcommand', () => {
       return Response.json({ identities: [], sourceFailures: [] })
     } })
     try {
+      // Inside a DSH shell the launch removed LODESTAR_AGENT_*; a lone capability is not a context.
       const proc = Bun.spawn([process.execPath, CLI, 'agent', 'identities', '--json'], {
         env: { ...process.env, DSH_LODESTAR_AGENT_CONTEXT: JSON.stringify({ baseUrl: `http://127.0.0.1:${server.port}`, capability: 'dsh-test-capability' }),
-          LODESTAR_AGENT_CAPABILITY: 'must-not-use-legacy' }, stdout: 'pipe', stderr: 'pipe',
+          LODESTAR_AGENT_CAPABILITY: 'incomplete-without-url' }, stdout: 'pipe', stderr: 'pipe',
       })
       const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()])
       expect(code, stderr).toBe(0)
@@ -38,12 +39,37 @@ describe('lodestar agent subcommand', () => {
     } finally { await server.stop(true) }
   })
 
-  test('rejects malformed DSH context without using legacy credentials', () => {
-    const proc = Bun.spawnSync([process.execPath, CLI, 'agent', 'identities'], {
-      env: { ...process.env, DSH_LODESTAR_AGENT_CONTEXT: '{}', LODESTAR_AGENT_URL: 'http://127.0.0.1:1', LODESTAR_AGENT_CAPABILITY: 'legacy' },
-    })
-    expect(proc.exitCode).not.toBe(0)
-    expect(proc.stderr.toString()).toContain('invalid DSH Lodestar delegation context')
+  test('the context injected for this process wins over a DSH context left in the host environment', async () => {
+    const seen: Array<{ server: string; authorization: string | null }> = []
+    const serve = (name: string) => Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+      seen.push({ server: name, authorization: request.headers.get('authorization') })
+      return Response.json({ identities: [], sourceFailures: [] })
+    } })
+    const current = serve('current')
+    const stale = serve('stale')
+    try {
+      // e.g. a daemon started from a managed DSH shell still carries the earlier task's context.
+      for (const dsh of [JSON.stringify({ baseUrl: `http://127.0.0.1:${stale.port}`, capability: 'earlier-task' }), '{}', 'not json']) {
+        const proc = Bun.spawn([process.execPath, CLI, 'agent', 'identities', '--json'], {
+          env: { ...process.env, DSH_LODESTAR_AGENT_CONTEXT: dsh,
+            LODESTAR_AGENT_URL: `http://127.0.0.1:${current.port}/`, LODESTAR_AGENT_CAPABILITY: 'this-task' }, stdout: 'pipe', stderr: 'pipe',
+        })
+        const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()])
+        expect(code, stderr).toBe(0)
+      }
+      expect(seen).toEqual(Array(3).fill({ server: 'current', authorization: 'Bearer this-task' }))
+    } finally { await current.stop(true); await stale.stop(true) }
+  })
+
+  test('rejects a malformed or non-local DSH context when it is the only context', () => {
+    for (const dsh of ['{}', 'not json', JSON.stringify({ baseUrl: 'http://example.com:9876', capability: 'x' }),
+      JSON.stringify({ baseUrl: 'file:///tmp/x', capability: 'x' }), JSON.stringify({ baseUrl: 'http://127.0.0.1:1', capability: '' })]) {
+      const proc = Bun.spawnSync([process.execPath, CLI, 'agent', 'identities'], {
+        env: { ...process.env, DSH_LODESTAR_AGENT_CONTEXT: dsh },
+      })
+      expect(proc.exitCode).toBe(1)
+      expect(proc.stderr.toString()).toContain('invalid DSH Lodestar delegation context')
+    }
   })
 
   test('parses a parallel full-Agent run', () => {

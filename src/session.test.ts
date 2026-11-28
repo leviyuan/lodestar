@@ -13,7 +13,7 @@ import {
   setResumeWriteError, setTurnAnchorWriteError, setUpdateCardHandler,
   turnAnchorsBySession, resumeRefs, pendingConversationLaunchBySession,
   sentImages, uploadedImages, sentLocalFiles, setImageUploadHandler,
-  setLastUserMessageSender, setLastUserMessageSenderError, lastUserMessageSenderCalls,
+  setLastUserMessageSender, setLastUserMessageSenderError, lastUserMessageSenderCalls, addedReactions,
 } from './feishu-test-mock'
 
 const { Session } = await import('./session')
@@ -3926,6 +3926,96 @@ describe('Session provider switching', () => {
     }
   })
 
+  for (const provider of ['dsh', 'codex', 'claude'] as const) {
+    test(`${provider} cold start never submits a message stopped by a direct call while the backend was starting`, async () => {
+      const session = new Session('probe', 'chat_id') as any
+      const proc = new FakeAgentProc(provider, null) as any
+      let releaseInit!: () => void
+      proc.initialization = new Promise<void>(resolve => { releaseInit = resolve })
+      session.selectedProvider = provider
+      session.spawnAgent = () => proc
+      const cold = session.startColdUserTurn('删掉构建目录', '删掉构建目录', 'ou_user')
+      try {
+        // 防御性用例：直接调用 Session，在卡片显示 🚀 启动、后端还在初始化时 stop。生产里群里的 stop
+        // 经同群队列排在这条消息送入之后，按正常打断处理，到不了这个窗口。
+        await waitUntil(() => session.currentTurn !== null && session.proc === proc && session.status === 'starting')
+        expect(await session.runCommand('stop', 'ou_user')).toBe(true)
+        expect(session.currentTurn).toBeNull()
+        proc.sessionId = `${provider}-session`
+        releaseInit()
+        await cold
+        // 被停止的消息不能在启动完成后照样送进后端执行。
+        expect(proc.sentTexts).toEqual([])
+        expect(session.currentTurn).toBeNull()
+        // 不再等被打断轮的 result，否则下一轮的 result 会被当成它吞掉。
+        expect(session.userInterrupted).toBe(false)
+        // 进程保持就绪，留给下一条消息。
+        expect(session.proc).toBe(proc)
+        expect(proc.isAlive()).toBe(true)
+        expect(proc.killCalls).toBe(0)
+        expect(session.status).toBe('idle')
+      } finally {
+        if (session.currentTurn) {
+          session.stopFooterStatus(session.currentTurn)
+          await cardkit.dispose(session.currentTurn.cardId)
+        }
+        await session.stop('test cleanup', { announce: false }).catch(() => {})
+      }
+    })
+  }
+
+  for (const provider of ['dsh', 'codex', 'claude'] as const) {
+    test(`${provider} cold start stopped by a direct call before its card lands sends nothing and still starts the process`, async () => {
+      const session = new Session('probe', 'chat_id') as any
+      const proc = new FakeAgentProc(provider, `${provider}-session`) as any
+      let spawned = 0
+      session.selectedProvider = provider
+      session.spawnAgent = () => { spawned++; return proc }
+      let releaseCard!: () => void
+      const cardGate = new Promise<void>(resolve => { releaseCard = resolve })
+      const originalConvert = cardkit.convertMessageToCard
+      let converting = false
+      const convert = spyOn(cardkit, 'convertMessageToCard').mockImplementation(async (messageId: string) => {
+        converting = true
+        await cardGate
+        return originalConvert(messageId)
+      })
+      const cold = session.startColdUserTurn('删掉构建目录', '删掉构建目录', 'ou_user')
+      try {
+        // 防御性用例：直接调用 Session，在卡片还没落地（openTurnCard 在途、currentTurn 为空）时 stop。
+        // 生产里群里的 stop 经同群队列排在这条消息送入之后，按正常打断处理，到不了这个窗口。
+        await waitUntil(() => converting)
+        expect(session.currentTurn).toBeNull()
+        expect(session.openingTurn).toBe(true)
+        expect(await session.runCommand('stop', 'ou_user')).toBe(true)
+        // stop 生效，不回「当前没有正在执行的 turn」。
+        expect(JSON.stringify(sentCards)).not.toContain('当前没有正在执行的 turn')
+        expect(sentTexts.join('\n')).not.toContain('当前没有正在执行的 turn')
+        releaseCard()
+        await cold
+        // 卡片落地后以「🛑 打断」收尾，这条消息没有送进后端。
+        expect(calls.some(call => JSON.stringify(call.body ?? '').includes('🛑 打断'))).toBe(true)
+        expect(proc.sentTexts).toEqual([])
+        expect(session.currentTurn).toBeNull()
+        expect(session.userInterrupted).toBe(false)
+        // 冷启动照常完成，进程保持就绪，留给下一条消息。
+        expect(spawned).toBe(1)
+        expect(session.proc).toBe(proc)
+        expect(proc.isAlive()).toBe(true)
+        expect(proc.killCalls).toBe(0)
+        expect(session.status).toBe('idle')
+      } finally {
+        convert.mockRestore()
+        releaseCard()
+        if (session.currentTurn) {
+          session.stopFooterStatus(session.currentTurn)
+          await cardkit.dispose(session.currentTurn.cardId)
+        }
+        await session.stop('test cleanup', { announce: false }).catch(() => {})
+      }
+    })
+  }
+
 })
 
 describe('Session starts from cached model catalogs', () => {
@@ -5457,6 +5547,148 @@ describe('Session SDK-initiated bg-task resume turns', () => {
     expect(session.orphanAssistantSegments).toEqual([])
     expect(session.orphanAssistantCurrent).toBe('')
   })
+
+  function gateCardOpen(): { release: () => void; converting: () => boolean; restore: () => void } {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const originalConvert = cardkit.convertMessageToCard
+    let converting = false
+    const convert = spyOn(cardkit, 'convertMessageToCard').mockImplementation(async (messageId: string) => {
+      converting = true
+      await gate
+      return originalConvert(messageId)
+    })
+    let restored = false
+    const restore = (): void => {
+      if (!restored) convert.mockRestore()
+      restored = true
+      release()
+    }
+    return { release, converting: () => converting, restore }
+  }
+
+  test('stop while a resume turn card is still opening interrupts that turn and closes the card as 打断', async () => {
+    const { session, proc } = wiredClaudeSession()
+    let interrupts = 0
+    proc.sendInterrupt = () => { interrupts++ }
+    const open = gateCardOpen()
+    try {
+      proc.emit('bg_task_settled', { task_id: 't1', status: 'completed' })
+      proc.emit('init', { session_id: 'claude-session-1' }) // SDK 自发恢复轮，开始开卡
+      await waitFor(() => open.converting() && session.openingTurn)
+      expect(session.currentTurn).toBeNull()
+      expect(await session.runCommand('stop', 'ou_user')).toBe(true)
+      // 后端已开始的这一轮被中断，不回「当前没有正在执行的 turn」。
+      expect(interrupts).toBe(1)
+      expect(session.userInterrupted).toBe(true)
+      expect(JSON.stringify(sentCards)).not.toContain('当前没有正在执行的 turn')
+      open.release()
+      await waitFor(() => !session.openingTurn && session.currentTurn === null)
+      expect(calls.some(call => JSON.stringify(call.body ?? '').includes('🛑 打断'))).toBe(true)
+      // 打断后的 result 按打断丢弃，不会再收尾成 ✅，也不推送。
+      emitClaudeResult(proc)
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(session.userInterrupted).toBe(false)
+      expect(session.status).toBe('idle')
+      expect(urgentPushes).toEqual([])
+    } finally {
+      open.restore()
+      session.dispose()
+    }
+  })
+
+  test('stop while a queued batch card is still opening keeps that batch from reaching the backend', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread') as any
+    session.proc = proc
+    session.selectedProvider = 'codex'
+    session.wireProc(proc)
+    session.initCount = 1
+    session.status = 'idle'
+    session.pendingMidTurnMsgs = [{ text: '排队的消息', wireText: '排队的消息', userOpenId: 'ou_user', msgId: 'om_queued' }]
+    session.pendingReactionIds = new Map([['om_queued', 'reaction_queued']])
+    const open = gateCardOpen()
+    const drain = session.drainMidTurnAndOpen()
+    try {
+      // 上一轮收尾后接着为排队消息开卡，卡片还没落地时用户发 stop。
+      await waitFor(() => open.converting() && session.openingTurn)
+      expect(await session.runCommand('stop', 'ou_user')).toBe(true)
+      expect(JSON.stringify(sentCards)).not.toContain('当前没有正在执行的 turn')
+      open.release()
+      await drain
+      // 这批消息没有送进后端，卡片以「🛑 打断」收尾，等待表情换成取消标记，进程保持就绪。
+      expect(proc.sentTexts).toEqual([])
+      expect(calls.some(call => JSON.stringify(call.body ?? '').includes('🛑 打断'))).toBe(true)
+      expect(deletedReactions).toContainEqual(['om_queued', 'reaction_queued'])
+      expect(session.currentTurn).toBeNull()
+      expect(session.userInterrupted).toBe(false)
+      expect(session.status).toBe('idle')
+      expect(proc.isAlive()).toBe(true)
+    } finally {
+      open.restore()
+      session.dispose()
+    }
+  })
+
+  test('stop while a ⏰ wake-up card is still opening interrupts that turn and the next turn still closes', async () => {
+    const { session, proc } = wiredClaudeSession()
+    let interrupts = 0
+    proc.sendInterrupt = () => { interrupts++ }
+    const open = gateCardOpen()
+    try {
+      proc.emit('scheduled_turn_input', { text: 'cron tick', promptId: 'p1' }) // ⏰ 唤醒，开始开卡
+      await waitFor(() => open.converting() && session.openingTurn)
+      expect(await session.runCommand('stop', 'ou_user')).toBe(true)
+      expect(interrupts).toBe(1)
+      expect(JSON.stringify(sentCards)).not.toContain('当前没有正在执行的 turn')
+      open.release()
+      await waitFor(() => !session.openingTurn && session.currentTurn === null)
+      expect(calls.some(call => JSON.stringify(call.body ?? '').includes('🛑 打断'))).toBe(true)
+      emitClaudeResult(proc) // 打断后的 result 按打断丢弃
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(session.userInterrupted).toBe(false)
+      expect(urgentPushes).toEqual([])
+      // 下一条消息照常开卡、收尾并推送：打断标记没有吞掉它的 result。
+      open.restore()
+      await session.onUserMessage('下一条', [], 'ou_user', 'om_next')
+      await waitFor(() => session.currentTurn !== null)
+      emitClaudeResult(proc)
+      await waitFor(() => session.currentTurn === null && urgentPushes.length === 1)
+      expect(urgentPushes).toHaveLength(1)
+    } finally {
+      open.restore()
+      session.dispose()
+    }
+  })
+
+  test('stop while an init-opened queued batch card is still opening cancels its reaction and drops the interrupted result', async () => {
+    const { session, proc } = wiredClaudeSession()
+    let interrupts = 0
+    proc.sendInterrupt = () => { interrupts++ }
+    session.pendingUserMessageCount = 1
+    session.pendingReactionIds = new Map([['om_queued', 'reaction_queued']])
+    const open = gateCardOpen()
+    try {
+      proc.emit('init', { session_id: 'claude-session-1' }) // SDK 取走排队消息开新一轮，开始开卡
+      await waitFor(() => open.converting() && session.openingTurn)
+      expect(await session.runCommand('stop', 'ou_user')).toBe(true)
+      expect(interrupts).toBe(1)
+      emitClaudeResult(proc) // 打断后的 result 抢在卡片落地前到达
+      open.release()
+      await waitFor(() => !session.openingTurn && session.currentTurn === null)
+      await new Promise(resolve => setTimeout(resolve, 20))
+      // 等待表情换成取消标记，卡片以「🛑 打断」收尾，result 按打断丢弃、不推送。
+      expect(deletedReactions).toContainEqual(['om_queued', 'reaction_queued'])
+      expect(addedReactions).toContainEqual(['om_queued', 'CrossMark'])
+      expect(calls.some(call => JSON.stringify(call.body ?? '').includes('🛑 打断'))).toBe(true)
+      expect(session.userInterrupted).toBe(false)
+      expect(session.status).toBe('idle')
+      expect(urgentPushes).toEqual([])
+    } finally {
+      open.restore()
+      session.dispose()
+    }
+  })
 })
 
 describe('Session claude subagent tool calls stay off the main card', () => {
@@ -6027,6 +6259,40 @@ describe('Session startup account assignment labels', () => {
       expect(session.withModelAndAccount('✅ 已恢复上一会话 thread=…22e24c', proc))
         .toBe('✅ 已恢复上一会话 thread=…22e24c · codex · gpt-5.6-sol/xhigh · 账号 Codex·默认')
     } finally { proc.alive = false }
+  })
+
+  test('the 1:1 panel snapshot names the live account for non-subscription sources too', () => {
+    resetTokenSourceRegistry()
+    registerTokenSource({ id: 'label-glm', kind: 'test', agent: 'claude', enabled: true,
+      display: 'GLM', usageAccount: { id: 'glm', label: 'GLM' }, models: [], defaultModel: 'glm-5.3',
+      modelCatalogState: { status: 'ready', updatedAt: 1 },
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }) } as any)
+    const session = new Session('peer-account-glm', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'label-glm'
+    session.selectedModel = 'glm-5.3'
+    session.selectedEffort = 'high'
+    // 没有活进程就没有实际账号。
+    expect(session.peerSnapshot().accountLabel).toBeUndefined()
+    const proc = new FakeAgentProc('claude', 'glm-session', 'label-glm') as any
+    session.proc = proc
+    try {
+      // 与启动卡、群里 hi 同口径：GLM 会话的账号行写「GLM」，不再只有模型。
+      expect(session.peerSnapshot()).toMatchObject({ accountLabel: 'GLM', model: 'glm-5.3', effort: 'high' })
+      expect(session.peerSnapshot().claudeAccountName).toBeUndefined()
+      // 订阅进程仍只写已定号的账号名：尚未定号时不写「选号中」。
+      proc.alive = false
+      const codex = new FakeAgentProc('codex', 'codex-thread', 'codex-sub') as any
+      session.selectedProvider = 'codex'
+      session.selectedTokenSourceId = 'codex-sub'
+      session.proc = codex
+      expect(session.peerSnapshot().accountLabel).toBeUndefined()
+      expect(session.peerSnapshot().codexAccountName).toBeUndefined()
+      codex.alive = false
+    } finally {
+      proc.alive = false
+      session.dispose()
+    }
   })
 
   test('cold-start turn 1 shows the planned account from Waiting onward', async () => {
@@ -9167,6 +9433,22 @@ describe('Session task-end notifications', () => {
     }
   }
 
+  /** 真正后台化的命令行（run_in_background 提升入卡后带 isBackgrounded），不随 stop 停下。 */
+  function backgroundedTask(status: 'running' | 'completed') {
+    return { ...task(status), isBackgrounded: true }
+  }
+
+  async function closeWith(session: any, turn: any, suffix?: string, opts: any = { hasFreshResult: true }) {
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    try {
+      await session.closeTurnCard(suffix, opts)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  }
+
   test('switching source while idle settles the killed process\'s background tasks', async () => {
     const session = new Session('probe-bg-idle-switch', 'chat_bg_idle_switch') as any
     const proc = new FakeAgentProc('claude', 'claude-session-1', 'glm') as any
@@ -9328,17 +9610,392 @@ describe('Session task-end notifications', () => {
       await cardkit.dispose('card_next_turn')
     }
 
-    // 任务结束通知已经发过；同一代际的迟到续跑轮不再重复推送。
+    // 新一代后台任务结束后没有回合接手：空闲补发推了上一张卡。紧接着报告同一轮的
+    // SDK 恢复轮不再重复推送，只跳过这一次；之后的 ⏰ 唤醒与恢复轮照常推送。
     urgentPushes.length = 0
-    session.backgroundWorkGeneration = 2
-    session.notifiedBackgroundWorkGeneration = 2
-    session.currentTurn = { ...turnState('card_late_resume'), trigger: 'bg_task_resume' }
-    cardkit.recordCardCreated('card_late_resume', 1)
     try {
-      await session.closeTurnCard(undefined, { hasFreshResult: true })
-      expect(urgentPushes).toHaveLength(0)
+      session.backgroundWorkGeneration = 2
+      session.noteBackgroundWorkSettled()
+      session.clearCompletionNoticeTimer()
+      await session.deliverCompletionNotice()
+      expect(urgentPushes).toEqual([['om_session_turn', ['ou_user']]])
+      await closeWith(session, { ...turnState('card_late_resume'), messageId: 'om_late_resume', trigger: 'bg_task_resume' })
+      expect(urgentPushes).toHaveLength(1)
+      await closeWith(session, { ...turnState('card_wakeup'), messageId: 'om_wakeup', userOpenId: '', trigger: 'scheduled_wakeup' })
+      await closeWith(session, { ...turnState('card_resume_again'), messageId: 'om_resume_again', userOpenId: '', trigger: 'bg_task_resume' })
+      expect(urgentPushes).toEqual([
+        ['om_session_turn', ['ou_user']], ['om_wakeup', ['ou_user']], ['om_resume_again', ['ou_user']],
+      ])
     } finally {
-      await cardkit.dispose('card_late_resume')
+      session.dispose()
+    }
+  })
+
+  test('a session that already pushed once still pushes continuation turns that finish', async () => {
+    // 常态是会话此前已推送过：⏰ 唤醒、DSH「继续执行」与恢复轮完成时仍要推给最后发送者。
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    try {
+      await closeWith(session, turnState('card_first'))
+      for (const trigger of ['scheduled_wakeup', 'bg_task_resume'] as const) {
+        await closeWith(session, { ...turnState(`card_${trigger}`), messageId: `om_${trigger}`, userOpenId: '', trigger })
+      }
+      expect(urgentPushes).toEqual([
+        ['om_session_turn', ['ou_user']], ['om_scheduled_wakeup', ['ou_user']], ['om_bg_task_resume', ['ou_user']],
+      ])
+    } finally {
+      session.dispose()
+    }
+  })
+
+  test('a mid-turn handoff after an earlier push is still delivered once idle', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    try {
+      await closeWith(session, turnState('card_first'))
+      await closeWith(session, { ...turnState('card_handoff'), messageId: 'om_handoff' }, '📨 转交新卡')
+      expect(session.completionPushPending).toEqual({ messageId: 'om_handoff', userOpenId: 'ou_user' })
+      session.clearCompletionNoticeTimer()
+      // 之前推过一次不代表这次已宣告：排队那一轮没开起来时空闲后补发。
+      await session.deliverCompletionNotice()
+      expect(urgentPushes).toEqual([['om_session_turn', ['ou_user']], ['om_handoff', ['ou_user']]])
+    } finally {
+      session.dispose()
+    }
+  })
+
+  test('a settle with no sender in memory keeps the owed recipient and still times the push', async () => {
+    // daemon 重启后（未开续接）内存里没有发送者：收尾实时回读到接收人并记为欠账，
+    // 后台结束时沿用欠账里的接收人照常计时，不能只记 missing recipient 就不管。
+    const session = new Session('probe', 'chat_id') as any
+    setLastUserMessageSender('ou_from_tail')
+    session.backgroundWorkGeneration = 1
+    session.backgroundTasks = [task('running')]
+    try {
+      await closeWith(session, { ...turnState('card_tail'), messageId: 'om_tail', userOpenId: '', trigger: 'scheduled_wakeup' })
+      expect(session.completionPushPending).toEqual({ messageId: 'om_tail', userOpenId: 'ou_from_tail' })
+      session.backgroundTasks = [task('completed')]
+      session.noteBackgroundWorkSettled()
+      expect(session.completionNoticeTimer).not.toBeNull()
+      session.clearCompletionNoticeTimer()
+      await session.deliverCompletionNotice()
+      expect(urgentPushes).toEqual([['om_tail', ['ou_from_tail']]])
+    } finally {
+      session.dispose()
+    }
+  })
+
+  test('stopping the resume turn that took over an owed push drops it', async () => {
+    // 收尾时后台在跑 → 欠下推送；后台结束后 SDK 在宽限内开了续跑轮；用户 stop 打断它。
+    // 主动停止不补发：续跑轮收尾后不能重新计时，再给前一张卡发加急。
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    session.backgroundWorkGeneration = 1
+    session.backgroundTasks = [task('running')]
+    try {
+      await closeWith(session, { ...turnState('card_owing'), messageId: 'om_owing' })
+      expect(session.completionPushPending).toEqual({ messageId: 'om_owing', userOpenId: 'ou_user' })
+      session.backgroundTasks = [task('completed')]
+      session.noteBackgroundWorkSettled()
+      // 续跑轮开卡只停定时器、保留欠账。
+      session.clearCompletionNoticeTimer()
+      const resume = { ...turnState('card_resume'), messageId: 'om_resume', userOpenId: '', trigger: 'bg_task_resume' }
+      session.currentTurn = resume
+      cardkit.recordCardCreated(resume.cardId, 1)
+      try {
+        expect(await session.runCommand('stop', 'ou_user')).toBe(true)
+      } finally {
+        session.stopFooterStatus(resume)
+        await cardkit.dispose(resume.cardId)
+      }
+      expect(session.currentTurn).toBeNull()
+      expect(session.completionPushPending).toBeNull()
+      expect(session.completionNoticeTimer).toBeNull()
+      // 之后零星的任务事件也不能把这一代重新记成欠账。
+      session.noteBackgroundWorkSettled()
+      await session.deliverCompletionNotice()
+      expect(urgentPushes).toEqual([])
+    } finally {
+      session.dispose()
+    }
+  })
+
+  test('a close that will not push never reads the chat tail for a recipient', async () => {
+    // 被打断、进程退出这类收尾本就不推送：没有发送者时也不实时回读（stop/kill 要等这次收尾）。
+    const session = new Session('probe', 'chat_id') as any
+    setLastUserMessageSender('ou_from_tail')
+    try {
+      await closeWith(session, { ...turnState('card_stopped'), userOpenId: '', trigger: 'bg_task_resume' }, '🛑 打断', {})
+      await closeWith(session, { ...turnState('card_exited'), userOpenId: '' }, '⚠️ Codex 异常退出 (code=1, signal=null)', {})
+      expect(lastUserMessageSenderCalls).toEqual([])
+      expect(urgentPushes).toEqual([])
+      // 确实要推送时才回读。
+      await closeWith(session, { ...turnState('card_done'), userOpenId: '', trigger: 'bg_task_resume' })
+      expect(lastUserMessageSenderCalls).toEqual(['chat_id'])
+      expect(urgentPushes).toEqual([['om_session_turn', ['ou_from_tail']]])
+    } finally {
+      session.dispose()
+    }
+  })
+
+  test('a card open that never lands re-arms the owed push it paused', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    try {
+      await closeWith(session, { ...turnState('card_handoff'), messageId: 'om_handoff' }, '📨 转交新卡')
+      // 排队批次开卡只停计时、保留欠账。
+      const owner = session.beginTurnOpen(session.proc, session.procEpoch)
+      expect(session.completionNoticeTimer).toBeNull()
+      // 开卡失败释放 owner：重新计时，空闲后照常补发。
+      session.releaseTurnOpen(owner)
+      expect(session.completionPushPending).toEqual({ messageId: 'om_handoff', userOpenId: 'ou_user' })
+      expect(session.completionNoticeTimer).not.toBeNull()
+      // 开卡被作废（进程更换、停止）同理。
+      session.clearCompletionNoticeTimer()
+      session.beginTurnOpen(session.proc, session.procEpoch)
+      session.invalidateTurnOpen()
+      expect(session.completionNoticeTimer).not.toBeNull()
+    } finally {
+      session.dispose()
+    }
+  })
+
+  test('a queued batch whose card fails after the handoff card landed still times the owed push', async () => {
+    // 真实顺序：一轮以「📨 转交新卡」收尾欠下推送，排队批次随即开卡；开卡失败晚于上一张卡收尾落地
+    // （收尾时开卡在途、没能计时），欠账也不能就此没人计时。
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1') as any
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    proc.emit('init', { session_id: 'claude-session-1' })
+    session.lastUserOpenId = 'ou_user'
+    await session.onUserMessage('第一条', [], 'ou_user', 'om_first')
+    await waitUntil(() => session.currentTurn !== null)
+    session.pendingMidTurnMsgs.push({ text: '第二条', wireText: '第二条', userOpenId: 'ou_user', msgId: 'om_second' })
+    const convert = spyOn(cardkit, 'convertMessageToCard').mockImplementation(async () => {
+      await waitUntil(() => session.turnCloseInflight.size === 0)
+      await new Promise(resolve => setTimeout(resolve, 20))
+      throw new Error('id_convert failed late')
+    })
+    try {
+      proc.emit('result', {})
+      await waitUntil(() => session.currentTurn === null && !session.openingTurn && session.turnCloseInflight.size === 0)
+      expect(proc.sentTexts).toEqual(['第一条'])
+      expect(session.completionPushPending).not.toBeNull()
+      expect(session.completionNoticeTimer).not.toBeNull()
+    } finally {
+      convert.mockRestore()
+      session.dispose()
+    }
+  })
+
+  test('a stop with backgrounded work still running leaves its end push owed to the same person', async () => {
+    // 收尾时后台化的命令在跑 → 欠下推送；用户又开一轮并 stop 打断它，后台任务不受 stop 影响继续跑：
+    // 它结束时照常补发给原来的人。
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    session.backgroundWorkGeneration = 1
+    session.backgroundTasks = [backgroundedTask('running')]
+    try {
+      await closeWith(session, { ...turnState('card_owing'), messageId: 'om_owing' })
+      expect(session.completionPushPending).toEqual({ messageId: 'om_owing', userOpenId: 'ou_user' })
+      const stopped = { ...turnState('card_stopped'), messageId: 'om_stopped' }
+      session.currentTurn = stopped
+      cardkit.recordCardCreated(stopped.cardId, 1)
+      try {
+        expect(await session.runCommand('stop', 'ou_user')).toBe(true)
+      } finally {
+        session.stopFooterStatus(stopped)
+        await cardkit.dispose(stopped.cardId)
+      }
+      expect(session.completionPushPending).not.toBeNull()
+      session.backgroundTasks = [backgroundedTask('completed')]
+      session.noteBackgroundWorkSettled()
+      expect(session.completionNoticeTimer).not.toBeNull()
+      session.clearCompletionNoticeTimer()
+      await session.deliverCompletionNotice()
+      expect(urgentPushes).toEqual([['om_stopped', ['ou_user']]])
+    } finally {
+      session.dispose()
+    }
+  })
+
+  test('a stop with backgrounded work still running keeps the sender for a settle that owes nothing yet', async () => {
+    // 被打断的这一轮自己起的后台化命令还在跑：stop 时没有欠账，结束时也要找得到接收人。
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    session.backgroundWorkGeneration = 1
+    session.backgroundTasks = [backgroundedTask('running')]
+    const stopped = { ...turnState('card_stopped'), messageId: 'om_stopped' }
+    session.currentTurn = stopped
+    cardkit.recordCardCreated(stopped.cardId, 1)
+    try {
+      try {
+        expect(await session.runCommand('stop', 'ou_user')).toBe(true)
+      } finally {
+        session.stopFooterStatus(stopped)
+        await cardkit.dispose(stopped.cardId)
+      }
+      expect(session.completionPushPending).toBeNull()
+      session.backgroundTasks = [backgroundedTask('completed')]
+      session.noteBackgroundWorkSettled()
+      session.clearCompletionNoticeTimer()
+      await session.deliverCompletionNotice()
+      expect(urgentPushes).toEqual([['om_stopped', ['ou_user']]])
+    } finally {
+      session.dispose()
+    }
+  })
+
+  test('backgrounded work running at stop that then ends killed owes no push', async () => {
+    // 后台化的命令也随这次打断被停掉（killed/failed）：仍按主动停止处理，不补发。
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    session.backgroundWorkGeneration = 1
+    session.backgroundTasks = [backgroundedTask('running')]
+    const stopped = { ...turnState('card_stopped'), messageId: 'om_stopped' }
+    session.currentTurn = stopped
+    cardkit.recordCardCreated(stopped.cardId, 1)
+    try {
+      try {
+        expect(await session.runCommand('stop', 'ou_user')).toBe(true)
+      } finally {
+        session.stopFooterStatus(stopped)
+        await cardkit.dispose(stopped.cardId)
+      }
+      session.backgroundTasks = [{ ...backgroundedTask('completed'), status: 'killed' }]
+      session.noteBackgroundWorkSettled()
+      expect(session.completionPushPending).toBeNull()
+      expect(session.completionNoticeTimer).toBeNull()
+      await session.deliverCompletionNotice()
+      expect(urgentPushes).toEqual([])
+    } finally {
+      session.dispose()
+    }
+  })
+
+  for (const [provider, taskType, settledAs] of [
+    ['claude', 'local_agent', 'stopped'],
+    ['codex', 'local_agent', 'completed'],
+    ['dsh', 'agent', 'stopped'],
+  ] as const) {
+    test(`${provider} stop that also ends the turn's foreground subagent sends no completion push`, async () => {
+      // 前台子 Agent 一启动就进 active 池，但属于被打断的这一轮：打断随即把它停掉（Claude/DSH 结算为
+      // stopped，Codex 子任务随父轮取消后可能直接 idle），之后都不能给被 stop 的那张卡补发加急。
+      const session = new Session('probe', 'chat_id') as any
+      const proc = new FakeAgentProc(provider, `${provider}-session`) as any
+      session.proc = proc
+      session.selectedProvider = provider
+      session.wireProc(proc)
+      proc.emit('init', { session_id: `${provider}-session` })
+      try {
+        await session.onUserMessage('审查一下', [], 'ou_user', 'om_user')
+        await waitUntil(() => session.currentTurn !== null)
+        proc.emit('bg_task_started', { task_id: 'agent-1', tool_use_id: 'tool-1', description: '审查', task_type: taskType })
+        expect(session.hasActiveBackgroundWork()).toBe(true)
+        expect(await session.runCommand('stop', 'ou_user')).toBe(true)
+        proc.emit('bg_task_settled', { task_id: 'agent-1', status: settledAs })
+        proc.emit('result', {})
+        await waitUntil(() => session.currentTurn === null && session.turnCloseInflight.size === 0)
+        await new Promise(resolve => setTimeout(resolve, 20))
+        expect(session.completionPushPending).toBeNull()
+        expect(session.completionNoticeTimer).toBeNull()
+        await session.deliverCompletionNotice()
+        expect(urgentPushes).toEqual([])
+      } finally {
+        session.dispose()
+      }
+    })
+  }
+
+  test('a kill that takes a while never delivers an owed push while the process is stopping', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread') as any
+    let releaseKill!: () => void
+    const killGate = new Promise<void>(resolve => { releaseKill = resolve })
+    proc.kill = async () => {
+      proc.killCalls++
+      await killGate
+      proc.alive = false
+      proc.emit('exit', { code: 0, signal: null, expected: true })
+    }
+    session.proc = proc
+    session.selectedProvider = 'codex'
+    session.wireProc(proc)
+    session.lastUserOpenId = 'ou_user'
+    try {
+      await closeWith(session, { ...turnState('card_handoff'), messageId: 'om_handoff' }, '📨 转交新卡')
+      // 排队批次开卡在途（开卡只停计时），这时 kill：作废开卡不能在 kill 等待期间重新计时推送。
+      session.beginTurnOpen(proc, session.procEpoch)
+      const stopping = session.stop('测试停止', { announce: false })
+      await waitUntil(() => proc.killCalls === 1)
+      expect(session.completionPushPending).toBeNull()
+      expect(session.completionNoticeTimer).toBeNull()
+      await session.deliverCompletionNotice()
+      expect(urgentPushes).toEqual([])
+      releaseKill()
+      await stopping
+      expect(urgentPushes).toEqual([])
+    } finally {
+      releaseKill()
+      session.dispose()
+    }
+  })
+
+  test('a resume turn continuing without a card holds the owed push until its result', async () => {
+    // 后台结束时空闲 → 欠下推送并等 SDK 恢复轮；恢复轮开卡失败改为无卡续写，补发不能早于这轮回复结束。
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1') as any
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    proc.emit('init', { session_id: 'claude-session-1' })
+    session.lastUserOpenId = 'ou_user'
+    session.lastClosedTurnMessageId = 'om_prev'
+    try {
+      proc.emit('bg_task_started', { task_id: 'sh-1', description: 'build', task_type: 'local_bash' })
+      proc.emit('bg_task_updated', { task_id: 'sh-1', patch: { is_backgrounded: true } })
+      proc.emit('bg_task_settled', { task_id: 'sh-1', status: 'completed' })
+      session.clearCompletionNoticeTimer()
+      const convert = spyOn(cardkit, 'convertMessageToCard').mockImplementation(async () => { throw new Error('id_convert failed') })
+      try {
+        proc.emit('init', { session_id: 'claude-session-1' }) // SDK 自发恢复轮，开卡失败
+        await waitUntil(() => !session.openingTurn)
+      } finally {
+        convert.mockRestore()
+      }
+      expect(session.bgResumeCardless).toBe(true)
+      expect(session.completionPushPending).not.toBeNull()
+      expect(session.completionNoticeTimer).toBeNull()
+      await session.deliverCompletionNotice()
+      expect(urgentPushes).toEqual([])
+      // 这一轮的 result 到达：续窗结束，这时才计时补发。
+      proc.emit('result', {})
+      await waitUntil(() => session.completionNoticeTimer !== null)
+      expect(session.bgResumeCardless).toBe(false)
+      session.clearCompletionNoticeTimer()
+      await session.deliverCompletionNotice()
+      expect(urgentPushes).toEqual([['om_prev', ['ou_user']]])
+    } finally {
+      session.dispose()
+    }
+  })
+
+  test('a settle after the close already pushed owes nothing for the same generation', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    session.backgroundWorkGeneration = 1
+    session.backgroundTasks = [task('completed')]
+    try {
+      await closeWith(session, turnState('card_done'))
+      expect(urgentPushes).toHaveLength(1)
+      // 同一代际的迟到结算事件不能再欠一次推送。
+      session.noteBackgroundWorkSettled()
+      expect(session.completionPushPending).toBeNull()
+      await session.deliverCompletionNotice()
+      expect(urgentPushes).toHaveLength(1)
+    } finally {
       session.dispose()
     }
   })

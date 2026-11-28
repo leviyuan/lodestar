@@ -1653,6 +1653,36 @@ describe('project-owned Agent runs', () => {
     expect(cards).toBe(3)
   })
 
+  test('a cross-owner continuation takes the caller owner default display instead of the chain display', async () => {
+    let cards = 0
+    const h = harness({
+      loadArtifacts: () => completedHistory(1), // session-owned, carded
+      sendCard: async () => `card-${++cards}`,
+      startWorker: opts => resolvedHandle(result(opts.resumeSessionId ?? 'native-sid', 'agent output')),
+    })
+    const project = h.service.projectPrincipal(context())
+    // Project caller continuing a session-owned run: project default is silent.
+    const resumed = await h.service.startRun(project, { description: '项目续跑会话任务', identityIds: [], sessionId: 'sid-history-0', prompt: 'next' })
+    expect(resumed).toMatchObject({ display: 'silent', resumedFromRunId: 'agent_history_0' })
+    await waitFor(h.service, project, resumed.runId, 'completed')
+    expect(h.service.getRun(project, resumed.runId).cardMessageId).toBeUndefined()
+    expect(cards).toBe(0)
+    const followed = await h.service.followUp(project, 'agent_history_0', { description: '项目续跑会话任务 2', prompt: 'next' })
+    expect(followed.display).toBe('silent')
+    await waitFor(h.service, project, followed.runId, 'completed')
+    expect(cards).toBe(0)
+    // An explicit card request is still honored.
+    const carded = await h.service.followUp(project, 'agent_history_0', { description: '显式建卡', prompt: 'next', display: 'card' })
+    await waitFor(h.service, project, carded.runId, 'completed')
+    expect(carded.display).toBeUndefined()
+    expect(cards).toBe(1)
+    // Session delegation continuing the silent project run still gets its own card.
+    const back = await h.service.followUp(h.root, resumed.runId, { description: '会话续跑项目任务', prompt: 'next' })
+    await waitFor(h.service, h.root, back.runId, 'completed')
+    expect(back.display).toBeUndefined()
+    expect(cards).toBe(2)
+  })
+
   test('silent runs keep worker failures in the run record without posting to the chat', async () => {
     const notices: string[] = []
     const h = harness({

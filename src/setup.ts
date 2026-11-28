@@ -383,6 +383,8 @@ export async function runSetup(): Promise<void> {
   console.log(`     ${C.dim}a)${C.reset} ${C.bold}事件配置${C.reset} 页:`)
   console.log(`        ${C.yellow}• "订阅方式" → 选 "长连接" → 点保存${C.reset}`)
   console.log(`        • 添加事件: ${C.bold}im.message.receive_v1${C.reset}   ${C.dim}# 收群消息${C.reset}`)
+  console.log(`        • 添加事件: ${C.bold}im.chat.disbanded_v1${C.reset}    ${C.dim}# 群解散: 停止该群的会话并清理绑定 (项目目录与云空间文件保留)${C.reset}`)
+  console.log(`          ${C.dim}└ 不订阅时解散的群要等下次启动核对才清理，期间会话和绑定一直残留${C.reset}`)
   console.log(`     ${C.dim}b)${C.reset} ${C.bold}回调配置${C.reset} 页:`)
   console.log(`        ${C.yellow}• "订阅方式" → 选 "长连接" → 点保存${C.reset}`)
   console.log(`        • 添加事件: ${C.bold}card.action.trigger${C.reset}     ${C.dim}# 卡片按钮点击回调${C.reset}`)

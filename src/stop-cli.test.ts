@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 
-function stopWithRecord(record: string, inspect: string) {
+function stopWithRecord(record: string, inspect: string, setup = '') {
   const script = `
     import { writeFileSync } from 'node:fs'
     import { mock } from 'bun:test'
@@ -10,6 +10,7 @@ function stopWithRecord(record: string, inspect: string) {
     const signals = []
     process.kill = (pid, signal) => { signals.push([pid, signal]); return true }
     process.on('exit', () => console.log('SIGNALS=' + JSON.stringify(signals)))
+    ${setup}
     mock.module('./src/pid-guard', () => ({ parseDaemonPid, isOurDaemon: () => { ${inspect} } }))
     const { stopDaemon } = await import('./src/stop-command')
     try {
@@ -50,4 +51,28 @@ test('stop never signals a recycled PID that no longer matches the daemon', () =
   expect(result.exitCode).toBe(0)
   expect(result.stdout.toString()).toContain('stale 文件')
   expect(result.stdout.toString()).toContain('SIGNALS=[]')
+})
+
+/** A synthetic clock: every sleep advances time instantly, so nothing really waits. */
+const FAKE_CLOCK = `
+  let now = 1_000_000
+  Date.now = () => now
+  globalThis.setTimeout = (fn, ms = 0) => { now += ms; queueMicrotask(fn); return 0 }
+  globalThis.elapsedMs = () => now - 1_000_000
+`
+
+// The signal step would run taskkill on Windows; the timing logic is platform independent.
+test.skipIf(process.platform === 'win32')('stop waits through the daemon 15-second shutdown deadline before reporting failure', () => {
+  // The daemon exits after 14.5 s of its 15 s graceful shutdown.
+  const slow = stopWithRecord('12345\n/project/daemon.ts', 'return globalThis.elapsedMs() < 14_500', FAKE_CLOCK)
+  expect(slow.stderr.toString()).toBe('')
+  expect(slow.exitCode).toBe(0)
+  expect(slow.stdout.toString()).toContain('daemon 已停')
+  expect(slow.stdout.toString()).toContain('SIGNALS=[[12345,"SIGTERM"]]')
+})
+
+test.skipIf(process.platform === 'win32')('stop reports a daemon that outlives the shutdown deadline', () => {
+  const stuck = stopWithRecord('12345\n/project/daemon.ts', 'return true', FAKE_CLOCK)
+  expect(stuck.exitCode).toBe(1)
+  expect(stuck.stderr.toString()).toContain('20s 内 PID 12345 的 daemon 仍未退出')
 })

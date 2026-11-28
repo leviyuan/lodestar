@@ -26,24 +26,35 @@ const DROPPED_EXACT = new Set([
   // Removed from the protocol entirely; drop it defensively in case an older
   // producer or a wrapper still sets it.
   'LODESTAR_AGENT_SESSION',
+  // A DSH delegation context present in the host (a daemon started from a
+  // managed DSH shell) belongs to that earlier task. `dsh-runtime.ts` derives
+  // the context of each DSH launch from its own LODESTAR_AGENT_URL/CAPABILITY
+  // after scrubbing, so the ShellEnv chain to native descendants is unaffected.
+  'DSH_LODESTAR_AGENT_CONTEXT',
 ])
 
 /** Prefixes that are part of the Agent protocol or the selected token source. */
 const KEPT_PREFIXES = ['LODESTAR_AGENT_', 'LODESTAR_DSH_', 'LODESTAR_RELAY_']
 
-export function scrubAgentHostEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+/** The name a rule compares: Windows environment names are case-insensitive, so
+ * `feishu_app_secret` there is the same variable as `FEISHU_APP_SECRET`. Other
+ * platforms keep exact names. */
+export function envRuleName(key: string, platform: NodeJS.Platform = process.platform): string {
+  return platform === 'win32' ? key.toUpperCase() : key
+}
+
+export function scrubAgentHostEnv(
+  env: Record<string, string | undefined>, platform: NodeJS.Platform = process.platform,
+): Record<string, string | undefined> {
   const out: Record<string, string | undefined> = { ...env }
   for (const key of Object.keys(out)) {
-    if (key.startsWith('FEISHU_')) {
+    const name = envRuleName(key, platform)
+    if (name.startsWith('FEISHU_') || DROPPED_EXACT.has(name)) {
       delete out[key]
       continue
     }
-    if (!key.startsWith('LODESTAR_')) continue
-    if (DROPPED_EXACT.has(key)) {
-      delete out[key]
-      continue
-    }
-    if (KEPT_PREFIXES.some(prefix => key.startsWith(prefix))) continue
+    if (!name.startsWith('LODESTAR_')) continue
+    if (KEPT_PREFIXES.some(prefix => name.startsWith(prefix))) continue
     delete out[key]
   }
   return out

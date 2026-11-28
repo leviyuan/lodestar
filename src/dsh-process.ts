@@ -126,7 +126,12 @@ export class DshProcess extends EventEmitter implements AgentProcess {
       catch (error) { this.fail(error) }
     })
     this.runtime.on('failure', error => this.fail(error))
-    this.runtime.on('exit', event => this.emit('exit', { ...event, expected: event.expected && !this.failedUnexpectedly }))
+    // exit 由子进程 close 回调触发：宿主监听器抛错会逃出 node:child_process 变成
+    // uncaughtException 让整个 daemon 停机，只记录不外抛。
+    this.runtime.on('exit', event => {
+      try { this.emit('exit', { ...event, expected: event.expected && !this.failedUnexpectedly }) }
+      catch (error) { logError('dsh-process: exit dispatch failed', error) }
+    })
   }
   sendInitialize(): void { void this.initializationPromise().catch(error => this.fail(error)) }
   initializationPromise(): Promise<void> {
@@ -145,7 +150,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
       this.sessionId = result.sessionId
       this.models = result.models
       this.lastContextWindow = this.models.find(m => m.model === this.lastModel)?.contextWindow ?? null
-      this.emit('init', { session_id: this.sessionId })
+      this.safeEmit('init', { session_id: this.sessionId })
       for (const notification of this.earlyNotifications.splice(0)) this.onNotification(notification)
     })()
   }
@@ -244,7 +249,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
     void this.runtime.request('question/answer', { id, answers,
       ...(decision === 'deny' ? { error: payload?.denyMessage ?? 'User declined the question' } : {}) }).then(() => {
       this.questionInputs.delete(id)
-      this.emit('tool_result', { tool_use_id: id, content: JSON.stringify({ answers }), is_error: decision === 'deny', parentToolUseId: null })
+      this.safeEmit('tool_result', { tool_use_id: id, content: JSON.stringify({ answers }), is_error: decision === 'deny', parentToolUseId: null })
     }).catch(error => this.fail(error))
   }
   sendHookResponse(): void { throw new Error('DSH does not issue hook callback requests') }
@@ -487,6 +492,6 @@ export class DshProcess extends EventEmitter implements AgentProcess {
     }
     this.lastTotalUsage = total
     this.lastContextTokens = u.inputTokens + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0)
-    this.emit('token_usage', { usage, totalUsage: total, contextWindow: this.lastContextWindow, threadId: this.sessionId })
+    this.safeEmit('token_usage', { usage, totalUsage: total, contextWindow: this.lastContextWindow, threadId: this.sessionId })
   }
 }

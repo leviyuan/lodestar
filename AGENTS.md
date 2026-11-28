@@ -8,7 +8,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 
 | 路径 | 职责 | 修改前阅读 |
 | --- | --- | --- |
-| `cli.ts`、`daemon.ts` | 首次配置、PID guard；WS、Session registry、Card action、本机通知 | 本文件 |
+| `cli.ts`、`daemon.ts` | 统一入口（分发在 `src/cli-main.ts`，首次配置与 PID guard 在 `src/daemon-entry.ts`）；WS、Session registry、Card action、本机通知 | 本文件 |
 | `src/` | 会话、后端进程、账号、飞书 API、持久化、worktree | `src/AGENTS.md` |
 | `src/cards/` | 卡片模板与展示文本 | `src/AGENTS.md`、`src/cards/AGENTS.md` |
 | `scripts/` | 安装脚本、真实飞书探针和人工 smoke | `scripts/AGENTS.md` |
@@ -17,14 +17,14 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 ## 开发规则
 
 - 源码运行使用 `bun daemon.ts` 或 `bun run start`；`bun run build` 生成 Node.js 22.19+（22.x）或 24+ 的发布入口，最后由 `scripts/obfuscate-dist.mjs` 对这些打包产物做轻度混淆（同版本结果可复现）；发布包由 Node 运行，Bun 自动加载的 `.env` 行为不适用于 npm 入口。
-- `config.ts` 在 import 时同步读取配置，缺失时报错。首次安装的延迟导入只放在 `cli.ts`。配置项校验失败抛 `ConfigError`（`src/config-error.ts`），其消息只含配置键和非敏感取值，不含路径与凭据；启动入口把该消息原样写到 stderr，其余启动失败仍只输出安全摘要。`[notify].bind` 只能是回环地址（`127.0.0.1`、`::1`、`localhost`），不支持远程访问。
+- `config.ts` 在 import 时同步读取配置，缺失时报错。首次安装的延迟导入只放在 `src/daemon-entry.ts`（先判断配置再导入 daemon）与 `src/cli-main.ts`（各子命令按需导入），`cli.ts` 只调用分发器；`--help`/`--version` 不读写配置与数据目录（`src/log.ts` 首次真正写日志时才建数据目录、迁移旧日志）。配置项校验失败抛 `ConfigError`（`src/config-error.ts`），其消息只含配置键和非敏感取值，不含路径与凭据；启动入口把该消息原样写到 stderr，其余启动失败仍只输出安全摘要。`[notify].bind` 只能是回环地址（`127.0.0.1`、`::1`、`localhost`），不支持远程访问。
 - 配置默认位于 `~/.config/lodestar/config.toml`，状态位于 `~/.local/share/lodestar/`。新增持久状态通过 `src/paths.ts` 定义，遵循 XDG 和 Windows 路径约定。数据目录与 PID 目录创建时使用 0700（只作用于新建目录，不改已有目录权限）；状态文件经 `state-store.ts` 原子写入（0600），`debug-context.json` 同样如此。
 - 凭据、本机配置、聊天成员、debug context 和 `~/.codex`、`~/.claude` 内容不得写入跟踪文件。
 - 运行日志只保留关键状态和故障摘要，禁止正常协议 payload、命令输出、代码 diff、请求/响应正文及逐步调试流水。日志不能包含用户、群、项目名称、账号备注、路径、可关联的聊天/消息/会话/任务 ID、人数或群数；不使用哈希或匿名编号替代身份。事件说明使用固定字面量，错误通过 `logError` 提取安全类别、错误码及 HTTP 状态，重复诊断通过 `logDiagnostic` 合并且不输出次数；不得直接记录上游 message/stack/stderr。用户侧错误反馈和恢复所需持久状态保留原始信息，不属于普通日志。
-- 后端 Agent 边界：三后端 spawn 前必须经 `src/agent-env.ts` 清洗环境，删除 `LODESTAR_CONFIG*`、`LODESTAR_DATA_DIR`、`LODESTAR_RESTART_CONTINUE_CHAT_ID`、`FEISHU_*` 等宿主变量，只保留 `LODESTAR_AGENT_*`、`LODESTAR_DSH_*`、`LODESTAR_RELAY_*`；不得注入 `LODESTAR_AGENT_SESSION`（受管上下文由 `LODESTAR_AGENT_ROLE/URL/CAPABILITY` 判定），清洗器对该键显式丢弃。收件附件落 `src/attachments.ts` 的临时私有目录，不得写入或指向状态目录。本机调试注入只在 `LODESTAR_DEBUG_SOCKET=1` 且 Bun 下启用，`debug-context.json` 不随普通运行写盘并在停机删除。
-- 本机通知响应与回调不回传 `chat_id`/操作者 `open_id`（只保留 `notify_id`、`message_id`、`project` 与按钮/回复），`feishu-notify` Skill 不写数据目录路径或状态文件名；Agent 侧错误回显先经 `redactMemberIds` 脱敏,`formatFeishuError` 只输出 code/message/log_id 等诊断字段。
-- Agent 可见的 `/agents` 诊断只保留脱敏文本（邮箱、IM ID、绝对路径替换为占位符）；`serializeRun` 不返回会话名。
-- Codex 项目信任通过启动参数 `-c projects.<path>.trust_level="trusted"` 逐次下发，不得写入共享 `~/.codex/config.toml`；启动时只清理当前会话绑定对应的直接子目录 trust 项（`src/codex-config.ts`），保留用户自建的其他信任。永久删除群后清理会话映射/租约/活跃时间；`agent-runs` 正文保留 30 天（启动与每日清理），已清理 run 记入 `pruned-artifacts.json` 并显示「已清理」，快照保留。`lodestar version` 默认不输出运行目录，`--verbose` 才输出。
+- 后端 Agent 边界：三后端 spawn 前必须经 `src/agent-env.ts` 清洗环境，删除 `LODESTAR_CONFIG*`、`LODESTAR_DATA_DIR`、`LODESTAR_RESTART_CONTINUE_CHAT_ID`、`FEISHU_*` 等宿主专有变量；`LODESTAR_` 前缀的变量只放行 `LODESTAR_AGENT_*`、`LODESTAR_DSH_*`、`LODESTAR_RELAY_*` 三类，`PATH`、`HOME` 等其他环境变量照常传给 Agent（Windows 环境变量名不区分大小写，规则按不区分大小写匹配，`feishu_app_secret` 同样删除；其他平台精确匹配）；不得注入 `LODESTAR_AGENT_SESSION`（受管上下文由 `LODESTAR_AGENT_ROLE/URL/CAPABILITY` 判定），清洗器对该键显式丢弃；宿主环境遗留的 `DSH_LODESTAR_AGENT_CONTEXT`（例如 daemon 从受管 DSH shell 启动）属于先前的任务，同样丢弃，DSH 的委派上下文只由 `dsh-runtime.ts` 按本次启动的 `LODESTAR_AGENT_URL/CAPABILITY` 注入。收件附件落 `src/attachments.ts` 的临时私有目录（0700），不得写入或指向状态目录；停机不删除（重启续接后会话历史仍引用这些路径），按年龄保留 7 天：启动时与每日清理，超期未变动的旧目录整体删除，本进程正在用的目录只删过期文件。已知限制：Agent 进程环境仍含指向数据目录的 `DSH_HOME`（`DATA_DIR/dsh`，`dsh-runtime.ts`）与备注 Codex 账号的 `CODEX_HOME`（`DATA_DIR/codex-accounts/<id>`，`codex-accounts.ts`），搬迁会破坏已有 DSH 会话与 Codex 登录，所以不搬；同 UID 的进程本就能读取数据目录与配置，环境清洗只避免主动泄露，不构成文件系统隔离。本机调试注入只在 `LODESTAR_DEBUG_SOCKET=1` 且 Bun 下启用，`debug-context.json` 不随普通运行写盘并在停机删除。
+- 本机通知响应与回调不回传 `chat_id`/操作者 `open_id`（只保留 `notify_id`、`message_id`、`project` 与按钮/回复），`feishu-notify` Skill 不写数据目录路径或状态文件名；Agent 侧错误回显（`/notify` 的 502/500 响应、结果查询里的 `reply.error`/`unknown_reason`）先经 `redactMemberIds`，再按 `/agents` 诊断同一口径（`src/agent-visible-text.ts`）脱敏，卡片上给点击人看的原文不变；`formatFeishuError` 只输出 code/message/log_id 等诊断字段。
+- Agent 可见的 `/agents` 诊断只保留脱敏文本（邮箱、IM ID、绝对路径替换为占位符；绝对路径按通用形式识别——POSIX、盘符 `C:\`/`C:/`、UNC、`file://`、`~/`——不误伤 `https://` 等 URL；一般的 `/` 紧跟在任何文字（含中文）的字母或数字后不算路径起点（`作者/模型`），常见根目录（`/Users/`、`/home/`、`/tmp/`、`/var/`、`/data/` 等）与 `~/` 只排除前面紧贴的 ASCII 字母数字、点与斜杠，紧贴中文的 `无法读取/Users/…` 仍脱敏；路径可含空格、括号与冒号，占位一直吞到换行或引号路径的右引号，遇到右括号（左括号不在路径里时）、ASCII `(`/`[` 或“冒号+空白”时，只有后面不再出现 `/`、`\` 才截止，宁可多删也不留路径片段；接口路径片段如 `（/v1/models …）` 同样按路径处理；飞书诊断在 ` log_id=` 处切开，log_id 保留）；`serializeRun` 不返回会话名。
+- Codex 项目信任通过启动参数 `-c projects={ "<path>" = { trust_level = "trusted" } }` 逐次下发（`codexProjectTrustArgs`：Codex 按 `.` 切分 `-c` 键且不识别引号，路径只能作为内联表的 TOML 基本字符串键，正确转义反斜杠、引号与控制字符；Codex 把 `-c` 与 `config.toml` 深合并，用户自建的其他 projects 项照常生效），不得写入共享 `~/.codex/config.toml`；启动时只清理当前会话绑定对应的直接子目录 trust 项（`src/codex-config.ts`），保留用户自建的其他信任。永久删除群后清理会话映射/租约/活跃时间；`agent-runs` 正文保留 30 天（启动与每日清理），已清理 run 先记入 `pruned-artifacts.json` 再删正文并显示「已清理」，快照保留；清理失败只记日志、下一轮重试，不阻断启动。启动加载时过期 run 的正文缺失按已清理显示，其他正文读不出来的 run 照常登记、`status` 再报读取错误；快照文件本身损坏或格式不符仍报错。`lodestar version` 默认不输出运行目录，`--verbose` 才输出；出错信息同样如此（路径替换为 `<运行目录>`）。
 - API、模型目录、额度、上传和进程启动失败必须记录并向调用方显示；缺失数据用 `MISS`，不能伪造成功或偷偷更换来源。仅允许对已知瞬态错误有限重试。Codex 自动选号成功时，其他账号的缓存过期、模型不支持、查询或认证失败等诊断仅保留在日志和主动查询面板，不单独推送警告；无法启动或继续任务的失败仍须明确提示。
 - 保留已有改动。依赖变化用 Bun 同步 `bun.lock`，不手改锁文件。
 - 禁止在 daemon 启动时检查、安装或更新 Agent，自动更新默认关闭。手动或显式开启的定期更新选择上游 `latest`，不等待 Lodestar 发版，不设置兼容版本白名单或旧版本上限。用户接受新版可能不兼容；发生不兼容时明确报错，由后续 Lodestar 更新适配，不能为规避适配而锁旧、降级、回退或恢复“先兼容验收才更新”的门槛。开发锁文件只记录测试依赖快照，不限制生产 Agent 更新。
@@ -34,14 +34,14 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 ## 模块边界
 
 - 一个群只有一个 Session 和一个当前主进程。Codex 使用 app-server JSON-RPC，Claude Code 及其第三方来源使用 Agent SDK streaming input，DSH 使用独立 Node 子进程和 Cordis stdio 桥接；不引入 tmux、JSONL 队列或旁路进程控制。
-- 单聊（p2p）不对应项目：不建 Session、不写状态、不启动任何东西，任何消息只回只读面板（`p2p-panel.ts`），没有按钮，操作都留在群里。全局总览（全部活跃项目、全部账号额度、主机）只在单聊面板，群里的 `hi` 只显示本项目的状态、模型、实际账号及其额度。细节见 `src/AGENTS.md`。
+- 单聊（p2p）不对应项目：不建 Session、不写状态、不启动任何东西，任何消息只回只读面板（`p2p-panel.ts`），没有按钮，操作都留在群里。跨项目总览（读者看得到的全部活跃项目、全部账号额度、主机）只在单聊面板，群里的 `hi` 只显示本项目的状态、模型、实际账号及其额度。细节见 `src/AGENTS.md`。
 - 启动、重启与恢复类状态卡/通知（`🚀 启动`、`🔁 重启`、`🔁 恢复上一会话`、`✅ 已就绪 / 已恢复` 等）在模型行后标注本次账号分配结果：`· 账号 Claude·默认`、`· 账号 Codex·备注`、`· 账号 GLM`、`· 账号 <中转站名>`；订阅池尚未选出时写 `账号 Claude·选号中` / `账号 Codex·选号中`，显式 `hi 备注` 在启动前就写该账号。冷启动第 1 个 turn 从 `Waiting...(0s)` 起同样标注，且「📥 收到 (N) 🚀」标题在 🚀 后写同一个账号（开卡时写计划中的分配，进程就绪后用实际分配的账号原地重绘该面板）；开始回答后及后续 turn 的 footer 仍固定为 `agent · 模型名/effort`。
 - DSH 的 `deepseek-harness` 与 Claude 兼容的 `deepseek` 共用 DeepSeek 凭据和平台地址；`dsh-glm` 与 `glm` 共用 GLM Coding Plan 账号，前者通过原生 pi-ai 适配器接入。共享凭据只存一份，模型、effort 和可见性按 Agent 保留；旧配置冲突必须明确报错，任一 setup 入口均更新共享账号。运行时经更新器选择 latest，子进程需要 Node 22.19+（22.x）或 24+；`src/dsh-bridge.ts` 仅在该子进程加载。启动补丁按实际安装的 profile 判断是否已自带 ask-user 工具，避免重复注册；模型接入链需要的 credentials 服务保持启用，凭据仍只由环境变量注入。
 - Agent 运行时更新（`agent-updates.ts`）：
   - 按 `[runtime.agent_auto_update]` 的 `codex`、`claude`、`dsh` 三个独立开关每 6 小时更新对应 Agent，首次检查也在 6 小时后；三项默认关闭，各自防止重叠执行，失败互不阻塞。旧布尔总开关按原值兼容转换并提示迁移，不与新表混用。
-  - `lodestar update --agents-only` 在当前进程立即安装/更新。不带参数的 `lodestar update`（`update-run.ts`）先安装新版 Lodestar 包，再以子进程运行新装入口的 `--agents-only`，让新版自带的安装逻辑执行本次 Agent 更新。
+  - `lodestar update --agents-only` 在当前进程立即安装/更新。不带参数的 `lodestar update`（`update-run.ts`）先安装新版 Lodestar 包，再以子进程运行新装入口的 `--agents-only`，让新版自带的安装逻辑执行本次 Agent 更新。顶层 `lodestar --agents-only`（`src/cli-main.ts` 分发到 update）是跨版本协议：已发布的旧版 update 会这样调用新装入口，不能删除或改名；0.24 及更早的旧版调用的是自己已移除的入口，必然失败，靠 postinstall 与 `docs/configuration.md` 的迁移提示让用户再运行一次 `lodestar update --agents-only`。
   - 实际程序和 SDK 从独立版本目录加载；安装成功直接启用，新进程使用新版，已有进程保留其运行目录。更新成功后只保留当前与最近两个版本目录，并清理中断或取消安装遗留的 `.install-*` 临时目录与过期锁目录；仍被运行中进程使用的目录不删除，无法核对进程的平台跳过清理，清理问题不使更新失败。遗留临时目录须同时满足没有进程引用、安装时记录的安装器 PID 已确认退出才删除，没有 PID 记录的满 24 小时才删除。
-  - 缺 PID 文件的锁目录超过 30 秒即回收，过期锁先改名再核对，避免两个等待者误删对方刚取得的锁。
+  - 锁目录以 `holder-<PID>-<令牌>` 文件标明持有者，连同持有者自己的进程启动标识在私有目录写好后一次改名发布，不会出现没有持有者的新锁；持有者已退出，或有正面证据表明其 PID 已被复用（该 PID 当前的启动标识与记录不同，标识与墙钟无关）才失效，证据不足或查询失败一律继续等待并退避重查；回收只把该持有者文件原子改名为自己的，同一把失效锁只有一个等待者成功，不挪走、不改回别人的锁；释放时先改名移出锁路径再删除；旧版留下的无持有者锁目录超过 30 秒才回收，且只删空目录。`.stale-lock-*` 不经进程核对直接清扫。
   - Windows 不覆盖或删除使用中的 EXE/DLL；安装取消按精确 PID 终止安装器进程树，未确认退出不得清理其临时目录。文件占用有限重试，最终错误必须显示。
   - 安装或查询失败只记录更新日志并向手动更新调用方返回失败，不修改当前安装记录，不影响已有安装的启动和 `lodestar version`；已开启自动更新的 Agent 在下一个 6 小时周期再试。旧状态中的更新错误不参与启动判断或版本展示。首次未安装、安装损坏或旧版已清掉选择记录时按实际安装状态报错，不扫描目录猜测版本。
   - 自动更新 Agent 不重启 daemon；daemon 停机在 15 秒期限内等待进行中的更新结算。
@@ -78,7 +78,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - 保留 Claude 的原生 resume/fork、提问、project profile、MCP/Skill、主动压缩和 SDK 后台任务；保留 Codex 的权限、提问、plan/goal、compaction、usage 和 collab 事件。共享接口须表达后端差异。
 - Claude 原生安全分类器拦截（SDK `model_refusal_fallback` / `model_refusal_no_fallback`）必须在群里另发独立提醒卡，写明原模型、降级模型与类别，不能当未知事件丢弃；会话级降级后 footer 显示实际在答的模型，`md` 重选原模型必须真正切回。实现约束见 `src/AGENTS.md`。
 - `cardkit.ts` 独占生产卡的队列、sequence、TTL 重开、元素计数和写入失败状态。正文按完整 block 插入静态元素，footer 用 replace；模板和 Session 不直调 Card Kit HTTP。
-- 飞书群解散事件 `im.chat.disbanded_v1` 必须注册：收到后停止 Session（`announce: false`）、`dispose`、从 registry 删除、`clearSessionConversationState(sessionName, chatId)` 并刷新 alive marker；项目目录和云空间文件不删除。应用需在开放平台订阅该事件。
+- 飞书群解散事件 `im.chat.disbanded_v1` 必须注册（处理在 `chat-disband.ts`，daemon 只接线）：收到后停止该群的 Session（`announce: false`）、`dispose`、从 registry 删除并刷新 alive marker；群名绑定确实指向该群时才 `clearSessionConversationState(sessionName, chatId)`（它按群名无条件清理，所以 stop 结束后才挑名字、每个名字清理前再核对一次，stop 期间同名群改走的绑定不清），否则只清该群自己的活跃时间、租约和群名缓存（`forgetChatState`），同名的另一个群不受影响；项目目录和云空间文件不删除。应用需在开放平台订阅该事件。
 - `workspace.ts` 统一按实际工作目录（含软链接归一化）解析目录配置；BTW/FK 与来源共享目录，WT 是独立目录。项目工具/MCP 配置按目录共享。模型/账号仅创建临时会话时继承快照，后续各会话独立。配置别名冲突必须报错。
 - `worktree.ts` 管理 `work/*` 分支和同级 `<project>[name]` 工作区。
 - 文件交付（`[[send: /abs/path]]`）：

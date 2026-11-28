@@ -38,6 +38,35 @@ describe('agent host environment scrubbing', () => {
     expect(env.CODEX_HOME).toBe('/home/me/.codex')
   })
 
+  test('drops a DSH delegation context inherited from the host', () => {
+    // A daemon started from a managed DSH shell must not hand that old task's context to new Agents.
+    const env = scrubAgentHostEnv({
+      PATH: '/usr/bin',
+      DSH_LODESTAR_AGENT_CONTEXT: JSON.stringify({ baseUrl: 'http://127.0.0.1:9876', capability: 'old-task' }),
+      LODESTAR_AGENT_URL: 'http://127.0.0.1:9876',
+      LODESTAR_AGENT_CAPABILITY: 'this-launch',
+    })
+    expect(env).toEqual({ PATH: '/usr/bin', LODESTAR_AGENT_URL: 'http://127.0.0.1:9876', LODESTAR_AGENT_CAPABILITY: 'this-launch' })
+  })
+
+  test('Windows matches the rules regardless of case; other platforms keep exact names', () => {
+    const host = {
+      Path: 'C:\\Windows',
+      feishu_app_secret: 'secret',
+      Feishu_App_Id: 'cli_x',
+      lodestar_data_dir: 'C:\\Users\\me\\AppData\\Local\\lodestar',
+      Lodestar_Config: 'C:\\Users\\me\\lodestar.toml',
+      dsh_lodestar_agent_context: '{"capability":"old-task"}',
+      lodestar_future_path: 'x',
+      lodestar_agent_capability: 'cap',
+      Lodestar_Relay_Api_Key: 'key',
+    }
+    // Windows resolves these names case-insensitively, so each is the host variable itself.
+    expect(scrubAgentHostEnv(host, 'win32')).toEqual({ Path: 'C:\\Windows', lodestar_agent_capability: 'cap', Lodestar_Relay_Api_Key: 'key' })
+    // Elsewhere a differently cased name is a different variable and is left alone.
+    expect(scrubAgentHostEnv(host, 'linux')).toEqual(host)
+  })
+
   test('is a copy: the daemon environment is never mutated', () => {
     const source = { FEISHU_APP_SECRET: 'secret', PATH: '/usr/bin' }
     const scrubbed = scrubAgentHostEnv(source)

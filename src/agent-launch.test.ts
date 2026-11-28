@@ -201,7 +201,90 @@ test('a conversation kept in a launcher source cannot be continued from the shar
   }
 })
 
-test('Codex spawn drops host identity, data paths and Feishu credentials', () => {
+test('a reclaude conversation from another organization says how to switch the organization back', () => {
+  const previous = listTokenSources()
+  resetTokenSourceRegistry()
+  const root = mkdtempSync(join(tmpdir(), 'lodestar-launch-org-'))
+  const workDir = join(root, 'project')
+  // reclaude binds each organization to its own directory: <data>/claude/accounts/<device>/config.
+  const binding = (device: string) => join(root, 'reclaude', 'claude', 'accounts', device, 'config')
+  const transcript = claudeTranscriptPath(workDir, 'from-old-org', { configDir: binding('device-old'), projectDirName: '' })
+  mkdirSync(dirname(transcript), { recursive: true })
+  writeFileSync(transcript, '{}\n')
+  mkdirSync(binding('device-new'), { recursive: true })
+  registerTokenSource({
+    id: 'reclaude', kind: 'reclaude', agent: 'claude', display: 'reclaude', enabled: true,
+    models: [{ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' }], defaultModel: 'opus',
+    modelCatalogState: { status: 'ready', updatedAt: 1 },
+    refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
+    readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    claudeHistoryDir: binding('device-new'),
+    claudeLauncher: { command: '/opt/reclaude', args: ['--org', '8', 'cli'], diagnosticPrefix: 'reclaude:' },
+  })
+  // A source reading the store other Claude sources share.
+  registerTokenSource({
+    id: 'shared-test', kind: 'test', agent: 'claude', display: '共享来源', enabled: true,
+    models: [{ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' }], defaultModel: 'opus',
+    modelCatalogState: { status: 'ready', updatedAt: 1 },
+    refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
+    readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+  })
+  const resume = (sessionId: string, tokenSourceId = 'reclaude') => () => createAgentProcess({
+    provider: 'claude', workDir, tokenSourceId, model: 'opus', effort: 'high',
+    launch: { kind: 'resume', source: { provider: 'claude', sessionId, cwd: workDir } },
+  })
+  const failure = (run: () => unknown) => { try { run() } catch (error) { return (error as Error).message } return '' }
+  try {
+    // The source is still reclaude, so md cannot switch back; the organization has to.
+    const sameSource = failure(resume('from-old-org'))
+    expect(sameSource).toContain('该会话的记录保存在 reclaude 的另一个组织下')
+    expect(sameSource).toContain('reclaude org use <原组织 ID>')
+    expect(sameSource).toContain('[token_source.reclaude] 配置 org')
+    expect(sameSource).not.toContain('md 切回')
+    // From another source both steps are needed: md back to reclaude, then its old organization.
+    const otherSource = failure(resume('from-old-org', 'shared-test'))
+    expect(otherSource).toContain('该会话的记录保存在 reclaude 的另一个组织下')
+    expect(otherSource).toContain('共享来源 无法续接')
+    expect(otherSource).toContain('用 md 切回 reclaude，并在本机执行 reclaude org use <原组织 ID>')
+    // A record found nowhere keeps the plain explanation, and the shared store leaves it to the native resume.
+    expect(resume('recorded-nowhere')).toThrow('该会话的记录不在 reclaude 的会话目录中')
+    expect(resume('recorded-nowhere', 'shared-test')().process.provider).toBe('claude')
+  } finally {
+    resetTokenSourceRegistry()
+    for (const item of previous) registerTokenSource(item)
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+/** 按 Codex 解释 `-c` 的规则还原覆盖结果:第一个 `=` 前为键,键按 `.` 切分且不识别引号;
+ * 值按 TOML 值解析,解析失败时退回去掉首尾引号的字符串。 */
+function codexConfigOverrides(args: string[]): Record<string, any> {
+  const root: Record<string, any> = {}
+  for (let index = 0; index < args.length; index++) {
+    if (args[index] !== '-c') continue
+    const raw = args[++index]!
+    const eq = raw.indexOf('=')
+    const valueText = raw.slice(eq + 1).trim()
+    let value: unknown
+    try {
+      value = (Bun.TOML.parse(`_x_ = ${valueText}`) as { _x_: unknown })._x_
+    } catch {
+      value = valueText.replace(/^["']+|["']+$/g, '')
+    }
+    const parts = raw.slice(0, eq).trim().split('.')
+    let table = root
+    for (const part of parts.slice(0, -1)) {
+      table = table[part] !== null && typeof table[part] === 'object' ? table[part] : (table[part] = {})
+    }
+    table[parts.at(-1)!] = value
+  }
+  return root
+}
+
+test('Codex spawn drops host identity, data paths, Feishu credentials and an inherited DSH task context', () => {
+  // 含点、引号、空格、等号、制表符和 Windows 反斜杠的路径都必须原样成为 projects 的键。
+  const workDirs = ['/repo', '/Users/john.doe/my.repo', '/tmp/a "quoted" dir', '/tmp/a=b.c', '/tmp/tab\there',
+    'C:\\Users\\x\\proj.v2']
   const script = `
     import { mock } from 'bun:test'
     import { EventEmitter } from 'node:events'
@@ -225,20 +308,30 @@ test('Codex spawn drops host identity, data paths and Feishu credentials', () =>
     process.env.LODESTAR_DATA_DIR = '/tmp/secret-data'
     process.env.LODESTAR_CONFIG = '/tmp/secret-config.toml'
     process.env.FEISHU_APP_SECRET = 'secret'
-    const { process: proc } = createAgentProcess({ provider: 'codex', tokenSourceId: 'env-test', workDir: '/repo',
-      model: 'm', effort: 'high' })
-    assert.equal(captured.options.env.LODESTAR_AGENT_SESSION, undefined)
-    const trustIndex = captured.args.indexOf('-c')
-    assert.ok(trustIndex >= 0)
-    assert.equal(captured.args[trustIndex + 1], 'projects."/repo".trust_level="trusted"')
-    assert.equal(captured.options.env.LODESTAR_RESTART_CONTINUE_CHAT_ID, undefined)
-    assert.equal(captured.options.env.LODESTAR_DATA_DIR, undefined)
-    assert.equal(captured.options.env.LODESTAR_CONFIG, undefined)
-    assert.equal(captured.options.env.FEISHU_APP_SECRET, undefined)
-    child.emit('exit', 0, null); child.emit('close', 0, null)
+    process.env.DSH_LODESTAR_AGENT_CONTEXT = JSON.stringify({ baseUrl: 'http://127.0.0.1:9876', capability: 'old-task' })
+    const launched = []
+    for (const workDir of ${JSON.stringify(workDirs)}) {
+      createAgentProcess({ provider: 'codex', tokenSourceId: 'env-test', workDir, model: 'm', effort: 'high' })
+      assert.equal(captured.options.env.LODESTAR_AGENT_SESSION, undefined)
+      assert.equal(captured.options.env.LODESTAR_RESTART_CONTINUE_CHAT_ID, undefined)
+      assert.equal(captured.options.env.LODESTAR_DATA_DIR, undefined)
+      assert.equal(captured.options.env.LODESTAR_CONFIG, undefined)
+      assert.equal(captured.options.env.FEISHU_APP_SECRET, undefined)
+      assert.equal(captured.options.env.DSH_LODESTAR_AGENT_CONTEXT, undefined)
+      launched.push({ workDir, args: captured.args })
+      child.emit('exit', 0, null); child.emit('close', 0, null)
+    }
+    process.stdout.write('\\nLAUNCHED ' + JSON.stringify(launched) + '\\n')
   `
   const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
     cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
   })
-  expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+  const output = result.stdout.toString()
+  expect(result.exitCode, output + result.stderr.toString()).toBe(0)
+  const line = output.split('\n').find(text => text.startsWith('LAUNCHED '))
+  const launched = JSON.parse(line!.slice('LAUNCHED '.length)) as { workDir: string, args: string[] }[]
+  expect(launched.map(item => item.workDir)).toEqual(workDirs)
+  for (const { workDir, args } of launched) {
+    expect(codexConfigOverrides(args).projects).toEqual({ [workDir]: { trust_level: 'trusted' } })
+  }
 })
